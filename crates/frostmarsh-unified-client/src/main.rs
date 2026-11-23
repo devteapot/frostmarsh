@@ -32,7 +32,7 @@ use crate::mesh_gen::StaticMeshBank;
 use crate::net::QuicClientHandle;
 use crate::renderer::{Approach4Renderer, Atmosphere, RenderStyle};
 use crate::surfel_gen::SurfelProtoBank;
-use crate::world_bridge::{assemble_live_frame, LiveApproach4World};
+use crate::world_bridge::{assemble_live_frame, AimReticle, LiveApproach4World, SP_ICE};
 use clap::Parser;
 use frostmarsh_proto::*;
 use glam::Vec3;
@@ -276,6 +276,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         cam_main.dist,
         sim_time,
         0,
+        None,
     );
 
     // Benchmark 4 modes (with full HUD active!)
@@ -422,7 +423,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut panels = Vec::with_capacity(4);
     for (cam, st, with_hud, slice_mode) in &views {
         let m = cam.compute_matrices(960.0, 540.0, sun_dir);
-        let fr = assemble_live_frame(&world, entities.as_ref(), &surfels, &m, cam.target, cam.dist, sim_time, *slice_mode);
+        let fr = assemble_live_frame(&world, entities.as_ref(), &surfels, &m, cam.target, cam.dist, sim_time, *slice_mode, None);
         let hb = if *with_hud {
             Some(build_hud(
                 960.0,
@@ -500,6 +501,104 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 // INTERACTIVE PLAYABLE WINDOW MODE (macOS Metal / Linux Vulkan via winit)
 // =========================================================================
 
+#[derive(Clone, Copy, Debug)]
+struct PendingMoveInput {
+    seq: u32,
+    move_x: f32,
+    move_y: f32,
+    dt: f32,
+    dash: bool,
+}
+
+fn hero_class_base_speed(class_id: u8) -> f32 {
+    match class_id {
+        CLASS_WARDEN => 15.5,
+        CLASS_ALCHEMIST => 16.0,
+        _ => 18.8,
+    }
+}
+
+/// Exact client-side mirror of `frostmarsh-server`'s locomotion + wall sliding + terrain drag/glide
+/// so predicted hero motion matches authoritative server updates with zero rubber-banding!
+#[allow(clippy::too_many_arguments)]
+fn predict_hero_step(
+    world: &LiveApproach4World,
+    x: f32,
+    y: f32,
+    z: f32,
+    move_x: f32,
+    move_y: f32,
+    dt: f32,
+    class_id: u8,
+    carrying_relic: bool,
+    dashing: bool,
+    hasted: bool,
+    bodies: &[CellBodySnap],
+) -> (f32, f32) {
+    let gw = world.grid_w as f32;
+    let gh = world.grid_h as f32;
+    let mlen = move_x.hypot(move_y);
+    if mlen < 0.01 && !dashing {
+        return (x, y);
+    }
+    let (dx, dy) = if mlen >= 0.01 { (move_x / mlen, move_y / mlen) } else { (0.0, 0.0) };
+    let mut speed = if dashing {
+        42.0
+    } else {
+        let mut s = hero_class_base_speed(class_id);
+        if carrying_relic { s *= 0.78; }
+        if hasted { s *= 1.32; }
+        s
+    };
+
+    let sample_cell = |tx: f32, ty: f32| {
+        let xi = (tx.floor() as i32).clamp(0, (world.grid_w.saturating_sub(1)) as i32) as usize;
+        let yi = (ty.floor() as i32).clamp(0, (world.grid_h.saturating_sub(1)) as i32) as usize;
+        let idx = yi * world.grid_w + xi;
+        if z >= 1.55 { world.decoded_l2[idx] } else { world.decoded[idx] }
+    };
+
+    let c_here = sample_cell(x, y);
+    let on_raft = z < 1.35
+        && bodies.iter().any(|b| (x - b.x).powi(2) + (y - b.y).powi(2) <= (b.radius + 1.0).powi(2));
+    if !dashing {
+        if !on_raft && c_here.water_slow && c_here.s1 != SP_ICE {
+            speed *= 0.60;
+        } else if c_here.s1 == SP_ICE {
+            speed *= 1.20;
+        }
+    }
+
+    let nx = (x + dx * speed * dt).clamp(3.5, (gw - 3.5).max(3.5));
+    let ny = (y + dy * speed * dt).clamp(3.5, (gh - 3.5).max(3.5));
+
+    let can_step = |tx: f32, ty: f32| -> bool {
+        let xi = (tx.floor() as i32).clamp(0, (world.grid_w.saturating_sub(1)) as i32) as usize;
+        let yi = (ty.floor() as i32).clamp(0, (world.grid_h.saturating_sub(1)) as i32) as usize;
+        let idx = yi * world.grid_w + xi;
+        if z >= 1.55 {
+            let c2 = world.decoded_l2[idx];
+            if c2.walkable && !c2.wall {
+                return true;
+            }
+            return !world.decoded[idx].wall;
+        }
+        let c1 = world.decoded[idx];
+        let raft = bodies.iter().any(|b| (tx - b.x).powi(2) + (ty - b.y).powi(2) <= (b.radius + 1.0).powi(2));
+        (c1.walkable || raft || dashing) && !c1.wall
+    };
+
+    if can_step(nx, ny) {
+        (nx, ny)
+    } else if can_step(nx, y) {
+        (nx, y)
+    } else if can_step(x, ny) {
+        (x, ny)
+    } else {
+        (x, y)
+    }
+}
+
 struct InteractiveApp {
     args: Args,
     rt: tokio::runtime::Runtime,
@@ -540,6 +639,8 @@ struct InteractiveApp {
     pending_ability_e: bool,
     pending_ult_r: bool,
     input_seq: u32,
+    input_dirty: bool,
+    actuator_edge_fire: bool,
     last_input_send: Instant,
     last_actuator_send: Instant,
     start_time: Instant,
@@ -548,6 +649,12 @@ struct InteractiveApp {
     smooth_players: HashMap<u32, (f32, f32, f32)>,
     smooth_projs: HashMap<u32, (f32, f32, f32)>,
     smooth_bodies: HashMap<u32, (f32, f32, f32)>,
+    pending_inputs: VecDeque<PendingMoveInput>,
+    pred_hero_pos: Option<(f32, f32, f32)>,
+    hero_visual_err: (f32, f32),
+    hero_dash_pred_until: Option<Instant>,
+    local_aim_dir: (f32, f32),
+    local_actuator_pulses: Vec<(Instant, ActuatorPulseSnap)>,
     last_snap_tick: u64,
     snap_age_s: f32,
 }
@@ -574,10 +681,10 @@ impl InteractiveApp {
             surfels,
             world: LiveApproach4World::new(GRID_W, GRID_H, GRID_D),
             camera: MobaCamera {
-                target: Vec3::new(0.0, 1.0, 0.0),
+                target: Vec3::new(0.0, 1.6, 0.0),
                 yaw: 0.42,
-                pitch: 0.74,
-                dist: 68.0,
+                pitch: 0.64,
+                dist: 44.0,
                 fov_y: 38.0_f32.to_radians(),
                 ortho: false,
             },
@@ -609,6 +716,8 @@ impl InteractiveApp {
             pending_ability_e: false,
             pending_ult_r: false,
             input_seq: 0,
+            input_dirty: false,
+            actuator_edge_fire: false,
             last_input_send: Instant::now(),
             last_actuator_send: Instant::now(),
             start_time: Instant::now(),
@@ -617,6 +726,12 @@ impl InteractiveApp {
             smooth_players: HashMap::new(),
             smooth_projs: HashMap::new(),
             smooth_bodies: HashMap::new(),
+            pending_inputs: VecDeque::with_capacity(96),
+            pred_hero_pos: None,
+            hero_visual_err: (0.0, 0.0),
+            hero_dash_pred_until: None,
+            local_aim_dir: (0.0, -1.0),
+            local_actuator_pulses: Vec::new(),
             last_snap_tick: 0,
             snap_age_s: 0.0,
         }
@@ -670,53 +785,150 @@ impl InteractiveApp {
         }
         let local_move_v = (pre_fwd_xz * f_in_now + pre_right_xz * r_in_now).clamp_length_max(1.0);
 
-        // Smooth 60-120 FPS Client-Side Hero Prediction + Velocity-Extrapolated Entity Interpolation!
-        // Eliminates 10-30 Hz snapshot stepping so your hero, bots, projectiles, and camera glide smoothly.
+        // Exact server-matched client-side hero prediction + `ack_input_seq` replay reconciliation
+        // + smooth velocity-extrapolated interpolation for all remote entities/projectiles/rafts!
+        let mut new_snap_arrived = false;
         if let Some(ref mut ent) = entities {
             if ent.sim_tick != self.last_snap_tick {
                 self.last_snap_tick = ent.sim_tick;
                 self.snap_age_s = 0.0;
+                new_snap_arrived = true;
             } else {
                 self.snap_age_s = (self.snap_age_s + dt).min(0.16);
             }
             let alpha_other = 1.0 - (-18.0 * dt).exp();
-            let alpha_self = 1.0 - (-11.0 * dt).exp();
-            let extrap_t = self.snap_age_s.min(0.12);
+            let extrap_t = self.snap_age_s.min(0.10);
             let gw_max = (self.world.grid_w.saturating_sub(2)) as f32;
             let gh_max = (self.world.grid_h.saturating_sub(2)) as f32;
-            let self_speed = 14.0 * (self.world.grid_w as f32 / 256.0).clamp(1.0, 2.0);
+            let bodies_ref = ent.bodies.clone();
 
             let mut live_pids = HashSet::with_capacity(ent.players.len());
             for p in &mut ent.players {
                 live_pids.insert(p.id);
-                let target_x = (p.x + p.vx * extrap_t).clamp(1.0, gw_max);
-                let target_y = (p.y + p.vy * extrap_t).clamp(1.0, gh_max);
-                let target_z = (p.z + p.vz * extrap_t).clamp(0.0, (self.world.grid_d.saturating_sub(1)) as f32);
+                if p.id == ent.your_player_id {
+                    let hasted = (p.status_flags & STATUS_HASTE) != 0;
+                    let pred_dashing = p.dashing
+                        || self.hero_dash_pred_until.map_or(false, |t| Instant::now() < t);
 
-                let entry = self.smooth_players.entry(p.id).or_insert((p.x, p.y, p.z));
-                let err = (entry.0 - p.x).hypot(entry.1 - p.y);
-                if err > 14.0 {
-                    *entry = (p.x, p.y, p.z);
-                } else if p.id == ent.your_player_id {
-                    // Advance local hero smoothly on WASD input + softly reconcile to authoritative server position
-                    if local_move_v.length_squared() > 0.01 && p.hp > 0 {
-                        entry.0 = (entry.0 + local_move_v.x * self_speed * dt).clamp(1.0, gw_max);
-                        entry.1 = (entry.1 + local_move_v.z * self_speed * dt).clamp(1.0, gh_max);
+                    // 1. On each authoritative server snapshot, drop acknowledged inputs & replay unacked ones
+                    if new_snap_arrived || self.pred_hero_pos.is_none() {
+                        while let Some(front) = self.pending_inputs.front() {
+                            // Wrapping-safe ack check
+                            if p.ack_input_seq.wrapping_sub(front.seq) < 10_000 {
+                                self.pending_inputs.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        let (mut rx, mut ry) = (p.x, p.y);
+                        for pin in &self.pending_inputs {
+                            let (nx, ny) = predict_hero_step(
+                                &self.world,
+                                rx,
+                                ry,
+                                p.z,
+                                pin.move_x,
+                                pin.move_y,
+                                pin.dt,
+                                p.class_id,
+                                p.carrying_relic,
+                                pin.dash,
+                                hasted,
+                                &bodies_ref,
+                            );
+                            rx = nx;
+                            ry = ny;
+                        }
+                        if let Some((old_x, old_y, old_z)) = self.pred_hero_pos {
+                            let old_disp_x = old_x + self.hero_visual_err.0;
+                            let old_disp_y = old_y + self.hero_visual_err.1;
+                            let err = (old_disp_x - rx).hypot(old_disp_y - ry);
+                            if err > 10.0 || p.hp <= 0 {
+                                // Teleport / respawn -> snap cleanly
+                                self.hero_visual_err = (0.0, 0.0);
+                            } else if err > 0.06 {
+                                // Absorb tiny residual into visual offset so hero NEVER snaps backwards!
+                                self.hero_visual_err = (old_disp_x - rx, old_disp_y - ry);
+                            }
+                            self.pred_hero_pos = Some((rx, ry, old_z + (p.z - old_z) * alpha_other));
+                        } else {
+                            self.pred_hero_pos = Some((rx, ry, p.z));
+                            self.hero_visual_err = (0.0, 0.0);
+                        }
                     }
-                    let recon = if err > 3.5 { (alpha_self * 1.8).min(1.0) } else { alpha_self };
-                    entry.0 += (target_x - entry.0) * recon;
-                    entry.1 += (target_y - entry.1) * recon;
-                    entry.2 += (target_z - entry.2) * alpha_other;
+
+                    // 2. Advance local predicted hero smoothly every frame at native FPS
+                    let (mut px, mut py, mut pz) = self.pred_hero_pos.unwrap_or((p.x, p.y, p.z));
+                    if p.hp > 0 {
+                        let (step_mx, step_my) = if pred_dashing && local_move_v.length_squared() < 0.01 {
+                            self.local_aim_dir
+                        } else {
+                            (local_move_v.x, local_move_v.z)
+                        };
+                        let (nx, ny) = predict_hero_step(
+                            &self.world,
+                            px,
+                            py,
+                            pz,
+                            step_mx,
+                            step_my,
+                            dt,
+                            p.class_id,
+                            p.carrying_relic,
+                            pred_dashing,
+                            hasted,
+                            &bodies_ref,
+                        );
+                        px = nx;
+                        py = ny;
+                    }
+                    pz += (p.z - pz) * alpha_other;
+                    self.pred_hero_pos = Some((px, py, pz));
+
+                    // Smoothly decay any tiny visual reconciliation residual
+                    let decay = (-16.0 * dt).exp();
+                    self.hero_visual_err.0 *= decay;
+                    self.hero_visual_err.1 *= decay;
+                    if self.hero_visual_err.0.abs() < 0.005 { self.hero_visual_err.0 = 0.0; }
+                    if self.hero_visual_err.1.abs() < 0.005 { self.hero_visual_err.1 = 0.0; }
+
+                    p.x = (px + self.hero_visual_err.0).clamp(1.0, gw_max);
+                    p.y = (py + self.hero_visual_err.1).clamp(1.0, gh_max);
+                    p.z = pz;
+                    if local_move_v.length_squared() > 0.01 && p.hp > 0 {
+                        let sp = hero_class_base_speed(p.class_id);
+                        p.vx = local_move_v.x * sp;
+                        p.vy = local_move_v.z * sp;
+                    }
+                    if pred_dashing {
+                        p.dashing = true;
+                    }
                 } else {
-                    entry.0 += (target_x - entry.0) * alpha_other;
-                    entry.1 += (target_y - entry.1) * alpha_other;
-                    entry.2 += (target_z - entry.2) * alpha_other;
+                    let target_x = (p.x + p.vx * extrap_t).clamp(1.0, gw_max);
+                    let target_y = (p.y + p.vy * extrap_t).clamp(1.0, gh_max);
+                    let target_z = (p.z + p.vz * extrap_t).clamp(0.0, (self.world.grid_d.saturating_sub(1)) as f32);
+                    let entry = self.smooth_players.entry(p.id).or_insert((p.x, p.y, p.z));
+                    let err = (entry.0 - p.x).hypot(entry.1 - p.y);
+                    if err > 14.0 {
+                        *entry = (p.x, p.y, p.z);
+                    } else {
+                        entry.0 += (target_x - entry.0) * alpha_other;
+                        entry.1 += (target_y - entry.1) * alpha_other;
+                        entry.2 += (target_z - entry.2) * alpha_other;
+                    }
+                    p.x = entry.0;
+                    p.y = entry.1;
+                    p.z = entry.2;
                 }
-                p.x = entry.0;
-                p.y = entry.1;
-                p.z = entry.2;
             }
             self.smooth_players.retain(|id, _| live_pids.contains(id));
+
+            // Inject short-lived local predicted actuator pulses for 0 ms visual click responsiveness
+            let now_inst = Instant::now();
+            self.local_actuator_pulses.retain(|(exp, _)| *exp > now_inst);
+            for (_, lp) in &self.local_actuator_pulses {
+                ent.actuator_pulses.push(lp.clone());
+            }
 
             let mut live_prids = HashSet::with_capacity(ent.projectiles.len());
             for pr in &mut ent.projectiles {
@@ -888,9 +1100,55 @@ impl InteractiveApp {
             }
         }
 
-        // Send 30 Hz inputs to server (camera-basis WASD + exact mouse-ray aiming!)
-        if self.last_input_send.elapsed() >= Duration::from_millis(33) {
+        // Compute exact every-frame mouse-ray cursor aiming on the hero's actual 3D altitude plane!
+        let fwd_xz = Vec3::new(mats.fwd.x, 0.0, mats.fwd.z).normalize_or(Vec3::NEG_Z);
+        let right_xz = Vec3::new(-fwd_xz.z, 0.0, fwd_xz.x);
+        let (hero_gx, hero_gy, hero_gz, hero_team, hero_stamina, hero_hp) = entities
+            .as_ref()
+            .and_then(|e| e.players.iter().find(|p| p.id == e.your_player_id))
+            .map(|me| (me.x, me.y, me.z, me.team, me.stamina, me.hp))
+            .unwrap_or((self.world.grid_w as f32 * 0.5, self.world.grid_h as f32 * 0.5, 1.0, 0, 100, 100));
+        let hero_plane_y = self.world.sample_3d_y(hero_gx, hero_gy, hero_gz);
+
+        let mut aim_x = fwd_xz.x;
+        let mut aim_y = fwd_xz.z;
+        let mut cursor_grid: Option<(f32, f32)> = None;
+        if let Some((hit_wx, hit_wz)) = self.camera.screen_to_world_xz(
+            &mats,
+            self.mouse_pos.0,
+            self.mouse_pos.1,
+            out_w as f32,
+            out_h as f32,
+            hero_plane_y,
+        ) {
+            let (hgx, hgy) = self.world.world_xz_to_grid(hit_wx, hit_wz);
+            cursor_grid = Some((hgx, hgy));
+            let dx = hgx - hero_gx;
+            let dy = hgy - hero_gy;
+            if dx.hypot(dy) > 0.05 {
+                aim_x = dx;
+                aim_y = dy;
+            }
+        }
+        let alen = aim_x.hypot(aim_y);
+        if alen > 0.01 {
+            self.local_aim_dir = (aim_x / alen, aim_y / alen);
+            // Zero-latency 120 FPS client-side hero facing toward exact mouse cursor!
+            if let Some(ref mut ent) = entities {
+                if let Some(me) = ent.players.iter_mut().find(|p| p.id == ent.your_player_id) {
+                    me.aim_x = self.local_aim_dir.0;
+                    me.aim_y = self.local_aim_dir.1;
+                }
+            }
+        }
+
+        // Send 60 Hz (or immediate edge-triggered 0 ms!) inputs + physical actuators to server
+        let send_elapsed = self.last_input_send.elapsed();
+        let should_send_input = self.input_dirty || send_elapsed >= Duration::from_millis(16);
+        if should_send_input {
+            let step_dt = send_elapsed.as_secs_f32().clamp(0.004, 0.05);
             self.last_input_send = Instant::now();
+            self.input_dirty = false;
             if let Some(ref quic) = self.quic {
                 let mut f_in = 0.0f32;
                 let mut r_in = 0.0f32;
@@ -900,32 +1158,7 @@ impl InteractiveApp {
                     if self.keys.contains(&KeyCode::KeyD) { r_in += 1.0; }
                     if self.keys.contains(&KeyCode::KeyA) { r_in -= 1.0; }
                 }
-
-                // Project camera forward/right onto XZ grid plane
-                let fwd_xz = Vec3::new(mats.fwd.x, 0.0, mats.fwd.z).normalize_or(Vec3::NEG_Z);
-                let right_xz = Vec3::new(-fwd_xz.z, 0.0, fwd_xz.x);
-                let move_v = fwd_xz * f_in + right_xz * r_in;
-
-                // Aim toward mouse ground ray hit
-                let mut aim_x = fwd_xz.x;
-                let mut aim_y = fwd_xz.z;
-                if let Some((hit_wx, hit_wz)) = self.camera.screen_to_world_xz(
-                    &mats,
-                    self.mouse_pos.0,
-                    self.mouse_pos.1,
-                    out_w as f32,
-                    out_h as f32,
-                    self.camera.target.y,
-                ) {
-                    let (hgx, hgy) = self.world.world_xz_to_grid(hit_wx, hit_wz);
-                    if let Some(me) = entities
-                        .as_ref()
-                        .and_then(|e| e.players.iter().find(|p| p.id == e.your_player_id))
-                    {
-                        aim_x = hgx - me.x;
-                        aim_y = hgy - me.y;
-                    }
-                }
+                let move_v = (fwd_xz * f_in + right_xz * r_in).clamp_length_max(1.0);
 
                 let physics_native = entities
                     .as_ref()
@@ -937,6 +1170,25 @@ impl InteractiveApp {
                 let shift_held = !self.chat_open
                     && (self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight));
 
+                let dash_req = !self.chat_open && (self.pending_dash || self.keys.contains(&KeyCode::Space));
+                if dash_req && hero_stamina >= 25 && hero_hp > 0
+                    && self.hero_dash_pred_until.map_or(true, |t| Instant::now() >= t)
+                {
+                    self.hero_dash_pred_until = Some(Instant::now() + Duration::from_millis(200));
+                }
+
+                // Record unacknowledged movement input for exact `ack_input_seq` replay reconciliation
+                self.pending_inputs.push_back(PendingMoveInput {
+                    seq: self.input_seq,
+                    move_x: move_v.x,
+                    move_y: move_v.z,
+                    dt: step_dt,
+                    dash: dash_req,
+                });
+                while self.pending_inputs.len() > 90 {
+                    self.pending_inputs.pop_front();
+                }
+
                 if physics_native && !self.chat_open {
                     let emit_matter = self.pending_ability_e
                         || self.keys.contains(&KeyCode::KeyE)
@@ -945,9 +1197,11 @@ impl InteractiveApp {
                     let emit_cryo = self.mouse_right;
                     let emit_pulse = self.pending_ult_r;
 
-                    let ready_cont = self.last_actuator_send.elapsed() >= Duration::from_millis(85);
+                    let ready_cont = self.actuator_edge_fire
+                        || self.last_actuator_send.elapsed() >= Duration::from_millis(85);
                     if emit_pulse || (ready_cont && (emit_heat || emit_cryo || emit_matter)) {
                         self.last_actuator_send = Instant::now();
+                        self.actuator_edge_fire = false;
                         let mut thermal_flux = 0.0f32;
                         if emit_heat { thermal_flux += 1.0; }
                         if emit_cryo { thermal_flux -= 1.0; }
@@ -986,6 +1240,38 @@ impl InteractiveApp {
                             focus_radius: radius,
                             impulse,
                         });
+                        // Instant 0 ms local predicted volumetric actuator beam + crisp audio response!
+                        let tx = (hero_gx + dx).clamp(2.0, (self.world.grid_w.saturating_sub(3)) as f32);
+                        let ty = (hero_gy + dy).clamp(2.0, (self.world.grid_h.saturating_sub(3)) as f32);
+                        let local_pulse = ActuatorPulseSnap {
+                            x0: hero_gx,
+                            y0: hero_gy,
+                            z0: hero_gz,
+                            x1: tx,
+                            y1: ty,
+                            z1: hero_gz,
+                            thermal_flux,
+                            sp_water,
+                            sp_oil,
+                            sp_smoke,
+                            focus_radius: radius,
+                            impulse,
+                            team: hero_team,
+                        };
+                        self.local_actuator_pulses.push((Instant::now() + Duration::from_millis(160), local_pulse.clone()));
+                        if let Some(ref mut ent) = entities {
+                            ent.actuator_pulses.push(local_pulse);
+                        }
+                        if let Some(ref audio) = self.audio {
+                            let sfx = if thermal_flux > 0.2 {
+                                SfxKind::FireCast
+                            } else if thermal_flux < -0.2 {
+                                SfxKind::FrostCast
+                            } else {
+                                SfxKind::OilCast
+                            };
+                            audio.trigger_sfx(sfx, (self.input_seq & 0xFF) as u8, 0.52, 0.0);
+                        }
                     }
                 }
 
@@ -995,7 +1281,7 @@ impl InteractiveApp {
                     move_y: move_v.z,
                     aim_x,
                     aim_y,
-                    dash: !self.chat_open && (self.pending_dash || self.keys.contains(&KeyCode::Space)),
+                    dash: dash_req,
                     melee: !self.chat_open && !physics_native && self.mouse_right,
                     cast_bolt: !self.chat_open && !physics_native && self.mouse_left,
                     bolt_element: self.selected_element,
@@ -1012,10 +1298,35 @@ impl InteractiveApp {
             }
         }
 
+        let aim_reticle = cursor_grid.map(|(cgx, cgy)| {
+            let shift_held = !self.chat_open
+                && (self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight));
+            let col = if self.mouse_right {
+                [0.42, 0.92, 1.0]
+            } else if shift_held || self.keys.contains(&KeyCode::KeyE) {
+                match self.selected_element % 3 {
+                    0 => [0.76, 0.36, 0.98],
+                    1 => [0.34, 0.84, 1.0],
+                    _ => [0.68, 0.72, 0.84],
+                }
+            } else if self.mouse_left {
+                [1.0, 0.56, 0.16]
+            } else {
+                [0.44, 0.98, 0.68]
+            };
+            AimReticle {
+                gx: cgx.clamp(2.0, (self.world.grid_w.saturating_sub(3)) as f32),
+                gy: cgy.clamp(2.0, (self.world.grid_h.saturating_sub(3)) as f32),
+                gz: hero_gz,
+                radius: self.focus_radius,
+                color: col,
+            }
+        });
+
         let style = if self.style_clean {
             RenderStyle::clean_3d()
         } else {
-            RenderStyle::pixel_art(if out_h >= 1600 { 3 } else { 2 })
+            RenderStyle::pixel_art(if out_h >= 2100 { 3 } else { 2 })
         };
         let frame = assemble_live_frame(
             &self.world,
@@ -1026,6 +1337,7 @@ impl InteractiveApp {
             self.camera.dist,
             sim_time,
             self.layer_slice_mode,
+            aim_reticle,
         );
         let hud_batch = build_hud(
             out_w as f32,
@@ -1175,8 +1487,20 @@ impl ApplicationHandler for InteractiveApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left => self.mouse_left = down,
-                    MouseButton::Right => self.mouse_right = down,
+                    MouseButton::Left => {
+                        if down && !self.mouse_left {
+                            self.input_dirty = true;
+                            self.actuator_edge_fire = true;
+                        }
+                        self.mouse_left = down;
+                    }
+                    MouseButton::Right => {
+                        if down && !self.mouse_right {
+                            self.input_dirty = true;
+                            self.actuator_edge_fire = true;
+                        }
+                        self.mouse_right = down;
+                    }
                     MouseButton::Middle => {
                         self.mouse_mid = down;
                         if !down {
@@ -1191,7 +1515,7 @@ impl ApplicationHandler for InteractiveApp {
                     MouseScrollDelta::LineDelta(_, y) => y * 4.5,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.08,
                 };
-                self.camera.dist = (self.camera.dist - dy).clamp(26.0, 170.0);
+                self.camera.dist = (self.camera.dist - dy).clamp(18.0, 145.0);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -1240,6 +1564,12 @@ impl ApplicationHandler for InteractiveApp {
                     if event.state == ElementState::Pressed {
                         self.keys.insert(code);
                         if !event.repeat {
+                            if matches!(code, KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD | KeyCode::Space | KeyCode::KeyE | KeyCode::KeyR | KeyCode::KeyC) {
+                                self.input_dirty = true;
+                            }
+                            if matches!(code, KeyCode::KeyE | KeyCode::KeyR) {
+                                self.actuator_edge_fire = true;
+                            }
                             match code {
                                 KeyCode::Escape => event_loop.exit(),
                                 KeyCode::Enter | KeyCode::NumpadEnter => {
@@ -1259,6 +1589,11 @@ impl ApplicationHandler for InteractiveApp {
                                 KeyCode::KeyP => {
                                     if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::TogglePhysicsNative);
+                                    }
+                                }
+                                KeyCode::KeyK => {
+                                    if let Some(ref q) = self.quic {
+                                        q.send_reliable_detached(ClientReliable::CycleTimeScale);
                                     }
                                 }
                                 KeyCode::Space => self.pending_dash = true,
@@ -1342,6 +1677,9 @@ impl ApplicationHandler for InteractiveApp {
                         }
                     } else {
                         self.keys.remove(&code);
+                        if matches!(code, KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD) {
+                            self.input_dirty = true;
+                        }
                     }
                 }
             }

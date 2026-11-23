@@ -1943,6 +1943,337 @@ impl VolumeField {
         }
     }
 
+    /// Apply physics-coupled diurnal solar heating/cooling across exposed surface & highland cells.
+    /// Computes `solar = (day_time * TAU - FRAC_PI_2).sin()` (`-1` midnight, `+1` noon):
+    /// - Night (`solar < -0.2`): gently cools exposed surface water/air toward freezing (midnight ice
+    ///   crossings & damped wildfires).
+    /// - Midday (`solar > 0.3`): warms exposed terrain & thaws thin ice (fiercer midday wildfires).
+    /// Strictly accounts for all added/removed thermal energy in `faucet_energy` so `energy_error == 0`.
+    pub fn apply_solar_cycle_3d(&mut self, day_time: f32, tick: u64) {
+        if self.depth == 0 || self.width == 0 || self.height == 0 {
+            return;
+        }
+        let solar = (day_time * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2).sin();
+        if (-0.2..=0.3).contains(&solar) {
+            return;
+        }
+
+        let len = self.width * self.height;
+        let surf_l = if self.depth >= 2 { 1 } else { 0 };
+        let has_overhang_layer = self.depth >= 3;
+        let stride = 5usize;
+        let phase = (tick as usize) % stride;
+
+        if solar < -0.2 {
+            let night_strength = ((-solar - 0.2) / 0.8).clamp(0.0, 1.0);
+            let mut idx = phase;
+            while idx < len {
+                // Surface layer (skip cells sheltered underneath solid L2 plateaus/bridges)
+                let surf_sheltered = has_overhang_layer
+                    && (self.layers[2].mass[SP_ROCK][idx] >= 400
+                        || self.layers[2].mass[SP_SOIL][idx] >= 400
+                        || self.layers[2].mass[SP_WOOD][idx] >= 350);
+                if !surf_sheltered {
+                    let f = &mut self.layers[surf_l];
+                    let c = f.cell_heat_capacity(idx);
+                    if c > 0 && f.mass[SP_ROCK][idx] < 500 {
+                        let t = f.cell_temp_ck(idx);
+                        if t > 38_000 {
+                            let cool_ck = (((t - 30_000) / 14).max(180) as f32 * night_strength) as i64;
+                            let min_e = c * T_AMB;
+                            let delta = (cool_ck * c).min((f.energy[idx] - min_e).max(0));
+                            if delta > 0 {
+                                f.energy[idx] -= delta;
+                                f.faucet_energy -= delta;
+                            }
+                        } else if t > 26_600
+                            && (f.mass[SP_WATER][idx] > 40
+                                || f.mass[SP_STEAM][idx] > 20
+                                || f.mass[SP_SMOKE][idx] > 20
+                                || f.mass[SP_SOIL][idx] > 40)
+                        {
+                            let cool_ck = (240.0 * night_strength) as i64;
+                            let min_e = c * 26_400;
+                            let delta = (cool_ck * c).min((f.energy[idx] - min_e).max(0));
+                            if delta > 0 {
+                                f.energy[idx] -= delta;
+                                f.faucet_energy -= delta;
+                            }
+                        }
+                    }
+                }
+                // Exposed highland layer (L2) also cools at night
+                if has_overhang_layer {
+                    let f2 = &mut self.layers[2];
+                    let c2 = f2.cell_heat_capacity(idx);
+                    if c2 > 0 && f2.mass[SP_ROCK][idx] < 500 {
+                        let t2 = f2.cell_temp_ck(idx);
+                        if t2 > 26_600 {
+                            let cool_ck = (200.0 * night_strength) as i64;
+                            let min_e = c2 * 26_400;
+                            let delta = (cool_ck * c2).min((f2.energy[idx] - min_e).max(0));
+                            if delta > 0 {
+                                f2.energy[idx] -= delta;
+                                f2.faucet_energy -= delta;
+                            }
+                        }
+                    }
+                }
+                idx += stride;
+            }
+        } else {
+            // Midday warming (solar > 0.3): warm exposed terrain, thaw thin ice, intensify midday fires
+            let sun_strength = ((solar - 0.3) / 0.7).clamp(0.0, 1.0);
+            let mut idx = phase;
+            while idx < len {
+                let surf_sheltered = has_overhang_layer
+                    && (self.layers[2].mass[SP_ROCK][idx] >= 400
+                        || self.layers[2].mass[SP_SOIL][idx] >= 400
+                        || self.layers[2].mass[SP_WOOD][idx] >= 350);
+                if !surf_sheltered {
+                    let f = &mut self.layers[surf_l];
+                    let c = f.cell_heat_capacity(idx);
+                    if c > 0 && f.mass[SP_ROCK][idx] < 800 {
+                        let t = f.cell_temp_ck(idx);
+                        let is_fuel = f.mass[SP_WOOD][idx] > 100
+                            || f.mass[SP_PLANT][idx] > 100
+                            || f.mass[SP_OIL][idx] > 80;
+                        let is_thin_ice = f.mass[SP_ICE][idx] > 0 && f.mass[SP_ICE][idx] < 650;
+                        if t > 44_000 {
+                            let heat_ck = (320.0 * sun_strength) as i64;
+                            let cap_e = c * (t + 500).min(T_MAX);
+                            let delta = (heat_ck * c).min((cap_e - f.energy[idx]).max(0));
+                            if delta > 0 {
+                                f.energy[idx] += delta;
+                                f.faucet_energy += delta;
+                            }
+                        } else if is_fuel || is_thin_ice || f.mass[SP_SOIL][idx] > 40 || f.mass[SP_WATER][idx] > 40 {
+                            let target_t = if is_fuel { 32_500 } else { 30_200 };
+                            if t < target_t {
+                                let heat_ck = (220.0 * sun_strength) as i64;
+                                let cap_e = c * target_t;
+                                let delta = (heat_ck * c).min((cap_e - f.energy[idx]).max(0));
+                                if delta > 0 {
+                                    f.energy[idx] += delta;
+                                    f.faucet_energy += delta;
+                                }
+                            }
+                        }
+                    }
+                }
+                if has_overhang_layer {
+                    let f2 = &mut self.layers[2];
+                    let c2 = f2.cell_heat_capacity(idx);
+                    if c2 > 0 && f2.mass[SP_ROCK][idx] < 800 {
+                        let t2 = f2.cell_temp_ck(idx);
+                        if t2 < 30_200 {
+                            let heat_ck = (180.0 * sun_strength) as i64;
+                            let cap_e = c2 * 30_200;
+                            let delta = (heat_ck * c2).min((cap_e - f2.energy[idx]).max(0));
+                            if delta > 0 {
+                                f2.energy[idx] += delta;
+                                f2.faucet_energy += delta;
+                            }
+                        }
+                    }
+                }
+                idx += stride;
+            }
+        }
+    }
+
+    /// Apply `[depth - 1, 5, H, W]` neural vertical interface predictions from `WorldModel3D` v4
+    /// (`flux_z_water, flux_z_oil, flux_z_steam, flux_z_smoke, heat_z`) through an **exact
+    /// antisymmetric integer conservation firewall**:
+    /// - Donor clamp across all interfaces so no cell mass ever goes negative (`m >= 0`)
+    /// - Receiver `H_CAP` headroom clamp so no cell ever exceeds `H_CAP`
+    /// - Exact `+dm / -dm` across layer `z <-> z+1`
+    /// - Exact `+dE / -dE` for both advected thermal enthalpy and 2nd-law vertical heat conduction `heat_z`
+    /// Strictly preserves **`mass_error == 0 && energy_error == 0`** even under adversarial/NaN/Inf inputs!
+    /// Returns `(gravity_mass_moved, buoyancy_mass_moved)`.
+    pub fn apply_neural_3d_vertical_fluxes(&mut self, z_flux_f32: &[f32]) -> (i64, i64) {
+        if self.depth < 2 || self.width == 0 || self.height == 0 {
+            return (0, 0);
+        }
+        let d = self.depth;
+        let n_if = d - 1;
+        let len = self.width * self.height;
+        let stride_z = 5 * len;
+        if z_flux_f32.len() < n_if * stride_z {
+            return (0, 0);
+        }
+
+        const Z_SPECIES: [usize; 4] = [SP_WATER, SP_OIL, SP_STEAM, SP_SMOKE];
+        let mut q_if = vec![[0i32; 4]; n_if];
+        let mut caps_pre = vec![0i64; d];
+        let mut energy_pre = vec![0i64; d];
+        let mut grav_moved = 0i64;
+        let mut buoy_moved = 0i64;
+
+        for idx in 0..len {
+            // 1. Decode & sanitize raw neural vertical mass fluxes [n_if, 4] (positive = z -> z+1)
+            let mut any_mass_flux = false;
+            for z in 0..n_if {
+                let base = z * stride_z;
+                for k in 0..4 {
+                    let raw_f = sanitize_f32(z_flux_f32[base + k * len + idx]) * 1000.0;
+                    let qv = round_ties_even_i32(raw_f);
+                    q_if[z][k] = qv;
+                    if qv != 0 {
+                        any_mass_flux = true;
+                    }
+                }
+            }
+
+            if any_mass_flux {
+                // 2. Exact integer donor clamping per layer & species (guarantees non-negative masses)
+                for l in 0..d {
+                    for (k, &sp) in Z_SPECIES.iter().enumerate() {
+                        let out_up = if l < n_if { q_if[l][k].max(0) as i64 } else { 0 };
+                        let out_dn = if l > 0 { (-q_if[l - 1][k]).max(0) as i64 } else { 0 };
+                        let out_tot = out_up + out_dn;
+                        if out_tot > 0 {
+                            let avail = self.layers[l].mass[sp][idx] as i64;
+                            if out_tot > avail {
+                                if l < n_if && q_if[l][k] > 0 {
+                                    q_if[l][k] = ((q_if[l][k] as i64) * avail / out_tot) as i32;
+                                }
+                                if l > 0 && q_if[l - 1][k] < 0 {
+                                    q_if[l - 1][k] = -(((-q_if[l - 1][k]) as i64) * avail / out_tot) as i32;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. Exact integer receiver H_CAP headroom clamping per layer
+                for l in 0..d {
+                    let mut in_tot = 0i64;
+                    if l > 0 {
+                        for k in 0..4 {
+                            in_tot += q_if[l - 1][k].max(0) as i64;
+                        }
+                    }
+                    if l < n_if {
+                        for k in 0..4 {
+                            in_tot += (-q_if[l][k]).max(0) as i64;
+                        }
+                    }
+                    if in_tot > 0 {
+                        let headroom = H_CAP.saturating_sub(self.layers[l].cell_volume(idx)) as i64;
+                        if in_tot > headroom {
+                            if l > 0 {
+                                for k in 0..4 {
+                                    if q_if[l - 1][k] > 0 {
+                                        q_if[l - 1][k] = ((q_if[l - 1][k] as i64) * headroom / in_tot) as i32;
+                                    }
+                                }
+                            }
+                            if l < n_if {
+                                for k in 0..4 {
+                                    if q_if[l][k] < 0 {
+                                        q_if[l][k] = -(((-q_if[l][k]) as i64) * headroom / in_tot) as i32;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 4. Snapshot pre-transport heat capacities & energies for exact proportional enthalpy advection
+                for l in 0..d {
+                    caps_pre[l] = self.layers[l].cell_heat_capacity(idx);
+                    energy_pre[l] = self.layers[l].energy[idx].max(0);
+                }
+
+                // 5. Apply exact antisymmetric integer mass + advected thermal energy across each interface
+                for z in 0..n_if {
+                    let mut e_adv_up = 0i64;
+                    for (k, &sp) in Z_SPECIES.iter().enumerate() {
+                        let qv = q_if[z][k];
+                        if qv == 0 {
+                            continue;
+                        }
+                        if qv > 0 {
+                            let q_u16 = qv as u16;
+                            self.layers[z].mass[sp][idx] -= q_u16;
+                            self.layers[z + 1].mass[sp][idx] += q_u16;
+                            if caps_pre[z] > 0 {
+                                let e_xfer = ((qv as i128)
+                                    * (SPECIES[sp].c as i128)
+                                    * (energy_pre[z] as i128)
+                                    / (caps_pre[z] as i128)) as i64;
+                                e_adv_up += e_xfer;
+                            }
+                            if k == 2 || k == 3 {
+                                buoy_moved += qv as i64;
+                            }
+                        } else {
+                            let q_abs = (-qv) as u16;
+                            self.layers[z + 1].mass[sp][idx] -= q_abs;
+                            self.layers[z].mass[sp][idx] += q_abs;
+                            if caps_pre[z + 1] > 0 {
+                                let e_xfer = ((q_abs as i128)
+                                    * (SPECIES[sp].c as i128)
+                                    * (energy_pre[z + 1] as i128)
+                                    / (caps_pre[z + 1] as i128)) as i64;
+                                e_adv_up -= e_xfer;
+                            }
+                            if k == 0 || k == 1 {
+                                grav_moved += q_abs as i64;
+                            }
+                        }
+                    }
+                    if e_adv_up != 0 {
+                        self.layers[z].energy[idx] -= e_adv_up;
+                        self.layers[z + 1].energy[idx] += e_adv_up;
+                    }
+                }
+            }
+
+            // 6. Apply exact antisymmetric 2nd-law vertical heat conduction (`heat_z`, channel 4)
+            for z in 0..n_if {
+                let g_raw_f = sanitize_f32(z_flux_f32[z * stride_z + 4 * len + idx]);
+                if g_raw_f == 0.0 {
+                    continue;
+                }
+                let c_lo = self.layers[z].cell_heat_capacity(idx);
+                let c_hi = self.layers[z + 1].cell_heat_capacity(idx);
+                if c_lo <= 0 || c_hi <= 0 {
+                    continue;
+                }
+                let g_raw = (g_raw_f as f64 * 1e6).clamp(-1e15, 1e15).round() as i64;
+                let t_lo = self.layers[z].energy[idx] / c_lo;
+                let t_hi = self.layers[z + 1].energy[idx] / c_hi;
+                let dt = t_lo - t_hi;
+                if dt == 0 {
+                    continue;
+                }
+                let max_g = ((dt.unsigned_abs() as u128)
+                    * (c_lo as u128)
+                    * (c_hi as u128)
+                    / (4 * ((c_lo + c_hi) as u128))) as i64;
+                let g = if dt > 0 && g_raw > 0 {
+                    let avail = (self.layers[z].energy[idx] - c_lo * T_MIN).max(0) / 2;
+                    let room = (c_hi * T_MAX - self.layers[z + 1].energy[idx]).max(0) / 2;
+                    g_raw.min(max_g).min(avail).min(room)
+                } else if dt < 0 && g_raw < 0 {
+                    let avail = (self.layers[z + 1].energy[idx] - c_hi * T_MIN).max(0) / 2;
+                    let room = (c_lo * T_MAX - self.layers[z].energy[idx]).max(0) / 2;
+                    g_raw.max(-max_g).max(-avail).max(-room)
+                } else {
+                    0
+                };
+                if g != 0 {
+                    self.layers[z].energy[idx] -= g;
+                    self.layers[z + 1].energy[idx] += g;
+                }
+            }
+        }
+
+        (grav_moved, buoy_moved)
+    }
+
     /// Exact integer 3D vertical exchange between adjacent strata (`z <-> z+1`):
     /// - **Gravity (`z+1 -> z`):** Liquid `water` & `oil` fall down through open air (3D Waterfalls & Oil Cascades!)
     /// - **Buoyancy (`z -> z+1`):** Hot `steam` & `smoke` rise upward into L2/L3 (3D Plume Columns!)
@@ -2053,6 +2384,17 @@ impl VolumeField {
 
     /// Apply all `L` horizontal neural/refsim layer steps + exact 3D vertical exchange + dirty chunk diffing.
     pub fn step_3d(&mut self, raw_layers: &[RawStepOutput]) -> VolumeStepStats {
+        self.step_3d_with_neural_z(raw_layers, None)
+    }
+
+    /// Apply all `L` horizontal layer steps + either neural `WorldModel3D` v4 vertical interface fluxes
+    /// (`Some(z_flux_f32)` of layout `[depth - 1, 5, H, W]`) or analytic `step_vertical_exchange_3d` (`None`),
+    /// then re-hash dirty chunks and report exact 3D mass & energy conservation errors.
+    pub fn step_3d_with_neural_z(
+        &mut self,
+        raw_layers: &[RawStepOutput],
+        z_flux_f32: Option<&[f32]>,
+    ) -> VolumeStepStats {
         self.snapshot_prev_sensors();
         let mut proj_sum = 0.0f32;
         for (z, l) in self.layers.iter_mut().enumerate() {
@@ -2061,7 +2403,11 @@ impl VolumeField {
                 proj_sum += st.proj_active_pct;
             }
         }
-        let (grav, buoy) = self.step_vertical_exchange_3d();
+        let (grav, buoy) = if let Some(zf) = z_flux_f32 {
+            self.apply_neural_3d_vertical_fluxes(zf)
+        } else {
+            self.step_vertical_exchange_3d()
+        };
         self.tick += 1;
 
         let mut dirty_chunks = Vec::new();
@@ -2539,5 +2885,83 @@ mod tests {
 
         let phys_air = vf.sample_entity_physics(32.0, 26.0, 2);
         assert!(!phys_air.support_solid, "open air over fjord on L2 should have !support_solid");
+    }
+
+    #[test]
+    fn test_neural_3d_vertical_flux_conservation() {
+        let mut vf = VolumeField::new_shattered_reach_3d(64, 64, 4);
+        let len = 64 * 64;
+        let n_if = 3usize;
+        let stride_z = 5 * len;
+
+        // Seed steam/smoke & fire on L1 so both gravity (L2->L1->L0) and buoyancy (L1->L2->L3) are active
+        vf.apply_steam_burst_3d(32, 32, 1, 5);
+        vf.apply_fire_3d(24, 42, 1, 4, 1.8);
+
+        // 1. Realistic neural vertical fluxes (downward water/oil, upward steam/smoke, vertical heat)
+        let mut z_flux = vec![0.0f32; n_if * stride_z];
+        for z in 0..n_if {
+            let base = z * stride_z;
+            for idx in 0..len {
+                z_flux[base + 0 * len + idx] = -0.35; // downward water plunge
+                z_flux[base + 1 * len + idx] = -0.25; // downward oil cascade
+                z_flux[base + 2 * len + idx] = 0.40;  // upward steam buoyancy
+                z_flux[base + 3 * len + idx] = 0.35;  // upward smoke buoyancy
+                z_flux[base + 4 * len + idx] = 2.5;   // upward heat conduction/convection
+            }
+        }
+        let raws = vf.refsim_raw_outputs_all();
+        let st = vf.step_3d_with_neural_z(&raws, Some(&z_flux));
+        assert_eq!(st.mass_error, 0, "realistic neural z_flux mass error");
+        assert_eq!(st.energy_error, 0, "realistic neural z_flux energy error");
+        assert!(st.vertical_gravity_mass > 0, "expected downward gravity mass transfer");
+        assert!(st.vertical_buoyancy_mass > 0, "expected upward buoyancy mass transfer");
+
+        // 2. Adversarial / extreme neural z_flux values (NaN, +/-Inf, +/-1e9, huge alternating signs)
+        for step in 0..20 {
+            for (i, v) in z_flux.iter_mut().enumerate() {
+                *v = match (i + step) % 9 {
+                    0 => f32::NAN,
+                    1 => f32::INFINITY,
+                    2 => f32::NEG_INFINITY,
+                    3 => 1e9,
+                    4 => -1e9,
+                    5 => 9999.5,
+                    6 => -9999.5,
+                    7 => 500.0,
+                    _ => -500.0,
+                };
+            }
+            // Also verify diurnal solar cycle coupling stays exactly conserved!
+            let day_t = if step % 2 == 0 { 0.0 } else { 0.5 }; // midnight & noon
+            vf.apply_solar_cycle_3d(day_t, step as u64);
+            let (_g, _b) = vf.apply_neural_3d_vertical_fluxes(&z_flux);
+            assert_eq!(
+                vf.current_accounted_mass() - vf.initial_total_mass,
+                0,
+                "adversarial neural z_flux mass violation at step {}",
+                step
+            );
+            assert_eq!(
+                vf.current_accounted_energy() - vf.initial_total_energy,
+                0,
+                "adversarial neural z_flux energy violation at step {}",
+                step
+            );
+            for l in &vf.layers {
+                for idx in 0..len {
+                    assert!(l.cell_volume(idx) <= H_CAP, "H_CAP violated at step {}", step);
+                    if l.cell_heat_capacity(idx) > 0 {
+                        let t = l.cell_temp_ck(idx);
+                        assert!(
+                            (T_MIN..=T_MAX).contains(&t),
+                            "temp out of bounds ({}) at step {}",
+                            t,
+                            step
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -818,6 +818,9 @@ struct GameState {
     hazard_layers: Vec<Vec<u8>>,
     weather_kind: u8,
     day_time: f32,
+    time_scale: f32,
+    world_day: u32,
+    neural_3d_vertical: bool,
     wind_x: f32,
     wind_y: f32,
     infer_ms_last: f32,
@@ -913,6 +916,9 @@ impl GameState {
             peers: HashMap::new(),
             weather_kind: WEATHER_CLEAR,
             day_time: 0.25,
+            time_scale: 1.0,
+            world_day: 1,
+            neural_3d_vertical: false,
             wind_x: 0.65,
             wind_y: 0.35,
             infer_ms_last: 0.0,
@@ -2474,7 +2480,11 @@ impl GameState {
         let surf_l = self.surf_layer();
         let surf_z = surf_l as f32;
 
-        self.day_time = ((tick as f32) * 0.00018) % 1.0;
+        self.day_time += (dt / 240.0) * self.time_scale;
+        while self.day_time >= 1.0 {
+            self.day_time -= 1.0;
+            self.world_day = self.world_day.saturating_add(1);
+        }
         let wind_ang = (tick as f32) * 0.0012;
         let wind_mag = match self.weather_kind {
             WEATHER_BLIZZARD => 1.65,
@@ -3138,6 +3148,9 @@ impl GameState {
             acoustic_ms: self.acoustic_ms,
             world_sparse_pct: self.world_sparse_pct,
             physics_native: self.physics_native,
+            time_scale: self.time_scale,
+            world_day: self.world_day,
+            neural_3d_vertical: self.neural_3d_vertical,
         };
         let match_secs = self.match_start_instant.elapsed().as_secs() as u32;
         let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
@@ -3417,9 +3430,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = (&model_path, &eco_path);
 
         let period = Duration::from_millis(100);
+        let mut world_3d_backoff: u32 = 0;
         loop {
             let t_loop = Instant::now();
-            let (mode, eco_on, gw, gh, gd, weather_kind, batched_in, eco_in, fallback_raws) = {
+            let (mode, eco_on, gw, gh, gd, weather_kind, day_time_now, batched_in, eco_in, fallback_raws) = {
                 let gs = field_state.lock().unwrap();
                 let sl = gs.surf_layer();
                 let m = gs.sim_mode.clone();
@@ -3427,30 +3441,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let bin = if m == "neural" { Some(gs.volume.encode_batched_input_tensor()) } else { None };
                 let ein = if e { Some(gs.eco.build_input(&gs.volume.layers[sl])) } else { None };
                 let raws = if m != "neural" { Some(gs.volume.refsim_raw_outputs_all()) } else { None };
-                (m, e, gs.grid_w, gs.grid_h, gs.grid_d, gs.weather_kind, bin, ein, raws)
+                (m, e, gs.grid_w, gs.grid_h, gs.grid_d, gs.weather_kind, gs.day_time, bin, ein, raws)
             };
 
             let t0 = Instant::now();
-            let (raw_layers, reported_ms, active_backend) = if mode == "neural" {
+            let (raw_layers, z_flux_opt, reported_ms, active_backend, used_neural_3d_z) = if mode == "neural" {
                 if let Some(ref mut rpc) = cuda_rpc {
-                    match rpc.call_batched(1, gd as u8, INPUT_CHANNELS as u16, gh as u16, gw as u16, batched_in.as_ref().unwrap()) {
-                        Ok((flat, gpu_ms)) => {
-                            let per = OUTPUT_CHANNELS * gw * gh;
-                            let mut layers_out = Vec::with_capacity(gd);
-                            for z in 0..gd {
-                                let s = z * per;
-                                layers_out.push(RawStepOutput {
-                                    width: gw,
-                                    height: gh,
-                                    data: flat[s..s + per].to_vec(),
-                                });
+                    let per = OUTPUT_CHANNELS * gw * gh;
+                    let horiz_len = gd * per;
+                    let z_len = gd.saturating_sub(1) * 5 * gw * gh;
+                    let expected_3d_len = horiz_len + z_len;
+
+                    let mut op8_result: Option<(Vec<RawStepOutput>, Vec<f32>, f32)> = None;
+                    if world_3d_backoff == 0 && gd >= 2 {
+                        match rpc.call_batched(8, gd as u8, INPUT_CHANNELS as u16, gh as u16, gw as u16, batched_in.as_ref().unwrap()) {
+                            Ok((flat, gpu_ms)) if flat.len() == expected_3d_len => {
+                                let mut layers_out = Vec::with_capacity(gd);
+                                for z in 0..gd {
+                                    let s = z * per;
+                                    layers_out.push(RawStepOutput {
+                                        width: gw,
+                                        height: gh,
+                                        data: flat[s..s + per].to_vec(),
+                                    });
+                                }
+                                let z_flux = flat[horiz_len..expected_3d_len].to_vec();
+                                op8_result = Some((layers_out, z_flux, gpu_ms));
                             }
-                            (layers_out, gpu_ms, "cuda-fp16-3d".to_string())
+                            Ok((flat, _)) => {
+                                log::warn!(
+                                    "CUDA op=8 returned unexpected payload len {} (expected {}), falling back to op=1",
+                                    flat.len(),
+                                    expected_3d_len
+                                );
+                                world_3d_backoff = 50;
+                            }
+                            Err(_) => {
+                                // Daemon does not have world_model_3d_v4.pt loaded; retry periodically
+                                world_3d_backoff = 50;
+                            }
                         }
-                        Err(e) => {
-                            log::warn!("CUDA 3D RPC failed ({}), fallback RefSim", e);
-                            let gs = field_state.lock().unwrap();
-                            (gs.volume.refsim_raw_outputs_all(), t0.elapsed().as_secs_f32() * 1000.0, "refsim-fallback".into())
+                    } else if world_3d_backoff > 0 {
+                        world_3d_backoff -= 1;
+                    }
+
+                    if let Some((layers_out, z_flux, gpu_ms)) = op8_result {
+                        (layers_out, Some(z_flux), gpu_ms, "cuda-fp16-3d-v4".to_string(), true)
+                    } else {
+                        match rpc.call_batched(1, gd as u8, INPUT_CHANNELS as u16, gh as u16, gw as u16, batched_in.as_ref().unwrap()) {
+                            Ok((flat, gpu_ms)) => {
+                                let mut layers_out = Vec::with_capacity(gd);
+                                for z in 0..gd {
+                                    let s = z * per;
+                                    layers_out.push(RawStepOutput {
+                                        width: gw,
+                                        height: gh,
+                                        data: flat[s..s + per].to_vec(),
+                                    });
+                                }
+                                (layers_out, None, gpu_ms, "cuda-fp16-3d".to_string(), false)
+                            }
+                            Err(e) => {
+                                log::warn!("CUDA 3D RPC failed ({}), fallback RefSim", e);
+                                let gs = field_state.lock().unwrap();
+                                (gs.volume.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-fallback".into(), false)
+                            }
                         }
                     }
                 } else {
@@ -3458,21 +3513,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(ref mut ob) = onnx {
                         let vclone = { field_state.lock().unwrap().volume.clone() };
                         match ob.step_volume(&vclone) {
-                            Ok(v) => (v, t0.elapsed().as_secs_f32() * 1000.0, "onnx-cpu-3d".into()),
-                            Err(_) => (vclone.refsim_raw_outputs_all(), t0.elapsed().as_secs_f32() * 1000.0, "refsim-fallback".into()),
+                            Ok(v) => (v, None, t0.elapsed().as_secs_f32() * 1000.0, "onnx-cpu-3d".into(), false),
+                            Err(_) => (vclone.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-fallback".into(), false),
                         }
                     } else {
                         let gs = field_state.lock().unwrap();
-                        (gs.volume.refsim_raw_outputs_all(), t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into())
+                        (gs.volume.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into(), false)
                     }
                     #[cfg(not(feature = "onnx"))]
                     {
                         let gs = field_state.lock().unwrap();
-                        (gs.volume.refsim_raw_outputs_all(), t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into())
+                        (gs.volume.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into(), false)
                     }
                 }
             } else {
-                (fallback_raws.unwrap(), t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into())
+                (fallback_raws.unwrap(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into(), false)
             };
 
             let (eco_out, eco_ms) = if eco_on {
@@ -3504,7 +3559,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sl = gs.surf_layer();
                 let tick_now = gs.volume.tick;
                 gs.volume.apply_weather_and_springs_3d(weather_kind, tick_now);
-                let stats = gs.volume.step_3d(&raw_layers);
+                gs.volume.apply_solar_cycle_3d(day_time_now, tick_now);
+                let stats = gs.volume.step_3d_with_neural_z(&raw_layers, z_flux_opt.as_deref());
+                gs.neural_3d_vertical = used_neural_3d_z;
                 if eco_on {
                     if let Some(ref eo) = eco_out {
                         let mut eco_tmp = std::mem::replace(&mut gs.eco, EcosystemState::new(1, 1));
@@ -3685,6 +3742,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 };
                                 let (mx, my) = (gs.grid_w as f32 * 0.5, gs.grid_h as f32 * 0.5);
                                 gs.push_event(5, mx, my, 0, 2, lbl.to_string());
+                            }
+                            ClientReliable::CycleTimeScale => {
+                                gs.time_scale = if (gs.time_scale - 1.0).abs() < 0.05 {
+                                    4.0
+                                } else if (gs.time_scale - 4.0).abs() < 0.05 {
+                                    16.0
+                                } else if (gs.time_scale - 16.0).abs() < 0.05 {
+                                    0.25
+                                } else {
+                                    1.0
+                                };
+                                let lbl = if gs.time_scale < 0.5 {
+                                    "TIME WARP: 0.25X SLOW-MO!".to_string()
+                                } else {
+                                    format!("TIME WARP: {:.0}X", gs.time_scale)
+                                };
+                                let (mx, my) = (gs.grid_w as f32 * 0.5, gs.grid_h as f32 * 0.5);
+                                gs.push_event(5, mx, my, 0, 2, lbl);
                             }
                             ClientReliable::PhysicalActuator {
                                 dx,

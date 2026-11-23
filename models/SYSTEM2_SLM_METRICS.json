@@ -1,0 +1,1990 @@
+{
+  "hardware": {
+    "gpu": "NVIDIA GB10",
+    "torch_version": "2.14.1+cu130",
+    "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+    "dtype": "torch.bfloat16",
+    "world_model_checkpoint": "/home/gooning/.t3/scratch/frostmarsh-ml/world_model_v3.pt",
+    "model_load_time_s": 29.723
+  },
+  "latency_metrics": {
+    "ttft_ms_p50": 56.86,
+    "ttft_ms_mean": 73.22,
+    "ttft_ms_p95": 130.27,
+    "p50_total_ms": 1216.82,
+    "mean_total_ms": 1400.46,
+    "p95_total_ms": 2366.57,
+    "tokens_per_sec_p50": 44.45,
+    "tokens_per_sec_mean": 38.74,
+    "decode_tokens_per_sec_p50": 45.87,
+    "mean_generated_tokens": 49.44,
+    "bridge_observe_ms_p50": 24.572,
+    "vram_gb": 3.444,
+    "vram_allocated_gb": 3.332,
+    "vram_reserved_gb": 3.891,
+    "non_blocking_submit_us_p50": 0.78,
+    "non_blocking_submit_us_max": 17.06,
+    "non_blocking_poll_us_p50": 21.36,
+    "async_submitted": 6,
+    "async_completed": 6,
+    "game_loop_30hz_budget_ms": 33.33,
+    "game_loop_stall_free": true
+  },
+  "quality_metrics": {
+    "total_evaluated_turns": 38,
+    "conversation_turns": 24,
+    "num_conversations": 8,
+    "valid_plan_pct": 100.0,
+    "raw_json_valid_pct": 86.84,
+    "conversation_valid_plan_pct": 100.0,
+    "conversation_raw_json_valid_pct": 83.33,
+    "low_snr_turns_count": 3,
+    "low_snr_acoustic_awareness_pct": 100.0
+  },
+  "conversations": [
+    {
+      "id": "conv1_clear_oil_trap",
+      "title": "Clear High-SNR Oil Trap & Ignition Negotiation (Human \u2194 Pyra)",
+      "category": "clear_high_snr_oil_ignition",
+      "scene_seed": 1401,
+      "diurnal_time": "Dawn Mist (06:20)",
+      "turns": [
+        {
+          "turn": 1,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            36.7,
+            137.8,
+            1
+          ],
+          "speaker_volume": 0.85,
+          "listener": "Pyra",
+          "listener_class": "Pyromancer",
+          "listener_pos": [
+            47.7,
+            144.8,
+            1
+          ],
+          "raw_utterance": "Pyra, enemy scouts are nearing the oil basin \u2014 confirm unlit oil status and stage an ignition trap!",
+          "heard_utterance": "Pyra, enemy scouts are nearing the oil basin \u2014 confirm unlit oil status and stage an ignition trap!",
+          "snr_db": 43.71,
+          "snr_tier": "clear",
+          "occlusion_cause": "distance attenuation",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.8412,
+          "z_world_saliency": 0.03098,
+          "z_peak_quadrant": "SW",
+          "grounded_hazards": {
+            "local_temp_c": 5.8,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 0.4,
+              "bearing": "SE",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 279.0,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 61.6,
+              "bearing": "S",
+              "sector": "SW Oil Basin",
+              "peak_temp_k": 698.7,
+              "smoke_density": 0.31
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 280.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 88.5,
+              "bearing": "SE"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 82.5,
+              "bearing": "NE",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Ignite oil slick 10m SE to trap enemy scouts.",
+            "intent": "STAGE_OIL",
+            "target_sector": "SW Oil Basin",
+            "actuator_bias": {
+              "thermal_flux": 0.9,
+              "matter": "oil",
+              "focus_radius": 6.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 54.31,
+          "total_ms": 1203.54,
+          "generated_tokens": 51,
+          "tokens_per_sec": 42.38
+        },
+        {
+          "turn": 2,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            36.7,
+            137.8,
+            1
+          ],
+          "speaker_volume": 0.85,
+          "listener": "Pyra",
+          "listener_class": "Pyromancer",
+          "listener_pos": [
+            47.7,
+            144.8,
+            1
+          ],
+          "raw_utterance": "Hold fire two seconds until both scouts step onto the slick, then widen focus to 7m.",
+          "heard_utterance": "Hold fire two seconds until both scouts step onto the slick, then widen focus to 7m.",
+          "snr_db": 43.71,
+          "snr_tier": "clear",
+          "occlusion_cause": "distance attenuation",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.8412,
+          "z_world_saliency": 0.03098,
+          "z_peak_quadrant": "SW",
+          "grounded_hazards": {
+            "local_temp_c": 5.8,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 0.4,
+              "bearing": "SE",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 279.0,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 61.6,
+              "bearing": "S",
+              "sector": "SW Oil Basin",
+              "peak_temp_k": 698.7,
+              "smoke_density": 0.31
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 280.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 88.5,
+              "bearing": "SE"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 82.5,
+              "bearing": "NE",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Hold fire on oil slick 10m SE for two seconds, then widen focus to 7m.",
+            "intent": "HOLD_FIRE",
+            "target_sector": "SW Oil Basin",
+            "actuator_bias": {
+              "thermal_flux": -0.85,
+              "matter": "oil",
+              "focus_radius": 7.0
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 51.7,
+          "total_ms": 1318.43,
+          "generated_tokens": 59,
+          "tokens_per_sec": 44.75
+        },
+        {
+          "turn": 3,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            36.7,
+            137.8,
+            1
+          ],
+          "speaker_volume": 0.85,
+          "listener": "Pyra",
+          "listener_class": "Pyromancer",
+          "listener_pos": [
+            47.7,
+            144.8,
+            1
+          ],
+          "raw_utterance": "They are dead center on the oil slick \u2014 ignite it with maximum thermal flux right now!",
+          "heard_utterance": "They are dead center on the oil slick \u2014 ignite it with maximum thermal flux right now!",
+          "snr_db": 43.71,
+          "snr_tier": "clear",
+          "occlusion_cause": "distance attenuation",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.8412,
+          "z_world_saliency": 0.03098,
+          "z_peak_quadrant": "SW",
+          "grounded_hazards": {
+            "local_temp_c": 5.8,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 0.4,
+              "bearing": "SE",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 279.0,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 61.6,
+              "bearing": "S",
+              "sector": "SW Oil Basin",
+              "peak_temp_k": 698.7,
+              "smoke_density": 0.31
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 280.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 88.5,
+              "bearing": "SE"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 82.5,
+              "bearing": "NE",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Ignite oil slick 10m SE with maximum thermal flux immediately.",
+            "intent": "IGNITE_TRAP",
+            "target_sector": "SW Oil Basin",
+            "actuator_bias": {
+              "thermal_flux": 1.0,
+              "matter": "oil",
+              "focus_radius": 6.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 59.61,
+          "total_ms": 1169.3,
+          "generated_tokens": 52,
+          "tokens_per_sec": 44.47
+        }
+      ]
+    },
+    {
+      "id": "conv2_waterfall_muffled",
+      "title": "Muffled Low-SNR Waterfall Roar Confusion & Repeat Request (Human \u2194 Mire)",
+      "category": "low_snr_waterfall_confusion",
+      "scene_seed": 1402,
+      "diurnal_time": "High Noon (12:45)",
+      "turns": [
+        {
+          "turn": 1,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            104.2,
+            60.9,
+            1
+          ],
+          "speaker_volume": 0.96,
+          "listener": "Mire",
+          "listener_class": "Shadow-Flanker",
+          "listener_pos": [
+            92.2,
+            50.9,
+            1
+          ],
+          "raw_utterance": "Mire, coat the northern waterfall rim in crude oil and fall back!",
+          "heard_utterance": "[INAUDIBLE (-6.3 dB) \u2014 drowned out by L2\u2192L1 plunging waterfall roar]",
+          "snr_db": -6.33,
+          "snr_tier": "inaudible",
+          "occlusion_cause": "L2\u2192L1 plunging waterfall roar",
+          "ambient_noise_db": 85.0,
+          "z_world_energy": 0.8778,
+          "z_world_saliency": 0.10299,
+          "z_peak_quadrant": "NW",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 85.2,
+              "bearing": "SW",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.4,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 114.0,
+              "bearing": "SE",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 878.1,
+              "smoke_density": 0.34
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 134.2,
+              "bearing": "S"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 44.2,
+              "bearing": "S",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Repeating comms request...",
+            "intent": "REQUEST_REPEAT",
+            "target_sector": "L2_south_skybridge",
+            "actuator_bias": {
+              "thermal_flux": 0.0,
+              "matter": "none",
+              "focus_radius": 3.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 56.95,
+          "total_ms": 1035.04,
+          "generated_tokens": 46,
+          "tokens_per_sec": 44.44
+        },
+        {
+          "turn": 2,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            82.2,
+            64.9,
+            1
+          ],
+          "speaker_volume": 0.92,
+          "listener": "Mire",
+          "listener_class": "Shadow-Flanker",
+          "listener_pos": [
+            72.2,
+            70.9,
+            1
+          ],
+          "raw_utterance": "Repeating loud now that you cleared the falls! Coat the NW choke in oil!",
+          "heard_utterance": "Repeating loud now that you cleared the falls! Coat the NW choke in oil!",
+          "snr_db": 36.95,
+          "snr_tier": "clear",
+          "occlusion_cause": "L2\u2192L1 plunging waterfall roar",
+          "ambient_noise_db": 42.16,
+          "z_world_energy": 0.876,
+          "z_world_saliency": 0.02001,
+          "z_peak_quadrant": "NE",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 59.4,
+              "bearing": "S",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.4,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 123.0,
+              "bearing": "E",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 879.5,
+              "smoke_density": 0.34
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 122.7,
+              "bearing": "SE"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 33.2,
+              "bearing": "SE",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Request repeat of comms clearance.",
+            "intent": "REQUEST_REPEAT",
+            "target_sector": "NW Highland",
+            "actuator_bias": {
+              "thermal_flux": 0.0,
+              "matter": "none",
+              "focus_radius": 3.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 52.21,
+          "total_ms": 918.97,
+          "generated_tokens": 41,
+          "tokens_per_sec": 44.62
+        },
+        {
+          "turn": 3,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            78.2,
+            66.9,
+            1
+          ],
+          "speaker_volume": 0.85,
+          "listener": "Mire",
+          "listener_class": "Shadow-Flanker",
+          "listener_pos": [
+            70.2,
+            72.9,
+            1
+          ],
+          "raw_utterance": "Oil confirmed \u2014 pop a wide smoke screen now while we pull back east!",
+          "heard_utterance": "Oil confirmed \u2014 pop a wide smoke screen now while we pull back east!",
+          "snr_db": 39.79,
+          "snr_tier": "clear",
+          "occlusion_cause": "distance attenuation",
+          "ambient_noise_db": 37.62,
+          "z_world_energy": 0.8844,
+          "z_world_saliency": 0.0123,
+          "z_peak_quadrant": "NE",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 56.9,
+              "bearing": "S",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.4,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 124.2,
+              "bearing": "E",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 879.5,
+              "smoke_density": 0.34
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 121.9,
+              "bearing": "SE"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 33.3,
+              "bearing": "SE",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Smoke screen laid, heading east to avoid fire.",
+            "intent": "HOLD_FIRE",
+            "target_sector": "NE Skybridge",
+            "actuator_bias": {
+              "thermal_flux": -0.85,
+              "matter": "water",
+              "focus_radius": 6.0
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 60.48,
+          "total_ms": 1049.4,
+          "generated_tokens": 47,
+          "tokens_per_sec": 44.79
+        }
+      ]
+    },
+    {
+      "id": "conv3_cavern_ceiling_occlusion",
+      "title": "Inaudible L0 Rock Ceiling Occlusion & Vertical Shaft Recovery (Human \u2194 Bram)",
+      "category": "low_snr_wall_ceiling_occlusion",
+      "scene_seed": 1403,
+      "diurnal_time": "Overcast Dusk (18:30)",
+      "turns": [
+        {
+          "turn": 1,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            190.0,
+            72.0,
+            1
+          ],
+          "speaker_volume": 0.55,
+          "listener": "Bram",
+          "listener_class": "Vanguard",
+          "listener_pos": [
+            42.0,
+            192.0,
+            0
+          ],
+          "raw_utterance": "Bram, climb the vertical shaft and reinforce the river bridge immediately!",
+          "heard_utterance": "[INAUDIBLE (-14.9 dB) \u2014 drowned out by L0 rock ceiling + 1 basalt wall]",
+          "snr_db": -14.85,
+          "snr_tier": "inaudible",
+          "occlusion_cause": "L0 rock ceiling + 1 basalt wall",
+          "ambient_noise_db": 28.0,
+          "z_world_energy": 1.0307,
+          "z_world_saliency": 0.0,
+          "z_peak_quadrant": "NW",
+          "grounded_hazards": {
+            "local_temp_c": -1.2,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 0.0,
+              "bearing": "HERE",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.0,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 24.7,
+              "bearing": "E",
+              "sector": "SW Oil Basin",
+              "peak_temp_k": 834.1,
+              "smoke_density": 0.33
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 86.8,
+              "bearing": "E"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 97.5,
+              "bearing": "NE",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Receiving signal, attempting to re-establish comms.",
+            "intent": "RELOCATE_COMMS",
+            "target_sector": "SW Oil Basin",
+            "actuator_bias": {
+              "thermal_flux": 0.0,
+              "matter": "none",
+              "focus_radius": 3.5
+            }
+          },
+          "raw_json_valid": false,
+          "plan_valid": true,
+          "repaired": true,
+          "ttft_ms": 55.12,
+          "total_ms": 460.37,
+          "generated_tokens": 20,
+          "tokens_per_sec": 43.44
+        },
+        {
+          "turn": 2,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            93.2,
+            77.7,
+            1
+          ],
+          "speaker_volume": 0.9,
+          "listener": "Bram",
+          "listener_class": "Vanguard",
+          "listener_pos": [
+            85.2,
+            71.7,
+            0
+          ],
+          "raw_utterance": "Bram, loud and clear at the open shaft! Push up and freeze the central river choke!",
+          "heard_utterance": "Bram, loud and clear at the open shaft! Push up and freeze the central river choke!",
+          "snr_db": 25.5,
+          "snr_tier": "clear",
+          "occlusion_cause": "L2\u2192L1 plunging waterfall roar",
+          "ambient_noise_db": 49.56,
+          "z_world_energy": 0.776,
+          "z_world_saliency": 0.041,
+          "z_peak_quadrant": "NW",
+          "grounded_hazards": {
+            "local_temp_c": -1.2,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 66.7,
+              "bearing": "SW",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.4,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 102.7,
+              "bearing": "E",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 700.2,
+              "smoke_density": 0.3
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 116.4,
+              "bearing": "S"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 17.3,
+              "bearing": "S",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Hold fire on the central river choke\u2014quelling with cold ice.",
+            "intent": "QUENCH_FIRE",
+            "target_sector": "Central River",
+            "actuator_bias": {
+              "thermal_flux": -0.85,
+              "matter": "water",
+              "focus_radius": 5.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 66.1,
+          "total_ms": 1140.14,
+          "generated_tokens": 50,
+          "tokens_per_sec": 43.85
+        },
+        {
+          "turn": 3,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            91.2,
+            75.7,
+            1
+          ],
+          "speaker_volume": 0.85,
+          "listener": "Bram",
+          "listener_class": "Vanguard",
+          "listener_pos": [
+            85.2,
+            71.7,
+            0
+          ],
+          "raw_utterance": "Good hold \u2014 drop a wide water barrier if their pyro pushes the rim!",
+          "heard_utterance": "Good hold \u2014 drop a wide water barrier if their pyro pushes the rim!",
+          "snr_db": 24.52,
+          "snr_tier": "clear",
+          "occlusion_cause": "L2\u2192L1 plunging waterfall roar",
+          "ambient_noise_db": 49.56,
+          "z_world_energy": 0.776,
+          "z_world_saliency": 0.041,
+          "z_peak_quadrant": "NW",
+          "grounded_hazards": {
+            "local_temp_c": -1.2,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 66.7,
+              "bearing": "SW",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.4,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 102.7,
+              "bearing": "E",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 700.2,
+              "smoke_density": 0.3
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 116.4,
+              "bearing": "S"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 17.3,
+              "bearing": "S",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Hold fire on the central river choke\u2014quelling with cold ice.",
+            "intent": "QUENCH_FIRE",
+            "target_sector": "SE Shrine Valley",
+            "actuator_bias": {
+              "thermal_flux": -0.9,
+              "matter": "water",
+              "focus_radius": 5.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 53.98,
+          "total_ms": 1110.39,
+          "generated_tokens": 50,
+          "tokens_per_sec": 45.03
+        }
+      ]
+    },
+    {
+      "id": "conv4_midnight_burning_skybridge",
+      "title": "Midnight Freeze & Burning L2 Skybridge Collapse Warning (Human \u2194 Kael)",
+      "category": "midnight_freeze_burning_skybridge",
+      "scene_seed": 1404,
+      "diurnal_time": "Midnight Freeze (01:45)",
+      "turns": [
+        {
+          "turn": 1,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            94.0,
+            178.9,
+            2
+          ],
+          "speaker_volume": 0.95,
+          "listener": "Kael",
+          "listener_class": "Vanguard",
+          "listener_pos": [
+            100.0,
+            176.9,
+            2
+          ],
+          "raw_utterance": "Kael, sprint across the L2 south skybridge to flank their shrine!",
+          "heard_utterance": "Kael, sprint across the L2 [wildfire crackle] skybridge to flank their shrine!",
+          "snr_db": 6.86,
+          "snr_tier": "partial",
+          "occlusion_cause": "roaring wildfire crackle",
+          "ambient_noise_db": 77.0,
+          "z_world_energy": 0.6602,
+          "z_world_saliency": 0.26705,
+          "z_peak_quadrant": "NE",
+          "grounded_hazards": {
+            "local_temp_c": 421.9,
+            "oil_slick": {
+              "found": false,
+              "dist_cells": 999.0,
+              "bearing": "NONE",
+              "sector": "None",
+              "peak_mass": 0.0,
+              "temp_k": 290.0,
+              "status": "absent"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 0.1,
+              "bearing": "S",
+              "sector": "SW Oil Basin",
+              "peak_temp_k": 695.0,
+              "smoke_density": 0.72
+            },
+            "skybridge": {
+              "south_integrity_pct": 30.0,
+              "peak_temp_k": 695.0,
+              "smoke": 0.72,
+              "status": "BURNING \u2014 COLLAPSE IMMINENT",
+              "dist_cells": 28.0,
+              "bearing": "E"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 12.2,
+              "bearing": "NE",
+              "peak_mass": 0.85,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "L2 south skybridge at 30% integrity (695K) \u2014 COLLAPSE IMMINENT! Warn teammate off the burning bridge.",
+            "intent": "WARN_COLLAPSE",
+            "target_sector": "NE Skybridge",
+            "actuator_bias": {
+              "thermal_flux": -0.0,
+              "matter": "water",
+              "focus_radius": 5.5
+            }
+          },
+          "raw_json_valid": false,
+          "plan_valid": true,
+          "repaired": true,
+          "ttft_ms": 57.89,
+          "total_ms": 1430.59,
+          "generated_tokens": 64,
+          "tokens_per_sec": 44.74
+        },
+        {
+          "turn": 2,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            94.0,
+            178.9,
+            2
+          ],
+          "speaker_volume": 0.95,
+          "listener": "Kael",
+          "listener_class": "Vanguard",
+          "listener_pos": [
+            100.0,
+            176.9,
+            2
+          ],
+          "raw_utterance": "Copy the collapse risk \u2014 quench the burning timbers with cryo water right now!",
+          "heard_utterance": "Copy the collapse risk \u2014 quench the [wildfire crackle] timbers with cryo water right now!",
+          "snr_db": 6.86,
+          "snr_tier": "partial",
+          "occlusion_cause": "roaring wildfire crackle",
+          "ambient_noise_db": 77.0,
+          "z_world_energy": 0.6602,
+          "z_world_saliency": 0.26705,
+          "z_peak_quadrant": "NE",
+          "grounded_hazards": {
+            "local_temp_c": 421.9,
+            "oil_slick": {
+              "found": false,
+              "dist_cells": 999.0,
+              "bearing": "NONE",
+              "sector": "None",
+              "peak_mass": 0.0,
+              "temp_k": 290.0,
+              "status": "absent"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 0.1,
+              "bearing": "S",
+              "sector": "SW Oil Basin",
+              "peak_temp_k": 695.0,
+              "smoke_density": 0.72
+            },
+            "skybridge": {
+              "south_integrity_pct": 30.0,
+              "peak_temp_k": 695.0,
+              "smoke": 0.72,
+              "status": "BURNING \u2014 COLLAPSE IMMINENT",
+              "dist_cells": 28.0,
+              "bearing": "E"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 12.2,
+              "bearing": "NE",
+              "peak_mass": 0.85,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Collapsing L2 south skybridge imminent \u2014 warn team and quench with cryo water.",
+            "intent": "WARN_COLLAPSE",
+            "target_sector": "NE Skybridge",
+            "actuator_bias": {
+              "thermal_flux": -0.9,
+              "matter": "water",
+              "focus_radius": 5.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 54.76,
+          "total_ms": 1276.51,
+          "generated_tokens": 57,
+          "tokens_per_sec": 44.65
+        },
+        {
+          "turn": 3,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            94.0,
+            178.9,
+            2
+          ],
+          "speaker_volume": 0.92,
+          "listener": "Kael",
+          "listener_class": "Vanguard",
+          "listener_pos": [
+            100.0,
+            176.9,
+            2
+          ],
+          "raw_utterance": "Once quenched, pop smoke cover and pivot north to the stone skybridge!",
+          "heard_utterance": "Once quenched, [wildfire crackle] smoke [wildfire crackle] pivot north to the stone skybridge!",
+          "snr_db": 5.72,
+          "snr_tier": "partial",
+          "occlusion_cause": "roaring wildfire crackle",
+          "ambient_noise_db": 77.0,
+          "z_world_energy": 0.6602,
+          "z_world_saliency": 0.26705,
+          "z_peak_quadrant": "NE",
+          "grounded_hazards": {
+            "local_temp_c": 421.9,
+            "oil_slick": {
+              "found": false,
+              "dist_cells": 999.0,
+              "bearing": "NONE",
+              "sector": "None",
+              "peak_mass": 0.0,
+              "temp_k": 290.0,
+              "status": "absent"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 0.1,
+              "bearing": "S",
+              "sector": "SW Oil Basin",
+              "peak_temp_k": 695.0,
+              "smoke_density": 0.72
+            },
+            "skybridge": {
+              "south_integrity_pct": 30.0,
+              "peak_temp_k": 695.0,
+              "smoke": 0.72,
+              "status": "BURNING \u2014 COLLAPSE IMMINENT",
+              "dist_cells": 28.0,
+              "bearing": "E"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 12.2,
+              "bearing": "NE",
+              "peak_mass": 0.85,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "L2 south skybridge at 30% integrity (695K) \u2014 COLLAPSE IMMINENT! Warn teammate off the burning bridge.",
+            "intent": "WARN_COLLAPSE",
+            "target_sector": "NE Skybridge",
+            "actuator_bias": {
+              "thermal_flux": -0.9,
+              "matter": "water",
+              "focus_radius": 5.5
+            }
+          },
+          "raw_json_valid": false,
+          "plan_valid": true,
+          "repaired": true,
+          "ttft_ms": 64.79,
+          "total_ms": 1436.26,
+          "generated_tokens": 64,
+          "tokens_per_sec": 44.56
+        }
+      ]
+    },
+    {
+      "id": "conv5_bot2bot_oil_fire_negotiation",
+      "title": "Bot-to-Bot Emergent Negotiation: Oil-Then-Fire Shrine Ambush (Nyx \u2194 Pyra)",
+      "category": "bot_to_bot_emergent_negotiation",
+      "scene_seed": 1405,
+      "diurnal_time": "Clear Afternoon (15:10)",
+      "turns": [
+        {
+          "turn": 1,
+          "speaker": "Nyx",
+          "speaker_pos": [
+            39.8,
+            194.6,
+            1
+          ],
+          "speaker_volume": 0.78,
+          "listener": "Pyra",
+          "listener_class": "Pyromancer",
+          "listener_pos": [
+            27.8,
+            190.6,
+            1
+          ],
+          "raw_utterance": "Pyra, I am coating the shrine choke in oil \u2014 hold your flame until I clear out!",
+          "heard_utterance": "Pyra, I am coating the shrine choke in oil \u2014 hold your flame until I clear out!",
+          "snr_db": 41.25,
+          "snr_tier": "clear",
+          "occlusion_cause": "distance attenuation",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.8622,
+          "z_world_saliency": 0.0223,
+          "z_peak_quadrant": "SE",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 4.2,
+              "bearing": "E",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.4,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 58.2,
+              "bearing": "N",
+              "sector": "SW Oil Basin",
+              "peak_temp_k": 922.4,
+              "smoke_density": 0.34
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 101.5,
+              "bearing": "E"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 96.2,
+              "bearing": "NE",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Hold fire on shrine choke, Pyra.",
+            "intent": "HOLD_FIRE",
+            "target_sector": "SE Shrine Valley",
+            "actuator_bias": {
+              "thermal_flux": 0.0,
+              "matter": "oil",
+              "focus_radius": 7.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 50.95,
+          "total_ms": 993.25,
+          "generated_tokens": 45,
+          "tokens_per_sec": 45.31
+        },
+        {
+          "turn": 2,
+          "speaker": "Pyra",
+          "speaker_pos": [
+            27.8,
+            190.6,
+            1
+          ],
+          "speaker_volume": 0.8,
+          "listener": "Nyx",
+          "listener_class": "Shadow-Flanker",
+          "listener_pos": [
+            39.8,
+            194.6,
+            1
+          ],
+          "raw_utterance": "Hold fire on shrine choke, Pyra. Lay crude oil across the shrine choke now!",
+          "heard_utterance": "Hold fire on shrine choke, Pyra. Lay crude oil across the shrine choke now!",
+          "snr_db": 42.01,
+          "snr_tier": "clear",
+          "occlusion_cause": "distance attenuation",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.8532,
+          "z_world_saliency": 0.03738,
+          "z_peak_quadrant": "NW",
+          "grounded_hazards": {
+            "local_temp_c": 15.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 0.4,
+              "bearing": "SE",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.0,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 59.2,
+              "bearing": "N",
+              "sector": "SW Oil Basin",
+              "peak_temp_k": 922.4,
+              "smoke_density": 0.34
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 90.5,
+              "bearing": "E"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 92.9,
+              "bearing": "NE",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Hold fire on shrine choke, Pyra. Lay crude oil across the shrine choke now!",
+            "intent": "HOLD_FIRE",
+            "target_sector": "SE Shrine Valley",
+            "actuator_bias": {
+              "thermal_flux": 0.95,
+              "matter": "oil",
+              "focus_radius": 6.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 62.1,
+          "total_ms": 1262.43,
+          "generated_tokens": 56,
+          "tokens_per_sec": 44.36
+        },
+        {
+          "turn": 3,
+          "speaker": "Nyx",
+          "speaker_pos": [
+            39.8,
+            194.6,
+            1
+          ],
+          "speaker_volume": 0.85,
+          "listener": "Pyra",
+          "listener_class": "Pyromancer",
+          "listener_pos": [
+            27.8,
+            190.6,
+            1
+          ],
+          "raw_utterance": "Hold fire on shrine choke, Pyra. Lay crude oil across the shrine choke now! I am clear of the oil \u2014 ignite the trap now!",
+          "heard_utterance": "Hold fire on shrine choke, Pyra. Lay crude oil across the shrine choke now! I am clear of the oil \u2014 ignite the trap now!",
+          "snr_db": 43.91,
+          "snr_tier": "clear",
+          "occlusion_cause": "distance attenuation",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.8622,
+          "z_world_saliency": 0.0223,
+          "z_peak_quadrant": "SE",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 4.2,
+              "bearing": "E",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.4,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 58.2,
+              "bearing": "N",
+              "sector": "SW Oil Basin",
+              "peak_temp_k": 922.4,
+              "smoke_density": 0.34
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 101.5,
+              "bearing": "E"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 96.2,
+              "bearing": "NE",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Hold fire on shrine choke, Pyra.",
+            "intent": "STAGE_OIL",
+            "target_sector": "SW Oil Basin",
+            "actuator_bias": {
+              "thermal_flux": 0.95,
+              "matter": "oil",
+              "focus_radius": 6.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 51.85,
+          "total_ms": 1044.91,
+          "generated_tokens": 47,
+          "tokens_per_sec": 44.98
+        }
+      ]
+    },
+    {
+      "id": "conv6_bot2bot_wildfire_containment",
+      "title": "Bot-to-Bot Emergent Negotiation: Wildfire Containment & Screen (Kael \u2194 Glacius)",
+      "category": "bot_to_bot_emergent_negotiation",
+      "scene_seed": 1406,
+      "diurnal_time": "Dusk Ember (20:10)",
+      "turns": [
+        {
+          "turn": 1,
+          "speaker": "Kael",
+          "speaker_pos": [
+            176.5,
+            108.6,
+            1
+          ],
+          "speaker_volume": 0.88,
+          "listener": "Glacius",
+          "listener_class": "Cryo-Scout",
+          "listener_pos": [
+            188.5,
+            112.6,
+            1
+          ],
+          "raw_utterance": "Glacius, wildfire is roaring at 650K \u2014 quench the front with cryo water while I screen!",
+          "heard_utterance": "Glacius, wildfire is roaring at 650K \u2014 quench the front with cryo water while I screen!",
+          "snr_db": 20.52,
+          "snr_tier": "clear",
+          "occlusion_cause": "roaring wildfire crackle",
+          "ambient_noise_db": 56.53,
+          "z_world_energy": 0.9657,
+          "z_world_saliency": 0.37986,
+          "z_peak_quadrant": "NE",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 4.5,
+              "bearing": "E",
+              "sector": "NE Skybridge",
+              "peak_mass": 0.92,
+              "temp_k": 289.6,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 8.3,
+              "bearing": "SE",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 852.8,
+              "smoke_density": 0.3
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 89.8,
+              "bearing": "SW"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 61.0,
+              "bearing": "SW",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Hold fire on SE wildfire, focusing radius 6.5m.",
+            "intent": "QUENCH_FIRE",
+            "target_sector": "NE Skybridge",
+            "actuator_bias": {
+              "thermal_flux": -0.85,
+              "matter": "water",
+              "focus_radius": 6.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 54.67,
+          "total_ms": 1133.97,
+          "generated_tokens": 51,
+          "tokens_per_sec": 44.97
+        },
+        {
+          "turn": 2,
+          "speaker": "Glacius",
+          "speaker_pos": [
+            188.5,
+            112.6,
+            1
+          ],
+          "speaker_volume": 0.88,
+          "listener": "Kael",
+          "listener_class": "Vanguard",
+          "listener_pos": [
+            176.5,
+            108.6,
+            1
+          ],
+          "raw_utterance": "Hold fire on SE wildfire, focusing radius 6.5m. Pop smoke cover so I can safely advance!",
+          "heard_utterance": "Hold fire on SE wildfire, focusing radius 6.5m. Pop smoke cover so I can safely advance!",
+          "snr_db": 42.02,
+          "snr_tier": "clear",
+          "occlusion_cause": "roaring wildfire crackle",
+          "ambient_noise_db": 35.03,
+          "z_world_energy": 0.8784,
+          "z_world_saliency": 0.01389,
+          "z_peak_quadrant": "SE",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 17.1,
+              "bearing": "E",
+              "sector": "NE Skybridge",
+              "peak_mass": 0.92,
+              "temp_k": 289.6,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 20.4,
+              "bearing": "SE",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 852.8,
+              "smoke_density": 0.3
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 85.4,
+              "bearing": "SW"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 52.5,
+              "bearing": "SW",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Understood, advancing to assist.",
+            "intent": "HOLD_FIRE",
+            "target_sector": "NE Skybridge",
+            "actuator_bias": {
+              "thermal_flux": -0.85,
+              "matter": "smoke",
+              "focus_radius": 6.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 50.15,
+          "total_ms": 1022.51,
+          "generated_tokens": 45,
+          "tokens_per_sec": 44.01
+        },
+        {
+          "turn": 3,
+          "speaker": "Kael",
+          "speaker_pos": [
+            176.5,
+            108.6,
+            1
+          ],
+          "speaker_volume": 0.9,
+          "listener": "Glacius",
+          "listener_class": "Cryo-Scout",
+          "listener_pos": [
+            188.5,
+            112.6,
+            1
+          ],
+          "raw_utterance": "Understood, advancing to assist. Smoke is up \u2014 hit the wildfire with wide cryo water!",
+          "heard_utterance": "Understood, advancing to assist. Smoke is up \u2014 hit the wildfire with wide cryo water!",
+          "snr_db": 21.28,
+          "snr_tier": "clear",
+          "occlusion_cause": "roaring wildfire crackle",
+          "ambient_noise_db": 56.53,
+          "z_world_energy": 0.9657,
+          "z_world_saliency": 0.37986,
+          "z_peak_quadrant": "NE",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 4.5,
+              "bearing": "E",
+              "sector": "NE Skybridge",
+              "peak_mass": 0.92,
+              "temp_k": 289.6,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 8.3,
+              "bearing": "SE",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 852.8,
+              "smoke_density": 0.3
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 89.8,
+              "bearing": "SW"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 61.0,
+              "bearing": "SW",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Wide cryo bursts held on SE wildfire, holding focus radius 6.5m.",
+            "intent": "STAGE_OIL",
+            "target_sector": "NE Skybridge",
+            "actuator_bias": {
+              "thermal_flux": 0.0,
+              "matter": "smoke",
+              "focus_radius": 6.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 51.11,
+          "total_ms": 1244.03,
+          "generated_tokens": 56,
+          "tokens_per_sec": 45.02
+        }
+      ]
+    },
+    {
+      "id": "conv7_midnight_freeze_ice_bridge",
+      "title": "Midnight Freeze River Crossing & Anti-Pyro Cryo Lockdown (Human \u2194 Glacius)",
+      "category": "midnight_freeze_burning_skybridge",
+      "scene_seed": 1407,
+      "diurnal_time": "Midnight Freeze (02:15)",
+      "turns": [
+        {
+          "turn": 1,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            136.1,
+            123.9,
+            1
+          ],
+          "speaker_volume": 0.82,
+          "listener": "Glacius",
+          "listener_class": "Cryo-Scout",
+          "listener_pos": [
+            146.1,
+            128.9,
+            1
+          ],
+          "raw_utterance": "Glacius, river is frozen solid at -17C \u2014 lock down the central ice bridge with frost!",
+          "heard_utterance": "Glacius, river is frozen solid at -17C \u2014 lock down the central ice bridge with frost!",
+          "snr_db": 31.58,
+          "snr_tier": "clear",
+          "occlusion_cause": "1 basalt wall",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.9916,
+          "z_world_saliency": 0.11547,
+          "z_peak_quadrant": "SW",
+          "grounded_hazards": {
+            "local_temp_c": -44.0,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 57.1,
+              "bearing": "E",
+              "sector": "SE Shrine Valley",
+              "peak_mass": 0.92,
+              "temp_k": 255.7,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 44.1,
+              "bearing": "NE",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 783.2,
+              "smoke_density": 0.31
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 256.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 44.3,
+              "bearing": "SW"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 1.9,
+              "bearing": "E",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Understood, commander. Ice bridge secured with cold barrier.",
+            "intent": "RELOCATE_COMMS",
+            "target_sector": "Central River",
+            "actuator_bias": {
+              "thermal_flux": -0.85,
+              "matter": "none",
+              "focus_radius": 4.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 50.06,
+          "total_ms": 1111.71,
+          "generated_tokens": 50,
+          "tokens_per_sec": 44.98
+        },
+        {
+          "turn": 2,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            136.1,
+            123.9,
+            1
+          ],
+          "speaker_volume": 0.85,
+          "listener": "Glacius",
+          "listener_class": "Cryo-Scout",
+          "listener_pos": [
+            146.1,
+            128.9,
+            1
+          ],
+          "raw_utterance": "Enemy pyromancer spotted east \u2014 use wide focus water and deep cryo so fire cannot melt it!",
+          "heard_utterance": "Enemy pyromancer spotted east \u2014 use wide focus water and deep cryo so fire cannot melt it!",
+          "snr_db": 32.72,
+          "snr_tier": "clear",
+          "occlusion_cause": "1 basalt wall",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.9916,
+          "z_world_saliency": 0.11547,
+          "z_peak_quadrant": "SW",
+          "grounded_hazards": {
+            "local_temp_c": -44.0,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 57.1,
+              "bearing": "E",
+              "sector": "SE Shrine Valley",
+              "peak_mass": 0.92,
+              "temp_k": 255.7,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 44.1,
+              "bearing": "NE",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 783.2,
+              "smoke_density": 0.31
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 256.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 44.3,
+              "bearing": "SW"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 1.9,
+              "bearing": "E",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Hold fire on enemy pyromancer, focusing both water and cryo to prevent melting.",
+            "intent": "HOLD_FIRE",
+            "target_sector": "NE Skybridge",
+            "actuator_bias": {
+              "thermal_flux": -0.85,
+              "matter": "water",
+              "focus_radius": 6.0
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 56.76,
+          "total_ms": 1230.09,
+          "generated_tokens": 55,
+          "tokens_per_sec": 44.71
+        },
+        {
+          "turn": 3,
+          "speaker": "Human Commander",
+          "speaker_pos": [
+            136.1,
+            123.9,
+            1
+          ],
+          "speaker_volume": 0.85,
+          "listener": "Glacius",
+          "listener_class": "Cryo-Scout",
+          "listener_pos": [
+            146.1,
+            128.9,
+            1
+          ],
+          "raw_utterance": "Vanguard is crossing \u2014 pop smoke cover on the eastern ice edge!",
+          "heard_utterance": "Vanguard is crossing \u2014 pop smoke cover on the eastern ice edge!",
+          "snr_db": 32.72,
+          "snr_tier": "clear",
+          "occlusion_cause": "1 basalt wall",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.9916,
+          "z_world_saliency": 0.11547,
+          "z_peak_quadrant": "SW",
+          "grounded_hazards": {
+            "local_temp_c": -44.0,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 57.1,
+              "bearing": "E",
+              "sector": "SE Shrine Valley",
+              "peak_mass": 0.92,
+              "temp_k": 255.7,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 44.1,
+              "bearing": "NE",
+              "sector": "NE Skybridge",
+              "peak_temp_k": 783.2,
+              "smoke_density": 0.31
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 256.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 44.3,
+              "bearing": "SW"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 1.9,
+              "bearing": "E",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Smoke cover applied on eastern ice edge, target sector NE Skybridge.",
+            "intent": "SMOKE_COVER",
+            "target_sector": "NE Skybridge",
+            "actuator_bias": {
+              "thermal_flux": -0.85,
+              "matter": "water",
+              "focus_radius": 6.0
+            }
+          },
+          "raw_json_valid": false,
+          "plan_valid": true,
+          "repaired": true,
+          "ttft_ms": 56.42,
+          "total_ms": 687.93,
+          "generated_tokens": 30,
+          "tokens_per_sec": 43.61
+        }
+      ]
+    },
+    {
+      "id": "conv8_bot2bot_basalt_wall_flank",
+      "title": "Bot-to-Bot Negotiation Across Basalt Wall Occlusion (Sable \u2194 Vex)",
+      "category": "bot_to_bot_wall_occlusion",
+      "scene_seed": 1408,
+      "diurnal_time": "Late Dusk (21:00)",
+      "turns": [
+        {
+          "turn": 1,
+          "speaker": "Sable",
+          "speaker_pos": [
+            47.3,
+            145.0,
+            1
+          ],
+          "speaker_volume": 0.25,
+          "listener": "Vex",
+          "listener_class": "Pyromancer",
+          "listener_pos": [
+            99.3,
+            145.0,
+            1
+          ],
+          "raw_utterance": "Vex, I am behind the basalt ridge laying oil \u2014 prepare to ignite the canyon flank!",
+          "heard_utterance": "[basalt wall muffle] ... I ... behind ... basalt ridge laying ... [basalt wall muffle]",
+          "snr_db": -1.42,
+          "snr_tier": "muffled",
+          "occlusion_cause": "1 basalt wall",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.8787,
+          "z_world_saliency": 0.00425,
+          "z_peak_quadrant": "SW",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 38.0,
+              "bearing": "W",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.6,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 45.9,
+              "bearing": "NW",
+              "sector": "NW Highland",
+              "peak_temp_k": 723.8,
+              "smoke_density": 0.32
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 44.9,
+              "bearing": "SE"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 24.7,
+              "bearing": "E",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Request repetition due to signal muffling.",
+            "intent": "REQUEST_REPEAT",
+            "target_sector": "NW Highland",
+            "actuator_bias": {
+              "thermal_flux": 0.0,
+              "matter": "none",
+              "focus_radius": 3.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 57.87,
+          "total_ms": 964.58,
+          "generated_tokens": 42,
+          "tokens_per_sec": 43.54
+        },
+        {
+          "turn": 2,
+          "speaker": "Vex",
+          "speaker_pos": [
+            99.3,
+            145.0,
+            1
+          ],
+          "speaker_volume": 0.85,
+          "listener": "Sable",
+          "listener_class": "Shadow-Flanker",
+          "listener_pos": [
+            83.3,
+            136.0,
+            1
+          ],
+          "raw_utterance": "Request repetition due to signal muffling. Step clear of the basalt wall and lay oil!",
+          "heard_utterance": "Request repetition due to signal muffling. Step clear of the basalt wall and lay oil!",
+          "snr_db": 41.32,
+          "snr_tier": "clear",
+          "occlusion_cause": "distance attenuation",
+          "ambient_noise_db": 32.03,
+          "z_world_energy": 0.8998,
+          "z_world_saliency": 0.01222,
+          "z_peak_quadrant": "SW",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 20.4,
+              "bearing": "W",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.6,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 27.6,
+              "bearing": "NW",
+              "sector": "NW Highland",
+              "peak_temp_k": 723.8,
+              "smoke_density": 0.33
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 62.4,
+              "bearing": "SE"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 41.9,
+              "bearing": "E",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Hold fire on the oil slick ahead\u2014laying down oil now!",
+            "intent": "HOLD_FIRE",
+            "target_sector": "L0 Cavern",
+            "actuator_bias": {
+              "thermal_flux": 0.0,
+              "matter": "oil",
+              "focus_radius": 8.0
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 48.46,
+          "total_ms": 1152.99,
+          "generated_tokens": 52,
+          "tokens_per_sec": 45.1
+        },
+        {
+          "turn": 3,
+          "speaker": "Sable",
+          "speaker_pos": [
+            83.3,
+            136.0,
+            1
+          ],
+          "speaker_volume": 0.88,
+          "listener": "Vex",
+          "listener_class": "Pyromancer",
+          "listener_pos": [
+            99.3,
+            145.0,
+            1
+          ],
+          "raw_utterance": "Hold fire on the oil slick ahead\u2014laying down oil now! Clear of the wall \u2014 ignite the SW oil flank now!",
+          "heard_utterance": "Hold fire on the oil slick ahead\u2014laying down oil now! Clear of the wall \u2014 ignite the SW oil flank now!",
+          "snr_db": 42.49,
+          "snr_tier": "clear",
+          "occlusion_cause": "distance attenuation",
+          "ambient_noise_db": 32.0,
+          "z_world_energy": 0.8787,
+          "z_world_saliency": 0.00425,
+          "z_peak_quadrant": "SW",
+          "grounded_hazards": {
+            "local_temp_c": 16.9,
+            "oil_slick": {
+              "found": true,
+              "dist_cells": 38.0,
+              "bearing": "W",
+              "sector": "SW Oil Basin",
+              "peak_mass": 0.92,
+              "temp_k": 289.6,
+              "status": "unlit volatile crude"
+            },
+            "wildfire": {
+              "found": true,
+              "dist_cells": 45.9,
+              "bearing": "NW",
+              "sector": "NW Highland",
+              "peak_temp_k": 723.8,
+              "smoke_density": 0.32
+            },
+            "skybridge": {
+              "south_integrity_pct": 100.0,
+              "peak_temp_k": 290.0,
+              "smoke": 0.0,
+              "status": "INTACT",
+              "dist_cells": 44.9,
+              "bearing": "SE"
+            },
+            "ice_bridge": {
+              "found": true,
+              "dist_cells": 24.7,
+              "bearing": "E",
+              "peak_mass": 0.94,
+              "status": "SOLID ICE"
+            }
+          },
+          "plan": {
+            "reply": "Hold fire on the oil slick ahead\u2014laying down oil now! Clear of the wall \u2014 ignite.",
+            "intent": "HOLD_FIRE",
+            "target_sector": "SW Oil Basin",
+            "actuator_bias": {
+              "thermal_flux": 0.95,
+              "matter": "oil",
+              "focus_radius": 6.5
+            }
+          },
+          "raw_json_valid": true,
+          "plan_valid": true,
+          "repaired": false,
+          "ttft_ms": 54.17,
+          "total_ms": 1430.46,
+          "generated_tokens": 64,
+          "tokens_per_sec": 44.74
+        }
+      ]
+    }
+  ]
+}

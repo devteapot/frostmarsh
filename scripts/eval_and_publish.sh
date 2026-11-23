@@ -72,8 +72,8 @@ mkdir -p "$STAGE_DIR/checkpoints" "$STAGE_DIR/tiers" "$STAGE_DIR/metrics" "$STAG
 cp models/checkpoints/*.pt "$STAGE_DIR/checkpoints/" 2>/dev/null || true
 cp models/*.onnx "$STAGE_DIR/" 2>/dev/null || true
 cp models/tiers/*.onnx "$STAGE_DIR/tiers/" 2>/dev/null || true
-cp models/*.json ml/gate_results.json ml/world_train_summary.json ml/eco_eval_summary.json models/tiers/*.json models/unified_iter6_512/unified_metrics.json "$STAGE_DIR/metrics/" 2>/dev/null || true
-cp models/unified_iter6_512/unified_live_1080p_hud.png models/actuator_emergence_viz.png models/unified_iter3_256/unified_live_1080p_hud.png models/acoustic_field_viz.png "$STAGE_DIR/assets/" 2>/dev/null || true
+cp models/*.json ml/gate_results.json ml/world_train_summary.json ml/eco_eval_summary.json models/tiers/*.json models/unified_iter7_512/unified_metrics.json "$STAGE_DIR/metrics/" 2>/dev/null || true
+cp models/unified_iter7_512/unified_live_1080p_hud.png models/world_dt_structures_viz.png models/actuator_emergence_viz.png models/unified_iter3_256/unified_live_1080p_hud.png models/acoustic_field_viz.png "$STAGE_DIR/assets/" 2>/dev/null || true
 
 if [ "$MODE" = "dry-run" ]; then
   echo "[DRY-RUN] Staged files in $STAGE_DIR:"

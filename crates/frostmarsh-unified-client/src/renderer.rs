@@ -99,40 +99,92 @@ struct SmoothedAtmosphere {
 }
 
 impl SmoothedAtmosphere {
+    fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ]
+    }
+
     fn target_for(atmo: Atmosphere) -> Self {
-        let (sun_col, sky_col, bounce_col, fog_col, exposure, wind_mul) = match atmo.weather_kind {
-            WEATHER_BLIZZARD => (
-                [0.76, 0.90, 1.12],
-                [0.46, 0.62, 0.86],
-                [0.28, 0.36, 0.52],
-                [0.28, 0.38, 0.54],
-                1.04,
-                2.35,
-            ),
-            WEATHER_SQUALL => (
-                [0.82, 0.84, 0.94],
-                [0.30, 0.38, 0.54],
-                [0.20, 0.23, 0.34],
-                [0.15, 0.20, 0.30],
-                1.00,
-                1.75,
-            ),
-            WEATHER_EMBER => (
-                [1.22, 0.76, 0.46],
-                [0.48, 0.28, 0.42],
-                [0.32, 0.19, 0.24],
-                [0.26, 0.15, 0.22],
-                1.14,
-                1.55,
-            ),
-            _ => (
-                [1.06, 0.97, 0.86],
-                [0.35, 0.50, 0.72],
-                [0.22, 0.26, 0.40],
-                [0.16, 0.22, 0.34],
-                1.12,
-                0.85,
-            ),
+        // Diurnal solar phase: day_time 0.0=midnight, 0.25=sunrise, 0.50=noon, 0.75=sunset
+        let phase = atmo.day_time.rem_euclid(1.0) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        let solar = phase.sin(); // -1 midnight .. +1 noon
+        let cos_p = phase.cos(); // +1 sunrise .. -1 sunset
+
+        let day_lin = ((solar + 0.12) / 0.65).clamp(0.0, 1.0);
+        let day_w = day_lin * day_lin * (3.0 - 2.0 * day_lin);
+        let twilight_w = (1.0 - (solar.abs() / 0.45).clamp(0.0, 1.0)).powf(1.3) * 0.85;
+        let dusk_f = ((-cos_p) * 0.5 + 0.5).clamp(0.0, 1.0);
+
+        // 4 distinct Frostmarsh diurnal palettes:
+        // Night (cool indigo moonlit), Noon (crisp bright), Dawn (golden amber), Dusk (warm crimson)
+        let night_sun = [0.34, 0.48, 0.88];
+        let night_sky = [0.10, 0.14, 0.30];
+        let night_bnc = [0.08, 0.10, 0.22];
+        let night_fog = [0.06, 0.08, 0.18];
+        let night_exp = 0.86f32;
+
+        let noon_sun = [1.14, 1.07, 0.96];
+        let noon_sky = [0.38, 0.56, 0.82];
+        let noon_bnc = [0.25, 0.30, 0.44];
+        let noon_fog = [0.17, 0.24, 0.38];
+        let noon_exp = 1.15f32;
+
+        let dawn_sun = [1.28, 0.84, 0.46];
+        let dawn_sky = [0.56, 0.42, 0.60];
+        let dawn_bnc = [0.32, 0.23, 0.28];
+        let dawn_fog = [0.28, 0.19, 0.27];
+        let dawn_exp = 1.08f32;
+
+        let dusk_sun = [1.32, 0.56, 0.32];
+        let dusk_sky = [0.48, 0.23, 0.42];
+        let dusk_bnc = [0.30, 0.15, 0.23];
+        let dusk_fog = [0.24, 0.12, 0.21];
+        let dusk_exp = 1.02f32;
+
+        let tw_sun = Self::lerp3(dawn_sun, dusk_sun, dusk_f);
+        let tw_sky = Self::lerp3(dawn_sky, dusk_sky, dusk_f);
+        let tw_bnc = Self::lerp3(dawn_bnc, dusk_bnc, dusk_f);
+        let tw_fog = Self::lerp3(dawn_fog, dusk_fog, dusk_f);
+        let tw_exp = dawn_exp + (dusk_exp - dawn_exp) * dusk_f;
+
+        let mut sun_col = Self::lerp3(Self::lerp3(night_sun, noon_sun, day_w), tw_sun, twilight_w);
+        let mut sky_col = Self::lerp3(Self::lerp3(night_sky, noon_sky, day_w), tw_sky, twilight_w);
+        let mut bounce_col = Self::lerp3(Self::lerp3(night_bnc, noon_bnc, day_w), tw_bnc, twilight_w);
+        let mut fog_col = Self::lerp3(Self::lerp3(night_fog, noon_fog, day_w), tw_fog, twilight_w);
+        let mut exposure = (night_exp + (noon_exp - night_exp) * day_w) * (1.0 - twilight_w) + tw_exp * twilight_w;
+
+        // Modulate diurnal palette by live weather front (preserving day/night readability!)
+        let wind_mul = match atmo.weather_kind {
+            WEATHER_BLIZZARD => {
+                let s = 0.45 + 0.55 * day_w;
+                sun_col = Self::lerp3(sun_col, [0.76 * s, 0.90 * s, 1.12 * s], 0.50);
+                sky_col = Self::lerp3(sky_col, [0.46 * s, 0.62 * s, 0.86 * s], 0.45);
+                bounce_col = Self::lerp3(bounce_col, [0.28 * s, 0.36 * s, 0.52 * s], 0.45);
+                fog_col = Self::lerp3(fog_col, [0.28 * s, 0.38 * s, 0.54 * s], 0.50);
+                exposure *= 0.95;
+                2.35
+            }
+            WEATHER_SQUALL => {
+                let s = 0.45 + 0.55 * day_w;
+                sun_col = Self::lerp3(sun_col, [0.78 * s, 0.82 * s, 0.94 * s], 0.45);
+                sky_col = Self::lerp3(sky_col, [0.28 * s, 0.36 * s, 0.52 * s], 0.45);
+                bounce_col = Self::lerp3(bounce_col, [0.18 * s, 0.22 * s, 0.32 * s], 0.45);
+                fog_col = Self::lerp3(fog_col, [0.14 * s, 0.19 * s, 0.29 * s], 0.45);
+                exposure *= 0.92;
+                1.75
+            }
+            WEATHER_EMBER => {
+                sun_col = Self::lerp3(sun_col, [1.24, 0.72, 0.42], 0.42);
+                sky_col = Self::lerp3(sky_col, [0.46, 0.24, 0.38], 0.42);
+                bounce_col = Self::lerp3(bounce_col, [0.30, 0.17, 0.22], 0.40);
+                fog_col = Self::lerp3(fog_col, [0.24, 0.13, 0.20], 0.42);
+                exposure *= 1.04;
+                1.55
+            }
+            _ => 0.85,
         };
         let wind_mag = atmo.wind_x.hypot(atmo.wind_y).max(0.45);
         let sign = if atmo.wind_x < -0.05 { -1.0 } else { 1.0 };
@@ -1010,8 +1062,24 @@ impl Approach4Renderer {
     }
 
     pub fn sun_dir(atmo: Atmosphere) -> Vec3 {
-        let ang = atmo.day_time * std::f32::consts::TAU * 0.35;
-        Vec3::new(0.52 * ang.cos() + 0.15, 0.72, -0.44 - 0.15 * ang.sin()).normalize()
+        let phase = atmo.day_time.rem_euclid(1.0) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        let solar = phase.sin();
+        let horiz = phase.cos();
+        let sun_v = Vec3::new(
+            -horiz * 0.85,
+            0.24 + 0.66 * solar.clamp(0.0, 1.0).powf(0.75),
+            -0.38 - 0.18 * solar.clamp(0.0, 1.0),
+        )
+        .normalize();
+        let moon_v = Vec3::new(
+            horiz * 0.62,
+            0.26 + 0.42 * (-solar).clamp(0.0, 1.0),
+            -0.46,
+        )
+        .normalize();
+        let blend = ((solar + 0.15) / 0.20).clamp(0.0, 1.0);
+        let s_blend = blend * blend * (3.0 - 2.0 * blend);
+        moon_v.lerp(sun_v, s_blend).normalize()
     }
 
     pub fn upload_minimap(&mut self, w: u32, h: u32, rgba: &[u8]) {

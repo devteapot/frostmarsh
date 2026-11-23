@@ -149,89 +149,137 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // === MATERIAL 9: LIVE NEURAL A+ COMPOSITIONAL TERRAIN ===
     if (mat_id == 9) {
-        let patch_l = fbm2(wp.xz * 0.22);
-        let tuft = hash2(floor(wp.xz * 3.8));
-        let speck = hash2(floor(wp.xz * 6.0));
+        let patch_l = fbm2(wp.xz * 0.18);
+        let detail_n = vnoise(wp.xz * 0.95);
+        let tuft = hash2(floor(wp.xz * 4.2));
+        let speck = hash2(floor(wp.xz * 7.5));
 
-        // Organic painterly micro-variation over compositional A+ ground albedo
-        alb = clamp(alb * (0.88 + patch_l * 0.24 + (tuft - 0.5) * 0.11), vec3<f32>(0.0), vec3<f32>(1.0));
+        // Fast single-octave procedural normal bump for crisp ground/turf/rock relief at 70+ FPS
+        let h_x = vnoise((wp.xz + vec2<f32>(0.25, 0.0)) * 0.95) - detail_n;
+        let h_z = vnoise((wp.xz + vec2<f32>(0.0, 0.25)) * 0.95) - detail_n;
+        n = normalize(n + vec3<f32>(-h_x * 0.42, 0.0, -h_z * 0.42));
+
+        // Rich painterly macro + micro biome variation over compositional A+ ground albedo
+        alb = clamp(
+            alb * (0.84 + patch_l * 0.24 + (detail_n - 0.5) * 0.16 + (tuft - 0.5) * 0.08),
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
+
+        // Damp dark shoreline bank & pebble sheen right above water level
+        let shore_t = smoothstep(0.56, 0.14, wp.y);
+        if (shore_t > 0.02) {
+            let wet_bank = vec3<f32>(0.18, 0.22, 0.24) * (0.85 + detail_n * 0.30);
+            alb = mix(alb, wet_bank, shore_t * 0.45);
+            metallic = max(metallic, shore_t * 0.28);
+        }
 
         // Cliff / riverbank slope rock strata on steep faces
-        let slope = smoothstep(0.88, 0.66, n.y);
+        let slope = smoothstep(0.89, 0.62, n.y);
         if (slope > 0.02) {
-            let strata = sin(wp.y * 5.2 + vnoise(wp.xz * 0.6) * 2.2) * 0.14;
-            let cliff_col = clamp(vec3<f32>(0.34, 0.40, 0.52) * (1.0 + strata + (tuft - 0.5) * 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
-            alb = mix(alb, cliff_col, slope * 0.72);
-            n = normalize(n + vec3<f32>(strata * 0.38, 0.0, -strata * 0.38));
+            let strata = sin(wp.y * 5.8 + vnoise(wp.xz * 0.55) * 2.6) * 0.16;
+            let cliff_col = clamp(
+                vec3<f32>(0.30, 0.36, 0.48) * (0.94 + strata + (detail_n - 0.5) * 0.22),
+                vec3<f32>(0.0),
+                vec3<f32>(1.0),
+            );
+            alb = mix(alb, cliff_col, slope * 0.78);
+            n = normalize(n + vec3<f32>(strata * 0.42, 0.0, -strata * 0.42));
+        }
+
+        // High-elevation alpine snow dusting on flat upper ridges
+        let alpine_snow = smoothstep(3.4, 4.3, wp.y) * smoothstep(0.68, 0.90, n.y);
+        if (alpine_snow > 0.02) {
+            let snow_spark = step(0.93, speck) * 0.18;
+            alb = mix(alb, vec3<f32>(0.84, 0.91, 0.98) + vec3<f32>(snow_spark), alpine_snow * 0.52);
+            metallic = max(metallic, alpine_snow * 0.25);
         }
 
         // Frost / freezing shimmer when cold (temp_n < 0.075 => below freezing!)
-        let frost_t = smoothstep(0.085, 0.045, temp_n);
+        let frost_t = smoothstep(0.088, 0.044, temp_n);
         if (frost_t > 0.05) {
             let ice_flash = flash_pal(34);
-            let crystal_sparkle = step(0.91, speck);
-            let frost_col = mix(vec3<f32>(0.68, 0.88, 0.98), ice_flash.rgb, 0.28 + crystal_sparkle * 0.45);
-            alb = mix(alb, frost_col, frost_t * 0.58);
-            metallic = max(metallic, frost_t * 0.45);
+            let crystal_sparkle = step(0.89, speck);
+            let frost_col = mix(vec3<f32>(0.72, 0.90, 0.99), ice_flash.rgb, 0.30 + crystal_sparkle * 0.48);
+            alb = mix(alb, frost_col, frost_t * 0.64);
+            metallic = max(metallic, frost_t * 0.52);
         }
 
-        // Live wildfire / molten ember glow driven by 1 KB animated flash() palette!
+        // Live wildfire / molten ember glow with glowing lava/charcoal crack veins!
         if (burn_t > 0.04 || temp_n > 0.24) {
             let heat = max(burn_t, smoothstep(0.24, 0.62, temp_n));
             let flame_n = fbm2(wp.xz * 1.45 + vec2<f32>(t * 0.9, -t * 1.6));
-            let ember_p = flash_pal(27); // animated forge orange
-            let core_p = flash_pal(29);  // animated incandescent fire core
-            let ember_col = mix(ember_p.rgb, core_p.rgb, smoothstep(0.32, 0.78, flame_n * heat + heat * 0.35));
-            let mix_f = clamp(heat * (0.55 + flame_n * 0.65), 0.0, 1.0);
-            alb = mix(alb, ember_col, mix_f);
-            glow = max(glow, mix_f * max(ember_p.a, core_p.a));
+            let crack = smoothstep(0.42, 0.52, abs(vnoise(wp.xz * 2.4) - 0.5));
+            let ember_p = flash_pal(27);
+            let core_p = flash_pal(29);
+            let char_col = vec3<f32>(0.10, 0.08, 0.11);
+            let ember_col = mix(ember_p.rgb, core_p.rgb, smoothstep(0.30, 0.76, flame_n * heat + heat * 0.35));
+            let cracked_burn = mix(ember_col, char_col, (1.0 - crack) * 0.42 * (1.0 - heat * 0.5));
+            let mix_f = clamp(heat * (0.58 + flame_n * 0.62), 0.0, 1.0);
+            alb = mix(alb, cracked_burn, mix_f);
+            glow = max(glow, mix_f * (0.72 + crack * 0.40) * max(ember_p.a, core_p.a));
         }
     } else if (mat_id == 3) {
-        // === MATERIAL 3: LIVE FLOWING RIVER WATER (uses A+ flow vector + 1 KB flash() palette!) ===
+        // === MATERIAL 3: LIVE FLOWING RIVER & WATERFALL (caustics + Fresnel sky reflection + foam!) ===
         let fdir = select(vec2<f32>(0.0, 1.0), normalize(flow_v), length(flow_v) > 0.05);
-        let speed = 0.9 + clamp(length(flow_v), 0.0, 1.6) * 0.65;
-        let p_uv = wp.xz;
-        let w1 = vnoise(p_uv * 0.85 - fdir * t * 1.15 * speed);
-        let w2 = vnoise(p_uv * 1.65 - fdir * t * 0.85 * speed + vec2<f32>(7.3, -4.1));
-        let w3 = vnoise(floor(p_uv * 3.5) * 0.35 - fdir * t * 0.65);
+        let speed = 0.95 + clamp(length(flow_v), 0.0, 2.2) * 0.72;
+        let is_waterfall = abs(in.normal.y) < 0.45;
+        let p_uv = select(wp.xz, vec2<f32>(wp.x + wp.z, wp.y * 1.35), is_waterfall);
+        let w1 = vnoise(p_uv * 0.92 - fdir * t * 1.25 * speed);
+        let w2 = vnoise(p_uv * 1.85 - fdir * t * 0.92 * speed + vec2<f32>(7.3, -4.1));
+        let w3 = vnoise(p_uv * 3.60 - fdir * t * 1.55 * speed + vec2<f32>(-3.2, 5.7));
         let ripple = w1 * 0.45 + w2 * 0.35 + w3 * 0.20;
-        n = normalize(vec3<f32>((w1 - 0.5) * 0.36, 1.0, (w2 - 0.5) * 0.36));
+        let caustic = pow(clamp(1.0 - abs(w1 - w2) * 2.8, 0.0, 1.0), 3.0);
+        if (!is_waterfall) {
+            n = normalize(vec3<f32>((w1 - 0.5) * 0.42 + (w3 - 0.5) * 0.18, 1.0, (w2 - 0.5) * 0.42));
+        }
 
-        let deep_w = flash_pal(31).rgb;
+        let deep_w = flash_pal(31).rgb * 0.88;
         let mid_w = flash_pal(32).rgb;
         let sunlit_w = flash_pal(33).rgb;
         let crest_w = flash_pal(34).rgb;
-        alb = mix(deep_w, mid_w, smoothstep(0.24, 0.65, ripple));
-        alb = mix(alb, sunlit_w, smoothstep(0.58, 0.78, ripple) * 0.55);
-        let crest = step(0.76, ripple);
-        alb = mix(alb, mix(crest_w, vec3<f32>(0.88, 0.97, 1.0), 0.50), crest * 0.55);
+        alb = mix(deep_w, mid_w, smoothstep(0.22, 0.66, ripple));
+        alb = mix(alb, sunlit_w, smoothstep(0.56, 0.78, ripple) * 0.55 + caustic * 0.28);
+        let crest = smoothstep(0.72, 0.84, ripple);
+        alb = mix(alb, mix(crest_w, vec3<f32>(0.90, 0.98, 1.0), 0.58), crest * 0.65);
+
+        if (is_waterfall) {
+            let streak = smoothstep(0.35, 0.78, w2 * 0.6 + w3 * 0.4);
+            alb = mix(vec3<f32>(0.42, 0.80, 0.98), vec3<f32>(0.90, 0.98, 1.0), streak * 0.72);
+            glow = max(glow, 0.16);
+        }
 
         // Subtle steam glow when water is heated
         if (temp_n > 0.24) {
             let boil = smoothstep(0.24, 0.55, temp_n);
-            alb = mix(alb, vec3<f32>(0.76, 0.88, 0.96), boil * 0.32);
+            alb = mix(alb, vec3<f32>(0.78, 0.90, 0.98), boil * 0.35);
         }
     } else if (mat_id == 6) {
-        // === MATERIAL 6: CARVED ICE RAFT / GLACIAL BRIDGE ===
+        // === MATERIAL 6: CARVED ICE RAFT / GLACIAL BRIDGE (subsurface cyan + crystalline facets) ===
         let ice_p = flash_pal(35);
-        let sp = hash2(floor(wp.xz * 4.2));
-        let crack = smoothstep(0.47, 0.50, abs(vnoise(wp.xz * 1.9) - 0.5));
-        alb = mix(alb, ice_p.rgb, 0.22 + step(0.88, sp) * 0.32);
-        alb *= 1.0 - crack * 0.12;
-        metallic = 0.65;
+        let sp = hash2(floor(wp.xz * 4.8));
+        let facet = vnoise(wp.xz * 2.2);
+        let crack = smoothstep(0.46, 0.50, abs(facet - 0.5));
+        alb = mix(alb, vec3<f32>(0.44, 0.84, 0.98), 0.18 * (1.0 - facet));
+        alb = mix(alb, ice_p.rgb, 0.24 + step(0.87, sp) * 0.36);
+        alb *= 1.0 - crack * 0.15;
+        n = normalize(n + vec3<f32>((facet - 0.5) * 0.22, 0.0, (sp - 0.5) * 0.14));
+        metallic = 0.74;
     } else if (mat_id == 5) {
         // Emissive crystal / glowing relic / fire core / dash halo
         let pulse = flash_pal(35).a;
-        glow = max(glow, 0.82 * (0.85 + 0.15 * pulse));
+        glow = max(glow, 0.85 * (0.85 + 0.15 * pulse));
     } else if (mat_id == 1) {
-        // Rock / stone pillar masonry & bevel
-        let strata = sin(wp.y * 4.4 + vnoise(wp.xz * 0.8) * 2.0) * 0.10;
-        let grit = (hash2(floor(wp.xz * 3.0)) - 0.5) * 0.14;
-        alb = clamp(alb * (1.0 + strata + grit), vec3<f32>(0.0), vec3<f32>(1.0));
+        // Rock / stone pillar masonry & chiseled bevel
+        let strata = sin(wp.y * 4.8 + vnoise(wp.xz * 0.8) * 2.2) * 0.12;
+        let grit = (vnoise(wp.xz * 3.4) - 0.5) * 0.18;
+        alb = clamp(alb * (0.98 + strata + grit), vec3<f32>(0.0), vec3<f32>(1.0));
+        n = normalize(n + vec3<f32>(strata * 0.24, 0.0, grit * 0.24));
     } else if (mat_id == 4) {
-        // Wood bark / planks
-        let grain = sin((wp.x + wp.z) * 12.0 + vnoise(wp.xz * 3.5) * 2.2) * 0.08;
-        alb = clamp(alb * (1.0 + grain), vec3<f32>(0.0), vec3<f32>(1.0));
+        // Wood bark / weathered bridge planks
+        let grain = sin((wp.x + wp.z) * 14.0 + vnoise(wp.xz * 3.8) * 2.4) * 0.09;
+        let plank_seam = smoothstep(0.92, 0.99, abs(sin(wp.x * 3.14159)));
+        alb = clamp(alb * (1.0 + grain - plank_seam * 0.18), vec3<f32>(0.0), vec3<f32>(1.0));
     } else if (mat_id == 10) {
         // Polished steel / royal gold armor & relic metal
         metallic = 1.0;
@@ -245,39 +293,46 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var fill = mix(u.bounce_col.rgb, u.sky_col.rgb, n.y * 0.5 + 0.5);
     let horiz = 1.0 - n.y * n.y;
     let away = max(0.0, -dot(n.xz, normalize(u.sun_dir.xz + vec2<f32>(0.0001, 0.0))));
-    fill += u.bounce_col.rgb * horiz * (0.24 + 0.52 * away);
+    fill += u.bounce_col.rgb * horiz * (0.26 + 0.54 * away);
 
     let ndl = max(dot(n, u.sun_dir.xyz), 0.0) * sh;
     var light_scalar = ndl + 0.08 * max(dot(n, view_dir), 0.0);
     if (u.viewport.z > 0.5) {
-        // 9-step pixel-art tone ramp (72% discrete steps + 28% micro-bevel fidelity!)
+        // Smooth-bevel stylized cel ramp (55% stepped + 45% continuous lighting for rich form!)
         let q_l = round(light_scalar * u.viewport.z) / u.viewport.z;
-        light_scalar = mix(light_scalar, q_l, 0.72);
+        light_scalar = mix(light_scalar, q_l, 0.55);
     }
 
     var col = alb * (fill + u.sun_col.rgb * light_scalar) * u.sun_dir.w;
 
-    // 9-step Cool-Indigo (#261e48) shadow pull + Warm-Cream (#fff4d6) highlight push!
+    // Subtle Cool-Indigo shadow pull + Warm-Cream highlight push
     let cool_ink = vec3<f32>(0.149, 0.118, 0.282);
     let warm_hi = vec3<f32>(1.000, 0.957, 0.839);
     let shadow_t = clamp(1.0 - light_scalar * 1.45, 0.0, 1.0);
-    col = mix(col, cool_ink, shadow_t * 0.20);
+    col = mix(col, cool_ink, shadow_t * 0.17);
     let hi_t = clamp((light_scalar - 0.78) * 1.8, 0.0, 1.0);
-    col = mix(col, warm_hi, hi_t * 0.14);
+    col = mix(col, warm_hi, hi_t * 0.13);
+
+    let ndv = max(dot(n, view_dir), 0.0);
+    let fresnel = pow(1.0 - ndv, 3.2);
 
     // Metallic armor / gold / ice specular glint + rim
     if (metallic > 0.2) {
         let hv = normalize(u.sun_dir.xyz + view_dir);
-        let spec = pow(max(dot(n, hv), 0.0), 24.0) * sh;
-        let rim = pow(1.0 - max(dot(n, view_dir), 0.0), 2.5);
-        col += (u.sun_col.rgb * spec * 0.68 + u.sky_col.rgb * rim * 0.44) * metallic;
+        let spec = pow(max(dot(n, hv), 0.0), 28.0) * sh;
+        col += (u.sun_col.rgb * spec * 0.74 + u.sky_col.rgb * fresnel * 0.48) * metallic;
+    } else if (mat_id != 9 && mat_id != 3) {
+        // Crisp hero & prop readability rim light against dark terrain / night scenes
+        col += (u.sky_col.rgb * 0.55 + u.sun_col.rgb * 0.35) * fresnel * 0.28;
     }
 
-    // Water sun glint
+    // Water Fresnel sky reflection + crisp sun sparkle (keeps rich Nordic fjord azure!)
     if (mat_id == 3) {
         let hv = normalize(u.sun_dir.xyz + view_dir);
-        let spec = pow(max(dot(n, hv), 0.0), 64.0) * sh;
-        col += u.sun_col.rgb * spec * 1.10;
+        let spec = pow(max(dot(n, hv), 0.0), 72.0) * sh;
+        let sky_refl = mix(vec3<f32>(0.14, 0.44, 0.72), u.sky_col.rgb * 1.35, 0.48);
+        col = mix(col, sky_refl, clamp(fresnel * 0.34, 0.0, 0.28));
+        col += u.sun_col.rgb * spec * 1.30;
     }
 
     // Up to 8 local dynamic point lights (live wildfires, fire/frost bolts, golden relic!)
@@ -289,16 +344,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             if (r < lp.w) {
                 let att = max(0.0, 1.0 - r / lp.w);
                 let l_ndl = max(dot(n, d3 / max(r, 0.001)), 0.0);
-                col += (alb * 0.85 + vec3<f32>(0.10)) * u.point_col[i].rgb * att * att * (0.36 + 0.64 * l_ndl);
+                col += (alb * 0.85 + vec3<f32>(0.10)) * u.point_col[i].rgb * att * att * (0.38 + 0.62 * l_ndl);
             }
         }
     }
 
     if (glow > 0.05) {
-        col = mix(col, alb * 1.48, clamp(glow, 0.0, 1.0));
+        col = mix(col, alb * 1.50, clamp(glow, 0.0, 1.0));
     }
 
-    let fog_t = 0.58 * smoothstep(u.sky_col.w, u.bounce_col.w, dist);
-    col = mix(col, u.fog_col.rgb, fog_t * (1.0 - clamp(glow, 0.0, 1.0) * 0.85));
+    // Directional sun-scattered atmospheric perspective fog
+    let fog_t = 0.62 * smoothstep(u.sky_col.w, u.bounce_col.w, dist);
+    let sun_scatter = pow(max(dot(-view_dir, u.sun_dir.xyz), 0.0), 5.0);
+    let atmo_fog = u.fog_col.rgb + u.sun_col.rgb * sun_scatter * 0.26;
+    col = mix(col, atmo_fog, fog_t * (1.0 - clamp(glow, 0.0, 1.0) * 0.85));
     return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

@@ -108,14 +108,14 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     var col: vec3<f32>;
     if (u.crisp < 0.5) {
-        // Clean 3D mode: smooth supersampled resolve with subtle crevice contact AO
+        // Clean 3D mode: smooth supersampled resolve with crisp crevice contact AO
         let d0 = load_depth(cell);
         let d_min = min(
             min(load_depth(cell + vec2<i32>(-1, 0)), load_depth(cell + vec2<i32>(1, 0))),
             min(load_depth(cell + vec2<i32>(0, -1)), load_depth(cell + vec2<i32>(0, 1))),
         );
-        let occ = clamp(((d0 - d_min) - 0.0005) * 85.0, 0.0, 1.0);
-        let ao = 1.0 - 0.18 * occ;
+        let occ = clamp(((d0 - d_min) - 0.0004) * 95.0, 0.0, 1.0);
+        let ao = 1.0 - 0.22 * occ;
         col = (sum.rgb * ao) + u.background.rgb * (1.0 - clamp(sum.a, 0.0, 1.0));
     } else if (cov >= 0.5) {
         let continuous_col = solid_sum.rgb / max(solid_sum.a, 1.0);
@@ -127,8 +127,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let d_max = max(max(dl, dr), max(du, dd));
         let d_min = min(min(dl, dr), min(du, dd));
 
-        let occ = clamp(((d0 - d_min) - 0.0005) * 95.0, 0.0, 1.0);
-        let ao = 1.0 - 0.24 * occ;
+        let occ = clamp(((d0 - d_min) - 0.00045) * 95.0, 0.0, 1.0);
+        let ao = 1.0 - 0.25 * occ;
 
         var is_edge = false;
         if (u.outline > 0.5) {
@@ -136,25 +136,34 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         + i32(coverage(cell + vec2<i32>(-1,  0)) >= 0.5)
                         + i32(coverage(cell + vec2<i32>( 0,  1)) >= 0.5)
                         + i32(coverage(cell + vec2<i32>( 0, -1)) >= 0.5);
-            is_edge = (n_solid > 0 && n_solid < 4) || (d_max - d0 > 0.0028);
+            is_edge = (n_solid > 0 && n_solid < 4) || (d_max - d0 > 0.0038);
         }
 
         let shaded = continuous_col * ao;
         if (u.quantise > 0.5) {
-            let d_amt = max(u.dither, 0.16);
-            let d_shift = (bayer4(cell) - 0.5) * 0.075 * d_amt;
+            let d_amt = max(u.dither, 0.14);
+            let d_shift = (bayer4(cell) - 0.5) * 0.060 * d_amt;
             let pal_col = u.palette[nearest_palette(clamp(shaded + vec3<f32>(d_shift), vec3<f32>(0.0), vec3<f32>(1.0)), true)].rgb;
-            col = mix(shaded, pal_col, 0.68);
+            col = mix(shaded, pal_col, 0.42);
         } else {
             col = shaded;
         }
 
         if (is_edge) {
-            col = ink_color(col);
+            col = mix(col, ink_color(col), 0.72);
         }
     } else {
         col = u.background.rgb;
     }
+
+    // Subtle filmic S-curve + vibrance + gentle atmospheric edge vignette
+    let uv = pos.xy / max(u.low_res, vec2<f32>(1.0));
+    let luma = dot(col, vec3<f32>(0.299, 0.587, 0.114));
+    col = mix(vec3<f32>(luma), col, 1.12);
+    col = col * col * (3.0 - 2.0 * col) * 0.16 + col * 0.84;
+    let v_d = length((uv - vec2<f32>(0.5)) * vec2<f32>(1.25, 1.05));
+    let vig = 1.0 - smoothstep(0.55, 1.15, v_d) * 0.14;
+    col *= vig;
 
     return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

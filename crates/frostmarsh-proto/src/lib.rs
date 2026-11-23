@@ -53,6 +53,7 @@ pub enum ClientReliable {
     RequestFullSync,
     ChatCommand { text: String, volume: f32 },
     TogglePhysicsNative,
+    CycleTimeScale,
     PhysicalActuator {
         dx: f32,
         dy: f32,
@@ -258,6 +259,12 @@ pub struct TelemetrySnap {
     pub world_sparse_pct: f32,
     #[serde(default)]
     pub physics_native: bool,
+    #[serde(default)]
+    pub time_scale: f32,
+    #[serde(default)]
+    pub world_day: u32,
+    #[serde(default)]
+    pub neural_3d_vertical: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

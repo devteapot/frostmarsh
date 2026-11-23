@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Live 512x512x4 with ActuatorPolicyNet v2 (91.7% vs Legacy), Sparse Eco & Live Acoustic Chat](models/unified_iter6_512/unified_live_1080p_hud.png)
+![Frostmarsh Live 512x512x4 with WorldModel3D v4 Neural Vertical Physics, Diurnal World Time & Towering Pines](models/unified_iter7_512/unified_live_1080p_hud.png)
 
 ---
 
@@ -69,25 +69,29 @@
     - **vs. Actuator v1 (Iter 5A):** **`100.0%` (`24W–0L`)** · **vs. Thermal-Only:** **`95.83%` (`23W–1L`)** · **vs. Random:** **`100.0%` (`24W–0L`)**.
   - **True 3D Cross-Layer `WorldModel3D` v4** (`ml/world_model_3d.py`, `ml/train_world_3d_v4.py`, `world_model_3d_v4.pt`, [WORLD_3D_V4_METRICS.json](models/WORLD_3D_V4_METRICS.json), `123.8K` params): Adds `1×1×3` cross-layer mixing + vertical interface transport head (`flux_z_water/oil/steam/smoke`, `heat_z`), jumping **composite 3D vertical R² from `-0.031` (2D v3) → `+0.813`** (`0.922` active waterfall gravity R², `0.758` buoyancy R², `0.897` vertical heat R²) while keeping `proj_active_pct = 5.25%` (`< 6%`) and `0.999991` `Z_world` cosine parity.
   - **`SparseEcoRunner` (`ml/sparse_eco_runner.py`, FP32 `max_abs_diff = 2.09e-7`) + Live 3D Volumetric Actuator Beam VFX (`ActuatorPulseSnap`):** Cut live `512×512` `ECO` latency from `11.51 ms` → **`7.50 ms`** (`-35%`) and renders continuous heat beams, cryo cones, matter streams, and kinetic shockwave rings through `volumetric_splat.wgsl` + dynamic point lights.
-- **Live 30 Hz Server Loop (GB10, `512×512×4` 1M Voxels, Sparse World + Sparse Eco + `ActuatorPolicyNet` v2 `op=7`):** `11.43 ms` Sparse World (`SPARSE 6%`) + `7.50 ms` Sparse Eco + **`1.79 ms` Actuator v2 Bots+Saliency** + `2.24 ms` Live Acoustics (`mass_err = 0`, `energy_err = 0`, `119 KB/s` wire, **`74.8 FPS` @ 1080p / `71.3 FPS` @ 4K Metal**).
+- **Iteration 7 — Live `WorldModel3D` v4 (`op=8`), Continuous `Δt` Time Dilation (`WorldModelDT`), System-2 `Z_world → Qwen2.5-1.5B` Dialogue & Unified Client Overhaul:**
+  - **Live 3D Neural Vertical Physics (`op=8`, `SparseWorld3DRunner`, `apply_neural_3d_vertical_fluxes`):** Replaced hardcoded Rust vertical exchange on Spark GB10 with live `WorldModel3D` v4 predicting cross-layer gravity, buoyancy, and convective heat fluxes behind exact integer antisymmetric conservation (`9/9` `field-core` tests, `mass_err = 0`, `energy_err = 0` even under adversarial `NaN`/`±Inf` proposals; `15.77 ms` @ `512×512×4`, `SPARSE 6%`, `3D-NEURAL-Z`).
+  - **Physics-Coupled Diurnal World Time (`K`-Key Time-Warp `1×/4×/16×/0.25×`):** Solar cycle physically freezes rivers at midnight and thaws/dries timber at midday (`apply_solar_cycle_3d`, exact `faucet_energy` conservation) paired with full sunrise/noon/dusk/moonlit-night lighting and HUD world clock (`DAY N HH:MM [K]1X`).
+  - **`WorldModelDT` Continuous `Δt` Time-Dilation & Emergent Destructible Structures** (`ml/world_model_dt.py`, `world_model_dt.pt`, [WORLD_DT_STRUCTURES_METRICS.json](models/WORLD_DT_STRUCTURES_METRICS.json), `132.3K` params, Colab `L4`): Beats naive linear `Δt·v4` at `4.0×` (`Horiz R² = 0.7634` vs `0.3825`, `Rxn R² = +0.6663` vs `-0.4964`); **`2.79×`** adaptive multi-rate temporal-sparsity speedup at `512×512×4`; **`0.15×` Stasis Domes freeze wildfires `88.7%` and plunging waterfalls `86.6%`** (`3.0×` zones accelerate burn `2.34×`, drift `5.1e-10`); and `struct_head` (`R² = 0.800`) drives **L2 timber skybridge burn/collapse (`t=7`)**, **cryo ice rampart construction (`t=9`, `99.4%` integrity)**, and **thermal dam breach river redirection (`12.7k` mass surge)**.
+  - **System-2 `Z_world → Qwen2.5-1.5B-Instruct` Physics-Grounded Dialogue** (`ml/system2_slm.py`, [SYSTEM2_SLM_METRICS.json](models/SYSTEM2_SLM_METRICS.json), [SYSTEM2_SLM_REPORT.md](models/SYSTEM2_SLM_REPORT.md)): Runs on Spark GB10 (`bf16`, `3.44 GB` peak VRAM) at **`56.86 ms` p50 TTFT**, `44.45 tok/s`, **`0.78 µs`** non-blocking submit (zero 30 Hz stall), **`100%` valid structured `g_i` actuator plans (`38/38`)**, and **`100%` low-SNR acoustic awareness** (waterfall `-6.3 dB`, L0 cavern `-14.8 dB`, basalt wall `-1.4 dB`).
+  - **Unified Client Playability & Visual Overhaul:** Fixed exact 360° cursor facing (`(-aim_x).atan2(aim_y)` + 0 ms 3D `AimReticle`), added server-matched `ack_input_seq` replay prediction + 60 Hz edge-triggered inputs + 0 ms predicted actuator beams, smoothed terrain heightfields (`3×3` zero-spike pass), re-proportioned towering Nordic pines (`3–4×` hero height) & monumental `y=8.35` L2 Sky-Arches, and doubled Metal FPS to **`119.4–130.5 FPS` @ 1080p / `96.7–119.0 FPS` @ 4K**.
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
 | World Scale | Render Mode | Resolution | p50 Frame Time | FPS |
 |---|---|---|---:|---:|
-| `256×256×4` (262K vox) | Pixel-2xSS + Vol3DGS + Brain/Speech HUD | 1920×1080 | `7.80–8.54 ms` | **117–128 FPS** |
-| `256×256×4` (262K vox) | Pixel-2xSS + Vol3DGS + Brain/Speech HUD | 3840×2160 (4K) | `8.26–8.79 ms` | **114–121 FPS** |
-| **`512×512×4` (1.05M vox)** | **Pixel-2xSS + Vol3DGS + Brain/Speech HUD** | **1920×1080** | **`13.80–14.33 ms`** | **70–73 FPS** |
-| **`512×512×4` (1.05M vox)** | **Pixel-2xSS + Vol3DGS + Brain/Speech HUD** | **3840×2160 (4K)** | **`13.91 ms`** | **71.9 FPS** |
-| **`512×512×4` (1.05M vox)** | **Clean 3D + Vol3DGS + Brain/Speech HUD** | **3840×2160 (4K)** | **`15.73 ms`** | **63.6 FPS** |
+| **`512×512×4` (1.05M vox)** | **Pixel-2xSS + Vol3DGS + Brain/Speech HUD** | **1920×1080** | **`8.37 ms`** | **119.4 FPS** |
+| **`512×512×4` (1.05M vox)** | **Clean 3D + Vol3DGS + Brain/Speech HUD** | **1920×1080** | **`7.67 ms`** | **130.5 FPS** |
+| **`512×512×4` (1.05M vox)** | **Pixel-2xSS + Vol3DGS + Brain/Speech HUD** | **3840×2160 (4K)** | **`8.41 ms`** | **119.0 FPS** |
+| **`512×512×4` (1.05M vox)** | **Clean 3D + Vol3DGS + Brain/Speech HUD** | **3840×2160 (4K)** | **`10.34 ms`** | **96.7 FPS** |
 
 ---
 
 ## Visual Showcase
 
-| Emergent Continuous Physical Actuators (`ActuatorPolicyNet`, Colab `A100`) | 3D Physical Acoustics & Emergent Neural Vocabulary |
+| `WorldModelDT` Continuous Δt Time-Dilation & Destructible Structures | Emergent Continuous Physical Actuators (`ActuatorPolicyNet`, Colab `A100`) |
 |---|---|
-| ![Emergent Physical Actuators](models/actuator_emergence_viz.png) | ![3D Acoustics & Emergent Speech](models/acoustic_field_viz.png) |
+| ![WorldModelDT Time Dilation & Structures](models/world_dt_structures_viz.png) | ![Emergent Physical Actuators](models/actuator_emergence_viz.png) |
 
 | Tier 1 (`512²` Painterly) | Tier 4 (Multi-Style Client Diffusion) |
 |---|---|
@@ -140,6 +144,7 @@ FROSTMARSH_SERVER=127.0.0.1:4433 ./play_frostmarsh.sh
 | `E` / `R` | Class signature ability & Ultimate |
 | `F1` / `F2` / `F3` | Switch class (**Frost Warden**, **Pyro Alchemist**, **Marsh Ranger**) |
 | **`P`** | **Live hot-toggle `PHYSICS-NATIVE` continuous actuators ↔ `CLASSIC` named spells** |
+| **`K`** | **Cycle Diurnal World Time-Warp (`1× → 4× → 16× → 0.25×` solar freeze/thaw cycle)** |
 | **`LMB` / `RMB` / `[` `]`** | **In Physics-Native mode: `+ΔE` Heat / `-ΔE` Cryo / Adjust Focus Radius (`2.0..8.0`)** |
 | **`Enter` / `Tab`** | **Open live Acoustic Chat (`Tab` toggles SHOUT/WHISPER while typing; hold `Tab` outside chat for 6v6 Scoreboard)** |
 | **`U`** | **Mute / unmute procedural 3D spatial audio & SNR-filtered voice synths** |

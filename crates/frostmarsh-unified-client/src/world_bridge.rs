@@ -121,28 +121,32 @@ fn cell_height_and_color(
 
     let nx = gx as f32 / grid_w.max(1) as f32;
     let ny = gy as f32 / grid_h.max(1) as f32;
-    let gentle_hill = 0.26 * (nx * 11.0).sin() * (ny * 9.0).cos() + (1.0 - ny) * 0.42;
+    let gentle_hill = 0.58 * (nx * 11.0).sin() * (ny * 9.0).cos()
+        + 0.28 * (nx * 23.0 + ny * 17.0).sin()
+        + (1.0 - ny) * 0.95;
 
-    let h = if c.s1 == SP_ROCK || (c.wall && c.s1 != SP_WOOD) {
+    // Keep terrain height smooth & continuous: never extrude sharp 1-cell pyramid spikes on `c.wall`!
+    // Discrete boulders (`RockOutcrop`) handle sharp rock silhouette geometry cleanly above the smooth hills.
+    let h = if c.s1 == SP_ROCK {
         if gx < 4 || gx + 4 >= grid_w || gy < 4 || gy + 4 >= grid_h {
-            3.1 + gentle_hill * 0.4
+            4.4 + gentle_hill * 0.55
         } else {
-            2.35 + gentle_hill * 0.35
+            2.15 + gentle_hill * 0.50
         }
     } else if is_bridge {
-        0.58
+        0.72
     } else if is_ice {
-        0.30
+        0.34
     } else if is_water {
-        -0.48
+        -0.65
     } else if c.s1 == SP_OIL && c.s2 == SP_WATER {
-        -0.36
+        -0.48
     } else if c.s1 == SP_OIL || (c.s2 == SP_OIL && c.s2_frac > 0.25) {
-        0.58 + gentle_hill * 0.2
+        0.72 + gentle_hill * 0.28
     } else if c.s1 == SP_ASH {
-        0.74 + gentle_hill * 0.4
+        0.92 + gentle_hill * 0.55
     } else {
-        0.94 + gentle_hill
+        1.18 + gentle_hill
     };
 
     let c1 = species_albedo(c.s1);
@@ -159,11 +163,12 @@ fn cell_height_and_color(
         let plank = if (gx + gy) % 2 == 0 { 1.0 } else { 0.88 };
         rgb = [0.56 * plank, 0.37 * plank, 0.22 * plank];
     } else if c.s1 == SP_OIL || (c.s2 == SP_OIL && c.s2_frac > 0.22) {
-        let sheen = 0.5 + 0.5 * ((gx as f32 * 0.6 + gy as f32 * 0.4).sin());
+        let swirl = hash2i(gx as i32 * 13 + 5, gy as i32 * 29 + 7) * 0.45
+            + 0.55 * (0.5 + 0.5 * ((gx as f32 * 0.14).sin() * (gy as f32 * 0.17).cos()));
         rgb = [
-            rgb[0] * 0.75 + 0.14 * sheen,
-            rgb[1] * 0.75 + 0.08 * (1.0 - sheen),
-            rgb[2] * 0.75 + 0.24 * sheen,
+            rgb[0] * 0.78 + 0.12 * swirl,
+            rgb[1] * 0.78 + 0.06 * (1.0 - swirl),
+            rgb[2] * 0.78 + 0.22 * swirl,
         ];
     } else if (c.s1 == SP_SOIL && c.s2 == SP_WATER) || (c.s1 == SP_WATER && c.s2 == SP_SOIL) {
         rgb = [0.30, 0.24, 0.20];
@@ -395,6 +400,7 @@ impl LiveApproach4World {
             } else {
                 (min_x.saturating_sub(3), min_y.saturating_sub(3), (max_x + 3).min(gw), (max_y + 3).min(gh))
             };
+            self.smooth_height_grid_region(rx0, ry0, rx1, ry1);
             self.compute_separable_top_weighted_normals(rx0, ry0, rx1, ry1);
 
             for &ci in &surf_dirty {
@@ -405,6 +411,8 @@ impl LiveApproach4World {
         // --- Layer 2 (Highland Basalt Plateaus, Overhanging Skybridges, Alpine Lakes & 3D Waterfalls!) ---
         if !l2_dirty.is_empty() && 2 < aplus_layers.len() {
             let raw2 = &aplus_layers[2];
+            // Pass 1: decode ALL dirty L2 chunks BEFORE meshing so neighbor checks across 16×16 chunk seams
+            // never see stale air and never emit phantom internal cliff/waterfall ribs!
             for &ci in &l2_dirty {
                 let cx = ci % cx_dim;
                 let cy = ci / cx_dim;
@@ -438,7 +446,23 @@ impl LiveApproach4World {
                         }
                     }
                 }
-                self.rebuild_layer2_chunk(cx, cy);
+            }
+            // Pass 2: rebuild L2 chunk meshes (plus immediate 4-neighbors on incremental updates to heal seams)
+            let mut to_rebuild = l2_dirty.clone();
+            if l2_dirty.len() < (cx_dim * cy_dim) / 2 {
+                for &ci in &l2_dirty {
+                    let cx = ci % cx_dim;
+                    let cy = ci / cx_dim;
+                    if cx > 0 { to_rebuild.push(cy * cx_dim + (cx - 1)); }
+                    if cx + 1 < cx_dim { to_rebuild.push(cy * cx_dim + (cx + 1)); }
+                    if cy > 0 { to_rebuild.push((cy - 1) * cx_dim + cx); }
+                    if cy + 1 < cy_dim { to_rebuild.push((cy + 1) * cx_dim + cx); }
+                }
+                to_rebuild.sort_unstable();
+                to_rebuild.dedup();
+            }
+            for &ci in &to_rebuild {
+                self.rebuild_layer2_chunk(ci % cx_dim, ci / cx_dim);
                 rebuilt += 1;
             }
             self.minimap_dirty = true;
@@ -540,15 +564,15 @@ impl LiveApproach4World {
                 let j0 = hash2i(gx as i32 * 23 + 7, gy as i32 * 37 + 13);
                 let j1 = hash2i(gx as i32 * 41 - 3, gy as i32 * 17 + 5);
 
-                // Mid-air rising Steam / Smoke on Layer 2 -> Soft Volumetric 3DGS!
+                // Mid-air rising Steam / Smoke on Layer 2 -> Delicate Translucent Volumetric 3DGS!
                 if c.s1 == SP_STEAM || c.s1 == SP_SMOKE {
-                    if j0 < 0.35 {
+                    if j0 < 0.14 {
                         cache.volumetrics.push(ChunkVolItem {
-                            world_pos: Vec3::new(wx, 4.6 + j1 * 1.1, wz),
-                            radius: 1.25 + j1 * 0.65,
-                            height_stretch: 1.15,
-                            color: if c.s1 == SP_STEAM { [0.88, 0.94, 0.99] } else { [0.22, 0.20, 0.28] },
-                            alpha: if c.s1 == SP_STEAM { 0.52 } else { 0.38 },
+                            world_pos: Vec3::new(wx, 8.8 + j1 * 1.6, wz),
+                            radius: 1.05 + j1 * 0.50,
+                            height_stretch: 1.12,
+                            color: if c.s1 == SP_STEAM { [0.80, 0.90, 0.98] } else { [0.22, 0.20, 0.28] },
+                            alpha: if c.s1 == SP_STEAM { 0.22 } else { 0.24 },
                             kind: if c.s1 == SP_STEAM { 2.0 } else { 1.0 },
                             phase: j0 * 14.0,
                         });
@@ -559,12 +583,37 @@ impl LiveApproach4World {
                 // Determine Layer 2 vertical slab height & overhang thickness!
                 let is_skybridge_wood = c.s1 == SP_WOOD && !c.wall && c.walkable;
                 let is_water_l2 = c.s1 == SP_WATER;
-                let is_overhang_arch = self.decoded[idx].s1 == SP_WATER && !is_water_l2;
+                let surf_sp = self.decoded[idx].s1;
+                let is_overhang_arch = !is_water_l2
+                    && (surf_sp == SP_WATER
+                        || surf_sp == SP_ICE
+                        || surf_sp == SP_OIL
+                        || surf_sp == SP_STEAM
+                        || self.height_grid[idx] < 0.45);
 
-                let top_y = if is_water_l2 { 4.05 } else if is_skybridge_wood { 4.35 } else { 4.45 };
-                // Overhanging skybridges & stone arches are 0.75m thick so you see right underneath them!
+                // Count adjacent L2 water neighbors so only contiguous highland lakes/rivers form waterfalls
+                let mut water_nbs = 0u8;
+                if is_water_l2 {
+                    for (ox, oy) in [(1isize, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let nx = gx as isize + ox;
+                        let ny = gy as isize + oy;
+                        if nx >= 0 && ny >= 0 && nx < gw as isize && ny < gh as isize {
+                            if self.decoded_l2[ny as usize * gw + nx as usize].s1 == SP_WATER {
+                                water_nbs += 1;
+                            }
+                        }
+                    }
+                    if water_nbs == 0 {
+                        // Skip isolated 1-voxel L2 rain droplets so they never spawn floating water blocks!
+                        continue;
+                    }
+                }
+
+                // Towering monumental Layer 2 elevation (~2.5x hero height) with ~6.0u clearance under arches!
+                let top_y = if is_water_l2 { 7.85 } else if is_skybridge_wood { 8.15 } else { 8.35 };
+                // Overhanging skybridges & stone arches are 1.35u thick so heroes walk freely underneath!
                 // Solid basalt plateaus extend all the way down into the ground (`bot_y = 0.4`)!
-                let bot_y = if is_overhang_arch || is_skybridge_wood { 3.55 } else { 0.40 };
+                let bot_y = if is_overhang_arch || is_skybridge_wood { 6.85 } else { 0.40 };
 
                 let (top_col, side_col, mat_id) = if is_water_l2 {
                     ([0.24, 0.64, 0.92], [0.46, 0.80, 0.98], 3.0)
@@ -611,18 +660,27 @@ impl LiveApproach4World {
                 for (nx, ny, norm, p0, p1, p2, p3) in nbs {
                     if !is_solid_l2(nx, ny) {
                         if is_water_l2 {
-                            // Animated plunging 3D Waterfall Curtain all the way down to fjord!
-                            let mut wp0 = p0; let mut wp3 = p3;
-                            wp0[1] = 0.05; wp3[1] = 0.05;
-                            Self::push_box_quad(
-                                &mut cache.terrain_verts,
-                                &mut cache.terrain_idxs,
-                                wp0, p1, p2, wp3,
-                                norm,
-                                [0.56, 0.88, 1.0, 3.0],
-                                [c.temp_norm, 0.0, 0.0, 2.2],
-                            );
-                            waterfall_edge = true;
+                            // Only emit a plunging 3D Waterfall Curtain when pouring off a true rim
+                            // (contiguous water body pouring over open fjord/ice/cliff drop, not shallow puddles!)
+                            let nb_in_bounds = nx >= 0 && ny >= 0 && nx < gw as isize && ny < gh as isize;
+                            let nb_surf_low = nb_in_bounds && {
+                                let nidx = ny as usize * gw + nx as usize;
+                                let ns = self.decoded[nidx].s1;
+                                ns == SP_WATER || ns == SP_ICE || self.height_grid[nidx] < 0.75
+                            };
+                            if water_nbs >= 2 && nb_surf_low {
+                                let mut wp0 = p0; let mut wp3 = p3;
+                                wp0[1] = 0.05; wp3[1] = 0.05;
+                                Self::push_box_quad(
+                                    &mut cache.terrain_verts,
+                                    &mut cache.terrain_idxs,
+                                    wp0, p1, p2, wp3,
+                                    norm,
+                                    [0.44, 0.82, 0.98, 3.0],
+                                    [c.temp_norm, 0.0, 0.0, 2.2],
+                                );
+                                waterfall_edge = true;
+                            }
                         } else {
                             Self::push_box_quad(
                                 &mut cache.terrain_verts,
@@ -636,17 +694,17 @@ impl LiveApproach4World {
                     }
                 }
 
-                // Billowing 3D waterfall splash mist at the base of the cascade!
+                // Delicate 3D waterfall splash mist at the base of the cascade (keeps stone arch crisp & visible!)
                 if waterfall_edge {
                     wf_sum += Vec3::new(wx, 2.2, wz);
                     wf_cnt += 1.0;
-                    if j0 < 0.65 {
+                    if j0 < 0.22 {
                         cache.volumetrics.push(ChunkVolItem {
-                            world_pos: Vec3::new(wx, 1.15 + j1 * 0.9, wz),
-                            radius: 1.55 + j1 * 0.65,
-                            height_stretch: 1.25,
-                            color: [0.82, 0.94, 1.0],
-                            alpha: 0.56,
+                            world_pos: Vec3::new(wx, 0.85 + j1 * 0.65, wz),
+                            radius: 0.92 + j1 * 0.40,
+                            height_stretch: 1.10,
+                            color: [0.76, 0.90, 0.99],
+                            alpha: 0.24,
                             kind: 2.0,
                             phase: j0 * 16.0,
                         });
@@ -670,20 +728,22 @@ impl LiveApproach4World {
                     }
                 }
 
-                // Highland Snow-Pine Surfels perched up on Layer 2 plateaus!
-                if !is_skybridge_wood && c.s1 == SP_WOOD && c.wall {
-                    let sc = 0.72 + j0 * 0.35;
+                // Majestic spaced Highland Snow-Pine Surfels perched up on Layer 2 plateaus!
+                if !is_skybridge_wood && c.s1 == SP_WOOD && c.wall && (gx % 3 == 0 && gy % 3 == 0) {
+                    let sc = 1.75 + j0 * 0.85;
+                    let jx = (j0 - 0.5) * 1.4;
+                    let jz = (j1 - 0.5) * 1.4;
                     cache.props.push(ChunkPropItem {
                         kind: MeshKind::TreeTrunk,
-                        world_pos: Vec3::new(wx, top_y - 0.05, wz),
+                        world_pos: Vec3::new(wx + jx, top_y - 0.12, wz + jz),
                         yaw: j0 * 6.28,
-                        scale: Vec3::splat(sc),
+                        scale: Vec3::new(sc * 0.92, sc * 1.05, sc * 0.92),
                         tint: [1.0, 1.0, 1.0],
                         glow: 0.0,
                     });
                     cache.surfels.push(ChunkSurfelItem {
                         kind: SurfelProtoKind::SnowPine,
-                        world_pos: Vec3::new(wx, top_y, wz),
+                        world_pos: Vec3::new(wx + jx, top_y, wz + jz),
                         yaw: j1 * 6.28,
                         scale: sc,
                         tint: [0.96, 0.99, 1.04],
@@ -729,27 +789,27 @@ impl LiveApproach4World {
                 }
                 let j0 = hash2i(gx as i32 * 29 + 11, gy as i32 * 13 + 7);
                 let j1 = hash2i(gx as i32 * 53 - 9, gy as i32 * 31 + 3);
-                if j0 > 0.34 {
+                if j0 > 0.14 {
                     continue;
                 }
                 let (wx, wz) = self.grid_to_world_xz(gx as f32 + 0.5, gy as f32 + 0.5);
                 if c.s1 == SP_STEAM || c.s2 == SP_STEAM {
                     cache.volumetrics.push(ChunkVolItem {
-                        world_pos: Vec3::new(wx, 7.6 + j1 * 2.2, wz),
-                        radius: 2.1 + j1 * 1.1,
-                        height_stretch: 0.85,
-                        color: [0.88, 0.94, 1.0],
-                        alpha: 0.42,
+                        world_pos: Vec3::new(wx, 14.2 + j1 * 3.2, wz),
+                        radius: 1.75 + j1 * 0.85,
+                        height_stretch: 0.82,
+                        color: [0.80, 0.90, 0.98],
+                        alpha: 0.17,
                         kind: 2.0,
                         phase: j0 * 20.0,
                     });
                 } else if c.s1 == SP_SMOKE || c.s2 == SP_SMOKE {
                     cache.volumetrics.push(ChunkVolItem {
-                        world_pos: Vec3::new(wx, 8.2 + j1 * 2.4, wz),
-                        radius: 2.2 + j0 * 1.2,
-                        height_stretch: 0.90,
+                        world_pos: Vec3::new(wx, 15.0 + j1 * 3.5, wz),
+                        radius: 1.95 + j0 * 1.05,
+                        height_stretch: 0.88,
                         color: [0.20, 0.18, 0.28],
-                        alpha: 0.36,
+                        alpha: 0.22,
                         kind: 1.0,
                         phase: j1 * 18.0,
                     });
@@ -757,6 +817,48 @@ impl LiveApproach4World {
             }
         }
         self.chunks_l3[ci] = cache;
+    }
+
+    /// Fast separable 3×3 height smoothing pass over dirty terrain regions so isolated
+    /// rock/border/species transitions form organic rolling hills and NEVER 1-cell spikes!
+    fn smooth_height_grid_region(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        let gw = self.grid_w;
+        let rw = x1.saturating_sub(x0);
+        let rh = y1.saturating_sub(y0);
+        if rw == 0 || rh == 0 {
+            return;
+        }
+        let mut tmp = vec![0.0f32; rw * rh];
+        for ly in 0..rh {
+            let gy = y0 + ly;
+            let row_g = gy * gw;
+            for lx in 0..rw {
+                let gx = x0 + lx;
+                let xm = gx.saturating_sub(1);
+                let xp = (gx + 1).min(gw - 1);
+                tmp[ly * rw + lx] = 0.25 * self.height_grid[row_g + xm]
+                    + 0.50 * self.height_grid[row_g + gx]
+                    + 0.25 * self.height_grid[row_g + xp];
+            }
+        }
+        for ly in 0..rh {
+            let gy = y0 + ly;
+            let ym = ly.saturating_sub(1);
+            let yp = (ly + 1).min(rh - 1);
+            for lx in 0..rw {
+                let gx = x0 + lx;
+                let idx = gy * gw + gx;
+                // Keep bridges flat and water basins depressed cleanly while smoothing land/banks
+                let c = &self.decoded[idx];
+                let is_bridge = c.s1 == SP_WOOD && !c.wall && c.walkable;
+                if is_bridge {
+                    continue;
+                }
+                self.height_grid[idx] = 0.25 * tmp[ym * rw + lx]
+                    + 0.50 * tmp[ly * rw + lx]
+                    + 0.25 * tmp[yp * rw + lx];
+            }
+        }
     }
 
     fn compute_separable_top_weighted_normals(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
@@ -874,7 +976,8 @@ impl LiveApproach4World {
                 let gx = x0 + lx;
                 let idx = gy * gw + gx;
                 let c = &self.decoded[idx];
-                let (h, rgb, _is_water, burn_t) = cell_height_and_color(c, gx, gy, gw, gh);
+                let (_raw_h, rgb, _is_water, burn_t) = cell_height_and_color(c, gx, gy, gw, gh);
+                let h = self.height_grid[idx];
                 let (wx, wz) = self.grid_to_world_xz(gx as f32, gy as f32);
                 let n = self.smooth_normals[idx];
                 // Keep terrain burn_t moderate (<= 0.55) so soft Vol-3DGS flames shine without white clipping!
@@ -915,7 +1018,8 @@ impl LiveApproach4World {
                 }
                 let idx = gy * gw + gx;
                 let c = &self.decoded[idx];
-                let (h, _, is_water, burn_t) = cell_height_and_color(c, gx, gy, gw, gh);
+                let (_raw_h, _, is_water, burn_t) = cell_height_and_color(c, gx, gy, gw, gh);
+                let h = self.height_grid[idx];
                 let (wx, wz) = self.grid_to_world_xz(gx as f32 + 0.5, gy as f32 + 0.5);
 
                 if is_water && gx + 1 < gw && gy + 1 < gh {
@@ -977,14 +1081,15 @@ impl LiveApproach4World {
                             });
                         }
                     }
-                    if c.s1 == SP_WOOD || c.s2 == SP_WOOD {
+                    if (c.s1 == SP_WOOD || c.s2 == SP_WOOD) && (gx % 3 == 0 && gy % 3 == 0) {
+                        let sc = 1.85 + j1 * 0.80;
                         cache.props.push(ChunkPropItem {
                             kind: MeshKind::TreeTrunk,
-                            world_pos: Vec3::new(wx, h - 0.05, wz),
+                            world_pos: Vec3::new(wx + (j0 - 0.5) * 1.1, h - 0.14, wz + (j1 - 0.5) * 1.1),
                             yaw: j0 * 6.28,
-                            scale: Vec3::splat(0.76 + j1 * 0.24),
-                            tint: [0.32, 0.20, 0.17],
-                            glow: 0.12,
+                            scale: Vec3::new(sc * 0.90, sc * 1.05, sc * 0.90),
+                            tint: [0.30, 0.18, 0.15],
+                            glow: 0.18,
                         });
                     }
                     continue;
@@ -1027,40 +1132,56 @@ impl LiveApproach4World {
                     });
                 }
 
-                // APPROACH 4 HARD-Z SDF FOLIAGE SURFELS: Pines & Marsh Brush (skip walkable timber bridges!)
+                // APPROACH 4 HARD-Z SDF FOLIAGE SURFELS: Majestic Towering Nordic Pines (~3x-4x hero height!)
+                // Spaced organically (1 tall pine per 3x3 forest cluster + mossy undergrowth) so heroes weave between trunks!
                 let is_bridge = c.s1 == SP_WOOD && !c.wall && c.walkable;
                 if !is_bridge && (c.s1 == SP_WOOD || (c.s2 == SP_WOOD && c.s2_frac > 0.35)) {
-                    let scale = 0.74 + j0 * 0.40;
                     let snowy = c.freezing || c.temp_norm < 0.088 || (gy as f32 / gh as f32) < 0.32;
-                    cache.props.push(ChunkPropItem {
-                        kind: MeshKind::TreeTrunk,
-                        world_pos: Vec3::new(wx, h - 0.08, wz),
-                        yaw: j0 * 6.28,
-                        scale: Vec3::splat(scale),
-                        tint: [1.0, 1.0, 1.0],
-                        glow: 0.0,
-                    });
-                    let tint = if c.temp_norm > 0.16 {
-                        [1.05, 0.82, 0.56]
-                    } else if snowy {
-                        [0.95, 0.99, 1.02]
-                    } else {
-                        [0.86 + j1 * 0.22, 0.92 + j0 * 0.14, 0.88 + j1 * 0.14]
-                    };
-                    cache.surfels.push(ChunkSurfelItem {
-                        kind: if snowy {
-                            SurfelProtoKind::SnowPine
+                    if gx % 3 == 0 && gy % 3 == 0 {
+                        let scale = 1.95 + j0 * 0.95; // ~9-13.5u tall towering pine!
+                        let jx = (j0 - 0.5) * 1.45;
+                        let jz = (j1 - 0.5) * 1.45;
+                        cache.props.push(ChunkPropItem {
+                            kind: MeshKind::TreeTrunk,
+                            world_pos: Vec3::new(wx + jx, h - 0.14, wz + jz),
+                            yaw: j0 * 6.28,
+                            scale: Vec3::new(scale * 0.92, scale * 1.08, scale * 0.92),
+                            tint: [1.0, 1.0, 1.0],
+                            glow: 0.0,
+                        });
+                        let tint = if c.temp_norm > 0.16 {
+                            [1.05, 0.82, 0.56]
+                        } else if snowy {
+                            [0.95, 0.99, 1.02]
                         } else {
-                            SurfelProtoKind::PineCanopy
-                        },
-                        world_pos: Vec3::new(wx, h, wz),
-                        yaw: j1 * 6.28,
-                        scale,
-                        tint,
-                        wind_phase: gx as f32 * 0.37 + gy as f32 * 0.51,
-                        glow_mul: 0.0,
-                    });
-                } else if (c.s1 == SP_PLANT || (c.s2 == SP_PLANT && c.s2_frac > 0.28)) && j0 < 0.20 {
+                            [0.84 + j1 * 0.24, 0.90 + j0 * 0.16, 0.86 + j1 * 0.14]
+                        };
+                        cache.surfels.push(ChunkSurfelItem {
+                            kind: if snowy {
+                                SurfelProtoKind::SnowPine
+                            } else {
+                                SurfelProtoKind::PineCanopy
+                            },
+                            world_pos: Vec3::new(wx + jx, h, wz + jz),
+                            yaw: j1 * 6.28,
+                            scale,
+                            tint,
+                            wind_phase: gx as f32 * 0.37 + gy as f32 * 0.51,
+                            glow_mul: 0.0,
+                        });
+                    } else if j0 < 0.10 {
+                        // Waist-high forest floor undergrowth & saplings between the giant trunks
+                        cache.surfels.push(ChunkSurfelItem {
+                            kind: SurfelProtoKind::MarshBrush,
+                            world_pos: Vec3::new(wx + (j0 - 0.5) * 0.5, h, wz + (j1 - 0.5) * 0.5),
+                            yaw: j1 * 6.28,
+                            scale: 0.85 + j1 * 0.45,
+                            tint: if snowy { [0.74, 0.86, 0.94] } else { [0.82, 0.94, 0.84] },
+                            wind_phase: j0 * 9.0,
+                            glow_mul: 0.08,
+                        });
+                    }
+                } else if (c.s1 == SP_PLANT || (c.s2 == SP_PLANT && c.s2_frac > 0.28)) && j0 < 0.14 {
                     let near_water = (gx as i32 - (gw as i32 / 2)).abs() < (gw as i32 / 5);
                     cache.surfels.push(ChunkSurfelItem {
                         kind: if near_water && j1 < 0.55 {
@@ -1068,9 +1189,9 @@ impl LiveApproach4World {
                         } else {
                             SurfelProtoKind::MarshBrush
                         },
-                        world_pos: Vec3::new(wx + (j0 - 0.5) * 0.4, h, wz + (j1 - 0.5) * 0.4),
+                        world_pos: Vec3::new(wx + (j0 - 0.5) * 0.5, h, wz + (j1 - 0.5) * 0.5),
                         yaw: j1 * 6.28,
-                        scale: 0.64 + j0 * 0.42,
+                        scale: 0.92 + j0 * 0.52,
                         tint: [0.90 + j1 * 0.18, 0.96, 0.88 + j0 * 0.16],
                         wind_phase: j0 * 10.0,
                         glow_mul: 0.15,
@@ -1080,27 +1201,33 @@ impl LiveApproach4World {
                     && gx + 5 < gw
                     && gy >= 5
                     && gy + 5 < gh
-                    && gx % 3 == 0
-                    && gy % 3 == 0
+                    && gx % 4 == 0
+                    && gy % 4 == 0
                 {
                     cache.props.push(ChunkPropItem {
                         kind: MeshKind::RockOutcrop,
-                        world_pos: Vec3::new(wx, h - 0.85, wz),
+                        world_pos: Vec3::new(wx, h - 1.15, wz),
                         yaw: j0 * 6.28,
-                        scale: Vec3::new(1.08 + j0 * 0.42, 1.15 + j1 * 0.52, 1.08 + j1 * 0.42),
+                        scale: Vec3::new(1.75 + j0 * 0.75, 1.85 + j1 * 0.95, 1.75 + j1 * 0.75),
                         tint: [1.0, 1.0, 1.0],
                         glow: 0.0,
                     });
                 }
 
-                // LIVE ECOSYSTEM WILDLIFE HERDS + Soft Bioluminescent Marsh Wisps!
-                if c.critter >= 2 && c.walkable && !c.burning && (gx % 4 == 0 && gy % 4 == 0) {
-                    if j0 < 0.55 {
+                // LIVE ECOSYSTEM WILDLIFE HERDS + Soft Bioluminescent Marsh Wisps (natural meadow/forest herds!)
+                if c.critter >= 2
+                    && c.walkable
+                    && !c.burning
+                    && c.s1 != SP_OIL
+                    && c.s1 != SP_WATER
+                    && (gx % 8 == 0 && gy % 8 == 0)
+                {
+                    if j0 < 0.42 {
                         cache.props.push(ChunkPropItem {
                             kind: MeshKind::MarshDeer,
-                            world_pos: Vec3::new(wx + (j0 - 0.5) * 0.6, h, wz + (j1 - 0.5) * 0.6),
+                            world_pos: Vec3::new(wx + (j0 - 0.5) * 1.4, h, wz + (j1 - 0.5) * 1.4),
                             yaw: j1 * 6.28,
-                            scale: Vec3::splat(0.92 + j0 * 0.28),
+                            scale: Vec3::splat(0.95 + j0 * 0.24),
                             tint: [1.0, 1.0, 1.0],
                             glow: 0.0,
                         });
@@ -1214,7 +1341,13 @@ impl LiveApproach4World {
             base_y
         } else {
             let t = (gz - surf_z).clamp(0.0, 2.0);
-            base_y + t * 3.55
+            // Smoothly interpolates from surface up onto monumental L2 plateau/skybridge deck (y ≈ 8.25)
+            let l2_target = 8.25f32.max(base_y + 4.5);
+            if t <= 1.0 {
+                base_y + (l2_target - base_y) * t
+            } else {
+                l2_target + (t - 1.0) * 6.5
+            }
         }
     }
 }
@@ -1231,6 +1364,15 @@ pub struct AssembledFrame {
     pub visible_chunks: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AimReticle {
+    pub gx: f32,
+    pub gy: f32,
+    pub gz: f32,
+    pub radius: f32,
+    pub color: [f32; 3],
+}
+
 pub fn assemble_live_frame(
     world: &LiveApproach4World,
     entities: Option<&LiveEntityState>,
@@ -1240,6 +1382,7 @@ pub fn assemble_live_frame(
     cam_dist: f32,
     sim_time: f32,
     layer_slice_mode: u8, // 0=ALL 4L (3D), 1=GROUND (L0-L1), 2=HIGH+SKY (L2-L3)
+    aim_reticle: Option<AimReticle>,
 ) -> AssembledFrame {
     let origin = mats.origin;
     let cull_rad = (cam_dist * 1.95 + 42.0).max(96.0);
@@ -1390,7 +1533,7 @@ pub fn assemble_live_frame(
             };
             mesh_batches[MeshKind::ShrineObelisk as usize].push(MeshInstance {
                 pos_yaw: [rel.x, rel.y, rel.z, sim_time * 0.35 + s.id as f32],
-                scale_pitch: [1.15, 1.15, 1.15, 0.0],
+                scale_pitch: [1.85, 1.85, 1.85, 0.0],
                 tint_glow: [scol[0], scol[1], scol[2], 0.35],
                 flags: [-1.0, 0.0, 0.0, 0.0],
             });
@@ -1403,11 +1546,11 @@ pub fn assemble_live_frame(
             });
             // Glowing shrine aura volumetric wisp
             vol_splats.push(VolSplat {
-                pos_rad: [rel.x, rel.y + 4.3, rel.z, 1.45],
+                pos_rad: [rel.x, rel.y + 7.2, rel.z, 1.95],
                 color_alpha: [scol[0] * 1.1, scol[1] * 1.1, scol[2] * 1.1, 0.62],
                 params: [1.35, 3.0, s.id as f32 * 3.1, 0.0],
             });
-            push_light(Vec3::new(wx, gy + 4.0, wz), 16.0, [scol[0] * 0.9, scol[1] * 0.9, scol[2] * 0.9]);
+            push_light(Vec3::new(wx, gy + 6.5, wz), 20.0, [scol[0] * 0.9, scol[1] * 0.9, scol[2] * 0.9]);
         }
 
         // Carved `CellBody` Ice Rafts
@@ -1466,7 +1609,9 @@ pub fn assemble_live_frame(
             } else {
                 0.0
             };
-            let yaw = p.aim_x.atan2(p.aim_y);
+            // Local hero meshes face +Z; mesh_pass rotates +Z to (-sin(yaw), cos(yaw)),
+            // so yaw = (-aim_x).atan2(aim_y) aligns facing exactly with (aim_x, aim_y)!
+            let yaw = (-p.aim_x).atan2(p.aim_y);
             let rel = Vec3::new(wx, gy + stride, wz) - origin;
 
             let kind = match p.class_id {
@@ -1480,9 +1625,16 @@ pub fn assemble_live_frame(
                 [0.94, 0.24, 0.26]
             };
 
+            let move_pitch = if p.dashing {
+                0.22
+            } else if speed > 1.2 {
+                0.07
+            } else {
+                0.0
+            };
             mesh_batches[kind as usize].push(MeshInstance {
                 pos_yaw: [rel.x, rel.y, rel.z, yaw],
-                scale_pitch: [1.28, 1.28, 1.28, if p.dashing { 0.18 } else { 0.0 }],
+                scale_pitch: [1.12, 1.12, 1.12, move_pitch],
                 tint_glow: [
                     team_tint[0],
                     team_tint[1],
@@ -1492,13 +1644,13 @@ pub fn assemble_live_frame(
                 flags: [-1.0, 1.0, 0.0, 0.0],
             });
 
-            // Ground ring (golden rim for self!)
+            // Ground ring (crisp heroic footprint!)
             let is_self = p.id == ent.your_player_id;
             let ring_col = if is_self { [0.38, 1.0, 0.56] } else { team_tint };
             let ring_rel = Vec3::new(wx, gy + 0.05, wz) - origin;
             mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
                 pos_yaw: [ring_rel.x, ring_rel.y, ring_rel.z, 0.0],
-                scale_pitch: [if is_self { 1.45 } else { 1.18 }, 1.0, if is_self { 1.45 } else { 1.18 }, 0.0],
+                scale_pitch: [if is_self { 1.25 } else { 1.02 }, 1.0, if is_self { 1.25 } else { 1.02 }, 0.0],
                 tint_glow: [ring_col[0], ring_col[1], ring_col[2], 0.72],
                 flags: [-1.0, 0.0, 0.0, 0.0],
             });
@@ -1513,8 +1665,10 @@ pub fn assemble_live_frame(
             }
 
             if p.melee_active {
+                // MeleeArc mesh is centered along local +X, rotated to (cos(a), sin(a)) -> a = atan2(aim_y, aim_x)
+                let arc_yaw = p.aim_y.atan2(p.aim_x);
                 mesh_batches[MeshKind::MeleeArc as usize].push(MeshInstance {
-                    pos_yaw: [rel.x, rel.y, rel.z, yaw - std::f32::consts::FRAC_PI_2],
+                    pos_yaw: [rel.x, rel.y, rel.z, arc_yaw],
                     scale_pitch: [1.25, 1.0, 1.25, 0.0],
                     tint_glow: [1.0, 0.95, 0.65, 0.95],
                     flags: [-1.0, 0.0, 0.0, 0.0],
@@ -1752,6 +1906,56 @@ pub fn assemble_live_frame(
                 }
             }
         }
+    }
+
+    // Live 3D Ground Aim Reticle under the player's cursor (shows exact aim point & focus radius!)
+    if let Some(ret) = aim_reticle {
+        let (rx, rz) = world.grid_to_world_xz(ret.gx, ret.gy);
+        let ry = world.sample_3d_y(ret.gx, ret.gy, ret.gz) + 0.08;
+        let rel = Vec3::new(rx, ry, rz) - origin;
+        let outer_s = (ret.radius * 0.72).clamp(1.2, 6.0);
+        // Outer focus-radius ring
+        mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+            pos_yaw: [rel.x, rel.y, rel.z, sim_time * 0.7],
+            scale_pitch: [outer_s, 0.85, outer_s, 0.0],
+            tint_glow: [ret.color[0], ret.color[1], ret.color[2], 0.78],
+            flags: [-1.0, 0.0, 0.0, 0.0],
+        });
+        // Crisp inner aim core ring
+        mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+            pos_yaw: [rel.x, rel.y + 0.04, rel.z, -sim_time * 1.4],
+            scale_pitch: [0.55, 1.15, 0.55, 0.0],
+            tint_glow: [1.0, 0.98, 0.90, 0.95],
+            flags: [-1.0, 0.0, 0.0, 0.0],
+        });
+        vol_splats.push(VolSplat {
+            pos_rad: [rel.x, rel.y + 0.45, rel.z, 0.62],
+            color_alpha: [ret.color[0], ret.color[1], ret.color[2], 0.45],
+            params: [1.0, 3.0, sim_time * 2.0, 0.0],
+        });
+    }
+
+    // Subtle atmospheric drifting snow / frost / ember motes around the camera for living depth
+    let weather_kind = entities.map(|e| e.telemetry.weather_kind).unwrap_or(0);
+    let mote_col = match weather_kind {
+        3 => [1.18, 0.62, 0.24], // Ember dusk sparks
+        1 => [0.88, 0.95, 1.05], // Blizzard snow flurries
+        _ => [0.78, 0.90, 1.02], // Crisp frost air motes
+    };
+    let mote_cnt = if weather_kind == 1 { 36 } else { 20 };
+    for m in 0..mote_cnt {
+        let h0 = hash2i(m * 37 + 11, 913);
+        let h1 = hash2i(m * 73 + 29, 419);
+        let h2 = hash2i(m * 19 + 5, 733);
+        let drift_x = (h0 * 76.0 + sim_time * (2.6 + h2 * 2.4)).rem_euclid(76.0) - 38.0;
+        let drift_z = (h1 * 76.0 + sim_time * (1.2 + h0 * 1.5)).rem_euclid(76.0) - 38.0;
+        let fall_y = (14.0 - (h2 * 14.0 + sim_time * (1.4 + h1 * 1.2)).rem_euclid(14.0)) + 1.2;
+        let rel = Vec3::new(cam_target.x + drift_x, fall_y, cam_target.z + drift_z) - origin;
+        vol_splats.push(VolSplat {
+            pos_rad: [rel.x, rel.y, rel.z, if weather_kind == 1 { 0.28 } else { 0.20 }],
+            color_alpha: [mote_col[0], mote_col[1], mote_col[2], if weather_kind == 1 { 0.48 } else { 0.34 }],
+            params: [1.0, 3.0, m as f32 * 1.9, 0.4],
+        });
     }
 
     // Back-to-front depth sort ONLY the compact soft volumetric splats (~300–1200) for clean alpha compositing!

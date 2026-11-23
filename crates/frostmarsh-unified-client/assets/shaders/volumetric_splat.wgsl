@@ -131,8 +131,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // Smoke: soft indigo-charcoal wisp
         a = clamp(a * 0.58, 0.0, 0.62);
     } else if (kind < 2.5) {
-        // Steam: luminous cool-white mist
-        a = clamp(a * 0.64, 0.0, 0.70);
+        // Steam: delicate translucent cool-white mist (never washes out solid geometry!)
+        a = clamp(a * 0.44, 0.0, 0.42);
     } else {
         // Bioluminescent critter / arcane glow
         let core = exp(-6.0 * r2);

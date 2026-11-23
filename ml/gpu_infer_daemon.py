@@ -10,6 +10,7 @@ Serves low-latency GPU inference on TCP_NODELAY and optional Unix domain socket:
   - op=5: BotPolicyInspect([N, 168]      f32 -> [N, 29]       f32) returns 13 action floats + 16 (4x4) Z_world saliency floats!
   - op=6: AcousticStep    (UTF-8 JSON -> UTF-8 JSON) 3D physical acoustics, emergent bot speech bubbles & human chat overrides!
   - op=7: ActuatorPolicy  ([N, 168]      f32 -> [N, 26]       f32) continuous physical actuators (10 floats) + 16 (4x4) Z_world saliency!
+  - op=8: WorldModel3D    ([L, 18, H, W] f32 -> [L, 17, H, W] + [L-1, 5, H, W] f32) true 3D sparse/dense horizontal + vertical interface fluxes + Z_world cache!
 """
 
 from __future__ import annotations
@@ -72,7 +73,9 @@ OP_BOT_POLICY = 4
 OP_BOT_POLICY_INSPECT = 5
 OP_ACOUSTIC_STEP = 6
 OP_ACTUATOR_POLICY = 7
+OP_WORLD_3D_STEP = 8
 
+Z_FLUX_CH = 5
 ACTUATOR_OUT_DIM = 10
 ACTUATOR_INSPECT_OUT_DIM = ACTUATOR_OUT_DIM + 16  # 26 floats per bot
 
@@ -347,6 +350,67 @@ class _SparseEcoAdapter:
         return self.host_out_bytes, z_eco, self.static_in, float(active_frac), infer_us
 
 
+class _SparseWorld3DAdapter:
+    """Wraps SparseWorld3DRunner with pinned host I/O buffers for op=8 (`OP_WORLD_3D_STEP`)."""
+
+    def __init__(
+        self,
+        runner_cls: Any,
+        model_3d: torch.nn.Module,
+        h: int,
+        w: int,
+        batch: int,
+        device: torch.device,
+        use_fp16: bool,
+        use_sparse: bool = True,
+    ):
+        self.device = device
+        self.use_fp16 = use_fp16
+        self.in_shape = (batch, 18, h, w)
+        self.horiz_shape = (batch, 17, h, w)
+        self.z_flux_layers = max(0, batch - 1)
+        self.z_flux_shape = (self.z_flux_layers, Z_FLUX_CH, h, w)
+        self.horiz_elems = batch * 17 * h * w
+        self.z_flux_elems = self.z_flux_layers * Z_FLUX_CH * h * w
+
+        self.static_in = torch.zeros(self.in_shape, dtype=torch.float32, device=device)
+        self.host_in = torch.empty(self.in_shape, dtype=torch.float32, pin_memory=(device.type == "cuda"))
+        self.host_out = torch.empty(
+            (self.horiz_elems + self.z_flux_elems,),
+            dtype=torch.float32,
+            pin_memory=(device.type == "cuda"),
+        )
+        self.host_out_horiz = self.host_out[: self.horiz_elems].view(*self.horiz_shape)
+        self.host_out_zflux = (
+            self.host_out[self.horiz_elems :].view(*self.z_flux_shape)
+            if self.z_flux_elems > 0
+            else None
+        )
+        self.host_in_np = self.host_in.numpy()
+        self.host_out_np = self.host_out.numpy()
+        self.host_in_u8 = self.host_in_np.view(np.uint8).ravel()
+        self.host_out_bytes = memoryview(self.host_out_np).cast("B")
+        self.runner = runner_cls(
+            model_3d,
+            device=device,
+            use_fp16=use_fp16,
+            sparse_threshold=(0.42 if use_sparse else 0.0),
+        )
+
+    def infer_from_host_in(self) -> tuple[memoryview, torch.Tensor, torch.Tensor, float, int]:
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            self.static_in.copy_(self.host_in, non_blocking=(self.device.type == "cuda"))
+            horiz_t, z_flux_t, z_world, active_frac = self.runner.step(self.static_in)
+            self.host_out_horiz.copy_(horiz_t.float(), non_blocking=False)
+            if self.host_out_zflux is not None:
+                self.host_out_zflux.copy_(z_flux_t.float(), non_blocking=False)
+            if self.use_fp16 and self.device.type == "cuda" and z_world.dtype != torch.float16:
+                z_world = z_world.half()
+        infer_us = int((time.perf_counter() - t0) * 1_000_000)
+        return self.host_out_bytes, z_world, self.static_in, float(active_frac), infer_us
+
+
 class InferenceEngine:
     def __init__(
         self,
@@ -359,6 +423,7 @@ class InferenceEngine:
         use_sparse_eco: bool | None = None,
         acoustic_pt: Path | None = None,
         actuator_pt: Path | None = None,
+        world_3d_pt: Path | None = None,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.use_fp16 = use_fp16 and (self.device.type == "cuda")
@@ -422,6 +487,32 @@ class InferenceEngine:
         self.use_sparse_eco: bool = bool(use_sparse_eco and SparseEcoRunner is not None)
         self._sparse_eco_runners: dict[tuple[int, int, int], _SparseEcoAdapter] = {}
 
+        # Optional WorldModel3D v4 (`op=8` true 3D horizontal + vertical neural physics)
+        self.world_model_3d: Any = None
+        self._sparse_3d_runner_cls: Any = None
+        self._sparse_3d_runners: dict[tuple[int, int, int], _SparseWorld3DAdapter] = {}
+        if world_3d_pt is not None and world_3d_pt.exists():
+            try:
+                from world_model_3d import WorldModel3D  # noqa: E402
+                from sparse_world_3d_runner import SparseWorld3DRunner  # noqa: E402
+
+                wm3d = WorldModel3D(in_ch=18, out_ch=17, width=48, num_res=5, z_flux_ch=Z_FLUX_CH).eval()
+                wm3d.load_state_dict(_load_state_dict(world_3d_pt))
+                wm3d.to(self.device)
+                self.world_model_3d = wm3d
+                self._sparse_3d_runner_cls = SparseWorld3DRunner
+                if self.device.type == "cuda" and use_sparse_world:
+                    torch.backends.cudnn.benchmark = False
+                print(f"[gpu_infer_daemon] Loaded WorldModel3D v4 from {world_3d_pt}", flush=True)
+            except Exception as exc:
+                print(
+                    f"[gpu_infer_daemon] WorldModel3D v4 load failed ({exc}); op=8 disabled",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.world_model_3d = None
+                self._sparse_3d_runner_cls = None
+
         self.acoustic_engine: Any = None
         ac_path = acoustic_pt if acoustic_pt is not None else (_SCRIPT_DIR / "acoustic_comm_live.pt")
         if LiveAcousticEngine is not None and ac_path.exists():
@@ -484,6 +575,42 @@ class InferenceEngine:
             )
             self._runners[key] = runner
         return runner
+
+    def _get_sparse_3d_runner(self, h: int, w: int, batch: int) -> _SparseWorld3DAdapter:
+        assert self.world_model_3d is not None and self._sparse_3d_runner_cls is not None
+        key = (batch, h, w)
+        adapter = self._sparse_3d_runners.get(key)
+        if adapter is None:
+            adapter = _SparseWorld3DAdapter(
+                runner_cls=self._sparse_3d_runner_cls,
+                model_3d=self.world_model_3d,
+                h=h,
+                w=w,
+                batch=batch,
+                device=self.device,
+                use_fp16=self.use_fp16,
+                use_sparse=self.use_sparse_world,
+            )
+            self._sparse_3d_runners[key] = adapter
+            print(
+                f"[gpu_infer_daemon] Activated SparseWorld3DRunner for {batch}x18x{h}x{w} (sparse={self.use_sparse_world})",
+                flush=True,
+            )
+        return adapter
+
+    def infer_world_3d_bytes(self, h: int, w: int, recv_fn, batch: int = 4) -> tuple[memoryview, int]:
+        if self.world_model_3d is None or self._sparse_3d_runner_cls is None:
+            raise RuntimeError("world_model_3d_v4.pt not loaded")
+        with self.lock:
+            adapter = self._get_sparse_3d_runner(h, w, batch)
+            if not recv_fn(memoryview(adapter.host_in_u8)):
+                raise ConnectionError("EOF reading op=8 request payload")
+            out_view, z_latent, x_dev, active_frac, infer_us = adapter.infer_from_host_in()
+            self.last_z_world = z_latent
+            self.last_world_state = x_dev
+            self.last_sparse_active_frac = active_frac
+            out_copy = bytes(out_view)
+        return memoryview(out_copy), infer_us
 
     def _get_sparse_runner(self, h: int, w: int, batch: int) -> _SparseWorldAdapter | None:
         if not self.use_sparse_world or SparseWorldRunner is None:
@@ -1169,6 +1296,38 @@ class GPUInferDaemon:
                     break
                 op, pad_batch, channels, height, width, payload_bytes, _seq = HEADER_STRUCT.unpack(hdr_buf)
 
+                if op == OP_WORLD_3D_STEP:
+                    batch = max(1, int(pad_batch))
+                    expected_bytes = batch * 18 * height * width * 4
+                    if (
+                        self.engine.world_model_3d is None
+                        or channels != 18
+                        or height == 0
+                        or width == 0
+                        or payload_bytes != expected_bytes
+                    ):
+                        if 0 < payload_bytes <= 64 * 1024 * 1024:
+                            _recv_exact(conn, memoryview(bytearray(payload_bytes)))
+                        self._send_error(conn, STATUS_BAD_REQUEST, height, width)
+                        continue
+                    try:
+                        out_bytes, infer_us = self.engine.infer_world_3d_bytes(
+                            height, width, lambda mv: _recv_exact(conn, mv), batch=batch
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[gpu_infer_daemon] WorldModel3D op=8 error ({height}x{width}): {exc}",
+                            file=sys.stderr,
+                        )
+                        self._send_error(conn, STATUS_INTERNAL_ERROR, height, width)
+                        continue
+                    resp_hdr = HEADER_STRUCT.pack(
+                        STATUS_OK, batch, 17, height, width, len(out_bytes), infer_us
+                    )
+                    conn.sendall(resp_hdr)
+                    conn.sendall(out_bytes)
+                    continue
+
                 if op == OP_ACOUSTIC_STEP:
                     if payload_bytes == 0 or payload_bytes > 4 * 1024 * 1024:
                         if 0 < payload_bytes <= 16 * 1024 * 1024:
@@ -1295,6 +1454,12 @@ def main() -> None:
         help="Optional Unix domain socket path for zero-overhead local IPC (e.g. /tmp/frostmarsh-gpu.sock)",
     )
     parser.add_argument("--world-model", type=Path, default=_SCRIPT_DIR / "world_model.pt")
+    parser.add_argument(
+        "--world-model-3d",
+        type=Path,
+        default=_SCRIPT_DIR / "world_model_3d_v4.pt",
+        help="Optional WorldModel3D v4 checkpoint path for op=8 true 3D vertical physics",
+    )
     parser.add_argument("--eco-model", type=Path, default=_SCRIPT_DIR / "ecosystem_model.pt")
     parser.add_argument("--bot-policy", type=Path, default=_SCRIPT_DIR / "bot_policy.pt")
     parser.add_argument("--actuator-policy", type=Path, default=_SCRIPT_DIR / "actuator_policy_rl.pt")
@@ -1325,6 +1490,7 @@ def main() -> None:
         use_sparse_eco=use_sparse_eco,
         acoustic_pt=args.acoustic_ckpt,
         actuator_pt=args.actuator_policy,
+        world_3d_pt=args.world_model_3d,
     )
     daemon = GPUInferDaemon(host, port, engine, unix_sock=args.unix_sock)
     daemon.start_listening()
@@ -1339,7 +1505,8 @@ def main() -> None:
     unix_info = f" | unix={daemon.unix_sock_path}" if daemon.unix_sock_path is not None else ""
     print(
         f"[gpu_infer_daemon] Ready on {host}:{daemon.actual_port}{unix_info} | device={dev_name} | "
-        f"fp16={engine.use_fp16} | neural_bots={engine.bot_policy is not None} | "
+        f"fp16={engine.use_fp16} | world_3d={engine.world_model_3d is not None} | "
+        f"neural_bots={engine.bot_policy is not None} | "
         f"actuator_policy={engine.actuator_policy is not None} | "
         f"sparse_world={engine.use_sparse_world} | sparse_eco={engine.use_sparse_eco} | "
         f"acoustics={'neural' if engine.acoustic_engine is not None else 'physical-fallback'}",

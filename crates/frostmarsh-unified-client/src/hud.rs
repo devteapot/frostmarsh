@@ -424,6 +424,35 @@ pub fn build_hud(
             b.rect(px, py0, pip_sz, pip_sz, col);
             b.rect_outline(px, py0, pip_sz, pip_sz, 1.5 * ui, text_hi);
         }
+
+        // Diurnal World Time + Time-Warp Pill directly below top-center banner
+        let total_mins = ((tel.day_time.rem_euclid(1.0) * 1440.0).floor() as u32) % 1440;
+        let hh = total_mins / 60;
+        let mm = total_mins % 60;
+        let day_num = tel.world_day.max(1);
+        let ts = if tel.time_scale > 0.01 { tel.time_scale } else { 1.0 };
+        let ts_str = if ts < 0.5 {
+            "0.25X".to_string()
+        } else {
+            format!("{:.0}X", ts)
+        };
+        let clock_str = format!("DAY {} {:02}:{:02} [K]{}", day_num, hh, mm, ts_str);
+        let solar = (tel.day_time.rem_euclid(1.0) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2).sin();
+        let clock_col = if solar < -0.2 {
+            [0.58, 0.74, 1.00, 1.0] // Moonlit night indigo
+        } else if solar > 0.3 {
+            [1.00, 0.96, 0.78, 1.0] // Bright midday sun
+        } else {
+            [1.00, 0.70, 0.38, 1.0] // Golden dawn / crimson dusk
+        };
+        let csc = 1.25 * ui;
+        let cw = HudBatch::text_width(&clock_str, csc) + 18.0 * ui;
+        let ch = 20.0 * ui;
+        let cx = bx + (banner_w - cw) * 0.5;
+        let cy = by + banner_h + 4.0 * ui;
+        b.rect(cx, cy, cw, ch, [0.07, 0.06, 0.14, 0.84]);
+        b.rect_outline(cx, cy, cw, ch, 1.2 * ui, clock_col);
+        b.text_shadow(cx + 9.0 * ui, cy + 5.0 * ui, csc, clock_col, &clock_str);
     } else {
         b.text_shadow(bx + 90.0 * ui, by + 20.0 * ui, 2.0 * ui, text_hi, "CONNECTING TO SPARK GB10...");
     }
@@ -752,10 +781,17 @@ pub fn build_hud(
                 format!("AI: SCRIPTED FALLBACK ({} BOTS) [N TOGGLE]", t.active_bots)
             };
             let sparse_disp = if t.world_sparse_pct > 0.01 { t.world_sparse_pct } else { 100.0 };
-            let l6 = format!(
-                "ACOUSTIC {:.2}MS  SPARSE {:.0}%",
-                t.acoustic_ms, sparse_disp
-            );
+            let l6 = if t.neural_3d_vertical {
+                format!(
+                    "ACOUSTIC {:.2}MS SPARSE {:.0}% 3D-NEURAL-Z",
+                    t.acoustic_ms, sparse_disp
+                )
+            } else {
+                format!(
+                    "ACOUSTIC {:.2}MS  SPARSE {:.0}%",
+                    t.acoustic_ms, sparse_disp
+                )
+            };
             let (l7, l7_col) = if t.physics_native {
                 (
                     format!("PHYSICS-NATIVE [P]  FOCUS R={:.1}", cfg.focus_radius),
@@ -895,9 +931,9 @@ pub fn build_hud(
 
         // Controls hint bar at bottom
         let hint_bar = if phys_native {
-            format!("1-3 MATTER  [/] R={:.1}  P MODE  TAB SCORE  ENTER CHAT", cfg.focus_radius)
+            format!("1-3 MATTER  [/] R={:.1}  P MODE  K TIME  ENTER CHAT", cfg.focus_radius)
         } else {
-            "1-3 ELEM  P MODE  F1-F3 CLS  TAB SCORE  ENTER CHAT".to_string()
+            "1-3 ELEM  P MODE  K TIME  F1-F3 CLS  ENTER CHAT".to_string()
         };
         b.text(
             bar_x,

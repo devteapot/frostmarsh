@@ -1648,6 +1648,18 @@ impl Field {
 // TRUE 3D VOLUMETRIC MULTI-STRATA ENGINE (`VolumeField`: W × H × L)
 // =========================================================================
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EntityVoxelPhysics {
+    pub temp_c: f32,            // local voxel temperature
+    pub delta_temp_spike: f32,  // positive sharp thermal rise since last tick (combustion/ignition!)
+    pub delta_steam_burst: f32, // sharp steam surge since last tick (flash-boil!)
+    pub ice_frac: f32,          // low friction / glide
+    pub oil_frac: f32,          // slip / flammable substrate
+    pub water_frac: f32,        // drag / buoyancy
+    pub smoke_opacity: f32,     // optical smoke+steam concealment [0..1]
+    pub support_solid: bool,    // whether solid ground/bridge exists at or directly below entity
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct VolumeStepStats {
     pub tick: u64,
@@ -1676,6 +1688,8 @@ pub struct VolumeField {
     pub height: usize,
     pub depth: usize,
     pub layers: Vec<Field>,
+    pub prev_temp: Vec<i32>,
+    pub prev_steam: Vec<i32>,
     pub initial_total_mass: i64,
     pub initial_total_energy: i64,
     pub tick: u64,
@@ -1804,17 +1818,59 @@ impl VolumeField {
             }
         }
 
+        let vlen = d * width * height;
         let mut vf = Self {
             width,
             height,
             depth: d,
             layers,
+            prev_temp: vec![T_AMB as i32; vlen],
+            prev_steam: vec![0i32; vlen],
             initial_total_mass: 0,
             initial_total_energy: 0,
             tick: 0,
         };
         vf.snapshot_conservation_baseline();
+        vf.snapshot_prev_sensors();
         vf
+    }
+
+    pub fn snapshot_prev_sensors(&mut self) {
+        let len = self.width * self.height;
+        let total = self.depth * len;
+        if self.prev_temp.len() != total {
+            self.prev_temp.resize(total, T_AMB as i32);
+        }
+        if self.prev_steam.len() != total {
+            self.prev_steam.resize(total, 0);
+        }
+        for (z, f) in self.layers.iter().enumerate() {
+            let base = z * len;
+            for idx in 0..len {
+                self.prev_temp[base + idx] = f.cell_temp_ck(idx) as i32;
+                self.prev_steam[base + idx] = f.mass[SP_STEAM][idx] as i32;
+            }
+        }
+    }
+
+    pub fn snapshot_layer_prev_sensors(&mut self, layer: usize) {
+        if layer >= self.depth {
+            return;
+        }
+        let len = self.width * self.height;
+        let total = self.depth * len;
+        if self.prev_temp.len() != total {
+            self.prev_temp.resize(total, T_AMB as i32);
+        }
+        if self.prev_steam.len() != total {
+            self.prev_steam.resize(total, 0);
+        }
+        let f = &self.layers[layer];
+        let base = layer * len;
+        for idx in 0..len {
+            self.prev_temp[base + idx] = f.cell_temp_ck(idx) as i32;
+            self.prev_steam[base + idx] = f.mass[SP_STEAM][idx] as i32;
+        }
     }
 
     pub fn snapshot_conservation_baseline(&mut self) {
@@ -1988,8 +2044,16 @@ impl VolumeField {
         (grav_moved, buoy_moved)
     }
 
+    /// Apply a single layer step while snapshotting `prev_temp` / `prev_steam` first.
+    pub fn step_layer(&mut self, layer: usize, raw: &RawStepOutput) -> StepStats {
+        let l = layer.min(self.depth.saturating_sub(1));
+        self.snapshot_layer_prev_sensors(l);
+        self.layers[l].project_and_apply(raw)
+    }
+
     /// Apply all `L` horizontal neural/refsim layer steps + exact 3D vertical exchange + dirty chunk diffing.
     pub fn step_3d(&mut self, raw_layers: &[RawStepOutput]) -> VolumeStepStats {
+        self.snapshot_prev_sensors();
         let mut proj_sum = 0.0f32;
         for (z, l) in self.layers.iter_mut().enumerate() {
             if let Some(raw) = raw_layers.get(z) {
@@ -2018,6 +2082,161 @@ impl VolumeField {
             vertical_gravity_mass: grav,
             vertical_buoyancy_mass: buoy,
         }
+    }
+
+    /// Sample continuous voxel-coupled physical state at `(x, y, layer)` for physics-native entities.
+    pub fn sample_entity_physics(&self, x: f32, y: f32, layer: usize) -> EntityVoxelPhysics {
+        if self.depth == 0 || self.width == 0 || self.height == 0 {
+            return EntityVoxelPhysics::default();
+        }
+        let l = layer.min(self.depth - 1);
+        let xi = (x.floor() as i32).clamp(0, (self.width - 1) as i32) as usize;
+        let yi = (y.floor() as i32).clamp(0, (self.height - 1) as i32) as usize;
+        let f = &self.layers[l];
+        let idx = f.idx(xi, yi);
+        let len = self.width * self.height;
+        let vidx = l * len + idx;
+
+        let t_ck = f.cell_temp_ck(idx) as i32;
+        let prev_t = self.prev_temp.get(vidx).copied().unwrap_or(t_ck);
+        let temp_c = (t_ck as f32 - 27_315.0) * 0.01;
+        let delta_temp_spike = ((t_ck - prev_t).max(0) as f32) * 0.01;
+
+        let steam_now = f.mass[SP_STEAM][idx] as i32;
+        let prev_st = self.prev_steam.get(vidx).copied().unwrap_or(steam_now);
+        let delta_steam_burst = ((steam_now - prev_st).max(0) as f32) / (C_NOM as f32);
+
+        let ice_frac = (f.mass[SP_ICE][idx] as f32 / (C_NOM as f32)).clamp(0.0, 1.0);
+        let oil_frac = (f.mass[SP_OIL][idx] as f32 / (C_NOM as f32)).clamp(0.0, 1.0);
+        let water_frac = (f.mass[SP_WATER][idx] as f32 / (C_NOM as f32)).clamp(0.0, 1.0);
+        let smoke_opacity = (((f.mass[SP_SMOKE][idx] as f32) + (f.mass[SP_STEAM][idx] as f32))
+            / 600.0)
+            .clamp(0.0, 1.0);
+
+        let support_solid = f.mass[SP_SOIL][idx] >= 250
+            || f.mass[SP_ROCK][idx] >= 250
+            || f.mass[SP_WOOD][idx] >= 200
+            || f.mass[SP_ICE][idx] >= 300;
+
+        EntityVoxelPhysics {
+            temp_c,
+            delta_temp_spike,
+            delta_steam_burst,
+            ice_frac,
+            oil_frac,
+            water_frac,
+            smoke_opacity,
+            support_solid,
+        }
+    }
+
+    /// Conservation-guarded continuous physical actuator: injects bounded thermal energy (`±ΔE`)
+    /// and/or matter (`water`, `oil`, `smoke`) into `(x, y, layer)` while keeping exact integer
+    /// accounting (`mass_error == 0 && energy_error == 0`). Returns `(delta_mass, delta_energy)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_physical_actuator(
+        &mut self,
+        x: f32,
+        y: f32,
+        layer: usize,
+        thermal_flux: f32,
+        sp_water: f32,
+        sp_oil: f32,
+        sp_smoke: f32,
+        focus_radius: f32,
+    ) -> (i64, i64) {
+        if self.depth == 0 || self.width < 4 || self.height < 4 {
+            return (0, 0);
+        }
+        let l = layer.min(self.depth - 1);
+        let tf = sanitize_f32(thermal_flux).clamp(-1.0, 1.0);
+        let mw = sanitize_f32(sp_water).clamp(0.0, 1.0);
+        let mo = sanitize_f32(sp_oil).clamp(0.0, 1.0);
+        let ms = sanitize_f32(sp_smoke).clamp(0.0, 1.0);
+        let rf = sanitize_f32(focus_radius).clamp(1.0, 10.0);
+        let r_i = rf.ceil() as i32;
+        let r2 = (rf * rf).max(1.0);
+        let focus_gain = (4.0 / rf).clamp(0.65, 1.6);
+
+        let cx = sanitize_f32(x).round() as i32;
+        let cy = sanitize_f32(y).round() as i32;
+
+        let f = &mut self.layers[l];
+        let w_i = f.width as i32;
+        let h_i = f.height as i32;
+        let mut total_dm = 0i64;
+        let mut total_de = 0i64;
+
+        let matter_specs = [
+            (SP_WATER, mw, 420.0f32),
+            (SP_OIL, mo, 380.0f32),
+            (SP_SMOKE, ms, 320.0f32),
+        ];
+
+        for dy in -r_i..=r_i {
+            for dx in -r_i..=r_i {
+                let d2 = (dx * dx + dy * dy) as f32;
+                if d2 > r2 {
+                    continue;
+                }
+                let gx = cx + dx;
+                let gy = cy + dy;
+                if gx < 2 || gy < 2 || gx + 2 >= w_i || gy + 2 >= h_i {
+                    continue;
+                }
+                let falloff = (1.0 - (d2 / r2).sqrt() * 0.65).clamp(0.15, 1.0);
+                let idx = f.idx(gx as usize, gy as usize);
+
+                // 1. Continuous matter injection (bounded by H_CAP, skips solid rock walls)
+                if f.mass[SP_ROCK][idx] < 500 {
+                    for &(sp, amt, max_units) in &matter_specs {
+                        if amt > 0.01 {
+                            let room = H_CAP.saturating_sub(f.cell_volume(idx));
+                            let add = ((max_units * amt * falloff) as u32).min(room) as u16;
+                            if add > 0 {
+                                f.mass[sp][idx] += add;
+                                let e_th = (add as i64) * SPECIES[sp].c * T_AMB;
+                                let e_chem = (add as i64) * SPECIES[sp].u0;
+                                f.energy[idx] += e_th;
+                                f.faucet_mass[sp] += add as i64;
+                                f.faucet_energy += e_th + e_chem;
+                                f.forcing_mass[idx] = f.forcing_mass[idx].saturating_add(add as i32);
+                                total_dm += add as i64;
+                                total_de += e_th + e_chem;
+                            }
+                        }
+                    }
+                }
+
+                // 2. Continuous bounded thermal flux (+ΔE heat / -ΔE cryo)
+                let c = f.cell_heat_capacity(idx);
+                if c > 0 {
+                    if tf > 0.01 {
+                        let add_e = ((36_000.0 * tf * falloff * focus_gain) as i64) * c;
+                        let cap_e = (c * T_MAX - f.energy[idx]).max(0);
+                        let delta = add_e.min(cap_e);
+                        if delta > 0 {
+                            f.energy[idx] += delta;
+                            f.faucet_energy += delta;
+                            f.forcing_energy[idx] = f.forcing_energy[idx].saturating_add(delta);
+                            total_de += delta;
+                        }
+                    } else if tf < -0.01 {
+                        let sub_e = ((12_000.0 * (-tf) * falloff * focus_gain) as i64) * c;
+                        let min_e = c * T_MIN;
+                        let delta = -(sub_e.min((f.energy[idx] - min_e).max(0)));
+                        if delta < 0 {
+                            f.energy[idx] += delta;
+                            f.faucet_energy += delta;
+                            f.forcing_energy[idx] = f.forcing_energy[idx].saturating_add(delta);
+                            total_de += delta;
+                        }
+                    }
+                }
+            }
+        }
+
+        (total_dm, total_de)
     }
 
     /// Check whether a 3D cell `(x, y, layer)` has non-empty matter (used to skip empty air chunks on L2/L3).
@@ -2249,5 +2468,76 @@ mod tests {
             total_grav += stats.vertical_gravity_mass;
         }
         assert!(total_grav > 0, "expected 3D waterfall gravity transport at 512x512x4");
+    }
+
+    #[test]
+    fn test_physical_actuator_conservation_and_entity_physics() {
+        let mut vf = VolumeField::new_shattered_reach_3d(64, 64, 4);
+
+        // 1. Oil + Heat ignition on dry west bank (L1): verify exact conservation & positive delta_temp_spike
+        let (ox, oy) = (12.0f32, 32.0f32);
+        let (dm_oil, de_oil) = vf.apply_physical_actuator(ox, oy, 1, 0.0, 0.0, 1.0, 0.0, 3.5);
+        assert!(dm_oil > 0 && de_oil > 0, "oil injection should add mass & chemical+thermal energy");
+        assert_eq!(vf.current_accounted_mass() - vf.initial_total_mass, 0);
+        assert_eq!(vf.current_accounted_energy() - vf.initial_total_energy, 0);
+
+        let (_dm_heat, de_heat) = vf.apply_physical_actuator(ox, oy, 1, 0.75, 0.0, 0.0, 0.0, 3.5);
+        assert!(de_heat > 0, "positive thermal flux should inject energy");
+        assert_eq!(vf.current_accounted_mass() - vf.initial_total_mass, 0);
+        assert_eq!(vf.current_accounted_energy() - vf.initial_total_energy, 0);
+
+        let mut max_temp_spike = 0.0f32;
+        for tick in 0..8 {
+            let raws = vf.refsim_raw_outputs_all();
+            let stats = vf.step_3d(&raws);
+            assert_eq!(stats.mass_error, 0, "mass error during oil ignition at tick {}", tick);
+            assert_eq!(stats.energy_error, 0, "energy error during oil ignition at tick {}", tick);
+            let phys = vf.sample_entity_physics(ox, oy, 1);
+            max_temp_spike = max_temp_spike.max(phys.delta_temp_spike);
+        }
+        assert!(
+            max_temp_spike > 0.0,
+            "expected positive delta_temp_spike from exothermic oil combustion, got {}",
+            max_temp_spike
+        );
+
+        // 2. Water + Heat flash-boil in central fjord (L1): verify positive delta_steam_burst & conservation
+        let water_cell = (0..(64 * 64))
+            .find(|&i| {
+                let x = i % 64;
+                let y = i / 64;
+                x > 6 && x < 58 && y > 6 && y < 58 && vf.layers[1].mass[SP_WATER][i] >= 800
+            })
+            .expect("shattered reach should have fjord water");
+        let (wx, wy) = ((water_cell % 64) as f32, (water_cell / 64) as f32);
+        vf.apply_physical_actuator(wx, wy, 1, 1.0, 0.0, 0.0, 0.0, 3.5);
+        assert_eq!(vf.current_accounted_mass() - vf.initial_total_mass, 0);
+        assert_eq!(vf.current_accounted_energy() - vf.initial_total_energy, 0);
+
+        let mut max_steam_burst = 0.0f32;
+        for tick in 0..6 {
+            let raws = vf.refsim_raw_outputs_all();
+            let stats = vf.step_3d(&raws);
+            assert_eq!(stats.mass_error, 0, "mass error during flash-boil at tick {}", tick);
+            assert_eq!(stats.energy_error, 0, "energy error during flash-boil at tick {}", tick);
+            let phys = vf.sample_entity_physics(wx, wy, 1);
+            max_steam_burst = max_steam_burst.max(phys.delta_steam_burst);
+        }
+        assert!(
+            max_steam_burst > 0.0,
+            "expected positive delta_steam_burst from water+heat flash-boil, got {}",
+            max_steam_burst
+        );
+
+        // 3. Cryo extractor + smoke + L2 structural support check
+        let (_dm_s, _de_s) = vf.apply_physical_actuator(ox, oy, 1, -0.8, 0.4, 0.0, 0.9, 3.0);
+        assert_eq!(vf.current_accounted_mass() - vf.initial_total_mass, 0);
+        assert_eq!(vf.current_accounted_energy() - vf.initial_total_energy, 0);
+        let phys_smk = vf.sample_entity_physics(ox, oy, 1);
+        assert!(phys_smk.smoke_opacity > 0.0, "smoke injection should increase smoke_opacity");
+        assert!(phys_smk.support_solid, "west bank soil should provide solid support");
+
+        let phys_air = vf.sample_entity_physics(32.0, 26.0, 2);
+        assert!(!phys_air.support_solid, "open air over fjord on L2 should have !support_solid");
     }
 }

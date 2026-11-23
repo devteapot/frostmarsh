@@ -302,6 +302,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 show_brain_inspector: true,
                 brain_selected_idx: None,
                 selected_element: 0,
+                focus_radius: 4.0,
                 style_label: st.label,
                 fps: fps_1080,
                 rtt_ms: 1.2,
@@ -361,6 +362,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             show_brain_inspector: true,
             brain_selected_idx: None,
             selected_element: 0,
+            focus_radius: 4.0,
             style_label: style_main.label,
             fps: fps_1080,
             rtt_ms: 1.2,
@@ -434,6 +436,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     show_brain_inspector: true,
                     brain_selected_idx: None,
                     selected_element: 1,
+                    focus_radius: 4.0,
                     style_label: st.label,
                     fps: fps_1080,
                     rtt_ms: 1.2,
@@ -516,6 +519,7 @@ struct InteractiveApp {
     brain_inspector_on: bool,
     brain_selected_idx: Option<usize>,
     selected_element: u8,
+    focus_radius: f32,
     chat_open: bool,
     chat_input: String,
     chat_shout: bool,
@@ -537,6 +541,7 @@ struct InteractiveApp {
     pending_ult_r: bool,
     input_seq: u32,
     last_input_send: Instant,
+    last_actuator_send: Instant,
     start_time: Instant,
     last_frame: Instant,
     fps_ema: f32,
@@ -578,6 +583,7 @@ impl InteractiveApp {
             brain_inspector_on: true,
             brain_selected_idx: None,
             selected_element: 0,
+            focus_radius: 4.0,
             chat_open: false,
             chat_input: String::new(),
             chat_shout: true,
@@ -599,6 +605,7 @@ impl InteractiveApp {
             pending_ult_r: false,
             input_seq: 0,
             last_input_send: Instant::now(),
+            last_actuator_send: Instant::now(),
             start_time: Instant::now(),
             last_frame: Instant::now(),
             fps_ema: 60.0,
@@ -812,8 +819,68 @@ impl InteractiveApp {
                     }
                 }
 
+                let physics_native = entities
+                    .as_ref()
+                    .map(|e| e.telemetry.physics_native)
+                    .unwrap_or(false);
+
                 self.input_seq = self.input_seq.wrapping_add(1);
                 let now_ms = quic.state.lock().unwrap().client_time_ms();
+                let shift_held = !self.chat_open
+                    && (self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight));
+
+                if physics_native && !self.chat_open {
+                    let emit_matter = self.pending_ability_e
+                        || self.keys.contains(&KeyCode::KeyE)
+                        || (shift_held && self.mouse_left);
+                    let emit_heat = self.mouse_left && !shift_held;
+                    let emit_cryo = self.mouse_right;
+                    let emit_pulse = self.pending_ult_r;
+
+                    let ready_cont = self.last_actuator_send.elapsed() >= Duration::from_millis(85);
+                    if emit_pulse || (ready_cont && (emit_heat || emit_cryo || emit_matter)) {
+                        self.last_actuator_send = Instant::now();
+                        let mut thermal_flux = 0.0f32;
+                        if emit_heat { thermal_flux += 1.0; }
+                        if emit_cryo { thermal_flux -= 1.0; }
+                        let mut sp_oil = 0.0f32;
+                        let mut sp_water = 0.0f32;
+                        let mut sp_smoke = 0.0f32;
+                        if emit_matter {
+                            match self.selected_element % 3 {
+                                0 => sp_oil = 1.0,
+                                1 => sp_water = 1.0,
+                                _ => sp_smoke = 1.0,
+                            }
+                        }
+                        let mut radius = self.focus_radius;
+                        let mut impulse = 0.0f32;
+                        if emit_pulse {
+                            thermal_flux = if shift_held { -1.0 } else { 1.0 };
+                            radius = (self.focus_radius + 2.0).min(8.0);
+                            impulse = 1.0;
+                        }
+                        let adist = aim_x.hypot(aim_y);
+                        let (dx, dy) = if adist > 22.0 {
+                            (aim_x * (22.0 / adist), aim_y * (22.0 / adist))
+                        } else if adist < 1.5 {
+                            (fwd_xz.x * 8.0, fwd_xz.z * 8.0)
+                        } else {
+                            (aim_x, aim_y)
+                        };
+                        quic.send_reliable_detached(ClientReliable::PhysicalActuator {
+                            dx,
+                            dy,
+                            thermal_flux,
+                            sp_water,
+                            sp_oil,
+                            sp_smoke,
+                            focus_radius: radius,
+                            impulse,
+                        });
+                    }
+                }
+
                 let inp = ClientInputDatagram {
                     seq: self.input_seq,
                     move_x: move_v.x,
@@ -821,12 +888,12 @@ impl InteractiveApp {
                     aim_x,
                     aim_y,
                     dash: !self.chat_open && (self.pending_dash || self.keys.contains(&KeyCode::Space)),
-                    melee: !self.chat_open && self.mouse_right,
-                    cast_bolt: !self.chat_open && self.mouse_left,
+                    melee: !self.chat_open && !physics_native && self.mouse_right,
+                    cast_bolt: !self.chat_open && !physics_native && self.mouse_left,
                     bolt_element: self.selected_element,
                     carve_ice: !self.chat_open && self.pending_carve,
-                    cast_ability_e: !self.chat_open && self.pending_ability_e,
-                    cast_ultimate_r: !self.chat_open && self.pending_ult_r,
+                    cast_ability_e: !self.chat_open && !physics_native && self.pending_ability_e,
+                    cast_ultimate_r: !self.chat_open && !physics_native && self.pending_ult_r,
                     client_time_ms: now_ms,
                 };
                 self.pending_dash = false;
@@ -864,6 +931,7 @@ impl InteractiveApp {
                 show_brain_inspector: self.brain_inspector_on,
                 brain_selected_idx: self.brain_selected_idx,
                 selected_element: self.selected_element,
+                focus_radius: self.focus_radius,
                 style_label: style.label,
                 fps: self.fps_ema,
                 rtt_ms,
@@ -1074,6 +1142,17 @@ impl ApplicationHandler for InteractiveApp {
                                 KeyCode::Digit1 => self.selected_element = 0,
                                 KeyCode::Digit2 => self.selected_element = 1,
                                 KeyCode::Digit3 => self.selected_element = 2,
+                                KeyCode::BracketLeft => {
+                                    self.focus_radius = (self.focus_radius - 0.5).clamp(2.0, 8.0);
+                                }
+                                KeyCode::BracketRight => {
+                                    self.focus_radius = (self.focus_radius + 0.5).clamp(2.0, 8.0);
+                                }
+                                KeyCode::KeyP => {
+                                    if let Some(ref q) = self.quic {
+                                        q.send_reliable_detached(ClientReliable::TogglePhysicsNative);
+                                    }
+                                }
                                 KeyCode::Space => self.pending_dash = true,
                                 KeyCode::KeyC => self.pending_carve = true,
                                 KeyCode::KeyE => self.pending_ability_e = true,

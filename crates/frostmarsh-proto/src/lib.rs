@@ -52,6 +52,17 @@ pub enum ClientReliable {
     ResetWorld,
     RequestFullSync,
     ChatCommand { text: String, volume: f32 },
+    TogglePhysicsNative,
+    PhysicalActuator {
+        dx: f32,
+        dy: f32,
+        thermal_flux: f32,
+        sp_water: f32,
+        sp_oil: f32,
+        sp_smoke: f32,
+        focus_radius: f32,
+        impulse: f32,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -227,6 +238,8 @@ pub struct TelemetrySnap {
     pub acoustic_ms: f32,
     #[serde(default)]
     pub world_sparse_pct: f32,
+    #[serde(default)]
+    pub physics_native: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Live 512x512x4 (1M Voxels) in 8.59ms with Dual-Scale BotPolicyNetV2-RL, Spatial Audio & Acoustic Speech](models/unified_iter4_512/unified_live_1080p_hud.png)
+![Frostmarsh Live 512x512x4 Physics-Native Continuous Actuators & Emergent Neural Bots](models/unified_iter5_512/unified_live_1080p_hud.png)
 
 ---
 
@@ -59,7 +59,11 @@
   - `WorldModel` v3 (`ml/train_world_v3.py`, `world_model_v3.pt`, [WORLD_V3_METRICS.json](models/WORLD_V3_METRICS.json)): Cut held-out projection firewall active rate by **`-76.6%`** (`22.27%` → **`5.21%`**) while beating v1 raw MAE by **`-23.1%`** and keeping `0.9906` `Z_world` cosine compatibility with `SparseWorldRunner` (`FP32 diff = 0.0`).
   - Dual-Scale `BotPolicyNetV2-RL` (`ml/bot_policy_v2.py`, `ml/train_bot_rl_v2.py`, `bot_policy_v2_rl.pt`, [BOT_RL_V2_TOURNAMENT.json](models/BOT_RL_V2_TOURNAMENT.json), `215K` params, `0.71 ms` / 12 bots): Fuses fine `14`-cell + coarse `60`-cell `Z_world` ego-crops. In 24-match held-out `256×256×4` tournaments, it beats **Scripted Teacher `87.5%` (`21W–3L`, `73.7` vs. `47.0` combos/match)**, **RL v1 `95.8%` (`23W–1L`, `3×` less wildfire burn)**, **BC `100.0%` (`24W–0L`)**, and **Blind `100.0%` (`24W–0L`)**.
   - **Procedural 3D Spatial Audio (`cpal` `src/audio.rs`) + 5-Min Match Loop & `Tab` Scoreboard:** Pure-Rust lock-free stereo DSP soundscape (panned waterfall/wildfire/weather ambience + **SNR-filtered neural-voice synth chirps**, `U`-key mute), `5:00` / `500`-pt match loop with MVP Victory banner, and **zero compiler warnings** across the entire Rust workspace.
-- **Live 30 Hz Server Loop (GB10, `512×512×4` 1M Voxels, `WorldModel` v3 + `BotPolicyNetV2-RL`, Unix Socket IPC + `op=5/6`):** **`8.59 ms` Sparse World (`SPARSE 3%`, `6.1×` faster than dense)** + `11.50 ms` Eco + `2.18 ms` Dual-Scale RL Bots+Saliency + `2.56 ms` Live Acoustics (`mass_err = 0`, `energy_err = 0`, `91 KB/s` wire).
+- **Iteration 5 — Zero-Hardcoded-Rules Emergent Physical Actuators & Pure-Physics Coupling (Trained on Colab `A100-SXM4-40GB`):**
+  - `ActuatorPolicyNet` (`ml/actuator_policy.py`, `ml/train_actuator_rl.py`, `actuator_policy_rl.pt`, [ACTUATOR_EMERGENCE_METRICS.json](models/ACTUATOR_EMERGENCE_METRICS.json), `214.6K` params): Replaces fixed named spells and `if was_oiled` rules with **`10` continuous conservation-bounded physical actuator channels** (`±thermal_flux`, `water/oil/smoke` matter emission, continuous `focus_radius`, kinetic `impulse`).
+  - Trained purely from random weights via sparse-goal PPO across **`64` parallel arenas (`768` bots, `3.69M` bot-steps at `10,799` steps/s on A100)** with zero imitation teacher: autonomously discovered **Oil→Ignition detonations (`15.5`/match)**, **Flash-Boil Steam Bursts (`17.5`/match)**, **Cryo-Bridge Crossings (`13.1`/match)**, **Smokescreen Cover (`7.9`/match)**, and bimodal `focus_radius` specialization (wide `3.5–7.0` cryo fields vs. tight `1.8–3.5` thermal beams). Beats Random Actuators **`100.0%` (`24W–0L`)** and Thermal-Only (no matter) **`62.5%` (`15W–9L`, `+88.6%` pressure-wave damage)**.
+  - **Live Physics-Native Engine (`P`-key hot-toggle `PHYSICS-NATIVE` ↔ `CLASSIC`):** `VolumeField::apply_physical_actuator` + `sample_entity_physics` (`8/8` exact `mass_err=0, energy_err=0` tests) drive thermal stress, combustion `ΔT` / flash-boil `Δsteam` blasts + knockback, ice/oil/water friction, and `L2` skybridge collapse directly from voxels (`op=7` live at `2.28 ms` / 12 bots alongside `8.69 ms` sparse `512×512×4` world!).
+- **Live 30 Hz Server Loop (GB10, `512×512×4` 1M Voxels, `WorldModel` v3 + `ActuatorPolicyNet` `op=7`):** **`8.69 ms` Sparse World (`SPARSE 5%`, `6.0×` faster than dense)** + `11.51 ms` Eco + `2.28 ms` Actuator Bots+Saliency + `2.50 ms` Live Acoustics (`mass_err = 0`, `energy_err = 0`, `109 KB/s` wire, `71.2 FPS` @ 1080p / `70.1 FPS` @ 4K Metal).
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
@@ -75,9 +79,9 @@
 
 ## Visual Showcase
 
-| Live `256×256×4` Human Chat → 3D SNR Speech Bubbles (`+17 dB` vs `-10 dB`) | 3D Physical Acoustics & Emergent Neural Vocabulary |
+| Emergent Continuous Physical Actuators (`ActuatorPolicyNet`, Colab `A100`) | 3D Physical Acoustics & Emergent Neural Vocabulary |
 |---|---|
-| ![Live Acoustic Speech Bubbles](models/unified_iter3_256/unified_live_1080p_hud.png) | ![3D Acoustics & Emergent Speech](models/acoustic_field_viz.png) |
+| ![Emergent Physical Actuators](models/actuator_emergence_viz.png) | ![3D Acoustics & Emergent Speech](models/acoustic_field_viz.png) |
 
 | Tier 1 (`512²` Painterly) | Tier 4 (Multi-Style Client Diffusion) |
 |---|---|
@@ -129,6 +133,8 @@ FROSTMARSH_SERVER=127.0.0.1:4433 ./play_frostmarsh.sh
 | `Space` | Dash |
 | `E` / `R` | Class signature ability & Ultimate |
 | `F1` / `F2` / `F3` | Switch class (**Frost Warden**, **Pyro Alchemist**, **Marsh Ranger**) |
+| **`P`** | **Live hot-toggle `PHYSICS-NATIVE` continuous actuators ↔ `CLASSIC` named spells** |
+| **`LMB` / `RMB` / `[` `]`** | **In Physics-Native mode: `+ΔE` Heat / `-ΔE` Cryo / Adjust Focus Radius (`2.0..8.0`)** |
 | **`Enter` / `Tab`** | **Open live Acoustic Chat (`Tab` toggles SHOUT/WHISPER while typing; hold `Tab` outside chat for 6v6 Scoreboard)** |
 | **`U`** | **Mute / unmute procedural 3D spatial audio & SNR-filtered voice synths** |
 | **`N`** | **Live hot-toggle Shared-Latent Neural-Z Bots ↔ Scripted Bots** |

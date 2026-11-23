@@ -16,8 +16,8 @@
 use bytes::Bytes;
 use clap::Parser;
 use field_core::{
-    Field, INPUT_CHANNELS, OUTPUT_CHANNELS, RawStepOutput, SP_ICE, SP_OIL, SP_PLANT, SP_ROCK,
-    SP_WATER, VolumeField,
+    EntityVoxelPhysics, Field, INPUT_CHANNELS, OUTPUT_CHANNELS, RawStepOutput, SP_ICE, SP_OIL,
+    SP_PLANT, SP_ROCK, SP_STEAM, SP_WATER, VolumeField,
 };
 use frostmarsh_proto::*;
 #[cfg(feature = "onnx")]
@@ -669,6 +669,9 @@ struct PlayerEntity {
     carrying_relic: bool,
     ack_input_seq: u32,
     echo_client_time_ms: u32,
+    kb_vx: f32,
+    kb_vy: f32,
+    last_phys_blast_field_tick: u64,
 }
 
 impl PlayerEntity {
@@ -780,6 +783,7 @@ struct GameState {
     backend_name: String,
     ecosystem_on: bool,
     neural_bots_on: bool,
+    physics_native: bool,
     bot_infer_ms: f32,
     acoustic_ms: f32,
     world_sparse_pct: f32,
@@ -808,6 +812,7 @@ struct GameState {
     speech_bubbles: VecDeque<(u64, SpeechBubbleSnap)>,
     pending_chat: Option<PendingChat>,
     bot_overrides: HashMap<u32, BotCommandOverride>,
+    recent_actuators: VecDeque<(u32, u8, f32, f32, f32, u64)>,
     peers: HashMap<u32, ClientPeer>,
     hazard_layers: Vec<Vec<u8>>,
     weather_kind: u8,
@@ -873,6 +878,7 @@ impl GameState {
             backend_name,
             ecosystem_on: true,
             neural_bots_on: use_cuda,
+            physics_native: true,
             bot_infer_ms: 0.0,
             acoustic_ms: 0.0,
             world_sparse_pct: 100.0,
@@ -901,6 +907,7 @@ impl GameState {
             speech_bubbles: VecDeque::with_capacity(6),
             pending_chat: None,
             bot_overrides: HashMap::new(),
+            recent_actuators: VecDeque::with_capacity(32),
             peers: HashMap::new(),
             weather_kind: WEATHER_CLEAR,
             day_time: 0.25,
@@ -1273,6 +1280,9 @@ impl GameState {
                 carrying_relic: false,
                 ack_input_seq: 0,
                 echo_client_time_ms: 0,
+                kb_vx: 0.0,
+                kb_vy: 0.0,
+                last_phys_blast_field_tick: 0,
             },
         );
         id
@@ -1641,6 +1651,164 @@ impl GameState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_player_physical_actuator(
+        &mut self,
+        pid: u32,
+        dx: f32,
+        dy: f32,
+        thermal_flux: f32,
+        sp_water: f32,
+        sp_oil: f32,
+        sp_smoke: f32,
+        focus_radius: f32,
+        impulse: f32,
+    ) {
+        if self.match_phase != MATCH_PHASE_ACTIVE {
+            return;
+        }
+        let dx = if dx.is_finite() { dx.clamp(-36.0, 36.0) } else { 0.0 };
+        let dy = if dy.is_finite() { dy.clamp(-36.0, 36.0) } else { 0.0 };
+        let tf = if thermal_flux.is_finite() { thermal_flux.clamp(-1.0, 1.0) } else { 0.0 };
+        let sw = if sp_water.is_finite() { sp_water.clamp(0.0, 1.0) } else { 0.0 };
+        let so = if sp_oil.is_finite() { sp_oil.clamp(0.0, 1.0) } else { 0.0 };
+        let ss = if sp_smoke.is_finite() { sp_smoke.clamp(0.0, 1.0) } else { 0.0 };
+        let r = if focus_radius.is_finite() { focus_radius.clamp(1.5, 8.5) } else { 4.0 };
+        let imp = if impulse.is_finite() { impulse.clamp(0.0, 1.0) } else { 0.0 };
+
+        let activity = tf.abs() + sw + so + ss + imp;
+        if activity < 0.04 {
+            return;
+        }
+
+        let mana_cost = (tf.abs() * 4.5 + (sw + so + ss) * 4.0 + imp * 7.5) * (0.65 + r * 0.08);
+        let (px, py, pz, team, scale) = {
+            let Some(p) = self.players.get_mut(&pid) else {
+                return;
+            };
+            if p.mana < 1.5 {
+                return;
+            }
+            let sc = (p.mana / mana_cost.max(0.1)).clamp(0.0, 1.0);
+            p.mana = (p.mana - mana_cost * sc).max(0.0);
+            let dlen = dx.hypot(dy);
+            if dlen > 0.1 {
+                p.aim_x = dx / dlen;
+                p.aim_y = dy / dlen;
+            }
+            (p.x, p.y, p.z, p.team, sc)
+        };
+        if scale < 0.05 {
+            return;
+        }
+
+        let gw = self.grid_w as f32;
+        let gh = self.grid_h as f32;
+        let tx = (px + dx).clamp(3.0, gw - 4.0);
+        let ty = (py + dy).clamp(3.0, gh - 4.0);
+        let layer = (pz.round() as usize).clamp(0, self.grid_d - 1);
+
+        let tf_s = tf * scale;
+        let sw_s = sw * scale;
+        let so_s = so * scale;
+        let ss_s = ss * scale;
+        let imp_s = imp * scale;
+
+        self.volume
+            .apply_physical_actuator(tx, ty, layer, tf_s, sw_s, so_s, ss_s, r);
+
+        let tick = self.sim_tick;
+        self.recent_actuators
+            .push_back((pid, team, tx, ty, r + 4.0, tick + 90));
+        while self.recent_actuators.len() > 36 {
+            self.recent_actuators.pop_front();
+        }
+
+        if tf_s.abs() > 0.45 || imp_s > 0.35 {
+            self.eco.inject_fear_pulse(tx, ty, (r * 3.0).clamp(10.0, 24.0), 0.75 * scale);
+        }
+
+        // Radial momentum impulse on nearby entities & floating ice rafts
+        if imp_s > 0.1 {
+            let eff_r = r + 4.5;
+            let mut shock_hits: Vec<(u32, i16)> = Vec::new();
+            for t in self.players.values_mut() {
+                if t.id == pid || tick < t.dash_until || (t.z - pz).abs() > 1.1 {
+                    continue;
+                }
+                let rx = t.x - tx;
+                let ry = t.y - ty;
+                let dist = rx.hypot(ry);
+                if dist <= eff_r {
+                    let fall = (1.0 - dist / (eff_r + 0.5)).clamp(0.15, 1.0);
+                    let (nx, ny) = if dist > 0.1 {
+                        (rx / dist, ry / dist)
+                    } else {
+                        let dl = dx.hypot(dy).max(1e-3);
+                        (dx / dl, dy / dl)
+                    };
+                    let push = 38.0 * imp_s * fall;
+                    t.kb_vx = (t.kb_vx + nx * push).clamp(-48.0, 48.0);
+                    t.kb_vy = (t.kb_vy + ny * push).clamp(-48.0, 48.0);
+                    if t.team != team && imp_s > 0.30 && dist <= r + 2.5 {
+                        let dmg = (14.0 * imp_s * fall).round().clamp(3.0, 18.0) as i16;
+                        shock_hits.push((t.id, dmg));
+                    }
+                }
+            }
+            for raft in &mut self.rafts {
+                let rx = raft.x - tx;
+                let ry = raft.y - ty;
+                let dist = rx.hypot(ry);
+                if dist <= eff_r + raft.radius {
+                    let fall = (1.0 - dist / (eff_r + raft.radius + 1.0)).clamp(0.15, 1.0);
+                    let (nx, ny) = if dist > 0.1 { (rx / dist, ry / dist) } else { (0.0, 1.0) };
+                    raft.vx = (raft.vx + nx * 20.0 * imp_s * fall).clamp(-26.0, 26.0);
+                    raft.vy = (raft.vy + ny * 20.0 * imp_s * fall).clamp(-26.0, 26.0);
+                }
+            }
+            for (tid, dmg) in shock_hits {
+                self.apply_damage(Some(pid), tid, dmg, "SHOCK", 3);
+            }
+        }
+    }
+
+    fn find_recent_actuator_owner(&self, x: f32, y: f32, victim_team: u8) -> Option<u32> {
+        let tick = self.sim_tick;
+        for &(pid, team, ax, ay, rad, exp) in self.recent_actuators.iter().rev() {
+            if tick <= exp && team != victim_team && (x - ax).hypot(y - ay) <= rad + 4.0 {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    /// Compute 2D spatial gradient away from a local temperature or steam peak for physical blast knockback.
+    fn voxel_blast_dir(&self, x: f32, y: f32, layer: usize, use_steam: bool) -> (f32, f32) {
+        let l = layer.min(self.grid_d - 1);
+        let f = &self.volume.layers[l];
+        let xi = (x.floor() as i32).clamp(1, (self.grid_w as i32) - 2) as usize;
+        let yi = (y.floor() as i32).clamp(1, (self.grid_h as i32) - 2) as usize;
+        let sample = |sx: usize, sy: usize| -> f32 {
+            let idx = f.idx(sx, sy);
+            if use_steam {
+                f.mass[SP_STEAM][idx] as f32
+            } else {
+                f.cell_temp_ck(idx) as f32
+            }
+        };
+        let gx = sample(xi + 1, yi) - sample(xi - 1, yi);
+        let gy = sample(xi, yi + 1) - sample(xi, yi - 1);
+        // Push DOWN the gradient (away from peak hotspot / steam core)
+        let mag = gx.hypot(gy);
+        if mag > 1.0 {
+            (-gx / mag, -gy / mag)
+        } else {
+            let ang = ((xi.wrapping_mul(73) ^ yi.wrapping_mul(151)) % 360) as f32 * 0.01745;
+            (ang.cos(), ang.sin())
+        }
+    }
+
     fn respawn_player(&mut self, pid: u32) {
         let Some((team, carrying, rx, ry)) = self
             .players
@@ -1668,6 +1836,9 @@ impl GameState {
             p.stamina = p.max_stamina;
             p.oiled_until = 0;
             p.chilled_until = 0;
+            p.kb_vx = 0.0;
+            p.kb_vy = 0.0;
+            p.last_phys_blast_field_tick = 0;
         }
     }
 
@@ -1694,6 +1865,7 @@ impl GameState {
         self.kill_feed.clear();
         self.speech_bubbles.clear();
         self.bot_overrides.clear();
+        self.recent_actuators.clear();
         self.pending_chat = None;
         self.weather_kind = WEATHER_CLEAR;
 
@@ -1735,6 +1907,9 @@ impl GameState {
                 p.oiled_until = 0;
                 p.chilled_until = 0;
                 p.carrying_relic = false;
+                p.kb_vx = 0.0;
+                p.kb_vy = 0.0;
+                p.last_phys_blast_field_tick = 0;
             }
         }
         for peer in self.peers.values_mut() {
@@ -1840,6 +2015,135 @@ impl GameState {
             feats[tr + 1] = ((self.relic_y - p.y) / 100.0).clamp(-1.0, 1.0);
             feats[tr + 3] = if p.carrying_relic { 1.0 } else { 0.0 };
             feats[tr + 11] = 1.0;
+        }
+
+        const ACTUATOR_OUT_DIM: usize = 10;
+        const ACTUATOR_INSPECT_DIM: usize = ACTUATOR_OUT_DIM + SALIENCY_DIM; // 26
+
+        if self.physics_native {
+            let act_res = if let Some(ref mut rpc) = self.bot_rpc {
+                rpc.call_batched(7, 1, 1, n as u16, BOT_FEAT_DIM as u16, &feats)
+            } else {
+                return false;
+            };
+            if let Ok((out_buf, gpu_ms)) = act_res {
+                if out_buf.len() == n * ACTUATOR_INSPECT_DIM {
+                    self.bot_infer_ms = gpu_ms;
+                    let to_u8 = |v: f32| -> u8 { (v.clamp(0.0, 1.0) * 255.0).round() as u8 };
+                    let mut brains = Vec::with_capacity(n);
+
+                    for (bi, &bid) in bot_ids.iter().enumerate() {
+                        let row = &out_buf[bi * ACTUATOR_INSPECT_DIM..(bi + 1) * ACTUATOR_INSPECT_DIM];
+                        let mut move_x = row[0];
+                        let mut move_y = row[1];
+                        let mut aim_dx = row[2];
+                        let mut aim_dy = row[3];
+                        let mut thermal_flux = row[4].clamp(-1.0, 1.0);
+                        let mut sp_water = row[5].clamp(0.0, 1.0);
+                        let mut sp_oil = row[6].clamp(0.0, 1.0);
+                        let mut sp_smoke = row[7].clamp(0.0, 1.0);
+                        let focus_radius = if row[8] <= 1.0 {
+                            1.5 + row[8].clamp(0.0, 1.0) * 7.0
+                        } else {
+                            row[8].clamp(1.5, 8.5)
+                        };
+                        let mut impulse = row[9].clamp(0.0, 1.0);
+
+                        if let Some(&ov) = self.bot_overrides.get(&bid) {
+                            if tick <= ov.expires_tick {
+                                if ov.move_x.hypot(ov.move_y) > 0.05 {
+                                    move_x = ov.move_x;
+                                    move_y = ov.move_y;
+                                    aim_dx = ov.move_x;
+                                    aim_dy = ov.move_y;
+                                }
+                                if let Some(oe) = ov.elem {
+                                    match oe % 3 {
+                                        0 => { thermal_flux = 0.95; }
+                                        1 => { thermal_flux = -0.95; }
+                                        _ => { sp_oil = 0.90; }
+                                    }
+                                }
+                                if let Some(ab) = ov.ability {
+                                    match ab {
+                                        0 => { sp_smoke = sp_smoke.max(0.65); impulse = impulse.max(0.75); }
+                                        1 | 5 => { impulse = impulse.max(0.90); }
+                                        3 => { sp_water = sp_water.max(0.75); }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+
+                        // Scale normalized emit vector [-1, 1] to physical target offset (up to 36 canonical cells)
+                        let aim_mag = aim_dx.hypot(aim_dy);
+                        let (tdx, tdy) = if aim_mag <= 1.5 {
+                            (aim_dx * 28.0, aim_dy * 28.0)
+                        } else {
+                            (aim_dx.clamp(-36.0, 36.0), aim_dy.clamp(-36.0, 36.0))
+                        };
+
+                        let move_inp = ClientInputDatagram {
+                            seq: tick as u32,
+                            move_x,
+                            move_y,
+                            aim_x: aim_dx,
+                            aim_y: aim_dy,
+                            dash: impulse > 0.78,
+                            melee: false,
+                            cast_bolt: false,
+                            bolt_element: 0,
+                            carve_ice: false,
+                            cast_ability_e: false,
+                            cast_ultimate_r: false,
+                            client_time_ms: 0,
+                        };
+                        self.apply_input(bid, &move_inp);
+                        self.apply_player_physical_actuator(
+                            bid,
+                            tdx,
+                            tdy,
+                            thermal_flux,
+                            sp_water,
+                            sp_oil,
+                            sp_smoke,
+                            focus_radius,
+                            impulse,
+                        );
+
+                        if let Some(p) = self.players.get(&bid) {
+                            let mut z_heatmap_4x4 = [0u8; 16];
+                            for k in 0..SALIENCY_DIM {
+                                z_heatmap_4x4[k] = to_u8(row[ACTUATOR_OUT_DIM + k]);
+                            }
+                            let elem_probs = [
+                                to_u8(thermal_flux.max(0.0)),
+                                to_u8((-thermal_flux).max(0.0)),
+                                to_u8(sp_oil.max(sp_water).max(sp_smoke)),
+                            ];
+                            let ability_probs = [
+                                to_u8(sp_smoke),
+                                to_u8(impulse),
+                                to_u8(thermal_flux.abs()),
+                                to_u8(sp_water),
+                                to_u8(sp_oil),
+                                to_u8(((focus_radius - 2.0) / 6.0).clamp(0.0, 1.0)),
+                            ];
+                            brains.push(BotBrainSnap {
+                                bot_id: bid,
+                                class_id: p.class_id,
+                                team: p.team,
+                                target_id: nearest_enemy_ids[bi],
+                                elem_probs,
+                                ability_probs,
+                                z_heatmap_4x4,
+                            });
+                        }
+                    }
+                    self.bot_brains = brains;
+                    return true;
+                }
+            }
         }
 
         // Try op=5 (OP_BOT_POLICY_INSPECT: 13 actions + 16 saliency floats), fallback gracefully to op=4
@@ -2006,6 +2310,84 @@ impl GameState {
                 _ => ((tick / 15 + bid as u64) % 3) as u8,
             };
 
+            if self.physics_native {
+                let mut move_inp = ClientInputDatagram {
+                    seq: tick as u32,
+                    move_x: tx - mx,
+                    move_y: ty - my,
+                    aim_x: ax,
+                    aim_y: ay,
+                    dash: (tick + bid as u64 * 17) % 75 == 0,
+                    melee: false,
+                    cast_bolt: false,
+                    bolt_element: 0,
+                    carve_ice: false,
+                    cast_ability_e: false,
+                    cast_ultimate_r: false,
+                    client_time_ms: 0,
+                };
+                let (mut tf, mut sw, mut so, mut ss, mut rad, mut imp) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 3.8f32, 0.0f32);
+                if (tick + bid as u64 * 9) % 12 == 0 && (edist < 34.0 || near_river) {
+                    match class_id {
+                        CLASS_WARDEN => {
+                            tf = -0.90;
+                            if edist < 8.0 { imp = 0.75; }
+                            rad = 4.5;
+                        }
+                        CLASS_ALCHEMIST => {
+                            if (tick / 12 + bid as u64) % 3 == 0 {
+                                so = 0.85;
+                                rad = 4.2;
+                            } else {
+                                tf = 0.95;
+                                rad = 3.8;
+                            }
+                        }
+                        _ => {
+                            if (tick / 12 + bid as u64) % 3 == 0 {
+                                ss = 0.75;
+                                sw = 0.35;
+                            } else {
+                                tf = if near_river { -0.80 } else { 0.85 };
+                            }
+                            if edist < 9.0 { imp = 0.65; }
+                        }
+                    }
+                }
+                if let Some(&ov) = self.bot_overrides.get(&bid) {
+                    if tick <= ov.expires_tick {
+                        if ov.move_x.hypot(ov.move_y) > 0.05 {
+                            move_inp.move_x = ov.move_x;
+                            move_inp.move_y = ov.move_y;
+                            move_inp.aim_x = ov.move_x;
+                            move_inp.aim_y = ov.move_y;
+                        }
+                        if let Some(oe) = ov.elem {
+                            match oe % 3 {
+                                0 => tf = 0.95,
+                                1 => tf = -0.95,
+                                _ => so = 0.90,
+                            }
+                        }
+                    }
+                }
+                self.apply_input(bid, &move_inp);
+                let dlen = move_inp.aim_x.hypot(move_inp.aim_y).max(1e-3);
+                let dist_off = edist.min(14.0).max(4.0);
+                self.apply_player_physical_actuator(
+                    bid,
+                    (move_inp.aim_x / dlen) * dist_off,
+                    (move_inp.aim_y / dlen) * dist_off,
+                    tf,
+                    sw,
+                    so,
+                    ss,
+                    rad,
+                    imp,
+                );
+                continue;
+            }
+
             let mut inp = ClientInputDatagram {
                 seq: tick as u32,
                 move_x: tx - mx,
@@ -2088,6 +2470,7 @@ impl GameState {
         }
         self.speech_bubbles.retain(|(exp, _)| tick <= *exp);
         self.bot_overrides.retain(|_, ov| tick <= ov.expires_tick);
+        self.recent_actuators.retain(|&(_, _, _, _, _, exp)| tick <= exp);
 
         // Hold victory celebration state for 10 seconds, then cleanly reset for the next match
         if self.match_phase != MATCH_PHASE_ACTIVE {
@@ -2129,14 +2512,25 @@ impl GameState {
 
         // Move players in 3D `(x, y, z)` with Skybridge/Plateau altitude & cliff-drop gravity!
         let pids: Vec<u32> = self.players.keys().copied().collect();
-        let mut burn_victims = Vec::new();
+        let mut phys_dmg_events: Vec<(Option<u32>, u32, i16, &'static str, u8)> = Vec::new();
+        let mut combo_callouts: Vec<(f32, f32, u8, String)> = Vec::new();
+        let field_tick = self.volume.tick;
+        let physics_native = self.physics_native;
         for pid in pids {
-            let (px, py, pz, vx, vy, mut vz, dash_until, chilled_until) = {
+            let (px, py, pz, vx, vy, mut vz, mut kb_vx, mut kb_vy, dash_until, chilled_until, team, last_blast_ft) = {
                 let p = &self.players[&pid];
-                (p.x, p.y, p.z, p.vx, p.vy, p.vz, p.dash_until, p.chilled_until)
+                (
+                    p.x, p.y, p.z, p.vx, p.vy, p.vz, p.kb_vx, p.kb_vy, p.dash_until,
+                    p.chilled_until, p.team, p.last_phys_blast_field_tick,
+                )
             };
             let cur_layer = (pz.round() as usize).clamp(surf_l, self.grid_d - 1);
             let hz_here = self.sample_hazard(px, py, cur_layer);
+            let phys = if physics_native {
+                self.volume.sample_entity_physics(px, py, cur_layer)
+            } else {
+                EntityVoxelPhysics::default()
+            };
             let on_raft = if pz < 1.35 {
                 self.rafts.iter().find_map(|b| {
                     if (px - b.x).powi(2) + (py - b.y).powi(2) <= (b.radius + 1.0).powi(2) {
@@ -2150,16 +2544,49 @@ impl GameState {
             };
 
             let mut mult = 1.0f32;
-            if on_raft.is_none() && (hz_here & (1 << 4)) != 0 { mult *= 0.60; }
-            if ((hz_here & (1 << 3)) != 0 || tick < chilled_until) && tick >= dash_until { mult *= 0.68; }
+            if physics_native {
+                // Locomotion emerges directly from voxel ice_frac (glide), oil_frac (slip), water_frac (drag)
+                if on_raft.is_none() && phys.water_frac > 0.05 && phys.ice_frac < 0.30 {
+                    mult *= (1.0 - 0.42 * phys.water_frac).clamp(0.45, 1.0);
+                }
+                if phys.ice_frac > 0.10 {
+                    mult *= 1.0 + 0.24 * phys.ice_frac;
+                }
+                if phys.oil_frac > 0.10 {
+                    mult *= 1.0 - 0.12 * phys.oil_frac;
+                }
+                if phys.temp_c < -15.0 && tick >= dash_until {
+                    let cold_slow = ((-15.0 - phys.temp_c) / 80.0).clamp(0.0, 0.32);
+                    mult *= 1.0 - cold_slow;
+                }
+                // Low-friction glide on ice / oil preserves momentum via kb_vx/kb_vy slip term
+                let slip = (phys.ice_frac * 0.72).max(phys.oil_frac * 0.55).clamp(0.0, 0.78);
+                if slip > 0.12 {
+                    kb_vx = kb_vx * (0.78 + 0.16 * slip) + vx * mult * (0.14 * slip);
+                    kb_vy = kb_vy * (0.78 + 0.16 * slip) + vy * mult * (0.14 * slip);
+                }
+            } else {
+                if on_raft.is_none() && (hz_here & (1 << 4)) != 0 { mult *= 0.60; }
+                if ((hz_here & (1 << 3)) != 0 || tick < chilled_until) && tick >= dash_until { mult *= 0.68; }
+            }
             let (cvx, cvy) = on_raft.unwrap_or((0.0, 0.0));
-            let nx = (px + (vx * mult + cvx) * dt).clamp(3.5, gw - 3.5);
-            let ny = (py + (vy * mult + cvy) * dt).clamp(3.5, gh - 3.5);
+            let nx = (px + (vx * mult + cvx + kb_vx) * dt).clamp(3.5, gw - 3.5);
+            let ny = (py + (vy * mult + cvy + kb_vy) * dt).clamp(3.5, gh - 3.5);
+            kb_vx *= 0.82;
+            kb_vy *= 0.82;
+            if kb_vx.abs() < 0.05 { kb_vx = 0.0; }
+            if kb_vy.abs() < 0.05 { kb_vy = 0.0; }
 
             // Can step on current layer OR onto Layer 2 highland plateau/skybridge via ramps!
             let can_step_xy = |tx: f32, ty: f32| -> bool {
                 if pz >= 1.55 {
-                    if self.layer2_has_walkable_deck(tx, ty) {
+                    if physics_native {
+                        let p2 = self.volume.sample_entity_physics(tx, ty, 2.min(self.grid_d - 1));
+                        let hz2 = self.sample_hazard(tx, ty, 2.min(self.grid_d - 1));
+                        if p2.support_solid && (hz2 & (1 << 1)) == 0 {
+                            return true;
+                        }
+                    } else if self.layer2_has_walkable_deck(tx, ty) {
                         return true;
                     }
                     // Allow stepping off cliff / skybridge into open air above walkable/water surface!
@@ -2182,9 +2609,18 @@ impl GameState {
             };
 
             // 3D Vertical Altitude Update:
-            // - Ramp transition near NW/NE plateau edges (ny≈0.32..0.35 or SE overlook) lifts player smoothly to L2!
-            // - Staying on Layer 2 deck holds z = 2.0; walking off cliff or burned timber Skybridge falls under gravity!
-            let l2_deck = self.layer2_has_walkable_deck(fx, fy);
+            // - In physics_native: structural support comes directly from `sample_entity_physics(..., 2).support_solid`!
+            //   If a timber skybridge burns or ice bridge melts beneath an L2 entity, gravity drops them cleanly to L1!
+            let l2_deck = if self.grid_d >= 3 {
+                if physics_native {
+                    let p2 = self.volume.sample_entity_physics(fx, fy, 2);
+                    p2.support_solid && (self.sample_hazard(fx, fy, 2) & (1 << 1)) == 0
+                } else {
+                    self.layer2_has_walkable_deck(fx, fy)
+                }
+            } else {
+                false
+            };
             let nx_norm = fx / gw;
             let ny_norm = fy / gh;
             let on_ramp = self.grid_d >= 3
@@ -2208,32 +2644,83 @@ impl GameState {
 
             let critter_here = (self.sample_hazard(fx, fy, surf_l) >> 5) & 0x07;
             let near_friendly_shrine = {
-                let t = self.players[&pid].team;
-                let want = if t == 0 { -1 } else { 1 };
+                let want = if team == 0 { -1 } else { 1 };
                 self.shrines.iter().any(|s| s.owner == want && (s.x - fx).hypot(s.y - fy) < 18.0)
             };
             let regen_mul = 1.0
                 + if critter_here >= 2 { 0.45 } else { 0.0 }
                 + if near_friendly_shrine { 0.55 } else { 0.0 };
 
+            let mut new_last_blast_ft = last_blast_ft;
+            if physics_native && tick >= dash_until {
+                let owner = self.find_recent_actuator_owner(fx, fy, team);
+                // 1. Emergent Blast Damage & Knockback from combustion (delta_temp_spike) & flash-boil (delta_steam_burst)
+                if field_tick != last_blast_ft {
+                    if phys.delta_temp_spike > 18.0 {
+                        let dmg = ((phys.delta_temp_spike - 15.0) * 0.42).round().clamp(6.0, 38.0) as i16;
+                        let (bx, by) = self.voxel_blast_dir(fx, fy, cur_layer, false);
+                        let push = (phys.delta_temp_spike.min(120.0) * 0.34).clamp(8.0, 42.0);
+                        kb_vx = (kb_vx + bx * push).clamp(-48.0, 48.0);
+                        kb_vy = (kb_vy + by * push).clamp(-48.0, 48.0);
+                        phys_dmg_events.push((owner, pid, dmg, "DETONATION!", 0));
+                        if dmg >= 14 {
+                            combo_callouts.push((fx, fy, 1 - team, "COMBUSTION BLAST!".into()));
+                        }
+                        new_last_blast_ft = field_tick;
+                    } else if phys.delta_steam_burst > 0.06 {
+                        let dmg = (phys.delta_steam_burst * 95.0).round().clamp(5.0, 32.0) as i16;
+                        let (bx, by) = self.voxel_blast_dir(fx, fy, cur_layer, true);
+                        let push = (phys.delta_steam_burst * 72.0).clamp(8.0, 38.0);
+                        kb_vx = (kb_vx + bx * push).clamp(-48.0, 48.0);
+                        kb_vy = (kb_vy + by * push).clamp(-48.0, 48.0);
+                        phys_dmg_events.push((owner, pid, dmg, "FLASH-BOIL!", 0));
+                        if dmg >= 12 {
+                            combo_callouts.push((fx, fy, 1 - team, "FLASH-BOIL BURST!".into()));
+                        }
+                        new_last_blast_ft = field_tick;
+                    }
+                }
+                // 2. Scorch / Hypothermia damage from temp_c extremes (>120°C or <-25°C)
+                if tick % 6 == 0 {
+                    if phys.temp_c > 120.0 {
+                        let dmg = (((phys.temp_c - 120.0) / 45.0).ceil() as i16).clamp(2, 16);
+                        phys_dmg_events.push((owner, pid, dmg, "SCORCH", 0));
+                    } else if phys.temp_c < -25.0 {
+                        let dmg = (((-25.0 - phys.temp_c) / 22.0).ceil() as i16).clamp(1, 10);
+                        phys_dmg_events.push((owner, pid, dmg, "HYPO", 1));
+                    }
+                }
+            }
+
             let p = self.players.get_mut(&pid).unwrap();
             p.x = fx;
             p.y = fy;
             p.z = fz;
             p.vz = vz;
+            p.kb_vx = kb_vx;
+            p.kb_vy = kb_vy;
+            p.last_phys_blast_field_tick = new_last_blast_ft;
             p.mana = (p.mana + 9.5 * regen_mul * dt).min(p.max_mana);
             p.stamina = (p.stamina + 16.0 * regen_mul * dt).min(p.max_stamina);
 
-            if tick % 8 == 0 && (hz_here & (1 << 2)) != 0 && tick >= dash_until {
+            if physics_native {
+                if tick % 25 == 0 && p.hp < p.max_hp && phys.temp_c <= 120.0 && phys.temp_c >= -25.0 {
+                    let heal = if near_friendly_shrine { 4 } else { 2 };
+                    p.hp = (p.hp + heal).min(p.max_hp);
+                }
+            } else if tick % 8 == 0 && (hz_here & (1 << 2)) != 0 && tick >= dash_until {
                 let burn_dmg = if tick < p.oiled_until { 8 } else { 4 };
-                burn_victims.push((pid, burn_dmg));
+                phys_dmg_events.push((None, pid, burn_dmg, "BURN", 0));
             } else if tick % 25 == 0 && p.hp < p.max_hp && (hz_here & (1 << 2)) == 0 {
                 let heal = if near_friendly_shrine { 4 } else { 2 };
                 p.hp = (p.hp + heal).min(p.max_hp);
             }
         }
-        for (vid, dmg) in burn_victims {
-            self.apply_damage(None, vid, dmg, "BURN", 0);
+        for (owner, vid, dmg, tag, elem) in phys_dmg_events {
+            self.apply_damage(owner, vid, dmg, tag, elem);
+        }
+        for (cx, cy, t, lbl) in combo_callouts {
+            self.push_event(2, cx, cy, 0, t, lbl);
         }
 
         // Advance 3D projectiles + High-Ground Damage Bonus + Elemental Combos!
@@ -2501,12 +2988,20 @@ impl GameState {
             .values()
             .map(|p| {
                 let pl = (p.z.round() as usize).clamp(surf_l, self.grid_d - 1);
-                let hz = self.sample_hazard(p.x, p.y, pl);
                 let mut status = 0u8;
-                if (hz & (1 << 2)) != 0 { status |= STATUS_BURNING; }
-                if (hz & (1 << 3)) != 0 || tick < p.chilled_until { status |= STATUS_CHILLED; }
-                if (hz & (1 << 4)) != 0 { status |= STATUS_WET; }
-                if tick < p.oiled_until { status |= STATUS_OILED; }
+                if self.physics_native {
+                    let phys = self.volume.sample_entity_physics(p.x, p.y, pl);
+                    if phys.temp_c > 120.0 { status |= STATUS_BURNING; }
+                    if phys.temp_c < -15.0 { status |= STATUS_CHILLED; }
+                    if phys.water_frac > 0.18 && phys.ice_frac < 0.30 { status |= STATUS_WET; }
+                    if phys.oil_frac > 0.12 { status |= STATUS_OILED; }
+                } else {
+                    let hz = self.sample_hazard(p.x, p.y, pl);
+                    if (hz & (1 << 2)) != 0 { status |= STATUS_BURNING; }
+                    if (hz & (1 << 3)) != 0 || tick < p.chilled_until { status |= STATUS_CHILLED; }
+                    if (hz & (1 << 4)) != 0 { status |= STATUS_WET; }
+                    if tick < p.oiled_until { status |= STATUS_OILED; }
+                }
                 if tick < p.shield_until { status |= STATUS_SHIELDED; }
                 if tick < p.haste_until { status |= STATUS_HASTE; }
                 PlayerSnap {
@@ -2610,6 +3105,7 @@ impl GameState {
             score_east: self.score_east,
             acoustic_ms: self.acoustic_ms,
             world_sparse_pct: self.world_sparse_pct,
+            physics_native: self.physics_native,
         };
         let match_secs = self.match_start_instant.elapsed().as_secs() as u32;
         let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
@@ -3137,6 +3633,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         });
                                     }
                                 }
+                            }
+                            ClientReliable::TogglePhysicsNative => {
+                                gs.physics_native = !gs.physics_native;
+                                let lbl = if gs.physics_native {
+                                    "MODE: PHYSICS-NATIVE ACTUATORS!"
+                                } else {
+                                    "MODE: CLASSIC SPELLS"
+                                };
+                                let (mx, my) = (gs.grid_w as f32 * 0.5, gs.grid_h as f32 * 0.5);
+                                gs.push_event(5, mx, my, 0, 2, lbl.to_string());
+                            }
+                            ClientReliable::PhysicalActuator {
+                                dx,
+                                dy,
+                                thermal_flux,
+                                sp_water,
+                                sp_oil,
+                                sp_smoke,
+                                focus_radius,
+                                impulse,
+                            } => {
+                                gs.apply_player_physical_actuator(
+                                    pid,
+                                    dx,
+                                    dy,
+                                    thermal_flux,
+                                    sp_water,
+                                    sp_oil,
+                                    sp_smoke,
+                                    focus_radius,
+                                    impulse,
+                                );
                             }
                         }
                     }

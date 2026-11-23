@@ -31,6 +31,7 @@ pub struct HudConfig<'a> {
     pub show_brain_inspector: bool,
     pub brain_selected_idx: Option<usize>,
     pub selected_element: u8,
+    pub focus_radius: f32,
     pub style_label: &'static str,
     pub fps: f32,
     pub rtt_ms: f32,
@@ -293,7 +294,7 @@ pub fn build_hud(
                 let mut cy = (sy - card_h - 10.0 * ui).clamp(safe_min_y, (safe_max_y - card_h).max(safe_min_y));
 
                 // Avoid top-left telemetry & top-right minimap / brain inspector
-                if cfg.show_telemetry && cx < 428.0 * ui && cy < 166.0 * ui {
+                if cfg.show_telemetry && cx < 428.0 * ui && cy < 184.0 * ui {
                     cx = 430.0 * ui;
                 }
                 let right_guard_h = if cfg.show_brain_inspector { 442.0 * ui } else { 226.0 * ui };
@@ -567,7 +568,7 @@ pub fn build_hud(
                 b.rect(mid_x - 4.0 * ui, mid_y - 0.75 * ui, 8.0 * ui, 1.5 * ui, [1.0, 1.0, 1.0, 0.75]);
                 b.rect(mid_x - 0.75 * ui, mid_y - 4.0 * ui, 1.5 * ui, 8.0 * ui, [1.0, 1.0, 1.0, 0.75]);
 
-                // Right: Element Intent Bars (FIR, FRS, OIL)
+                // Right: Element / Physical Actuator Intent Bars
                 let ex = bi_x + 108.0 * ui;
                 let mut ey = bi_y + 38.0 * ui;
                 let bar_w = 84.0 * ui;
@@ -581,11 +582,19 @@ pub fn build_hud(
                 } else {
                     2
                 };
-                let elems: [(&str, u8, [f32; 4]); 3] = [
-                    ("FIR", brain.elem_probs[0], [1.00, 0.44, 0.16, 1.0]),
-                    ("FRS", brain.elem_probs[1], [0.34, 0.88, 1.00, 1.0]),
-                    ("OIL", brain.elem_probs[2], [0.78, 0.36, 0.96, 1.0]),
-                ];
+                let elems: [(&str, u8, [f32; 4]); 3] = if ent.telemetry.physics_native {
+                    [
+                        ("+DE", brain.elem_probs[0], [1.00, 0.44, 0.16, 1.0]),
+                        ("-DE", brain.elem_probs[1], [0.34, 0.88, 1.00, 1.0]),
+                        ("MAT", brain.elem_probs[2], [0.78, 0.36, 0.96, 1.0]),
+                    ]
+                } else {
+                    [
+                        ("FIR", brain.elem_probs[0], [1.00, 0.44, 0.16, 1.0]),
+                        ("FRS", brain.elem_probs[1], [0.34, 0.88, 1.00, 1.0]),
+                        ("OIL", brain.elem_probs[2], [0.78, 0.36, 0.96, 1.0]),
+                    ]
+                };
                 for (ei, (lbl, prob, col)) in elems.iter().enumerate() {
                     let frac = (*prob as f32 / 255.0).clamp(0.0, 1.0);
                     b.text(ex, ey + 1.0 * ui, 1.05 * ui, if ei == dom_elem { *col } else { text_dim }, lbl);
@@ -616,16 +625,31 @@ pub fn build_hud(
                 };
                 b.text(ex, ey + 18.0 * ui, 1.00 * ui, text_dim, cls_tag);
 
-                // Bottom: 5 Ability Intent Bars (BLT, MLE, DSH, E, R)
+                // Bottom: 5 Ability / Actuator Intent Bars
                 let ab_y = bi_y + 136.0 * ui;
-                b.text(bi_x + 10.0 * ui, ab_y, 1.00 * ui, text_dim, "ABILITY INTENT");
-                let abilities: [(&str, u8, [f32; 4]); 5] = [
-                    ("BLT", brain.ability_probs[2], [1.00, 0.58, 0.20, 1.0]),
-                    ("MLE", brain.ability_probs[1], [0.96, 0.86, 0.52, 1.0]),
-                    ("DSH", brain.ability_probs[0], [0.36, 0.92, 1.00, 1.0]),
-                    ("E", brain.ability_probs[4], [0.40, 0.96, 0.58, 1.0]),
-                    ("R", brain.ability_probs[5], [1.00, 0.36, 0.44, 1.0]),
-                ];
+                let ab_hdr = if ent.telemetry.physics_native {
+                    "ACTUATOR INTENT"
+                } else {
+                    "ABILITY INTENT"
+                };
+                b.text(bi_x + 10.0 * ui, ab_y, 1.00 * ui, text_dim, ab_hdr);
+                let abilities: [(&str, u8, [f32; 4]); 5] = if ent.telemetry.physics_native {
+                    [
+                        ("FLX", brain.ability_probs[2], [1.00, 0.52, 0.18, 1.0]),
+                        ("IMP", brain.ability_probs[1], [0.96, 0.86, 0.52, 1.0]),
+                        ("SMK", brain.ability_probs[0], [0.68, 0.78, 0.92, 1.0]),
+                        ("OIL", brain.ability_probs[4], [0.78, 0.36, 0.96, 1.0]),
+                        ("RAD", brain.ability_probs[5], [0.32, 0.96, 0.76, 1.0]),
+                    ]
+                } else {
+                    [
+                        ("BLT", brain.ability_probs[2], [1.00, 0.58, 0.20, 1.0]),
+                        ("MLE", brain.ability_probs[1], [0.96, 0.86, 0.52, 1.0]),
+                        ("DSH", brain.ability_probs[0], [0.36, 0.92, 1.00, 1.0]),
+                        ("E", brain.ability_probs[4], [0.40, 0.96, 0.58, 1.0]),
+                        ("R", brain.ability_probs[5], [1.00, 0.36, 0.44, 1.0]),
+                    ]
+                };
                 let col_w = 38.0 * ui;
                 let col_gap = 6.5 * ui;
                 let meter_h = 34.0 * ui;
@@ -694,7 +718,7 @@ pub fn build_hud(
         let tx = 14.0 * ui;
         let ty = 14.0 * ui;
         let tw = 408.0 * ui;
-        let th = 134.0 * ui;
+        let th = 154.0 * ui;
         b.rect(tx, ty, tw, th, panel_bg);
         b.rect_outline(tx, ty, tw, th, 1.5 * ui, panel_border);
 
@@ -732,6 +756,14 @@ pub fn build_hud(
                 "ACOUSTIC {:.2}MS  SPARSE {:.0}%",
                 t.acoustic_ms, sparse_disp
             );
+            let (l7, l7_col) = if t.physics_native {
+                (
+                    format!("PHYSICS-NATIVE [P]  FOCUS R={:.1}", cfg.focus_radius),
+                    [0.24, 0.98, 0.72, 1.0],
+                )
+            } else {
+                ("CLASSIC SPELLS [P]".to_string(), text_dim)
+            };
             b.text_shadow(tx + 10.0 * ui, ty + 10.0 * ui, sc, gold_col, &l1);
             b.text_shadow(tx + 10.0 * ui, ty + 30.0 * ui, sc, text_hi, &l2);
             b.text_shadow(
@@ -760,6 +792,7 @@ pub fn build_hud(
                 if sparse_disp < 95.0 { [0.28, 0.96, 0.62, 1.0] } else { [0.76, 0.86, 1.0, 1.0] },
                 &l6,
             );
+            b.text_shadow(tx + 10.0 * ui, ty + 130.0 * ui, sc, l7_col, &l7);
         }
 
         // Compact Shrine / Combo / Weather Feed right below telemetry (kills live in dedicated right-edge Kill Feed)
@@ -858,42 +891,64 @@ pub fn build_hud(
         b.rect(bar_x, hy + 72.0 * ui, bar_w * st_f, 11.0 * ui, [0.96, 0.78, 0.24, 0.98]);
         b.text_shadow(bar_x + 6.0 * ui, hy + 73.5 * ui, 1.15 * ui, text_hi, &format!("STA {}", p.stamina));
 
+        let phys_native = entities.map(|e| e.telemetry.physics_native).unwrap_or(false);
+
         // Controls hint bar at bottom
+        let hint_bar = if phys_native {
+            format!("1-3 MATTER  [/] R={:.1}  P MODE  TAB SCORE  ENTER CHAT", cfg.focus_radius)
+        } else {
+            "1-3 ELEM  P MODE  F1-F3 CLS  TAB SCORE  ENTER CHAT".to_string()
+        };
         b.text(
             bar_x,
             hy + 92.0 * ui,
             1.05 * ui,
             text_dim,
-            "1-3 ELEM  F1-F3 CLS  TAB SCORE  U SFX  ENTER CHAT",
+            &hint_bar,
         );
 
-        // 5-Slot Spell Hotbar (right side of hero plate)
+        // 5-Slot Action Hotbar (right side of hero plate: Continuous Actuators or Classic Spells)
         let slot_sz = 54.0 * ui;
         let slot_gap = 8.0 * ui;
         let sx0 = hx + 244.0 * ui;
         let sy0 = hy + 32.0 * ui;
-        let elem_lbl = match cfg.selected_element % 3 {
-            0 => ("FIRE", [1.0, 0.50, 0.16, 1.0]),
-            1 => ("FROST", [0.42, 0.92, 1.0, 1.0]),
-            _ => ("OIL", [0.78, 0.36, 0.96, 1.0]),
+        let slots: [(&str, &str, [f32; 4], f32); 5] = if phys_native {
+            let matter_lbl = match cfg.selected_element % 3 {
+                0 => ("OIL", [0.78, 0.36, 0.96, 1.0]),
+                1 => ("WATER", [0.26, 0.66, 1.0, 1.0]),
+                _ => ("SMOKE", [0.74, 0.80, 0.90, 1.0]),
+            };
+            [
+                ("LMB", "+HEAT", [1.0, 0.46, 0.16, 1.0], 0.0),
+                ("RMB", "-CRYO", [0.36, 0.90, 1.0, 1.0], 0.0),
+                ("SPC", "DASH", [0.48, 0.92, 1.0, 1.0], p.dash_cd_frac),
+                ("E", matter_lbl.0, matter_lbl.1, 0.0),
+                ("R", "PULSE", [1.0, 0.72, 0.24, 1.0], 0.0),
+            ]
+        } else {
+            let elem_lbl = match cfg.selected_element % 3 {
+                0 => ("FIRE", [1.0, 0.50, 0.16, 1.0]),
+                1 => ("FROST", [0.42, 0.92, 1.0, 1.0]),
+                _ => ("OIL", [0.78, 0.36, 0.96, 1.0]),
+            };
+            let e_lbl = match p.class_id {
+                CLASS_WARDEN => "BRIDGE",
+                CLASS_ALCHEMIST => "OILFAN",
+                _ => "SPRINT",
+            };
+            let r_lbl = match p.class_id {
+                CLASS_WARDEN => "NOVA",
+                CLASS_ALCHEMIST => "METEOR",
+                _ => "SURGE",
+            };
+            [
+                ("LMB", elem_lbl.0, elem_lbl.1, 0.0),
+                ("RMB", "MELEE", [0.96, 0.86, 0.56, 1.0], 0.0),
+                ("SPC", "DASH", [0.48, 0.92, 1.0, 1.0], p.dash_cd_frac),
+                ("E", e_lbl, [0.46, 0.96, 0.62, 1.0], p.ability_e_cd_frac),
+                ("R", r_lbl, [1.0, 0.68, 0.24, 1.0], p.ult_r_cd_frac),
+            ]
         };
-        let e_lbl = match p.class_id {
-            CLASS_WARDEN => "BRIDGE",
-            CLASS_ALCHEMIST => "OILFAN",
-            _ => "SPRINT",
-        };
-        let r_lbl = match p.class_id {
-            CLASS_WARDEN => "NOVA",
-            CLASS_ALCHEMIST => "METEOR",
-            _ => "SURGE",
-        };
-        let slots: [(&str, &str, [f32; 4], f32); 5] = [
-            ("LMB", elem_lbl.0, elem_lbl.1, 0.0),
-            ("RMB", "MELEE", [0.96, 0.86, 0.56, 1.0], 0.0),
-            ("SPC", "DASH", [0.48, 0.92, 1.0, 1.0], p.dash_cd_frac),
-            ("E", e_lbl, [0.46, 0.96, 0.62, 1.0], p.ability_e_cd_frac),
-            ("R", r_lbl, [1.0, 0.68, 0.24, 1.0], p.ult_r_cd_frac),
-        ];
 
         for (i, (key, name, col, cd)) in slots.iter().enumerate() {
             let x = sx0 + i as f32 * (slot_sz + slot_gap);

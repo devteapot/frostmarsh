@@ -9,6 +9,7 @@ Serves low-latency GPU inference on TCP_NODELAY and optional Unix domain socket:
   - op=4: BotPolicyNet    ([N, 168]      f32 -> [N, 13]       f32) reads cached Z_world & Z_eco ZERO-COPY from VRAM!
   - op=5: BotPolicyInspect([N, 168]      f32 -> [N, 29]       f32) returns 13 action floats + 16 (4x4) Z_world saliency floats!
   - op=6: AcousticStep    (UTF-8 JSON -> UTF-8 JSON) 3D physical acoustics, emergent bot speech bubbles & human chat overrides!
+  - op=7: ActuatorPolicy  ([N, 168]      f32 -> [N, 26]       f32) continuous physical actuators (10 floats) + 16 (4x4) Z_world saliency!
 """
 
 from __future__ import annotations
@@ -52,6 +53,11 @@ try:
 except Exception:
     LiveAcousticEngine = None  # type: ignore[assignment]
 
+try:
+    from actuator_policy import ActuatorPolicyNet  # type: ignore  # noqa: E402
+except Exception:
+    ActuatorPolicyNet = None  # type: ignore[assignment]
+
 HEADER_STRUCT = struct.Struct("<BBHHHII")
 HEADER_SIZE = HEADER_STRUCT.size  # 16 bytes
 
@@ -60,6 +66,10 @@ OP_ECO_STEP = 2
 OP_BOT_POLICY = 4
 OP_BOT_POLICY_INSPECT = 5
 OP_ACOUSTIC_STEP = 6
+OP_ACTUATOR_POLICY = 7
+
+ACTUATOR_OUT_DIM = 10
+ACTUATOR_INSPECT_OUT_DIM = ACTUATOR_OUT_DIM + 16  # 26 floats per bot
 
 STATUS_OK = 0
 STATUS_BAD_REQUEST = 1
@@ -293,6 +303,7 @@ class InferenceEngine:
         warmup_shapes: tuple[tuple[int, int], ...] = ((128, 128),),
         use_sparse_world: bool = True,
         acoustic_pt: Path | None = None,
+        actuator_pt: Path | None = None,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.use_fp16 = use_fp16 and (self.device.type == "cuda")
@@ -326,6 +337,24 @@ class InferenceEngine:
                 bp.to(self.device)
                 self.bot_policy = bp
                 print(f"[gpu_infer_daemon] Loaded Shared-Latent BotPolicyNet from {bot_pt}", flush=True)
+
+        self.actuator_policy: Any = None
+        act_path = actuator_pt if actuator_pt is not None else (_SCRIPT_DIR / "actuator_policy_rl.pt")
+        if ActuatorPolicyNet is not None and act_path.exists():
+            try:
+                sd_act = _load_state_dict(act_path)
+                ap = ActuatorPolicyNet().eval()
+                ap.load_state_dict(sd_act)
+                ap.to(self.device)
+                self.actuator_policy = ap
+                print(f"[gpu_infer_daemon] Loaded ActuatorPolicyNet from {act_path}", flush=True)
+            except Exception as exc:
+                print(
+                    f"[gpu_infer_daemon] ActuatorPolicyNet load failed ({exc}); using BotPolicy->Actuator fallback",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.actuator_policy = None
 
         self.use_sparse_world: bool = bool(use_sparse_world and SparseWorldRunner is not None)
         self._sparse_runners: dict[tuple[int, int, int], _SparseWorldAdapter] = {}
@@ -854,6 +883,84 @@ class InferenceEngine:
             infer_us = int((time.perf_counter() - t0) * 1_000_000)
         return out_np.tobytes(), infer_us
 
+    def infer_actuators(self, n_bots: int, raw_bytes: bytes) -> tuple[bytes, int]:
+        if self.actuator_policy is None and self.bot_policy is None:
+            raise RuntimeError("neither actuator_policy_rl.pt nor bot_policy.pt loaded")
+        arr = np.frombuffer(raw_bytes, dtype=np.float32).reshape(n_bots, BOT_FEAT_DIM).copy()
+        with self.lock:
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                bf = torch.from_numpy(arr).to(self.device, non_blocking=False)
+                if self.actuator_policy is not None:
+                    if self.use_fp16:
+                        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                            res = self.actuator_policy(
+                                self.last_z_world, self.last_z_eco, bf, return_saliency=True
+                            )
+                    else:
+                        res = self.actuator_policy(
+                            self.last_z_world, self.last_z_eco, bf, return_saliency=True
+                        )
+                    if isinstance(res, tuple):
+                        act, saliency = res
+                        out_t = torch.cat([act.float(), saliency.float()], dim=-1)
+                    else:
+                        out_t = res.float()
+                else:
+                    # Clean fallback: run BotPolicyNetV2/BotPolicyNet and map to 10 continuous physical actuators + 16 saliency
+                    if self.use_fp16:
+                        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                            actions, saliency = self.bot_policy(
+                                self.last_z_world, self.last_z_eco, bf, return_saliency=True
+                            )
+                    else:
+                        actions, saliency = self.bot_policy(
+                            self.last_z_world, self.last_z_eco, bf, return_saliency=True
+                        )
+                    a = actions.float()
+                    sal = saliency.float()
+                    move_x = a[:, 0]
+                    move_y = a[:, 1]
+                    aim_dx = a[:, 2]
+                    aim_dy = a[:, 3]
+                    p_dash = a[:, 4]
+                    p_melee = a[:, 5]
+                    p_bolt = a[:, 6]
+                    p_carve = a[:, 7]
+                    p_e = a[:, 8]
+                    p_r = a[:, 9]
+                    p_fire = a[:, 10]
+                    p_frost = a[:, 11]
+                    p_oil = a[:, 12]
+
+                    cast_gate = F.relu(torch.clamp(p_bolt + 0.65 * p_e + 0.90 * p_r, 0.0, 1.0) - 0.30) / 0.70
+                    thermal_flux = torch.clamp((p_fire - p_frost) * cast_gate, -1.0, 1.0)
+                    sp_water = torch.clamp(0.35 * p_carve * p_frost + 0.25 * p_e * p_frost, 0.0, 1.0)
+                    sp_oil = torch.clamp(p_oil * cast_gate, 0.0, 1.0)
+                    sp_smoke = torch.clamp(0.55 * p_dash + 0.35 * p_e * (1.0 - p_frost), 0.0, 1.0)
+                    focus_radius = torch.clamp(0.20 + 0.50 * p_e + 0.80 * p_r, 0.0, 1.0)
+                    impulse = torch.clamp(0.75 * p_melee + 0.50 * p_dash + 0.85 * p_r, 0.0, 1.0)
+
+                    act10 = torch.stack(
+                        [
+                            move_x,
+                            move_y,
+                            aim_dx,
+                            aim_dy,
+                            thermal_flux,
+                            sp_water,
+                            sp_oil,
+                            sp_smoke,
+                            focus_radius,
+                            impulse,
+                        ],
+                        dim=-1,
+                    )
+                    out_t = torch.cat([act10, sal], dim=-1)
+                out_np = out_t.cpu().numpy().astype(np.float32, copy=False)
+            infer_us = int((time.perf_counter() - t0) * 1_000_000)
+        return out_np.tobytes(), infer_us
+
 
 class GPUInferDaemon:
     def __init__(self, host: str, port: int, engine: InferenceEngine, unix_sock: str | None = None):
@@ -965,6 +1072,30 @@ class GPUInferDaemon:
                     conn.sendall(out_bytes)
                     continue
 
+                if op == OP_ACTUATOR_POLICY:
+                    n_bots = int(height)
+                    expected_bytes = n_bots * BOT_FEAT_DIM * 4
+                    if n_bots <= 0 or width != BOT_FEAT_DIM or payload_bytes != expected_bytes:
+                        if 0 < payload_bytes <= 16 * 1024 * 1024:
+                            _recv_exact(conn, memoryview(bytearray(payload_bytes)))
+                        self._send_error(conn, STATUS_BAD_REQUEST, height, width)
+                        continue
+                    raw_in = bytearray(payload_bytes)
+                    if not _recv_exact(conn, memoryview(raw_in)):
+                        break
+                    try:
+                        out_bytes, infer_us = self.engine.infer_actuators(n_bots, bytes(raw_in))
+                    except Exception as exc:
+                        print(f"[gpu_infer_daemon] Actuator policy error: {exc}", file=sys.stderr)
+                        self._send_error(conn, STATUS_INTERNAL_ERROR, height, width)
+                        continue
+                    resp_hdr = HEADER_STRUCT.pack(
+                        STATUS_OK, 1, 1, n_bots, ACTUATOR_INSPECT_OUT_DIM, len(out_bytes), infer_us
+                    )
+                    conn.sendall(resp_hdr)
+                    conn.sendall(out_bytes)
+                    continue
+
                 if op in (OP_BOT_POLICY, OP_BOT_POLICY_INSPECT):
                     inspect = op == OP_BOT_POLICY_INSPECT
                     out_dim = INSPECT_OUT_DIM if inspect else ACTION_OUT_DIM
@@ -1047,6 +1178,7 @@ def main() -> None:
     parser.add_argument("--world-model", type=Path, default=_SCRIPT_DIR / "world_model.pt")
     parser.add_argument("--eco-model", type=Path, default=_SCRIPT_DIR / "ecosystem_model.pt")
     parser.add_argument("--bot-policy", type=Path, default=_SCRIPT_DIR / "bot_policy.pt")
+    parser.add_argument("--actuator-policy", type=Path, default=_SCRIPT_DIR / "actuator_policy_rl.pt")
     parser.add_argument("--acoustic-ckpt", type=Path, default=_SCRIPT_DIR / "acoustic_comm_live.pt")
     parser.add_argument(
         "--sparse-world",
@@ -1065,6 +1197,7 @@ def main() -> None:
         use_fp16=not args.fp32,
         use_sparse_world=args.sparse_world,
         acoustic_pt=args.acoustic_ckpt,
+        actuator_pt=args.actuator_policy,
     )
     daemon = GPUInferDaemon(host, port, engine, unix_sock=args.unix_sock)
     daemon.start_listening()
@@ -1080,6 +1213,7 @@ def main() -> None:
     print(
         f"[gpu_infer_daemon] Ready on {host}:{daemon.actual_port}{unix_info} | device={dev_name} | "
         f"fp16={engine.use_fp16} | neural_bots={engine.bot_policy is not None} | "
+        f"actuator_policy={engine.actuator_policy is not None} | "
         f"sparse_world={engine.use_sparse_world} | acoustics={'neural' if engine.acoustic_engine is not None else 'physical-fallback'}",
         flush=True,
     )

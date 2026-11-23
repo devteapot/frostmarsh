@@ -1,5 +1,5 @@
 //! Smooth 3D Surface-Nets Isosurface Mesh Extractor (`solid_density == 0.5`)
-//! with `16×16×16` Brick Partitioning for WASM & WebGPU.
+//! with `16×16×D` (`D = 16..=32`) Brick Partitioning and Incremental Brick Rebuild for WASM & WebGPU.
 
 use crate::volume::WorldVolume3D;
 use bytemuck::{Pod, Zeroable};
@@ -23,6 +23,8 @@ pub struct BrickMesh {
 }
 
 pub struct SurfaceNetsWorld {
+    pub bricks_x: usize,
+    pub bricks_z: usize,
     pub bricks: Vec<BrickMesh>,
 }
 
@@ -53,7 +55,7 @@ const CORNER_OFFSETS: [[f32; 3]; 8] = [
 ];
 
 impl SurfaceNetsWorld {
-    /// Extract the full 3D Surface-Nets mesh across all `16×16×16` bricks.
+    /// Extract the full 3D Surface-Nets mesh across all `16×16×D` bricks.
     pub fn build_all(volume: &WorldVolume3D) -> Self {
         let bricks_x = volume.width.div_ceil(SN_BRICK_SIZE);
         let bricks_z = volume.height.div_ceil(SN_BRICK_SIZE);
@@ -63,7 +65,41 @@ impl SurfaceNetsWorld {
                 bricks.push(extract_brick(volume, bx, bz));
             }
         }
-        Self { bricks }
+        Self {
+            bricks_x,
+            bricks_z,
+            bricks,
+        }
+    }
+
+    /// Incrementally rebuild a single `16×16×D` brick `(bx, bz)` and its watertight seam neighbors.
+    /// Returns the number of brick meshes rebuilt.
+    pub fn rebuild_brick_and_neighbors(
+        &mut self,
+        volume: &WorldVolume3D,
+        bx: usize,
+        bz: usize,
+    ) -> usize {
+        let bx_count = volume.width.div_ceil(SN_BRICK_SIZE);
+        let bz_count = volume.height.div_ceil(SN_BRICK_SIZE);
+        if bx_count != self.bricks_x || bz_count != self.bricks_z {
+            *self = Self::build_all(volume);
+            return self.bricks.len();
+        }
+
+        let mut rebuilt = 0usize;
+        let x_min = bx.saturating_sub(1);
+        let x_max = (bx + 1).min(self.bricks_x.saturating_sub(1));
+        let z_min = bz.saturating_sub(1);
+        let z_max = (bz + 1).min(self.bricks_z.saturating_sub(1));
+
+        for nz in z_min..=z_max {
+            for nx in x_min..=x_max {
+                self.bricks[nz * self.bricks_x + nx] = extract_brick(volume, nx, nz);
+                rebuilt += 1;
+            }
+        }
+        rebuilt
     }
 
     pub fn total_vertices(&self) -> usize {
@@ -89,8 +125,8 @@ impl SurfaceNetsWorld {
     }
 }
 
-/// Extract one `16×16×16` brick `(bx, bz)` with a 1-cell negative halo so seams across bricks
-/// are 100% watertight and outward-facing CCW.
+/// Extract one `16×16×D` (`D = 16..=32`) brick `(bx, bz)` with a 1-cell negative halo so seams
+/// across bricks are 100% watertight and outward-facing CCW.
 pub fn extract_brick(volume: &WorldVolume3D, bx: usize, bz: usize) -> BrickMesh {
     let cell_w = volume.width - 1;
     let cell_d = volume.depth - 1;

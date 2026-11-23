@@ -5,7 +5,7 @@ use glam::Vec3;
 use std::f32::consts::TAU;
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct HeroVertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
@@ -14,7 +14,7 @@ pub struct HeroVertex {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct HeroInstance {
     pub pos_yaw: [f32; 4],
     pub faction_scale: [f32; 4],
@@ -153,6 +153,49 @@ pub fn build_hero_knight_mesh() -> HeroMesh {
     push_box(&mut verts, &mut idxs, Vec3::new(0.24, 0.71, 0.26), Vec3::new(0.48, 0.81, 0.33), gold, 0.18, 0.0);
     push_quad(&mut verts, &mut idxs, Vec3::new(0.33, 0.74, 0.33), Vec3::new(0.39, 0.74, 0.33), Vec3::new(0.37, 1.24, 0.96), Vec3::new(0.35, 1.24, 0.96), blade, 0.12, 0.0);
     push_quad(&mut verts, &mut idxs, Vec3::new(0.39, 0.78, 0.33), Vec3::new(0.33, 0.78, 0.33), Vec3::new(0.35, 1.24, 0.96), Vec3::new(0.37, 1.24, 0.96), blade, 0.12, 0.0);
+
+    HeroMesh {
+        vertices: verts,
+        indices: idxs,
+    }
+}
+
+/// Build a compact glowing 3D orb mesh (octahedral crystal) for live multiplayer projectiles.
+/// Uses `flags.x = 1.0` (full faction/spell color tint) and `flags.y = 1.0` (emissive HDR glow).
+pub fn build_projectile_orb_mesh() -> HeroMesh {
+    let mut verts = Vec::with_capacity(32);
+    let mut idxs = Vec::with_capacity(48);
+    let white = [1.0, 1.0, 1.0];
+
+    let top = Vec3::new(0.0, 1.0, 0.0);
+    let bot = Vec3::new(0.0, -1.0, 0.0);
+    let ring = [
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(-1.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, -1.0),
+    ];
+
+    let mut push_tri = |a: Vec3, b: Vec3, c: Vec3| {
+        let n = (b - a).cross(c - a).normalize_or(Vec3::Y);
+        let base = verts.len() as u32;
+        for p in [a, b, c] {
+            verts.push(HeroVertex {
+                pos: p.to_array(),
+                normal: n.to_array(),
+                color_rough: [white[0], white[1], white[2], 0.12],
+                flags: [1.0, 1.0, 0.0, 0.0],
+            });
+        }
+        idxs.extend_from_slice(&[base, base + 1, base + 2]);
+    };
+
+    for i in 0..4 {
+        let p0 = ring[i];
+        let p1 = ring[(i + 1) % 4];
+        push_tri(top, p1, p0);
+        push_tri(bot, p0, p1);
+    }
 
     HeroMesh {
         vertices: verts,

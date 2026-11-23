@@ -4,7 +4,7 @@
 name = "frostmarsh-web-client"
 version = "0.1.0"
 edition = "2024"
-description = "Frostmarsh Iteration 9C: True 3D Z=16 WebGPU Smooth Surface-Nets + Volumetric Overlay Browser Client"
+description = "Frostmarsh Wave 12C: True 3D Z=16..32 WebGPU Smooth Surface-Nets + Neural Style Swap + Live WS Multiplayer Browser Client"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

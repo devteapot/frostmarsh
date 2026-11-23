@@ -250,8 +250,15 @@ impl LiveWorldState {
         let d = brick.depth as usize;
         let bx = brick.bx as usize;
         let by = brick.by as usize;
-        if d == 0 || d != self.depth || bx >= self.chunks_x || by >= self.chunks_y {
+        if d == 0 || bx >= self.chunks_x || by >= self.chunks_y {
             return;
+        }
+        if d != self.depth {
+            if (16..=64).contains(&d) {
+                self.resize_if_needed(self.width, self.height, d);
+            } else {
+                return;
+            }
         }
         let expected_brick_bytes = CHUNK_SIZE * CHUNK_SIZE * d * 4;
         let Some((dm_raw, at_raw)) = decode_brick3d_lz4(brick) else {
@@ -442,7 +449,7 @@ impl QuicClientHandle {
         let conn_rel = conn.clone();
         tokio::spawn(async move {
             while let Ok(mut recv) = conn_rel.accept_uni().await {
-                if let Ok(bytes) = recv.read_to_end(262_144).await {
+                if let Ok(bytes) = recv.read_to_end(524_288).await {
                     if bytes.first() == Some(&0xFE) {
                         if let Some(pkt) = decode_server_datagram(&bytes[1..]) {
                             let raw_len = bytes.len() as u64;

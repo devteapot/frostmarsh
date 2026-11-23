@@ -27,7 +27,7 @@ struct MeshInstance {
     pos_yaw: vec4<f32>,         // camera-relative xyz, w = yaw
     scale_pitch: vec4<f32>,     // xyz = scale, w = pitch
     tint_glow: vec4<f32>,       // rgb = tint multiplier, w = extra glow
-    flags: vec4<f32>,           // x = mat_override (<0 keep vertex), y = selective_tint (>0.5 only mat 12)
+    flags: vec4<f32>,           // x = mat_override (<0 keep vertex), y = selective_tint (>0.5 only mat 12), z = roll (rad), w = reserved
 };
 
 @group(0) @binding(0) var<uniform> u: SceneUniforms;
@@ -100,10 +100,15 @@ fn vs_main(
     let inst = instances[iid];
     let local_p = pos * inst.scale_pitch.xyz;
 
+    let cr = cos(inst.flags.z);
+    let sr = sin(inst.flags.z);
+    let p_rolled = vec3<f32>(local_p.x * cr - local_p.y * sr, local_p.x * sr + local_p.y * cr, local_p.z);
+    let n_rolled = vec3<f32>(normal.x * cr - normal.y * sr, normal.x * sr + normal.y * cr, normal.z);
+
     let cp = cos(inst.scale_pitch.w);
     let sp = sin(inst.scale_pitch.w);
-    let p_pitched = vec3<f32>(local_p.x, local_p.y * cp - local_p.z * sp, local_p.y * sp + local_p.z * cp);
-    let n_pitched = vec3<f32>(normal.x, normal.y * cp - normal.z * sp, normal.y * sp + normal.z * cp);
+    let p_pitched = vec3<f32>(p_rolled.x, p_rolled.y * cp - p_rolled.z * sp, p_rolled.y * sp + p_rolled.z * cp);
+    let n_pitched = vec3<f32>(n_rolled.x, n_rolled.y * cp - n_rolled.z * sp, n_rolled.y * sp + n_rolled.z * cp);
 
     let cy = cos(inst.pos_yaw.w);
     let sy = sin(inst.pos_yaw.w);

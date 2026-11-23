@@ -13,11 +13,13 @@
 //! - **3D Combat & Verticality:** Players/bots/projectiles move in 3D `(x, y, z)` with climbing ramps,
 //!   under-bridge rivers, cliff-drop gravity, destructible Layer 2 timber skybridges, and +25% High-Ground damage!
 
+mod ws_bridge;
+
 use bytes::Bytes;
 use clap::Parser;
 use field_core::{
-    EntityVoxelPhysics, Field, INPUT_CHANNELS, OUTPUT_CHANNELS, RawStepOutput, SP_ICE, SP_OIL,
-    SP_PLANT, SP_ROCK, SP_STEAM, SP_WATER, SP_WOOD, VolumeField,
+    biome_name, EntityVoxelPhysics, Field, INPUT_CHANNELS, NUM_BIOMES, OUTPUT_CHANNELS,
+    RawStepOutput, SP_ICE, SP_OIL, SP_PLANT, SP_ROCK, SP_STEAM, SP_WATER, SP_WOOD, VolumeField,
 };
 use frostmarsh_proto::*;
 #[cfg(feature = "onnx")]
@@ -55,15 +57,24 @@ struct Args {
     /// Horizontal square grid dimension (128, 256, or 512)
     #[arg(long, default_value_t = 256)]
     size: usize,
-    /// Number of physically coupled 3D vertical strata (1, 4, 8, or 16; default 4 => 262,144 voxels, 16 => isotropic 3D!)
+    /// Number of physically coupled 3D vertical strata (1..=32; 16..=32 enables isotropic 3D volumetric biomes!)
     #[arg(long, default_value_t = 4)]
     layers: usize,
-    /// Number of role-aware AI bots (6v6 = 12)
+    /// 3D Biome preset (0=Nordic Viaduct, 1=Volcanic Caldera, 2=Sinkhole Caverns, 3=Glacier Gorge, 4=Geothermal Mist Basin)
+    #[arg(long, default_value_t = 0)]
+    biome: u8,
+    /// Deterministic 3D world generation seed
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    /// Number of role-aware AI bots (up to 64; 12 default, supports 32-64 live scaling)
     #[arg(long, default_value_t = 12)]
     bots: usize,
     /// Per-player Area-of-Interest chunk radius (0 = full map)
     #[arg(long, default_value_t = 10)]
     aoi_radius: usize,
+    /// Optional zero-dependency RFC 6455 WebSocket bridge bind address for Wave 12C WebGPU browser clients (e.g. 0.0.0.0:4434)
+    #[arg(long)]
+    ws_bind: Option<String>,
 }
 
 // ---------------- Neural Backends ----------------
@@ -640,6 +651,7 @@ struct PlayerEntity {
     name: String,
     team: u8,
     class_id: u8,
+    squad_id: u8, // 0 = Solo Raider (Emberstalker) / Human, 1..=8 = Squad Alpha/Bravo/Charlie/...
     is_bot: bool,
     x: f32,
     y: f32,
@@ -647,6 +659,7 @@ struct PlayerEntity {
     vx: f32,
     vy: f32,
     vz: f32,
+    desired_vz: f32,
     aim_x: f32,
     aim_y: f32,
     hp: i16,
@@ -683,10 +696,11 @@ struct PlayerEntity {
 impl PlayerEntity {
     fn class_stats(class_id: u8, level: u8) -> (i16, f32, f32, f32) {
         let lvl_bonus = (level.saturating_sub(1)) as i16;
-        match class_id {
-            CLASS_WARDEN => (145 + lvl_bonus * 18, 100.0, 110.0, 15.5),
-            CLASS_ALCHEMIST => (105 + lvl_bonus * 12, 140.0, 95.0, 16.0),
-            _ => (118 + lvl_bonus * 14, 115.0, 130.0, 18.8),
+        match class_id % 4 {
+            CLASS_STRIDER => (175 + lvl_bonus * 20, 105.0, 110.0, 15.2),
+            CLASS_SKYWING => (115 + lvl_bonus * 12, 145.0, 115.0, 17.2),
+            CLASS_TIDEKIN => (128 + lvl_bonus * 14, 120.0, 135.0, 18.2),
+            _ => (122 + lvl_bonus * 13, 125.0, 145.0, 19.6), // CLASS_EMBERSTALKER
         }
     }
 
@@ -791,6 +805,8 @@ struct GameState {
     grid_w: usize,
     grid_h: usize,
     grid_d: usize,
+    biome_id: u8,
+    world_seed: u64,
     chunks_x: usize,
     chunks_y: usize,
     aoi_radius: usize,
@@ -838,7 +854,9 @@ struct GameState {
     weather_kind: u8,
     day_time: f32,
     time_scale: f32,
+    evo_speed: f32,
     world_day: u32,
+    last_squad_dome_tick: [u64; 2],
     neural_3d_vertical: bool,
     wind_x: f32,
     wind_y: f32,
@@ -853,6 +871,10 @@ struct GameState {
     bytes_window_start: Instant,
     wire_kbps: f32,
     rt_handle: tokio::runtime::Handle,
+    ws_bridge: Option<Arc<ws_bridge::WsBridge>>,
+    tps_window_start: Instant,
+    tps_window_ticks: u32,
+    measured_tps: f32,
 }
 
 impl GameState {
@@ -863,7 +885,7 @@ impl GameState {
 
     fn surf_layer(&self) -> usize {
         if self.grid_d >= 16 {
-            4
+            ((4.0 * (self.grid_d as f32 / 16.0)).round() as usize).min(self.grid_d - 1)
         } else if self.grid_d >= 2 {
             1
         } else {
@@ -872,14 +894,29 @@ impl GameState {
     }
 
     fn find_z16_surface_z(&self, x: f32, y: f32, start_z: f32) -> f32 {
-        let mut z = start_z.clamp(1.0, (self.grid_d as f32) - 1.5);
+        let max_z = (self.grid_d as f32) - 2.0;
+        let mut z = start_z.clamp(1.0, max_z.max(1.0));
+        // If start_z begins inside solid rock/terrain, step upward into open air first
+        while z < max_z && self.volume.sample_solid_density_3d(x, y, z) >= 0.5 {
+            z += 0.35;
+        }
+        // Scan downward to find the highest solid floor with open-air headroom above
+        let mut fallback_z: Option<f32> = None;
         while z > 0.6 {
             if self.volume.sample_solid_density_3d(x, y, z) >= 0.5 {
-                return (z + 0.25).min((self.grid_d as f32) - 2.0);
+                let foot_z = (z + 0.25).min(max_z.max(1.0));
+                if fallback_z.is_none() {
+                    fallback_z = Some(foot_z);
+                }
+                let clear_mid = self.volume.sample_solid_density_3d(x, y, (foot_z + 0.85).min(max_z + 1.0)) < 0.5;
+                let clear_top = self.volume.sample_solid_density_3d(x, y, (foot_z + 1.65).min(max_z + 1.5)) < 0.5;
+                if clear_mid && clear_top {
+                    return foot_z;
+                }
             }
             z -= 0.2;
         }
-        1.5
+        fallback_z.unwrap_or(1.5)
     }
 
     fn build_shrines(w: usize, h: usize) -> Vec<ShrineEntity> {
@@ -897,15 +934,18 @@ impl GameState {
         cuda_addr: String,
         size: usize,
         layers: usize,
+        biome: u8,
+        seed: u64,
         bot_count: usize,
         aoi_radius: usize,
     ) -> Self {
         let grid_w = (size / CHUNK_SIZE).max(4) * CHUNK_SIZE;
         let grid_h = grid_w;
-        let grid_d = layers.clamp(1, 16);
+        let grid_d = layers.clamp(1, 32);
+        let biome_id = biome % NUM_BIOMES;
         let chunks_x = chunks_for_dim(grid_w);
         let chunks_y = chunks_for_dim(grid_h);
-        let volume = VolumeField::new_shattered_reach_3d(grid_w, grid_h, grid_d);
+        let volume = VolumeField::new_biome_3d(grid_w, grid_h, grid_d, biome_id, seed);
         let eco = EcosystemState::new(grid_w, grid_h);
         let shrines = Self::build_shrines(grid_w, grid_h);
         let use_cuda = backend_name == "cuda-rpc";
@@ -914,6 +954,8 @@ impl GameState {
             grid_w,
             grid_h,
             grid_d,
+            biome_id,
+            world_seed: seed,
             chunks_x,
             chunks_y,
             aoi_radius,
@@ -961,7 +1003,9 @@ impl GameState {
             weather_kind: WEATHER_CLEAR,
             day_time: 0.25,
             time_scale: 1.0,
+            evo_speed: 1.0,
             world_day: 1,
+            last_squad_dome_tick: [0, 0],
             neural_3d_vertical: false,
             wind_x: 0.65,
             wind_y: 0.35,
@@ -976,19 +1020,50 @@ impl GameState {
             bytes_window_start: Instant::now(),
             wire_kbps: 0.0,
             rt_handle: tokio::runtime::Handle::current(),
+            ws_bridge: None,
+            tps_window_start: Instant::now(),
+            tps_window_ticks: 0,
+            measured_tps: 30.0,
         };
         gs.refresh_hazard_grids();
-        for i in 0..bot_count {
+        let capped_bots = bot_count.min(64);
+        let squad_size = if capped_bots >= 24 { 4usize } else { 3usize };
+        let mut team_squad_counts = [0usize; 2];
+        for i in 0..capped_bots {
             let team = (i % 2) as u8;
-            let class_id = ((i / 2) % 3) as u8;
+            let class_id = ((i / 2) % 4) as u8;
+            let squad_id = if class_id == CLASS_EMBERSTALKER {
+                0u8 // Solo Raider (~25% of bots)
+            } else {
+                let idx = team_squad_counts[team as usize];
+                team_squad_counts[team as usize] += 1;
+                ((idx / squad_size) + 1).min(8) as u8
+            };
             let role_tag = match class_id {
-                CLASS_WARDEN => "Warden",
-                CLASS_ALCHEMIST => "Pyro",
-                _ => "Ranger",
+                CLASS_STRIDER => "Strider",
+                CLASS_SKYWING => "Skywing",
+                CLASS_TIDEKIN => "Tidekin",
+                _ => "Stalker",
             };
             let prefix = if team == 0 { "Frost" } else { "Ember" };
-            let name = format!("{}-{}-{}", prefix, role_tag, i / 2 + 1);
-            gs.spawn_player(name, team, class_id, true);
+            let name = if squad_id == 0 {
+                format!("{}-{}-Solo{}", prefix, role_tag, i / 2 + 1)
+            } else {
+                let sq_code = match squad_id {
+                    1 => "A",
+                    2 => "B",
+                    3 => "C",
+                    4 => "D",
+                    5 => "E",
+                    6 => "F",
+                    _ => "G",
+                };
+                format!("{}-{}-{}{}", prefix, role_tag, sq_code, i / 2 + 1)
+            };
+            let pid = gs.spawn_player(name, team, class_id, true);
+            if let Some(p) = gs.players.get_mut(&pid) {
+                p.squad_id = squad_id;
+            }
         }
         gs
     }
@@ -1274,19 +1349,21 @@ impl GameState {
         let wf = self.grid_w as f32;
         let hf = self.grid_h as f32;
         if self.is_z16() {
-            let off = ((salt % 7) as f32 - 3.0) * (hf * 0.014);
-            let (sx, sy, scan_z) = if salt % 3 == 1 {
+            let z_scale = (self.grid_d as f32 / 16.0).clamp(1.0, 2.0);
+            let top_scan = (self.grid_d as f32 - 2.2).max(12.5);
+            let off = ((salt % 13) as f32 - 6.0) * (hf * 0.016);
+            let (sx, sy, scan_z) = if self.biome_id == field_core::BIOME_NORDIC_VIADUCT && salt % 4 == 3 {
                 if team == 0 {
-                    // Near the East mouth of the vaulted basalt cave (z ≈ 1.6..2.0)
-                    (wf * 0.375, hf * 0.700, 4.5)
+                    // Near the East mouth of the vaulted basalt cave
+                    (wf * 0.375, hf * 0.700, 4.5 * z_scale)
                 } else {
-                    // East bridge approach overlooking the 3-span stone & timber bridge (z ≈ 8.1)
-                    (wf * 0.715, hf * 0.500, 12.5)
+                    // East bridge approach overlooking the 3-span stone & timber bridge
+                    (wf * 0.715, hf * 0.500, top_scan)
                 }
             } else if team == 0 {
-                (wf * 0.22, hf * 0.50 + off, 12.5)
+                (wf * (0.20 + (salt % 3) as f32 * 0.025), hf * 0.50 + off, top_scan)
             } else {
-                (wf * 0.80, hf * 0.50 + off, 12.5)
+                (wf * (0.80 - (salt % 3) as f32 * 0.025), hf * 0.50 + off, top_scan)
             };
             let sz = self.find_z16_surface_z(sx, sy, scan_z);
             return (sx, sy, sz);
@@ -1300,7 +1377,7 @@ impl GameState {
                 return (wf * 0.72, hf * 0.28, 2.0);
             }
         }
-        let off = ((salt % 11) as f32 - 5.0) * (hf * 0.025);
+        let off = ((salt % 13) as f32 - 6.0) * (hf * 0.024);
         if team == 0 {
             (wf * 0.12, hf * 0.50 + off, surf_z)
         } else {
@@ -1311,15 +1388,21 @@ impl GameState {
     fn spawn_player(&mut self, name: String, team: u8, class_id: u8, is_bot: bool) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
-        let (x, y, z) = self.spawn_point(team % 2, id);
-        let (mhp, mmp, mst, _) = PlayerEntity::class_stats(class_id % 3, 1);
+        let cls = class_id % 4;
+        let (x, y, mut z) = self.spawn_point(team % 2, id);
+        if cls == CLASS_SKYWING {
+            // Skywings launch slightly aloft for immediate 3D flight!
+            z = (z + if self.is_z16() { 2.5 } else { 0.8 }).min((self.grid_d as f32 - 2.0).max(1.5));
+        }
+        let (mhp, mmp, mst, _) = PlayerEntity::class_stats(cls, 1);
         self.players.insert(
             id,
             PlayerEntity {
                 id,
                 name,
                 team: team % 2,
-                class_id: class_id % 3,
+                class_id: cls,
+                squad_id: 0,
                 is_bot,
                 x,
                 y,
@@ -1327,6 +1410,7 @@ impl GameState {
                 vx: 0.0,
                 vy: 0.0,
                 vz: 0.0,
+                desired_vz: 0.0,
                 aim_x: if team % 2 == 0 { 1.0 } else { -1.0 },
                 aim_y: 0.0,
                 hp: mhp,
@@ -1654,7 +1738,12 @@ impl GameState {
             let (dx, dy) = if mlen > 0.01 { (inp.move_x / mlen, inp.move_y / mlen) } else { (0.0, 0.0) };
 
             let (_, _, _, base_spd) = PlayerEntity::class_stats(p.class_id, p.level);
-            let dash_cd_ticks = if p.class_id == CLASS_RANGER { 24 } else { 32 };
+            let dash_cd_ticks = match p.class_id {
+                CLASS_EMBERSTALKER => 22,
+                CLASS_TIDEKIN => 24,
+                CLASS_SKYWING => 28,
+                _ => 32,
+            };
             if inp.dash && tick >= p.dash_cd && p.stamina >= 25.0 {
                 p.stamina -= 25.0;
                 p.dash_until = tick + 6;
@@ -1662,7 +1751,14 @@ impl GameState {
                 let (ddx, ddy) = if mlen > 0.01 { (dx, dy) } else { (p.aim_x, p.aim_y) };
                 p.vx = ddx * 42.0;
                 p.vy = ddy * 42.0;
-                p.vz = if self.grid_d >= 16 { 6.2 } else { 1.8 }; // vertical leap when dashing!
+                p.vz = match (self.grid_d >= 16, p.class_id) {
+                    (true, CLASS_SKYWING) => 8.5,      // Skywing wing-surge aloft!
+                    (true, CLASS_TIDEKIN) => 9.2,      // Tidekin breach launch out of water!
+                    (true, CLASS_EMBERSTALKER) => 7.6, // Emberstalker vault!
+                    (true, _) => 6.2,
+                    (false, CLASS_SKYWING) => 2.8,
+                    (false, _) => 1.8,
+                };
             } else if tick >= p.dash_until {
                 let mut speed = if p.carrying_relic { base_spd * 0.78 } else { base_spd };
                 if tick < p.haste_until {
@@ -1675,13 +1771,18 @@ impl GameState {
             if inp.melee && tick >= p.melee_cd {
                 p.melee_until = tick + 5;
                 p.melee_cd = tick + 15;
-                let dmg = if p.class_id == CLASS_WARDEN { 34 } else { 24 };
+                let dmg = match p.class_id {
+                    CLASS_STRIDER => 36,
+                    CLASS_EMBERSTALKER => 30,
+                    _ => 24,
+                };
                 melee_hit_check = Some((p.team, p.x, p.y, p.z, p.aim_x, p.aim_y, dmg + (p.level as i16) * 3));
             }
 
             let bolt_cd_ticks = match p.class_id {
-                CLASS_ALCHEMIST => 8,
-                CLASS_RANGER => 9,
+                CLASS_EMBERSTALKER => 7,
+                CLASS_SKYWING => 8,
+                CLASS_TIDEKIN => 9,
                 _ => 11,
             };
             if inp.cast_bolt && tick >= p.bolt_cd && p.mana >= 8.0 {
@@ -1717,11 +1818,11 @@ impl GameState {
                 p.ability_e_cd = tick + 120;
                 let cls = p.class_id;
                 match cls {
-                    CLASS_WARDEN => {
+                    CLASS_STRIDER => {
                         p.shield_until = tick + 90;
                         ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
                     }
-                    CLASS_ALCHEMIST => {
+                    CLASS_SKYWING => {
                         for ang_off in [-0.24f32, 0.0, 0.24] {
                             let (ca, sa) = (ang_off.cos(), ang_off.sin());
                             let vx = (p.aim_x * ca - p.aim_y * sa) * 48.0;
@@ -1730,13 +1831,20 @@ impl GameState {
                         }
                         ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
                     }
-                    _ => {
+                    CLASS_TIDEKIN => {
                         p.haste_until = tick + 90;
                         carve_pos = Some((
                             (p.x + p.aim_x * 3.2).clamp(3.0, gw - 4.0) as i32,
                             (p.y + p.aim_y * 3.2).clamp(3.0, gh - 4.0) as i32,
                             p.team,
                         ));
+                        ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
+                    }
+                    _ => {
+                        // CLASS_EMBERSTALKER: Smoke Veil + fast Oil/Fire Ambush!
+                        p.haste_until = tick + 90;
+                        spawn_projs.push((p.team, 2, p.x + p.aim_x * 1.4, p.y + p.aim_y * 1.4, p.z, p.aim_x * 52.0, p.aim_y * 52.0, 0.0, 1.2, 1.1, 22));
+                        spawn_projs.push((p.team, 0, p.x + p.aim_x * 1.0, p.y + p.aim_y * 1.0, p.z, p.aim_x * 58.0, p.aim_y * 58.0, 0.0, 1.1, 1.2, 24));
                         ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
                     }
                 }
@@ -1746,9 +1854,9 @@ impl GameState {
                 p.mana -= 55.0;
                 p.ult_r_cd = tick + 360;
                 p.ult_until = tick + 45;
-                if p.class_id == CLASS_WARDEN {
+                if p.class_id == CLASS_STRIDER {
                     p.shield_until = tick + 120;
-                } else if p.class_id == CLASS_RANGER {
+                } else if p.class_id == CLASS_TIDEKIN || p.class_id == CLASS_EMBERSTALKER {
                     p.haste_until = tick + 150;
                 }
                 ult_r_fx = Some((p.class_id, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
@@ -1799,7 +1907,7 @@ impl GameState {
         if let Some((cls, team, px, py, pz, ax, ay)) = ability_e_fx {
             let pl = (pz.round() as usize).clamp(0, self.grid_d - 1);
             match cls {
-                CLASS_WARDEN => {
+                CLASS_STRIDER => {
                     for step in 1..=3 {
                         let tx = (px + ax * (step as f32 * 4.5)).clamp(3.0, gw - 4.0) as i32;
                         let ty = (py + ay * (step as f32 * 4.5)).clamp(3.0, gh - 4.0) as i32;
@@ -1807,15 +1915,19 @@ impl GameState {
                     }
                     self.push_event(2, px, py, 0, team, "ICE BRIDGE!".into());
                 }
-                CLASS_ALCHEMIST => self.push_event(2, px, py, 0, team, "OIL BARRAGE!".into()),
-                _ => self.push_event(2, px, py, 0, team, "WIND SPRINT!".into()),
+                CLASS_SKYWING => self.push_event(2, px, py, 0, team, "OIL BARRAGE!".into()),
+                CLASS_TIDEKIN => self.push_event(2, px, py, 0, team, "HYDRO SURGE!".into()),
+                _ => {
+                    self.volume.apply_physical_actuator(px, py, pl, 0.25, 0.0, 0.35, 0.85, 4.5);
+                    self.push_event(2, px, py, 0, team, "SMOKE AMBUSH!".into());
+                }
             }
         }
 
         if let Some((cls, team, px, py, pz, ax, ay)) = ult_r_fx {
             let pl = (pz.round() as usize).clamp(0, self.grid_d - 1);
             match cls {
-                CLASS_WARDEN => {
+                CLASS_STRIDER => {
                     self.volume.layers[pl].apply_glacial_nova(px.clamp(4.0, gw - 5.0) as i32, py.clamp(4.0, gh - 5.0) as i32, 11);
                     let targets: Vec<u32> = self
                         .players
@@ -1831,7 +1943,7 @@ impl GameState {
                     }
                     self.push_event(2, px, py, 0, team, "GLACIAL NOVA!".into());
                 }
-                CLASS_ALCHEMIST => {
+                CLASS_SKYWING => {
                     let tx = (px + ax * 16.0).clamp(6.0, gw - 7.0);
                     let ty = (py + ay * 16.0).clamp(6.0, gh - 7.0);
                     self.volume.layers[pl].apply_meteor_impact(tx as i32, ty as i32, 8);
@@ -1847,7 +1959,7 @@ impl GameState {
                     self.eco.inject_fear_pulse(tx, ty, 24.0, 1.2);
                     self.push_event(2, tx, ty, 0, team, "METEOR STORM!".into());
                 }
-                _ => {
+                CLASS_TIDEKIN => {
                     let cx = (px + ax * 10.0).clamp(5.0, gw - 6.0) as i32;
                     let cy = (py + ay * 10.0).clamp(5.0, gh - 6.0) as i32;
                     self.volume.apply_steam_burst_3d(cx, cy, pl, 8);
@@ -1857,7 +1969,24 @@ impl GameState {
                             p.hp = (p.hp + 20).min(p.max_hp);
                         }
                     }
-                    self.push_event(2, px, py, 0, team, "SPIRIT SURGE!".into());
+                    self.push_event(2, px, py, 0, team, "TIDAL SURGE!".into());
+                }
+                _ => {
+                    // CLASS_EMBERSTALKER: Inferno Raid (oil + fire burst + smoke veil)
+                    let tx = (px + ax * 10.0).clamp(5.0, gw - 6.0);
+                    let ty = (py + ay * 10.0).clamp(5.0, gh - 6.0);
+                    self.volume.layers[pl].apply_oil_splash(tx as i32, ty as i32, 6, 1.3);
+                    self.volume.layers[pl].apply_fire_bolt(tx as i32, ty as i32, 7, 2.2);
+                    let targets: Vec<u32> = self
+                        .players
+                        .values()
+                        .filter(|t| t.team != team && (t.x - tx).hypot(t.y - ty) <= 10.0)
+                        .map(|t| t.id)
+                        .collect();
+                    for tid in targets {
+                        self.apply_damage(Some(pid), tid, 38, "AMBUSH!", 0);
+                    }
+                    self.push_event(2, tx, ty, 0, team, "INFERNO RAID!".into());
                 }
             }
         }
@@ -1938,7 +2067,21 @@ impl GameState {
         let gh = self.grid_h as f32;
         let tx = (px + dx).clamp(3.0, gw - 4.0);
         let ty = (py + dy).clamp(3.0, gh - 4.0);
-        let layer = (pz.round() as usize).clamp(0, self.grid_d - 1);
+        let mut layer = (pz.round() as usize).clamp(0, self.grid_d - 1);
+        // Project airborne Skywing actuators downward onto terrain/water surface below when targeting open air
+        if self.is_z16() && layer > 1 {
+            let txi = (tx.round() as usize).min(self.grid_w - 1);
+            let tyi = (ty.round() as usize).min(self.grid_h - 1);
+            let tidx = tyi * self.grid_w + txi;
+            if self.volume.layers[layer].cell_volume(tidx) < 25 {
+                for z_scan in (1..layer).rev() {
+                    if self.volume.layers[z_scan].cell_volume(tidx) >= 40 {
+                        layer = z_scan;
+                        break;
+                    }
+                }
+            }
+        }
 
         let tf_s = tf * scale;
         let sw_s = sw * scale;
@@ -2008,7 +2151,8 @@ impl GameState {
                         let dl = dx.hypot(dy).max(1e-3);
                         (dx / dl, dy / dl)
                     };
-                    let push = 38.0 * imp_s * fall;
+                    let kb_res = if t.class_id == CLASS_STRIDER { 0.40 } else { 1.0 };
+                    let push = 38.0 * imp_s * fall * kb_res;
                     t.kb_vx = (t.kb_vx + nx * push).clamp(-48.0, 48.0);
                     t.kb_vy = (t.kb_vy + ny * push).clamp(-48.0, 48.0);
                     if t.team != team && imp_s > 0.30 && dist <= r + 2.5 {
@@ -2105,7 +2249,7 @@ impl GameState {
 
     fn reset_match(&mut self) {
         let (w, h, d) = (self.grid_w, self.grid_h, self.grid_d);
-        self.volume = VolumeField::new_shattered_reach_3d(w, h, d);
+        self.volume = VolumeField::new_biome_3d(w, h, d, self.biome_id, self.world_seed);
         self.eco.reset();
         self.refresh_hazard_grids();
         self.shrines = GameState::build_shrines(w, h);
@@ -2178,8 +2322,69 @@ impl GameState {
         for peer in self.peers.values_mut() {
             peer.needs_full_sync = true;
         }
+        if let Some(ref ws) = self.ws_bridge {
+            ws.queue_full_sync_all();
+        }
         self.push_event(5, (w as f32) * 0.5, (h as f32) * 0.5, 0, 2, "NEW MATCH STARTED!".into());
-        log::info!("Match cleanly reset ({}x{}x{}, {} players)", w, h, d, self.players.len());
+        log::info!(
+            "Match cleanly reset ({}x{}x{}, biome={} [{}], seed={}, {} players)",
+            w,
+            h,
+            d,
+            self.biome_id,
+            biome_name(self.biome_id),
+            self.world_seed,
+            self.players.len()
+        );
+    }
+
+    fn cycle_biome(&mut self) {
+        self.biome_id = (self.biome_id + 1) % NUM_BIOMES;
+        let bname = biome_name(self.biome_id);
+        if self.grid_d >= 16 {
+            self.volume.init_biome_3d(self.biome_id, self.world_seed);
+            self.eco.reset();
+            self.refresh_hazard_grids();
+            self.projectiles.clear();
+            self.rafts.clear();
+            self.time_domes.clear();
+            self.mass_error = 0;
+            self.energy_error = 0;
+            // Respawn all players safely on valid 3D terrain via surface scan
+            let pids: Vec<u32> = self.players.keys().copied().collect();
+            for pid in pids {
+                let team = self.players[&pid].team;
+                let (sx, sy, sz) = self.spawn_point(team, self.sim_tick as u32 + pid);
+                if let Some(p) = self.players.get_mut(&pid) {
+                    p.x = sx;
+                    p.y = sy;
+                    p.z = sz;
+                    p.vx = 0.0;
+                    p.vy = 0.0;
+                    p.vz = 0.0;
+                    p.kb_vx = 0.0;
+                    p.kb_vy = 0.0;
+                }
+            }
+        }
+        let banner = format!("BIOME: {}!", bname.to_ascii_uppercase());
+        self.push_event(5, (self.grid_w as f32) * 0.5, (self.grid_h as f32) * 0.5, 0, 2, banner);
+        for peer in self.peers.values_mut() {
+            peer.needs_full_sync = true;
+        }
+        if let Some(ref ws) = self.ws_bridge {
+            ws.queue_full_sync_all();
+        }
+        log::info!(
+            "Cycled 3D biome -> {} ({}) seed={} ({}x{}x{}, full brick re-sync queued for {} peers)",
+            self.biome_id,
+            bname,
+            self.world_seed,
+            self.grid_w,
+            self.grid_h,
+            self.grid_d,
+            self.peers.len()
+        );
     }
 
     fn step_bots(&mut self) {
@@ -2232,6 +2437,8 @@ impl GameState {
             feats[base + 11] = p.team as f32;
             feats[base + 12] = if p.carrying_relic { 1.0 } else { 0.0 };
             feats[base + 13] = p.level as f32 / 5.0;
+            feats[base + 14] = if p.class_id == CLASS_EMBERSTALKER { 1.0 } else { 0.0 };
+            feats[base + 15] = (p.squad_id as f32 / 8.0).clamp(0.0, 1.0);
             feats[base + 20] = (p.dash_cd.saturating_sub(tick) as f32 / 32.0).clamp(0.0, 1.0);
             feats[base + 21] = (p.ability_e_cd.saturating_sub(tick) as f32 / 120.0).clamp(0.0, 1.0);
             feats[base + 22] = (p.ult_r_cd.saturating_sub(tick) as f32 / 360.0).clamp(0.0, 1.0);
@@ -2518,76 +2725,332 @@ impl GameState {
     fn step_bots_scripted(&mut self) {
         let gw = self.grid_w as f32;
         let gh = self.grid_h as f32;
-        let bot_ids: Vec<u32> = self.players.values().filter(|p| p.is_bot).map(|p| p.id).collect();
-        let snap: Vec<(u32, u8, u8, f32, f32, f32, bool)> = self
-            .players
-            .values()
-            .map(|p| (p.id, p.team, p.class_id, p.x, p.y, p.z, p.carrying_relic))
-            .collect();
-        let shrine_goals: Vec<(f32, f32, i8)> = self.shrines.iter().map(|s| (s.x, s.y, s.owner)).collect();
+        let is_z16 = self.is_z16();
+        let max_fly_z = (self.grid_d as f32 - 2.0).max(2.6);
         let tick = self.sim_tick;
 
+        struct BotSnap {
+            id: u32,
+            team: u8,
+            class_id: u8,
+            squad_id: u8,
+            x: f32,
+            y: f32,
+            z: f32,
+            hp_frac: f32,
+            carrying_relic: bool,
+            veiled: bool,
+        }
+
+        let bot_ids: Vec<u32> = self.players.values().filter(|p| p.is_bot).map(|p| p.id).collect();
+        let snap: Vec<BotSnap> = self
+            .players
+            .values()
+            .map(|p| {
+                let pl = (p.z.round() as usize).clamp(0, self.grid_d - 1);
+                let phys = self.volume.sample_entity_physics(p.x, p.y, pl);
+                let veiled = p.class_id == CLASS_EMBERSTALKER
+                    && (phys.smoke_opacity > 0.15
+                        || (is_z16 && self.volume.measure_vertical_clearance_3d((p.x, p.y, p.z)) < 6.0));
+                BotSnap {
+                    id: p.id,
+                    team: p.team,
+                    class_id: p.class_id,
+                    squad_id: p.squad_id,
+                    x: p.x,
+                    y: p.y,
+                    z: p.z,
+                    hp_frac: (p.hp as f32 / p.max_hp.max(1) as f32).clamp(0.0, 1.0),
+                    carrying_relic: p.carrying_relic,
+                    veiled,
+                }
+            })
+            .collect();
+        let shrine_goals: Vec<(f32, f32, i8)> = self.shrines.iter().map(|s| (s.x, s.y, s.owner)).collect();
+
+        // Precompute per-(team, squad_id) centroids, lowest-HP ally, and shared dynamic squad objectives!
+        let mut squad_sums: HashMap<(u8, u8), (f32, f32, u32)> = HashMap::new();
+        let mut squad_wounded: HashMap<(u8, u8), (f32, f32, f32)> = HashMap::new();
+        let mut team_relic_carrier: [Option<(f32, f32)>; 2] = [None, None];
+        for s in &snap {
+            if s.carrying_relic {
+                team_relic_carrier[s.team as usize] = Some((s.x, s.y));
+            }
+            if s.squad_id > 0 {
+                let entry = squad_sums.entry((s.team, s.squad_id)).or_insert((0.0, 0.0, 0));
+                entry.0 += s.x;
+                entry.1 += s.y;
+                entry.2 += 1;
+                if s.hp_frac < 0.45 {
+                    let w = squad_wounded.entry((s.team, s.squad_id)).or_insert((s.x, s.y, s.hp_frac));
+                    if s.hp_frac < w.2 {
+                        *w = (s.x, s.y, s.hp_frac);
+                    }
+                }
+            }
+        }
+
+        let mut pending_rescue_domes: Vec<(u32, u8, f32, f32)> = Vec::new();
+        let mut pending_desired_vz: Vec<(u32, f32)> = Vec::new();
+
         for bid in bot_ids {
-            let Some(&(_, team, class_id, mx, my, mz, carrying)) = snap.iter().find(|x| x.0 == bid) else {
+            let Some(me) = snap.iter().find(|s| s.id == bid) else {
                 continue;
             };
+            let (team, class_id, squad_id, mx, my, mz, carrying) =
+                (me.team, me.class_id, me.squad_id, me.x, me.y, me.z, me.carrying_relic);
             let desired_owner = if team == 0 { -1 } else { 1 };
-            let (tx, ty) = if carrying {
+
+            // --- 1. Target Selection (Squads vs Solo Emberstalker Raiders + Smoke Veil Aggro Reduction) ---
+            let mut best_enemy: Option<&BotSnap> = None;
+            let mut best_enemy_score = f32::MAX;
+            let mut nearby_enemy_cnt = 0usize;
+            let mut enemy_cluster_cx = 0.0f32;
+            let mut enemy_cluster_cy = 0.0f32;
+
+            for cand in &snap {
+                if cand.team == team {
+                    continue;
+                }
+                let d = (cand.x - mx).hypot(cand.y - my);
+                if d < 18.0 {
+                    nearby_enemy_cnt += 1;
+                    enemy_cluster_cx += cand.x;
+                    enemy_cluster_cy += cand.y;
+                }
+                // Smoke Veil passive: Emberstalkers in smoke/caves drop enemy aggro beyond 14m!
+                if cand.veiled && d > 14.0 {
+                    continue;
+                }
+                let mut score = d;
+                if class_id == CLASS_EMBERSTALKER {
+                    // Solo Emberstalkers hunt isolated stragglers & avoid packed enemy squads!
+                    let cand_allies = snap
+                        .iter()
+                        .filter(|o| o.id != cand.id && o.team == cand.team && (o.x - cand.x).hypot(o.y - cand.y) < 16.0)
+                        .count();
+                    score += (cand_allies as f32) * 18.0;
+                    if cand.hp_frac < 0.60 {
+                        score -= 10.0;
+                    }
+                } else if cand.carrying_relic {
+                    score -= 16.0;
+                }
+                if score < best_enemy_score {
+                    best_enemy_score = score;
+                    best_enemy = Some(cand);
+                }
+            }
+
+            let (ax, ay, edist, enemy_pos_z) = if let Some(e) = best_enemy {
+                (e.x - mx, e.y - my, (e.x - mx).hypot(e.y - my), Some((e.x, e.y, e.z)))
+            } else {
+                (gw * 0.5 - mx, gh * 0.5 - my, 999.0, None)
+            };
+
+            // --- 2. Dynamic Objective Steering: Squads (Alpha/Bravo/Charlie) vs Solo Emberstalkers ---
+            let (mut tx, mut ty) = if carrying {
                 if team == 0 { (gw * 0.12, gh * 0.50) } else { (gw * 0.88, gh * 0.50) }
-            } else if self.is_z16() && bid % 3 == 1 {
-                if team == 0 {
-                    // Vaulted basalt cave & under-bridge patrol
-                    let phase = ((tick as f32 * 0.008 + bid as f32).sin() + 1.0) * 0.5;
-                    (gw * (0.235 + 0.145 * phase), gh * (0.720 - 0.025 * phase))
-                } else {
-                    // 3-span arched bridge patrol across the canyon
-                    let patrol_x = gw * (0.50 + 0.18 * ((tick as f32 * 0.01 + bid as f32).sin()));
-                    (patrol_x, gh * 0.50)
-                }
-            } else if !self.is_z16() && mz >= 1.6 && bid % 3 == 1 {
-                // Highland Skybridge squad — actively duels across the Layer 2 Stone Sky-Arch!
-                let patrol_x = gw * (0.50 + 0.14 * ((tick as f32 * 0.01 + bid as f32).sin()));
-                (patrol_x, gh * 0.29)
-            } else if bid % 3 == 0 {
-                let on_home_side = (team == 0) == (mx < gw * 0.50);
-                if (mx - gw * 0.50).abs() > gw * 0.14 && on_home_side {
-                    let bridge_y = if self.is_z16() {
-                        gh * 0.50
-                    } else if bid % 2 == 0 {
-                        gh * 0.31
+            } else if squad_id == 0 {
+                // SOLO EMBERSTALKER RAIDER AI:
+                // Avoid big enemy clusters (>=3 within 18m), take subterranean cave/flank paths, ambush stragglers, or cap unguarded shrines!
+                if nearby_enemy_cnt >= 3 {
+                    let ecx = enemy_cluster_cx / nearby_enemy_cnt as f32;
+                    let ecy = enemy_cluster_cy / nearby_enemy_cnt as f32;
+                    let away_x = mx - ecx;
+                    let away_y = my - ecy;
+                    let amag = away_x.hypot(away_y).max(1e-3);
+                    // Sidestep tangentially into caves/flanks rather than straight back
+                    let side = if bid % 2 == 0 { 1.0 } else { -1.0 };
+                    (
+                        (mx + (away_x / amag * 0.7 - away_y / amag * 0.7 * side) * 20.0).clamp(6.0, gw - 6.0),
+                        (my + (away_y / amag * 0.7 + away_x / amag * 0.7 * side) * 20.0).clamp(6.0, gh - 6.0),
+                    )
+                } else if let Some(e) = best_enemy {
+                    let e_allies = snap
+                        .iter()
+                        .filter(|o| o.id != e.id && o.team == e.team && (o.x - e.x).hypot(o.y - e.y) < 16.0)
+                        .count();
+                    if e_allies <= 1 && edist < 48.0 {
+                        // Ambush isolated straggler!
+                        (e.x, e.y)
                     } else {
-                        gh * 0.71
-                    };
-                    (gw * 0.50, bridge_y)
+                        // Take cave/flank lane toward least-guarded enemy/neutral shrine or relic
+                        let unguarded_shrine = shrine_goals
+                            .iter()
+                            .filter(|s| s.2 != desired_owner)
+                            .min_by_key(|s| {
+                                snap.iter()
+                                    .filter(|o| o.team != team && (o.x - s.0).hypot(o.y - s.1) < 22.0)
+                                    .count()
+                            })
+                            .map(|s| (s.0, s.1));
+                        if is_z16 && self.biome_id == field_core::BIOME_NORDIC_VIADUCT && (tick / 180 + bid as u64) % 3 == 0 {
+                            // Subterranean SW basalt cave flank corridor!
+                            let phase = ((tick as f32 * 0.012 + bid as f32).sin() + 1.0) * 0.5;
+                            (gw * (0.20 + 0.22 * phase), gh * (0.73 - 0.03 * phase))
+                        } else {
+                            unguarded_shrine.unwrap_or((self.relic_x, self.relic_y))
+                        }
+                    }
                 } else {
-                    (self.relic_x + (bid as f32 * 1.9).sin() * 5.0, self.relic_y + (bid as f32 * 2.3).cos() * 5.0)
+                    (self.relic_x, self.relic_y)
                 }
             } else {
-                let target_shrine = shrine_goals
-                    .iter()
-                    .filter(|s| s.2 != desired_owner)
-                    .min_by(|a, b| (a.0 - mx).hypot(a.1 - my).partial_cmp(&(b.0 - mx).hypot(b.1 - my)).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|s| (s.0, s.1))
-                    .unwrap_or((self.relic_x, self.relic_y));
-                let jitter = (bid as f32 * 1.3 + tick as f32 * 0.008).sin() * 6.0;
-                (target_shrine.0 + jitter, target_shrine.1 - jitter * 0.6)
+                // COORDINATED SQUAD AI (Squad Alpha=1, Bravo=2, Charlie=3, Delta=4...):
+                // Shared dynamic squad objective: Escort Relic Carrier, Shrine Push, or Viaduct/Bridge Assault!
+                let (obj_x, obj_y) = if let Some((rx, ry)) = team_relic_carrier[team as usize] {
+                    // Escort friendly relic carrier!
+                    let esc_ang = (bid as f32) * 1.4;
+                    (rx + esc_ang.cos() * 6.5, ry + esc_ang.sin() * 6.5)
+                } else {
+                    // Rotate squad role cleanly across shrines, bridge, and relic
+                    let phase_idx = ((squad_id as usize) + (tick / 900) as usize) % 4;
+                    match phase_idx {
+                        1 => {
+                            // Bridge / Central Viaduct Assault
+                            let patrol_x = gw * (0.50 + 0.14 * ((tick as f32 * 0.008 + squad_id as f32).sin()));
+                            (patrol_x, gh * 0.50)
+                        }
+                        2 => {
+                            // North Shrine / Glacier Push (or first uncaptured shrine)
+                            shrine_goals
+                                .iter()
+                                .find(|s| s.2 != desired_owner)
+                                .map(|s| (s.0, s.1))
+                                .unwrap_or((gw * 0.50, gh * 0.18))
+                        }
+                        3 => {
+                            // South Shrine / Caldera Push (or last uncaptured shrine)
+                            shrine_goals
+                                .iter()
+                                .rev()
+                                .find(|s| s.2 != desired_owner)
+                                .map(|s| (s.0, s.1))
+                                .unwrap_or((gw * 0.50, gh * 0.82))
+                        }
+                        _ => {
+                            // Central Relic Contestation
+                            (self.relic_x, self.relic_y)
+                        }
+                    }
+                };
+
+                // Blend with Squad Cohesion (pull toward squad centroid if drifted >14m) + class-specific routing
+                let mut gx = obj_x + (bid as f32 * 1.7 + tick as f32 * 0.006).sin() * 4.5;
+                let mut gy = obj_y + (bid as f32 * 2.1 - tick as f32 * 0.006).cos() * 4.5;
+                if let Some(&(sx, sy, cnt)) = squad_sums.get(&(team, squad_id)) {
+                    if cnt >= 2 {
+                        let cx = sx / cnt as f32;
+                        let cy = sy / cnt as f32;
+                        let dist_sq = (cx - mx).hypot(cy - my);
+                        if dist_sq > 14.0 {
+                            gx = gx * 0.52 + cx * 0.48;
+                            gy = gy * 0.52 + cy * 0.48;
+                        }
+                    }
+                }
+                // Tidekins love flanking along the central river/fjord channel for 2.0x Hydrodynamic Surge!
+                if class_id == CLASS_TIDEKIN && (mx - gw * 0.50).abs() > gw * 0.09 && edist > 20.0 {
+                    gx = gx * 0.65 + (gw * 0.50) * 0.35;
+                }
+                (gx.clamp(5.0, gw - 5.0), gy.clamp(5.0, gh - 5.0))
             };
 
-            let enemy = snap
-                .iter()
-                .filter(|x| x.1 != team)
-                .min_by(|a, b| (a.3 - mx).hypot(a.4 - my).partial_cmp(&(b.3 - mx).hypot(b.4 - my)).unwrap_or(std::cmp::Ordering::Equal));
-            let (ax, ay, edist) = if let Some(e) = enemy {
-                (e.3 - mx, e.4 - my, (e.3 - mx).hypot(e.4 - my))
-            } else {
-                (tx - mx, ty - my, 999.0)
-            };
+            // Light local ally separation so 32-64 bots form readable formations instead of stacking
+            let mut sep_x = 0.0f32;
+            let mut sep_y = 0.0f32;
+            for other in &snap {
+                if other.id == bid || other.team != team {
+                    continue;
+                }
+                let dx = mx - other.x;
+                let dy = my - other.y;
+                let d2 = dx * dx + dy * dy;
+                if d2 > 0.01 && d2 < 10.24 {
+                    let d = d2.sqrt();
+                    let push = (3.2 - d) / 3.2;
+                    sep_x += (dx / d) * push * 4.5;
+                    sep_y += (dy / d) * push * 4.5;
+                }
+            }
+            tx = (tx + sep_x).clamp(4.0, gw - 4.0);
+            ty = (ty + sep_y).clamp(4.0, gh - 4.0);
 
+            // --- 3. 3D Vertical Flight / Diving Intent per Archetype ---
+            let desired_vz = match class_id {
+                CLASS_SKYWING => {
+                    // Soar smoothly above chasms/bridges (cruise ~5.5-8.5m above floor on Z16, ~2.5 on L4)
+                    let target_alt = if is_z16 {
+                        let base_cruise = (self.grid_d as f32 * 0.58)
+                            + ((tick as f32 * 0.04 + bid as f32).sin()) * 2.2;
+                        base_cruise.clamp(5.5, max_fly_z)
+                    } else {
+                        2.55
+                    };
+                    ((target_alt - mz) * 2.2).clamp(-3.0, 6.5)
+                }
+                CLASS_TIDEKIN => {
+                    // Dive smoothly in deep rivers or surge up toward banks
+                    if is_z16 {
+                        let pl = (mz.round() as usize).clamp(0, self.grid_d - 1);
+                        let p_here = self.volume.sample_entity_physics(mx, my, pl);
+                        if p_here.water_frac > 0.12 {
+                            let target_z = 2.0 + ((tick as f32 * 0.06 + bid as f32).sin() * 0.8);
+                            ((target_z - mz) * 2.5).clamp(-3.5, 4.5)
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            };
+            pending_desired_vz.push((bid, desired_vz));
+
+            // --- 4. Cross-Class Elemental Combos & Low-HP Ally Rescue ---
             let near_river = (mx - gw * 0.50).abs() < gw * 0.14;
-            let elem = match class_id {
-                CLASS_WARDEN => if near_river || tick % 3 != 0 { 1 } else { 0 },
-                CLASS_ALCHEMIST => if tick % 7 == 0 { 2 } else { 0 },
-                _ => ((tick / 15 + bid as u64) % 3) as u8,
+            let (enemy_oiled, enemy_wet) = if let Some((ex, ey, ez)) = enemy_pos_z {
+                let el = (ez.round() as usize).clamp(0, self.grid_d - 1);
+                let ep = self.volume.sample_entity_physics(ex, ey, el);
+                (ep.oil_frac > 0.08, ep.water_frac > 0.14)
+            } else {
+                (false, false)
+            };
+
+            let wounded_ally = if squad_id > 0 {
+                squad_wounded
+                    .get(&(team, squad_id))
+                    .copied()
+                    .filter(|&(wx, wy, _)| (wx - mx).hypot(wy - my) <= 18.0)
+            } else {
+                None
+            };
+
+            // Nearby Striders/Skywings drop a protective Stasis Dome over a low-HP squadmate!
+            if let Some((wx, wy, _)) = wounded_ally {
+                if (class_id == CLASS_STRIDER || class_id == CLASS_SKYWING)
+                    && tick >= self.last_squad_dome_tick[team as usize].saturating_add(480)
+                    && self.time_domes.len() < 4
+                {
+                    pending_rescue_domes.push((bid, team, wx, wy));
+                }
+            }
+
+            let elem = if enemy_oiled {
+                0 // Prioritize thermal ignition for OIL INFERNO combo!
+            } else if enemy_wet && (class_id == CLASS_STRIDER || class_id == CLASS_TIDEKIN) {
+                1 // Prioritize DEEP FREEZE combo!
+            } else if enemy_wet && class_id == CLASS_SKYWING {
+                0 // FLASH-BOIL STEAM BURST!
+            } else {
+                match class_id {
+                    CLASS_STRIDER => if near_river || tick % 3 != 0 { 1 } else { 0 },
+                    CLASS_SKYWING => if tick % 5 == 0 { 2 } else { 0 },
+                    CLASS_EMBERSTALKER => if tick % 3 == 0 { 2 } else { 0 },
+                    _ => ((tick / 15 + bid as u64) % 3) as u8,
+                }
             };
 
             if self.physics_native {
@@ -2597,7 +3060,7 @@ impl GameState {
                     move_y: ty - my,
                     aim_x: ax,
                     aim_y: ay,
-                    dash: (tick + bid as u64 * 17) % 75 == 0,
+                    dash: (tick + bid as u64 * 17) % (if class_id == CLASS_EMBERSTALKER { 48 } else { 72 }) == 0,
                     melee: false,
                     cast_bolt: false,
                     bolt_element: 0,
@@ -2607,30 +3070,56 @@ impl GameState {
                     client_time_ms: 0,
                 };
                 let (mut tf, mut sw, mut so, mut ss, mut rad, mut imp) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 3.8f32, 0.0f32);
-                if (tick + bid as u64 * 9) % 12 == 0 && (edist < 34.0 || near_river) {
-                    match class_id {
-                        CLASS_WARDEN => {
-                            tf = -0.90;
-                            if edist < 8.0 { imp = 0.75; }
-                            rad = 4.5;
-                        }
-                        CLASS_ALCHEMIST => {
-                            if (tick / 12 + bid as u64) % 3 == 0 {
-                                so = 0.85;
-                                rad = 4.2;
-                            } else {
-                                tf = 0.95;
-                                rad = 3.8;
+                let fire_cadence = if class_id == CLASS_EMBERSTALKER { 9 } else { 12 };
+                if (tick + bid as u64 * 9) % fire_cadence == 0 && (edist < 38.0 || near_river || wounded_ally.is_some()) {
+                    if wounded_ally.is_some() && (class_id == CLASS_STRIDER || class_id == CLASS_SKYWING) {
+                        // Drop protective Cryo-Wall / Smoke barrier for low-HP squadmate!
+                        tf = -0.95;
+                        ss = 0.65;
+                        rad = 5.0;
+                    } else if enemy_oiled && (class_id == CLASS_SKYWING || class_id == CLASS_EMBERSTALKER) {
+                        // Cross-class OIL -> IGNITION detonation!
+                        tf = 1.0;
+                        rad = 4.4;
+                        if edist < 10.0 { imp = 0.70; }
+                    } else if enemy_wet && (class_id == CLASS_STRIDER || class_id == CLASS_TIDEKIN) {
+                        // Cross-class WATER -> CRYO FREEZE combo!
+                        tf = -0.95;
+                        rad = 4.6;
+                    } else {
+                        match class_id {
+                            CLASS_STRIDER => {
+                                tf = -0.90;
+                                if edist < 9.0 { imp = 0.80; }
+                                rad = 4.5;
                             }
-                        }
-                        _ => {
-                            if (tick / 12 + bid as u64) % 3 == 0 {
-                                ss = 0.75;
-                                sw = 0.35;
-                            } else {
-                                tf = if near_river { -0.80 } else { 0.85 };
+                            CLASS_SKYWING => {
+                                if (tick / 12 + bid as u64) % 3 == 0 {
+                                    so = 0.88;
+                                    rad = 4.4;
+                                } else {
+                                    tf = 0.98;
+                                    rad = 4.0;
+                                }
                             }
-                            if edist < 9.0 { imp = 0.65; }
+                            CLASS_TIDEKIN => {
+                                if (tick / 12 + bid as u64) % 3 == 0 {
+                                    sw = 0.85;
+                                    ss = 0.40;
+                                    rad = 4.2;
+                                } else {
+                                    tf = if near_river { -0.88 } else { 0.85 };
+                                }
+                                if edist < 9.0 { imp = 0.65; }
+                            }
+                            _ => {
+                                // CLASS_EMBERSTALKER: rapid oil/smoke/ignition ambush burst!
+                                match (tick / 9 + bid as u64) % 3 {
+                                    0 => { so = 0.90; ss = 0.60; rad = 4.0; }
+                                    1 => { tf = 1.0; rad = 4.2; if edist < 10.0 { imp = 0.75; } }
+                                    _ => { ss = 0.80; so = 0.50; rad = 4.4; }
+                                }
+                            }
                         }
                     }
                 }
@@ -2653,7 +3142,7 @@ impl GameState {
                 }
                 self.apply_input(bid, &move_inp);
                 let dlen = move_inp.aim_x.hypot(move_inp.aim_y).max(1e-3);
-                let dist_off = edist.min(14.0).max(4.0);
+                let dist_off = edist.min(16.0).max(4.0);
                 self.apply_player_physical_actuator(
                     bid,
                     (move_inp.aim_x / dlen) * dist_off,
@@ -2674,7 +3163,7 @@ impl GameState {
                 move_y: ty - my,
                 aim_x: ax,
                 aim_y: ay,
-                dash: (tick + bid as u64 * 17) % 75 == 0,
+                dash: (tick + bid as u64 * 17) % (if class_id == CLASS_EMBERSTALKER { 48 } else { 75 }) == 0,
                 melee: edist < 6.0,
                 cast_bolt: (tick + bid as u64 * 9) % 16 == 0 && (edist < 60.0 || near_river),
                 bolt_element: elem,
@@ -2711,6 +3200,18 @@ impl GameState {
                 }
             }
             self.apply_input(bid, &inp);
+        }
+
+        for (bid, dvz) in pending_desired_vz {
+            if let Some(p) = self.players.get_mut(&bid) {
+                p.desired_vz = dvz;
+            }
+        }
+        for (bid, team, wx, wy) in pending_rescue_domes {
+            if tick >= self.last_squad_dome_tick[team as usize].saturating_add(480) {
+                self.last_squad_dome_tick[team as usize] = tick;
+                self.place_time_dome(bid, wx, wy, 1);
+            }
         }
     }
 
@@ -2796,18 +3297,18 @@ impl GameState {
         }
         self.rafts = new_rafts;
 
-        // Move players in 3D `(x, y, z)` with Skybridge/Plateau altitude & cliff-drop gravity!
+        // Move players in 3D `(x, y, z)` with 4 Physically Distinct Archetype Locomotion Modes!
         let pids: Vec<u32> = self.players.keys().copied().collect();
         let mut phys_dmg_events: Vec<(Option<u32>, u32, i16, &'static str, u8)> = Vec::new();
         let mut combo_callouts: Vec<(f32, f32, u8, String)> = Vec::new();
         let field_tick = self.volume.tick;
         let physics_native = self.physics_native;
         for pid in pids {
-            let (px, py, pz, vx, vy, mut vz, mut kb_vx, mut kb_vy, dash_until, chilled_until, team, last_blast_ft) = {
+            let (px, py, pz, vx, vy, mut vz, desired_vz, mut kb_vx, mut kb_vy, dash_until, chilled_until, team, class_id, last_blast_ft) = {
                 let p = &self.players[&pid];
                 (
-                    p.x, p.y, p.z, p.vx, p.vy, p.vz, p.kb_vx, p.kb_vy, p.dash_until,
-                    p.chilled_until, p.team, p.last_phys_blast_field_tick,
+                    p.x, p.y, p.z, p.vx, p.vy, p.vz, p.desired_vz, p.kb_vx, p.kb_vy, p.dash_until,
+                    p.chilled_until, p.team, p.class_id, p.last_phys_blast_field_tick,
                 )
             };
             let is_z16 = self.is_z16();
@@ -2834,10 +3335,40 @@ impl GameState {
                 None
             };
 
+            let xi_c = (px.floor() as i32).clamp(0, (self.grid_w - 1) as i32) as usize;
+            let yi_c = (py.floor() as i32).clamp(0, (self.grid_h - 1) as i32) as usize;
+            let idx_c = yi_c * self.grid_w + xi_c;
+
+            // Detect water contact for Tidekin Hydrodynamic Surge (current layer or layer directly below feet)
+            let in_water = phys.water_frac > 0.12
+                || (hz_here & (1 << 4)) != 0
+                || self.volume.layers[cur_layer].mass[SP_WATER][idx_c] >= 120
+                || (cur_layer > 0 && self.volume.layers[cur_layer - 1].mass[SP_WATER][idx_c] >= 200);
+
+            // Detect Smoke Veil / subterranean cave stealth for Emberstalker
+            let in_smoke_veil = class_id == CLASS_EMBERSTALKER
+                && (phys.smoke_opacity > 0.15
+                    || (is_z16 && self.volume.measure_vertical_clearance_3d((px, py, pz)) < 6.0));
+
+            // Detect Thermal Updraft column (`T > 340 K` = `34_000 cK`) beneath Skywings
+            let mut thermal_updraft_ck = 0i64;
+            if class_id == CLASS_SKYWING {
+                let z_lo = cur_layer.saturating_sub(if is_z16 { 6 } else { 2 });
+                for zs in z_lo..=cur_layer {
+                    let t_s = self.volume.layers[zs].cell_temp_ck(idx_c);
+                    if t_s > thermal_updraft_ck {
+                        thermal_updraft_ck = t_s;
+                    }
+                }
+            }
+
             let mut mult = 1.0f32;
-            if physics_native {
+            if class_id == CLASS_TIDEKIN && in_water {
+                // Tidekin Passive Hydrodynamic Surge: 2.0x move speed in water/rivers/sinkholes, zero chill penalty!
+                mult *= 2.0;
+            } else if physics_native {
                 // Locomotion emerges directly from voxel ice_frac (glide), oil_frac (slip), water_frac (drag)
-                if on_raft.is_none() && phys.water_frac > 0.05 && phys.ice_frac < 0.30 {
+                if on_raft.is_none() && class_id != CLASS_SKYWING && phys.water_frac > 0.05 && phys.ice_frac < 0.30 {
                     mult *= (1.0 - 0.42 * phys.water_frac).clamp(0.45, 1.0);
                 }
                 if phys.ice_frac > 0.10 {
@@ -2846,19 +3377,25 @@ impl GameState {
                 if phys.oil_frac > 0.10 {
                     mult *= 1.0 - 0.12 * phys.oil_frac;
                 }
-                if phys.temp_c < -15.0 && tick >= dash_until {
+                if phys.temp_c < -15.0 && tick >= dash_until && class_id != CLASS_TIDEKIN {
                     let cold_slow = ((-15.0 - phys.temp_c) / 80.0).clamp(0.0, 0.32);
                     mult *= 1.0 - cold_slow;
                 }
                 // Low-friction glide on ice / oil preserves momentum via kb_vx/kb_vy slip term
                 let slip = (phys.ice_frac * 0.72).max(phys.oil_frac * 0.55).clamp(0.0, 0.78);
-                if slip > 0.12 {
+                if slip > 0.12 && class_id != CLASS_SKYWING {
                     kb_vx = kb_vx * (0.78 + 0.16 * slip) + vx * mult * (0.14 * slip);
                     kb_vy = kb_vy * (0.78 + 0.16 * slip) + vy * mult * (0.14 * slip);
                 }
             } else {
-                if on_raft.is_none() && (hz_here & (1 << 4)) != 0 { mult *= 0.60; }
-                if ((hz_here & (1 << 3)) != 0 || tick < chilled_until) && tick >= dash_until { mult *= 0.68; }
+                if on_raft.is_none() && class_id != CLASS_SKYWING && (hz_here & (1 << 4)) != 0 { mult *= 0.60; }
+                if ((hz_here & (1 << 3)) != 0 || tick < chilled_until) && tick >= dash_until && class_id != CLASS_TIDEKIN {
+                    mult *= 0.68;
+                }
+            }
+            if in_smoke_veil {
+                // Emberstalker Smoke Veil: +28% agility in smoke & caves!
+                mult *= 1.28;
             }
             let (cvx, cvy) = on_raft.unwrap_or((0.0, 0.0));
             let mut vx_s = vx * mult + cvx + kb_vx;
@@ -2870,20 +3407,80 @@ impl GameState {
 
             let (fx, fy, fz);
             if is_z16 {
-                // True isotropic 3D continuous ∇solid_density capsule locomotion (caves, slopes, 3-span arched bridge!)
+                let max_alt = (self.grid_d as f32 - 2.0).max(2.0);
+                match class_id {
+                    CLASS_SKYWING => {
+                        // True 3D Flight & Thermal Glider:
+                        // Smooth glide (gravity * 0.22), passive Thermal Updraft lift (+vz over T > 340 K), free soaring up to depth - 2.0!
+                        vz += 18.0 * 0.78 * dt; // Counteract 78% of step_capsule_3d's 18.0 m/s^2 gravity -> 0.22x glide!
+                        if thermal_updraft_ck > 34_000 {
+                            let updraft_gain = ((thermal_updraft_ck - 34_000) as f32 / 12_000.0).clamp(0.45, 2.2);
+                            vz = (vz + 15.0 * updraft_gain * dt).min(8.5);
+                        }
+                        if desired_vz.abs() > 0.05 {
+                            vz = (vz + (desired_vz - vz) * 4.5 * dt).clamp(-3.6, 8.5);
+                        } else if vx_s.hypot(vy_s) > 2.0 && pz < max_alt {
+                            // Human Skywing horizontal flight maintains gentle gliding lift when airborne
+                            vz = vz.max(-2.6);
+                        }
+                        vz = vz.clamp(-3.8, 9.0);
+                    }
+                    CLASS_TIDEKIN => {
+                        // Amphibious Swimmer & Diver: neutral buoyancy in water, dive/breach freely!
+                        if in_water {
+                            vz += 18.0 * dt; // Neutral buoyancy in water
+                            vz = (vz + (desired_vz - vz) * 5.0 * dt).clamp(-5.5, 9.5);
+                            // Breach upward out of water when pushing against a riverbank/ledge
+                            let spd_h = vx_s.hypot(vy_s);
+                            if spd_h > 2.5 {
+                                let nx_d = vx_s / spd_h;
+                                let ny_d = vy_s / spd_h;
+                                if self.volume.sample_solid_density_3d(px + nx_d * 0.9, py + ny_d * 0.9, pz + 0.5) >= 0.45 {
+                                    vz = vz.max(8.5);
+                                }
+                            }
+                        }
+                    }
+                    CLASS_EMBERSTALKER => {
+                        // Solo Cavern Climber: Passive High-Wall Climb up to 3.5m vertical ledges & cave walls!
+                        let spd_h = vx_s.hypot(vy_s);
+                        if spd_h > 2.0 {
+                            let nx_d = vx_s / spd_h;
+                            let ny_d = vy_s / spd_h;
+                            let wall_ahead = self
+                                .volume
+                                .sample_solid_density_3d(px + nx_d * 0.95, py + ny_d * 0.95, pz + 0.55)
+                                >= 0.45;
+                            let can_top_out = self
+                                .volume
+                                .sample_solid_density_3d(px + nx_d * 0.95, py + ny_d * 0.95, (pz + 3.5).min(max_alt))
+                                < 0.50;
+                            let headroom_ok = self.volume.sample_solid_density_3d(px, py, (pz + 2.0).min(max_alt)) < 0.50;
+                            if wall_ahead && can_top_out && headroom_ok && pz < max_alt {
+                                vz = (vz + 26.0 * dt).clamp(6.8, 10.2);
+                            }
+                        }
+                    }
+                    _ => {} // CLASS_STRIDER: Heavy Grounded Walker via step_capsule_3d
+                }
                 let ((nx, ny, nz), (_nvx, _nvy, nvz), _grounded) =
                     self.volume.step_capsule_3d((px, py, pz), (vx_s, vy_s, vz), 0.55, 1.80, dt);
                 fx = nx;
                 fy = ny;
-                fz = nz.clamp(0.0, (self.grid_d as f32) - 0.5);
+                fz = if class_id == CLASS_SKYWING {
+                    nz.clamp(0.5, max_alt)
+                } else {
+                    nz.clamp(0.0, (self.grid_d as f32) - 0.5)
+                };
                 vz = nvz;
             } else {
-                // Continuous bilinear solid-density gradient capsule collider (R = 0.65, probes at 0.55)
-                // Exact 1:1 parity with client `predict_hero_step`: weaves between 3×3 pine trunks and glides smoothly along walls!
+                // Continuous bilinear solid-density gradient capsule collider (L=4 strata mode)
                 let coll_layer = if pz >= 1.55 { 2.min(self.grid_d - 1) } else { surf_l };
                 let dashing_now = tick < dash_until;
                 let capsule_at = |tx: f32, ty: f32| -> f32 {
                     let allow_water = dashing_now
+                        || class_id == CLASS_SKYWING
+                        || class_id == CLASS_TIDEKIN
                         || on_raft.is_some()
                         || (pz < 1.35
                             && self.rafts.iter().any(|b| {
@@ -2928,9 +3525,7 @@ impl GameState {
                 fx = mx;
                 fy = my;
 
-                // 3D Vertical Altitude Update:
-                // - In physics_native: structural support comes directly from `sample_entity_physics(..., 2).support_solid`!
-                //   If a timber skybridge burns or ice bridge melts beneath an L2 entity, gravity drops them cleanly to L1!
+                // 3D Vertical Altitude Update on L=4:
                 let l2_deck = if self.grid_d >= 3 {
                     if physics_native {
                         let p2 = self.volume.sample_entity_physics(fx, fy, 2);
@@ -2949,8 +3544,27 @@ impl GameState {
                             && ((nx_norm - 0.76).powi(2) + (ny_norm - 0.66).powi(2)).sqrt() < 0.11));
 
                 let mut mz = pz;
-                if l2_deck && (pz >= 1.45 || on_ramp) {
-                    mz = (pz + 3.2 * dt).min(2.0);
+                if class_id == CLASS_SKYWING {
+                    // Skywing 3D flight & thermal glide on L=4!
+                    let max_l4_z = (self.grid_d as f32 - 0.6).max(2.6);
+                    vz -= (8.5 * 0.22) * dt;
+                    if thermal_updraft_ck > 34_000 {
+                        vz = (vz + 4.5 * dt).min(3.0);
+                    }
+                    if desired_vz.abs() > 0.05 {
+                        vz = (vz + (desired_vz.clamp(-1.5, 2.2) - vz) * 4.0 * dt).clamp(-1.5, 2.8);
+                    }
+                    mz = (mz + vz * dt).clamp(surf_z, max_l4_z);
+                    if mz <= surf_z {
+                        vz = 0.0;
+                    }
+                } else if l2_deck && (pz >= 1.45 || on_ramp || class_id == CLASS_EMBERSTALKER) {
+                    // Emberstalkers can climb directly onto Layer 2 cliffs & bridges without ramps!
+                    mz = (pz + 3.8 * dt).min(2.0);
+                    vz = 0.0;
+                } else if class_id == CLASS_TIDEKIN && in_water {
+                    // Tidekin buoyant swim on surface/riverbed
+                    mz = (mz + (surf_z - mz) * 4.0 * dt).max(surf_z);
                     vz = 0.0;
                 } else {
                     // Apply gravity toward surface layer
@@ -2974,6 +3588,7 @@ impl GameState {
                 + if near_friendly_shrine { 0.55 } else { 0.0 };
 
             let mut new_last_blast_ft = last_blast_ft;
+            let kb_res = if class_id == CLASS_STRIDER { 0.40 } else { 1.0 };
             if physics_native && tick >= dash_until {
                 let owner = self.find_recent_actuator_owner(fx, fy, team);
                 // 1. Emergent Blast Damage & Knockback from combustion (delta_temp_spike) & flash-boil (delta_steam_burst)
@@ -2981,7 +3596,7 @@ impl GameState {
                     if phys.delta_temp_spike > 18.0 {
                         let dmg = ((phys.delta_temp_spike - 15.0) * 0.42).round().clamp(6.0, 38.0) as i16;
                         let (bx, by) = self.voxel_blast_dir(fx, fy, cur_layer, false);
-                        let push = (phys.delta_temp_spike.min(120.0) * 0.34).clamp(8.0, 42.0);
+                        let push = (phys.delta_temp_spike.min(120.0) * 0.34).clamp(8.0, 42.0) * kb_res;
                         kb_vx = (kb_vx + bx * push).clamp(-48.0, 48.0);
                         kb_vy = (kb_vy + by * push).clamp(-48.0, 48.0);
                         phys_dmg_events.push((owner, pid, dmg, "DETONATION!", 0));
@@ -2992,7 +3607,7 @@ impl GameState {
                     } else if phys.delta_steam_burst > 0.06 {
                         let dmg = (phys.delta_steam_burst * 95.0).round().clamp(5.0, 32.0) as i16;
                         let (bx, by) = self.voxel_blast_dir(fx, fy, cur_layer, true);
-                        let push = (phys.delta_steam_burst * 72.0).clamp(8.0, 38.0);
+                        let push = (phys.delta_steam_burst * 72.0).clamp(8.0, 38.0) * kb_res;
                         kb_vx = (kb_vx + bx * push).clamp(-48.0, 48.0);
                         kb_vy = (kb_vy + by * push).clamp(-48.0, 48.0);
                         phys_dmg_events.push((owner, pid, dmg, "FLASH-BOIL!", 0));
@@ -3009,7 +3624,8 @@ impl GameState {
                     if phys.temp_c > 120.0 {
                         let dmg = (((phys.temp_c - 120.0) / 45.0).ceil() as i16).clamp(2, 16);
                         phys_dmg_events.push((owner, pid, dmg, "SCORCH", 0));
-                    } else if phys.temp_c < -25.0 {
+                    } else if phys.temp_c < -25.0 && class_id != CLASS_TIDEKIN {
+                        // Tidekin are immune to aquatic chill & hypothermia!
                         let dmg = (((-25.0 - phys.temp_c) / 22.0).ceil() as i16).clamp(1, 10);
                         phys_dmg_events.push((owner, pid, dmg, "HYPO", 1));
                     }
@@ -3270,9 +3886,10 @@ impl GameState {
             self.push_event(4, px, py, 0, team, format!("{} TOOK RELIC!", name));
         }
 
-        // Check 5-minute match timeout or 500-point early victory
-        if self.score_west >= MATCH_SCORE_LIMIT
-            || self.score_east >= MATCH_SCORE_LIMIT
+        // Check 5-minute match timeout or player-scaled early victory (500 pts @ 12P, 1600 pts @ 40P, 2560 pts @ 64P)
+        let score_limit = MATCH_SCORE_LIMIT.max((self.players.len() as u16).saturating_mul(40));
+        if self.score_west >= score_limit
+            || self.score_east >= score_limit
             || self.match_time_left_s == 0
         {
             self.match_phase = if self.score_west > self.score_east {
@@ -3320,7 +3937,124 @@ impl GameState {
         }
     }
 
+    fn process_ws_commands(&mut self) {
+        let Some(ws) = self.ws_bridge.clone() else {
+            return;
+        };
+        let mut world_changed = false;
+        for cmd in ws.drain_commands() {
+            match cmd {
+                ws_bridge::WsCommand::CycleBiome => {
+                    self.cycle_biome();
+                    world_changed = true;
+                }
+                ws_bridge::WsCommand::ResetWorld => {
+                    self.reset_match();
+                    world_changed = true;
+                }
+                ws_bridge::WsCommand::RequestFullSync { peer_id } => {
+                    ws.queue_full_sync_peer(peer_id);
+                }
+            }
+        }
+        if world_changed {
+            self.broadcast_ws_entities(true);
+        }
+    }
+
+    fn encode_ws_brick_frame(&self, bx: u16, by: u16) -> Arc<[u8]> {
+        let (dm, at) = self.volume.encode_3d_brick_16(bx as usize, by as usize);
+        let payload = ws_bridge::encode_brick_payload(bx, by, self.grid_d as u8, &dm, &at);
+        Arc::from(ws_bridge::encode_ws_binary_frame(&payload))
+    }
+
+    fn broadcast_ws_entities(&self, force: bool) {
+        let Some(ref ws) = self.ws_bridge else {
+            return;
+        };
+        if !ws.has_clients() || (!force && self.sim_tick % 2 != 0) {
+            return;
+        }
+
+        let mut sorted_players: Vec<&PlayerEntity> = self.players.values().collect();
+        sorted_players.sort_by_key(|p| p.id);
+
+        let mut json = String::with_capacity(512 + sorted_players.len() * 128 + self.projectiles.len() * 96);
+        use std::fmt::Write as _;
+        let _ = write!(
+            json,
+            "{{\"tick\":{},\"world_day\":{},\"players\":[",
+            self.sim_tick, self.world_day
+        );
+        for (i, p) in sorted_players.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            let (r, g, b) = if p.team == 0 {
+                (0.16f32, 0.54f32, 0.98f32) // West team (blue)
+            } else {
+                (0.94f32, 0.24f32, 0.24f32) // East team (red)
+            };
+            let yaw = p.aim_y.atan2(p.aim_x);
+            // WebGPU client axis convention: x = east (p.x), y = altitude (p.z), z = north (p.y)
+            let _ = write!(
+                json,
+                "{{\"id\":{},\"name\":{},\"team\":{},\"class_id\":{},\"squad\":{},\"x\":{:.3},\"y\":{:.3},\"z\":{:.3},\"yaw\":{:.3},\"color\":[{:.2},{:.2},{:.2}],\"scale\":1.0}}",
+                p.id,
+                json_escape_str(&p.name),
+                p.team,
+                p.class_id,
+                p.squad_id,
+                p.x,
+                p.z,
+                p.y,
+                yaw,
+                r,
+                g,
+                b
+            );
+        }
+        json.push_str("],\"projectiles\":[");
+        for (i, pr) in self.projectiles.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            let (r, g, b) = match pr.element {
+                0 => (1.00f32, 0.46f32, 0.12f32), // Fire orb
+                1 => (0.22f32, 0.86f32, 1.00f32), // Frost orb
+                _ => (0.76f32, 0.38f32, 0.98f32), // Oil / Arcane orb
+            };
+            let rad = pr.radius.clamp(0.25, 1.2);
+            let _ = write!(
+                json,
+                "{{\"id\":{},\"x\":{:.3},\"y\":{:.3},\"z\":{:.3},\"color\":[{:.2},{:.2},{:.2}],\"radius\":{:.2}}}",
+                pr.id, pr.x, pr.z, pr.y, r, g, b, rad
+            );
+        }
+        let status = format!("{} Z={}", biome_name(self.biome_id), self.grid_d);
+        let _ = write!(
+            json,
+            "],\"telemetry\":{{\"server_tps\":{:.1},\"online_players\":{},\"status\":{}}}}}",
+            self.measured_tps,
+            sorted_players.len(),
+            json_escape_str(&status)
+        );
+
+        let payload = ws_bridge::encode_entities_payload(&json);
+        let frame: Arc<[u8]> = Arc::from(ws_bridge::encode_ws_binary_frame(&payload));
+        ws.broadcast_raw_frame(frame);
+    }
+
     fn broadcast_entities_30hz(&mut self) {
+        self.tps_window_ticks = self.tps_window_ticks.saturating_add(1);
+        let tps_elapsed = self.tps_window_start.elapsed().as_secs_f32();
+        if tps_elapsed >= 1.0 {
+            self.measured_tps = (self.tps_window_ticks as f32 / tps_elapsed).clamp(1.0, 120.0);
+            self.tps_window_ticks = 0;
+            self.tps_window_start = Instant::now();
+        }
+        self.broadcast_ws_entities(false);
+
         if self.peers.is_empty() {
             return;
         }
@@ -3520,7 +4254,8 @@ impl GameState {
                 Err(quinn::SendDatagramError::ConnectionLost(_)) => dead.push(pid),
                 Err(quinn::SendDatagramError::TooLarge) => {
                     let conn_c = peer.conn.clone();
-                    tokio::spawn(async move {
+                    let rt_h = self.rt_handle.clone();
+                    rt_h.spawn(async move {
                         if let Ok(mut send) = conn_c.open_uni().await {
                             let mut framed = Vec::with_capacity(1 + raw.len());
                             framed.push(0xFE);
@@ -3605,6 +4340,22 @@ impl GameState {
     }
 
     fn broadcast_chunks_10hz(&mut self, dirty: &[(u8, u16, u16)]) {
+        if let Some(ws) = self.ws_bridge.clone() {
+            if ws.has_clients() {
+                let mut dirty_xy: Vec<(u16, u16)> = Vec::new();
+                for &(_layer, cx, cy) in dirty {
+                    if !dirty_xy.contains(&(cx, cy)) {
+                        dirty_xy.push((cx, cy));
+                    }
+                }
+                ws.pump_bricks(
+                    &dirty_xy,
+                    ws_bridge::WS_INITIAL_BRICKS_PER_TICK,
+                    |bx, by| self.encode_ws_brick_frame(bx, by),
+                );
+            }
+        }
+
         if self.peers.is_empty() {
             return;
         }
@@ -3729,7 +4480,8 @@ impl GameState {
                         batch_pkts.push(b.clone());
                     }
                     log::info!(
-                        "Full Z=16 sync queued for player {}: {} VolumetricBrick3D bricks + {} surf chunks ({:.1} KB)",
+                        "Full Z={} sync queued for player {}: {} VolumetricBrick3D bricks + {} surf chunks ({:.1} KB)",
+                        self.grid_d,
                         pid,
                         full_bricks.len(),
                         full_pkts.len(),
@@ -3831,6 +4583,7 @@ fn make_quic_server_config() -> Result<ServerConfig, Box<dyn std::error::Error>>
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.max_concurrent_uni_streams(512u32.into());
     cfg.transport_config(Arc::new(transport));
     Ok(cfg)
 }
@@ -3848,22 +4601,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.cuda_addr.clone(),
         args.size,
         args.layers,
+        args.biome,
+        args.seed,
         args.bots,
         args.aoi_radius,
     )));
-    let (grid_w, grid_h, grid_d) = {
+    let (grid_w, grid_h, grid_d, biome_id, world_seed, chunks_x, chunks_y, bot_counts) = {
         let gs = state.lock().unwrap();
-        (gs.grid_w, gs.grid_h, gs.grid_d)
+        let mut cls_cnt = [0usize; 4];
+        for p in gs.players.values().filter(|p| p.is_bot) {
+            cls_cnt[(p.class_id as usize) % 4] += 1;
+        }
+        (gs.grid_w, gs.grid_h, gs.grid_d, gs.biome_id, gs.world_seed, gs.chunks_x, gs.chunks_y, cls_cnt)
     };
+    if let Some(ref ws_addr) = args.ws_bind {
+        let bridge = ws_bridge::WsBridge::start(ws_addr, chunks_x, chunks_y).await?;
+        state.lock().unwrap().ws_bridge = Some(bridge);
+        log::info!(
+            "Wave 12B Live RFC 6455 WebSocket bridge listening on ws://{} ({}x{} bricks, Z={})",
+            ws_addr,
+            chunks_x,
+            chunks_y,
+            grid_d
+        );
+    }
     log::info!(
-        "Frostmarsh v3 3D VOLUMETRIC QUIC Server listening on {} ({}x{}x{} = {} voxels, backend={}, bots={}, aoi_r={})",
+        "Frostmarsh v3 3D VOLUMETRIC QUIC Server listening on {} ({}x{}x{} = {} voxels, biome={} [{}], seed={}, backend={}, bots={} [Strider={} Skywing={} Tidekin={} Emberstalker={}], aoi_r={})",
         args.bind,
         grid_w,
         grid_h,
         grid_d,
         grid_w * grid_h * grid_d,
+        biome_id,
+        biome_name(biome_id),
+        world_seed,
         args.backend,
-        args.bots,
+        bot_counts.iter().sum::<usize>(),
+        bot_counts[0],
+        bot_counts[1],
+        bot_counts[2],
+        bot_counts[3],
         args.aoi_radius
     );
 
@@ -4102,8 +4879,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut gs = field_state.lock().unwrap();
                 let sl = gs.surf_layer();
                 let tick_now = gs.volume.tick;
+                let evo_speed = gs.evo_speed;
                 gs.volume.apply_weather_and_springs_3d(weather_kind, tick_now);
                 gs.volume.apply_solar_cycle_3d(day_time_now, tick_now);
+                if gs.volume.depth >= 12 && (evo_speed >= 4.0 || tick_now % 2 == 0) {
+                    gs.volume.step_world_evolution_3d(evo_speed);
+                }
                 let stats = gs.volume.step_3d_with_neural_z(&raw_layers, z_flux_opt.as_deref());
                 gs.neural_3d_vertical = used_neural_3d_z;
                 if eco_on {
@@ -4124,14 +4905,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gs.proj_active_pct = stats.proj_active_pct;
                 gs.mass_error = stats.mass_error;
                 gs.energy_error = stats.energy_error;
+                gs.process_ws_commands();
                 gs.broadcast_chunks_10hz(&stats.dirty_chunks);
 
-                if stats.tick % 30 == 0 {
+                if stats.tick % 10 == 0 {
+                    let bot_cnt = gs.players.values().filter(|p| p.is_bot).count();
+                    let ev = gs.volume.evolution_stats;
                     log::info!(
-                        "tick={} {}x{}x{} ({} vox) mode={} backend={} world={:.2}ms eco={:.2}ms grav_z={} buoy_z={} mass_err={} energy_err={} wire={:.1}KB/s dirty={} peers={}",
-                        stats.tick, gw, gh, gd, gw * gh * gd, gs.sim_mode, gs.backend_name,
+                        "tick={} {}x{}x{} ({} vox) biome={} mode={} backend={} world={:.2}ms eco={:.2}ms grav_z={} buoy_z={} mass_err={} energy_err={} bots={} evo={:.0}x basalt={} trees={} glaciers={} erosion={} wire={:.1}KB/s dirty={} peers={}",
+                        stats.tick, gw, gh, gd, gw * gh * gd, biome_name(gs.biome_id), gs.sim_mode, gs.backend_name,
                         reported_ms, eco_ms, stats.vertical_gravity_mass, stats.vertical_buoyancy_mass,
-                        stats.mass_error, stats.energy_error, gs.wire_kbps, stats.dirty_chunks.len(), gs.peers.len()
+                        stats.mass_error, stats.energy_error, bot_cnt, gs.evo_speed, ev.basalt_forged,
+                        ev.saplings_grown, ev.glaciers_formed, ev.erosion_events, gs.wire_kbps,
+                        stats.dirty_chunks.len(), gs.peers.len()
                     );
                 }
             }
@@ -4139,6 +4925,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let elapsed = t_loop.elapsed();
             if elapsed < period {
                 std::thread::sleep(period - elapsed);
+            } else {
+                std::thread::yield_now();
             }
         }
     });
@@ -4149,9 +4937,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval = tokio::time::interval(Duration::from_millis(33));
         loop {
             interval.tick().await;
-            let mut gs = combat_state.lock().unwrap();
-            gs.tick_combat_30hz();
-            gs.broadcast_entities_30hz();
+            tokio::task::block_in_place(|| {
+                let mut gs = combat_state.lock().unwrap();
+                gs.process_ws_commands();
+                gs.tick_combat_30hz();
+                gs.broadcast_entities_30hz();
+            });
         }
     });
 
@@ -4198,7 +4989,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             ClientReliable::SelectClass { class_id } => {
                                 if let Some(p) = gs.players.get_mut(&pid) {
-                                    p.class_id = class_id % 3;
+                                    p.class_id = class_id % 4;
                                     let (mhp, mmp, mst, _) = PlayerEntity::class_stats(p.class_id, p.level);
                                     p.max_hp = mhp;
                                     p.hp = p.hp.min(mhp);
@@ -4329,6 +5120,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             ClientReliable::PlaceTimeDome { gx, gy, mode } => {
                                 gs.place_time_dome(pid, gx, gy, mode);
+                            }
+                            ClientReliable::CycleBiome => {
+                                gs.cycle_biome();
+                            }
+                            ClientReliable::CycleEvolutionSpeed => {
+                                gs.evo_speed = if (gs.evo_speed - 1.0).abs() < 0.05 {
+                                    4.0
+                                } else if (gs.evo_speed - 4.0).abs() < 0.05 {
+                                    12.0
+                                } else {
+                                    1.0
+                                };
+                                let ev = gs.volume.evolution_stats;
+                                let lbl = format!(
+                                    "WORLD EVOLUTION: {:.0}X (BASALT:{} TREES:{})",
+                                    gs.evo_speed, ev.basalt_forged, ev.saplings_grown
+                                );
+                                let (mx, my) = (gs.grid_w as f32 * 0.5, gs.grid_h as f32 * 0.5);
+                                gs.push_event(5, mx, my, 0, 2, lbl);
                             }
                         }
                     }

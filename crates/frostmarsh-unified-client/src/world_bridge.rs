@@ -9,15 +9,16 @@
 //!   3 Capturable `ShrineObelisk`s, Golden Relic, carved `IceRaft`s, `MarshDeer` herds, and 8 dynamic lights!
 
 use crate::camera::CameraMatrices;
-use crate::mesh_gen::{MeshInstance, MeshKind, MeshVertex, MESH_KIND_COUNT};
+use crate::mesh_gen::{
+    MeshInstance, MeshKind, MeshVertex, CLASS_EMBERSTALKER, CLASS_SKYWING, CLASS_STRIDER,
+    CLASS_TIDEKIN, MESH_KIND_COUNT,
+};
 use crate::net::LiveEntityState;
 use crate::parametric::hash2i;
 use crate::surfel_gen::{SplatPlacement, SplatRef, SurfelProtoBank, SurfelProtoKind};
 use crate::z16_world::Z16World;
 use bytemuck::{Pod, Zeroable};
-use frostmarsh_proto::{
-    chunks_for_dim, CHUNK_SIZE, CLASS_ALCHEMIST, CLASS_WARDEN, STATUS_SHIELDED,
-};
+use frostmarsh_proto::{chunks_for_dim, CHUNK_SIZE, STATUS_SHIELDED};
 use glam::Vec3;
 use std::time::Instant;
 
@@ -1374,6 +1375,20 @@ pub struct AimReticle {
     pub color: [f32; 3],
 }
 
+/// Exact local-to-world-offset transform matching `mesh_pass.wgsl` & `shadow_pass.wgsl`
+/// (scale -> roll around Z -> pitch around X -> yaw around Y) so articulated Skywing wings
+/// stay rigidly locked to shoulder sockets while pitching and banking!
+#[inline]
+fn transform_local_offset(local: Vec3, scale: Vec3, roll: f32, pitch: f32, yaw: f32) -> Vec3 {
+    let s = local * scale;
+    let (cr, sr) = (roll.cos(), roll.sin());
+    let r = Vec3::new(s.x * cr - s.y * sr, s.x * sr + s.y * cr, s.z);
+    let (cp, sp) = (pitch.cos(), pitch.sin());
+    let p = Vec3::new(r.x, r.y * cp - r.z * sp, r.y * sp + r.z * cp);
+    let (cy, sy) = (yaw.cos(), yaw.sin());
+    Vec3::new(p.x * cy - p.z * sy, p.y, p.x * sy + p.z * cy)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_live_frame(
     world: &LiveApproach4World,
@@ -1658,61 +1673,319 @@ pub fn assemble_live_frame(
             });
         }
 
-        // 3-Class Heroes & Bots (using true 3D altitude `p.z` so L2 Skybridge/Plateau or Z=16 Bridge/Cave heroes align 1:1!)
+        // 4-Archetype Heroes & Bots (scales smoothly to 40–64 live players in true 3D `(x, y, z)`!)
         for p in &ent.players {
             let (wx, wz) = grid_to_xz(p.x, p.y);
+            let ground_y = sample_g_y(p.x, p.y);
             let gy = sample_e_y(p.x, p.y, p.z);
+            let altitude_above_ground = (gy - ground_y).max(0.0);
             let speed = p.vx.hypot(p.vy);
-            let stride = if speed > 1.0 {
-                (sim_time * 11.0 + p.id as f32 * 1.7).sin().abs() * 0.22
-            } else {
-                0.0
-            };
+            let phase = p.id as f32 * 1.73;
+
             // Local hero meshes face +Z; mesh_pass rotates +Z to (-sin(yaw), cos(yaw)),
             // so yaw = (-aim_x).atan2(aim_y) aligns facing exactly with (aim_x, aim_y)!
             let yaw = (-p.aim_x).atan2(p.aim_y);
-            let rel = Vec3::new(wx, gy + stride, wz) - origin;
+            let aim_len = p.aim_x.hypot(p.aim_y).max(0.001);
+            let lat_vel = (p.aim_x * p.vy - p.aim_y * p.vx) / aim_len;
 
-            let kind = match p.class_id {
-                CLASS_WARDEN => MeshKind::HeroKnight,
-                CLASS_ALCHEMIST => MeshKind::HeroMage,
-                _ => MeshKind::HeroRanger,
-            };
             let team_tint = if p.team == 0 {
                 [0.20, 0.58, 0.98]
             } else {
                 [0.94, 0.24, 0.26]
             };
-
-            let move_pitch = if p.dashing {
-                0.22
-            } else if speed > 1.2 {
-                0.07
-            } else {
-                0.0
-            };
-            mesh_batches[kind as usize].push(MeshInstance {
-                pos_yaw: [rel.x, rel.y, rel.z, yaw],
-                scale_pitch: [1.12, 1.12, 1.12, move_pitch],
-                tint_glow: [
-                    team_tint[0],
-                    team_tint[1],
-                    team_tint[2],
-                    if p.dashing || p.ult_active { 0.30 } else { 0.0 },
-                ],
-                flags: [-1.0, 1.0, 0.0, 0.0],
-            });
-
-            // Ground ring (crisp heroic footprint!)
             let is_self = p.id == ent.your_player_id;
             let ring_col = if is_self { [0.38, 1.0, 0.56] } else { team_tint };
-            let ring_rel = Vec3::new(wx, gy + 0.05, wz) - origin;
-            mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
-                pos_yaw: [ring_rel.x, ring_rel.y, ring_rel.z, 0.0],
-                scale_pitch: [if is_self { 1.25 } else { 1.02 }, 1.0, if is_self { 1.25 } else { 1.02 }, 0.0],
-                tint_glow: [ring_col[0], ring_col[1], ring_col[2], 0.72],
-                flags: [-1.0, 0.0, 0.0, 0.0],
+            let base_glow = if p.dashing || p.ult_active { 0.30 } else { 0.0 };
+
+            let (kind, body_scale, bob, move_pitch, body_roll) = match p.class_id {
+                CLASS_STRIDER => {
+                    // Heavy Walker / Squad Anchor: sturdy grounded rhythmic stride + slight shoulder sway
+                    let stride = if speed > 0.8 {
+                        (sim_time * 7.8 + phase).sin().abs() * 0.15
+                    } else {
+                        0.0
+                    };
+                    let sway = if speed > 0.8 {
+                        (sim_time * 7.8 + phase).sin() * 0.055
+                    } else {
+                        0.0
+                    };
+                    let pitch = if p.dashing {
+                        0.20
+                    } else if speed > 1.0 {
+                        0.08
+                    } else {
+                        0.0
+                    };
+                    (MeshKind::HeroStrider, Vec3::new(1.18, 1.16, 1.18), stride, pitch, sway)
+                }
+                CLASS_SKYWING => {
+                    // True 3D Flyer / Thermal Glider: rhythmic airborne hover/flapping + banking glide!
+                    let airborne = altitude_above_ground > 0.55
+                        || p.vz.abs() > 0.35
+                        || (z16.is_none() && p.z > 1.35);
+                    let gliding = airborne && speed > 11.5 && p.vz <= 0.45;
+                    let bob = if airborne {
+                        let freq = if gliding { 3.4 } else { 9.6 };
+                        0.24 - 0.16 * (sim_time * freq + phase).cos()
+                    } else if speed > 0.9 {
+                        (sim_time * 10.5 + phase).sin().abs() * 0.18
+                    } else {
+                        0.0
+                    };
+                    let bank = if airborne {
+                        (-lat_vel * 0.032
+                            + (sim_time * 1.8 + phase).sin() * if gliding { 0.08 } else { 0.03 })
+                        .clamp(-0.42, 0.42)
+                    } else {
+                        (-lat_vel * 0.012).clamp(-0.14, 0.14)
+                    };
+                    let pitch = if p.dashing {
+                        0.36
+                    } else if gliding {
+                        0.28
+                    } else if airborne {
+                        (0.14 - p.vz * 0.045).clamp(-0.18, 0.32)
+                    } else if speed > 1.0 {
+                        0.09
+                    } else {
+                        0.0
+                    };
+                    (MeshKind::HeroSkywing, Vec3::new(1.08, 1.12, 1.08), bob, pitch, bank)
+                }
+                CLASS_TIDEKIN => {
+                    // Amphibious Swimmer / Diver: fluid hydrodynamic bob + lateral swimming undulation
+                    let bob = if speed > 0.8 {
+                        (sim_time * 9.5 + phase).sin() * 0.12 + 0.08
+                    } else {
+                        (sim_time * 3.0 + phase).sin() * 0.05
+                    };
+                    let swim_roll = (sim_time * if speed > 0.8 { 7.5 } else { 2.6 } + phase).sin()
+                        * if speed > 0.8 { 0.13 } else { 0.04 }
+                        + (-lat_vel * 0.018).clamp(-0.18, 0.18);
+                    let pitch = if p.dashing {
+                        0.38
+                    } else if speed > 1.0 {
+                        0.18
+                    } else {
+                        0.04
+                    };
+                    (MeshKind::HeroTidekin, Vec3::new(1.08, 1.12, 1.12), bob, pitch, swim_roll)
+                }
+                _ => {
+                    // CLASS_EMBERSTALKER (3) — Solo Cavern Climber / Raider: agile low-slung crouched gait
+                    let bob = if speed > 0.8 {
+                        (sim_time * 13.5 + phase).sin().abs() * 0.15
+                    } else {
+                        (sim_time * 2.4 + phase).sin() * 0.03
+                    };
+                    let lean = (-lat_vel * 0.025).clamp(-0.22, 0.22);
+                    let pitch = if p.dashing {
+                        0.36
+                    } else if speed > 1.0 {
+                        0.24
+                    } else {
+                        0.10
+                    };
+                    (MeshKind::HeroStalker, Vec3::new(1.04, 1.06, 1.06), bob, pitch, lean)
+                }
+            };
+
+            let rel = Vec3::new(wx, gy + bob, wz) - origin;
+            mesh_batches[kind as usize].push(MeshInstance {
+                pos_yaw: [rel.x, rel.y, rel.z, yaw],
+                scale_pitch: [body_scale.x, body_scale.y, body_scale.z, move_pitch],
+                tint_glow: [team_tint[0], team_tint[1], team_tint[2], base_glow],
+                flags: [-1.0, 1.0, body_roll, 0.0],
             });
+
+            // Archetype-specific articulated attachments, trails & Squad/Solo visual indicators!
+            match p.class_id {
+                CLASS_STRIDER => {
+                    // Crisp inner footprint + outer Squad Anchor rally halo ring!
+                    let ring_rel = Vec3::new(wx, gy + 0.05, wz) - origin;
+                    let inner_s = if is_self { 1.28 } else { 1.08 };
+                    mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                        pos_yaw: [ring_rel.x, ring_rel.y, ring_rel.z, 0.0],
+                        scale_pitch: [inner_s, 1.0, inner_s, 0.0],
+                        tint_glow: [ring_col[0], ring_col[1], ring_col[2], 0.78],
+                        flags: [-1.0, 0.0, 0.0, 0.0],
+                    });
+                    let anchor_pulse = 1.62 + 0.08 * (sim_time * 2.4 + phase).sin();
+                    mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                        pos_yaw: [ring_rel.x, ring_rel.y + 0.02, ring_rel.z, sim_time * 0.55 + phase],
+                        scale_pitch: [anchor_pulse, 0.72, anchor_pulse, 0.0],
+                        tint_glow: [
+                            team_tint[0] * 0.75 + 0.25,
+                            team_tint[1] * 0.75 + 0.25,
+                            team_tint[2] * 0.75 + 0.25,
+                            0.36,
+                        ],
+                        flags: [-1.0, 0.0, 0.0, 0.0],
+                    });
+                }
+                CLASS_SKYWING => {
+                    let airborne = altitude_above_ground > 0.55
+                        || p.vz.abs() > 0.35
+                        || (z16.is_none() && p.z > 1.35);
+                    let gliding = airborne && speed > 11.5 && p.vz <= 0.45;
+                    let soaring_high =
+                        altitude_above_ground > 1.25 || (z16.is_none() && p.z > 1.45);
+                    let flap_rad = if gliding {
+                        0.18 + 0.14 * (sim_time * 3.4 + phase).sin()
+                    } else if airborne {
+                        0.20 + 0.62 * (sim_time * 9.6 + phase).sin()
+                    } else {
+                        -0.28 + 0.07 * (sim_time * 2.8 + phase).sin()
+                    };
+                    let wing_pitch = move_pitch + if gliding { 0.08 } else { 0.0 };
+                    let wing_scale = if gliding {
+                        Vec3::new(1.16, 1.08, 1.12)
+                    } else {
+                        Vec3::new(1.08, 1.08, 1.08)
+                    };
+                    let wing_glow = if p.dashing || p.ult_active {
+                        0.45
+                    } else if airborne {
+                        0.22
+                    } else {
+                        0.08
+                    };
+
+                    // Mount Left & Right glowing swept wings cleanly to the Skywing's back shoulder sockets
+                    let off_l = transform_local_offset(
+                        Vec3::new(-0.28, 1.56, -0.24),
+                        body_scale,
+                        body_roll,
+                        move_pitch,
+                        yaw,
+                    );
+                    let off_r = transform_local_offset(
+                        Vec3::new(0.28, 1.56, -0.24),
+                        body_scale,
+                        body_roll,
+                        move_pitch,
+                        yaw,
+                    );
+                    let wl_pos = rel + off_l;
+                    let wr_pos = rel + off_r;
+                    mesh_batches[MeshKind::SkywingWingL as usize].push(MeshInstance {
+                        pos_yaw: [wl_pos.x, wl_pos.y, wl_pos.z, yaw],
+                        scale_pitch: [wing_scale.x, wing_scale.y, wing_scale.z, wing_pitch],
+                        tint_glow: [team_tint[0], team_tint[1], team_tint[2], wing_glow],
+                        flags: [-1.0, 1.0, body_roll - flap_rad, 0.0],
+                    });
+                    mesh_batches[MeshKind::SkywingWingR as usize].push(MeshInstance {
+                        pos_yaw: [wr_pos.x, wr_pos.y, wr_pos.z, yaw],
+                        scale_pitch: [wing_scale.x, wing_scale.y, wing_scale.z, wing_pitch],
+                        tint_glow: [team_tint[0], team_tint[1], team_tint[2], wing_glow],
+                        flags: [-1.0, 1.0, body_roll + flap_rad, 0.0],
+                    });
+
+                    // Ground projection ring beneath the flyer (always readable in 3D!)
+                    let proj_y = if airborne { ground_y + 0.06 } else { gy + 0.05 };
+                    let ring_rel = Vec3::new(wx, proj_y, wz) - origin;
+                    let rs = if is_self { 1.24 } else { 1.00 };
+                    mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                        pos_yaw: [ring_rel.x, ring_rel.y, ring_rel.z, 0.0],
+                        scale_pitch: [rs, 0.9, rs, 0.0],
+                        tint_glow: [ring_col[0], ring_col[1], ring_col[2], if airborne { 0.56 } else { 0.72 }],
+                        flags: [-1.0, 0.0, 0.0, 0.0],
+                    });
+
+                    // Subtle rising thermal ring + warm-cyan thermal trail when soaring high!
+                    if soaring_high {
+                        let t_cyc = (sim_time * 1.35 + phase * 0.37).fract();
+                        let th_y = gy - 1.25 + t_cyc * 1.15;
+                        let th_s = 0.92 + t_cyc * 0.85;
+                        let th_rel = Vec3::new(wx, th_y, wz) - origin;
+                        let th_glow = (1.0 - t_cyc) * 0.72;
+                        mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                            pos_yaw: [th_rel.x, th_rel.y, th_rel.z, sim_time * 1.8 + phase],
+                            scale_pitch: [th_s, 0.65, th_s, 0.0],
+                            tint_glow: [1.0, 0.84, 0.42, th_glow],
+                            flags: [-1.0, 0.0, 0.0, 0.0],
+                        });
+                        // Soft rising thermal trail wisp behind/beneath the glider
+                        let trail_rel = Vec3::new(
+                            wx - p.vx * 0.08,
+                            gy - 0.35 + t_cyc * 0.45,
+                            wz - p.vy * 0.08,
+                        ) - origin;
+                        vol_splats.push(VolSplat {
+                            pos_rad: [trail_rel.x, trail_rel.y, trail_rel.z, 0.48 + (1.0 - t_cyc) * 0.25],
+                            color_alpha: [1.05, 0.88, 0.48, 0.34 * (1.0 - t_cyc * 0.65)],
+                            params: [1.25, 3.0, phase, 0.2],
+                        });
+                    }
+                }
+                CLASS_TIDEKIN => {
+                    // Team footprint + shimmering aqua bioluminescent water-wake ring beneath!
+                    let ring_rel = Vec3::new(wx, gy + 0.05, wz) - origin;
+                    let rs = if is_self { 1.24 } else { 1.00 };
+                    mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                        pos_yaw: [ring_rel.x, ring_rel.y, ring_rel.z, 0.0],
+                        scale_pitch: [rs, 1.0, rs, 0.0],
+                        tint_glow: [ring_col[0], ring_col[1], ring_col[2], 0.70],
+                        flags: [-1.0, 0.0, 0.0, 0.0],
+                    });
+                    let wake_s = 1.24 + 0.24 * (sim_time * 3.6 + phase).sin();
+                    mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                        pos_yaw: [ring_rel.x, ring_rel.y + 0.03, ring_rel.z, -sim_time * 1.4 + phase],
+                        scale_pitch: [wake_s, 0.72, wake_s, 0.0],
+                        tint_glow: [0.24, 0.96, 1.0, 0.76],
+                        flags: [-1.0, 0.0, 0.0, 0.0],
+                    });
+                    if speed > 1.2 {
+                        let w_cyc = (sim_time * 2.2 + phase * 0.5).fract();
+                        let rip_s = 0.95 + w_cyc * 0.90;
+                        let rip_rel = Vec3::new(
+                            wx - p.vx * 0.055 * w_cyc,
+                            gy + 0.04,
+                            wz - p.vy * 0.055 * w_cyc,
+                        ) - origin;
+                        mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                            pos_yaw: [rip_rel.x, rip_rel.y, rip_rel.z, sim_time * 1.1],
+                            scale_pitch: [rip_s, 0.52, rip_s, 0.0],
+                            tint_glow: [0.36, 0.98, 1.0, (1.0 - w_cyc) * 0.55],
+                            flags: [-1.0, 0.0, 0.0, 0.0],
+                        });
+                        vol_splats.push(VolSplat {
+                            pos_rad: [rip_rel.x, rip_rel.y + 0.28, rip_rel.z, 0.36],
+                            color_alpha: [0.32, 0.96, 1.08, 0.32 * (1.0 - w_cyc * 0.6)],
+                            params: [0.85, 2.0, phase, 0.15],
+                        });
+                    }
+                }
+                _ => {
+                    // CLASS_EMBERSTALKER (3): Compact Solo-Raider ember ground ring + ember aura!
+                    let ring_rel = Vec3::new(wx, gy + 0.05, wz) - origin;
+                    let solo_s = if is_self { 1.12 } else { 0.88 };
+                    let solo_col = if is_self {
+                        [1.0, 0.78, 0.24]
+                    } else {
+                        [1.0, 0.38, 0.14]
+                    };
+                    mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                        pos_yaw: [ring_rel.x, ring_rel.y, ring_rel.z, sim_time * 1.6 + phase],
+                        scale_pitch: [solo_s, 1.08, solo_s, 0.0],
+                        tint_glow: [solo_col[0], solo_col[1], solo_col[2], 0.84],
+                        flags: [-1.0, 0.0, 0.0, 0.0],
+                    });
+                    // Compact orbiting solo-raider ember spark aura hugging the silhouette
+                    let orb_a = sim_time * 3.8 + phase;
+                    let orb_rel = Vec3::new(
+                        wx + orb_a.cos() * 0.58,
+                        gy + 1.15 + (sim_time * 5.2 + phase).sin() * 0.22,
+                        wz + orb_a.sin() * 0.58,
+                    ) - origin;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [orb_rel.x, orb_rel.y, orb_rel.z, 0.34],
+                        color_alpha: [1.32, 0.46, 0.12, 0.52],
+                        params: [1.15, 0.0, phase, 0.12],
+                    });
+                }
+            }
 
             if p.dashing || (p.status_flags & STATUS_SHIELDED) != 0 {
                 mesh_batches[MeshKind::DashHalo as usize].push(MeshInstance {
@@ -1726,10 +1999,17 @@ pub fn assemble_live_frame(
             if p.melee_active {
                 // MeleeArc mesh is centered along local +X, rotated to (cos(a), sin(a)) -> a = atan2(aim_y, aim_x)
                 let arc_yaw = p.aim_y.atan2(p.aim_x);
+                let slash_col = if p.class_id == CLASS_EMBERSTALKER {
+                    [1.0, 0.44, 0.16]
+                } else if p.class_id == CLASS_TIDEKIN {
+                    [0.36, 0.98, 1.0]
+                } else {
+                    [1.0, 0.95, 0.65]
+                };
                 mesh_batches[MeshKind::MeleeArc as usize].push(MeshInstance {
                     pos_yaw: [rel.x, rel.y, rel.z, arc_yaw],
                     scale_pitch: [1.25, 1.0, 1.25, 0.0],
-                    tint_glow: [1.0, 0.95, 0.65, 0.95],
+                    tint_glow: [slash_col[0], slash_col[1], slash_col[2], 0.95],
                     flags: [-1.0, 0.0, 0.0, 0.0],
                 });
             }
@@ -1743,8 +2023,8 @@ pub fn assemble_live_frame(
             }
 
             if p.carrying_relic {
-                let bob = 0.22 * (sim_time * 3.8).sin();
-                let r_rel = Vec3::new(wx, gy + 4.1 + bob, wz) - origin;
+                let bob_r = 0.22 * (sim_time * 3.8).sin();
+                let r_rel = Vec3::new(wx, gy + 4.1 + bob_r, wz) - origin;
                 mesh_batches[MeshKind::GoldenRelic as usize].push(MeshInstance {
                     pos_yaw: [r_rel.x, r_rel.y, r_rel.z, sim_time * 2.2],
                     scale_pitch: [0.98, 0.98, 0.98, 0.0],
@@ -2106,5 +2386,236 @@ pub fn assemble_live_frame(
         point_pos,
         point_col,
         visible_chunks,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera::MobaCamera;
+    use crate::hud::{build_hud, HudConfig};
+    use crate::mesh_gen::StaticMeshBank;
+    use frostmarsh_proto::{PlayerSnap, TelemetrySnap};
+
+    fn make_mock_entities(player_count: usize) -> LiveEntityState {
+        let mut players = Vec::with_capacity(player_count);
+        for i in 0..player_count {
+            let class_id = (i % 4) as u8;
+            let team = (i % 2) as u8;
+            let angle = (i as f32 / player_count.max(1) as f32) * std::f32::consts::TAU;
+            let radius = 8.0 + (i as f32 * 1.15);
+            let x = (128.0 + angle.cos() * radius).clamp(6.0, 250.0);
+            let y = (128.0 + angle.sin() * radius).clamp(6.0, 250.0);
+            let z = match class_id {
+                CLASS_SKYWING => 2.2 + (i % 3) as f32 * 0.4,
+                CLASS_EMBERSTALKER => 1.6,
+                _ => 1.0,
+            };
+            players.push(PlayerSnap {
+                id: (i + 1) as u32,
+                name: format!("Hero{:02}", i + 1),
+                team,
+                class_id,
+                is_bot: i != 0,
+                x,
+                y,
+                z,
+                vx: angle.sin() * 14.0,
+                vy: -angle.cos() * 14.0,
+                vz: if class_id == CLASS_SKYWING { 0.8 } else { 0.0 },
+                aim_x: angle.cos(),
+                aim_y: angle.sin(),
+                hp: 110,
+                max_hp: 140,
+                mana: 85,
+                max_mana: 120,
+                stamina: 90,
+                max_stamina: 100,
+                level: (1 + (i % 5)) as u8,
+                xp: 50,
+                kills: (i % 7) as u16,
+                deaths: (i % 4) as u16,
+                status_flags: 0,
+                dashing: i % 11 == 0,
+                melee_active: i % 9 == 0,
+                ult_active: i % 16 == 0,
+                carrying_relic: i == 5,
+                dash_cd_frac: 0.0,
+                ability_e_cd_frac: 0.25,
+                ult_r_cd_frac: 0.5,
+                ack_input_seq: 1,
+                score: (player_count - i) as u32 * 10,
+            });
+        }
+        LiveEntityState {
+            sim_tick: 120,
+            match_time_secs: 95,
+            your_player_id: 1,
+            echo_client_time_ms: 10,
+            relic_x: 128.0,
+            relic_y: 128.0,
+            players,
+            projectiles: Vec::new(),
+            bodies: Vec::new(),
+            shrines: Vec::new(),
+            events: Vec::new(),
+            telemetry: TelemetrySnap {
+                mode: "neural".to_string(),
+                backend: "cuda".to_string(),
+                ecosystem_on: true,
+                grid_w: 256,
+                grid_h: 256,
+                grid_d: 4,
+                field_tick: 120,
+                infer_ms_last: 1.1,
+                infer_ms_p99: 1.4,
+                eco_infer_ms: 0.3,
+                proj_active_pct: 42.0,
+                mass_error: 0,
+                energy_error: 0,
+                wire_kbps: 210.0,
+                aoi_chunks_sent: 16,
+                total_chunks: 256,
+                active_bots: player_count.saturating_sub(1) as u16,
+                neural_bots_on: true,
+                bot_infer_ms: 0.8,
+                weather_kind: 0,
+                day_time: 0.45,
+                wind_x: 0.5,
+                wind_y: 0.2,
+                score_west: 180,
+                score_east: 165,
+                acoustic_ms: 0.4,
+                world_sparse_pct: 64.0,
+                physics_native: false,
+                time_scale: 1.0,
+                world_day: 1,
+                neural_3d_vertical: true,
+                active_time_domes: 0,
+                system2_slm_active: false,
+            },
+            bot_brains: Vec::new(),
+            kill_feed: Vec::new(),
+            speech_bubbles: Vec::new(),
+            actuator_pulses: Vec::new(),
+            match_phase: 0,
+            match_time_left_s: 205,
+            mvp_name: "Hero01".to_string(),
+            mvp_score: 480,
+            time_domes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_four_archetype_meshes_and_48_player_assembly_finite() {
+        let bank = StaticMeshBank::build(1);
+        let archetype_kinds = [
+            MeshKind::HeroStrider,
+            MeshKind::HeroSkywing,
+            MeshKind::SkywingWingL,
+            MeshKind::SkywingWingR,
+            MeshKind::HeroTidekin,
+            MeshKind::HeroStalker,
+        ];
+        for kind in archetype_kinds {
+            let sl = bank.slices[kind as usize];
+            assert!(sl.index_count > 0, "{:?} must produce non-empty geometry", kind);
+            let start = sl.first_index as usize;
+            let end = start + sl.index_count as usize;
+            assert!(end <= bank.indices.len());
+            for &idx in &bank.indices[start..end] {
+                let v = &bank.vertices[idx as usize];
+                assert!(v.pos.iter().all(|c| c.is_finite()), "{:?} has non-finite pos", kind);
+                assert!(v.normal.iter().all(|c| c.is_finite()), "{:?} has non-finite normal", kind);
+                assert!(v.color_mat.iter().all(|c| c.is_finite()), "{:?} has non-finite color", kind);
+            }
+        }
+
+        // Verify 48-player AND 64-player assembly + HUD scaling (no overflow, all finite)
+        let world = LiveApproach4World::new(256, 256, 4);
+        let surfels = SurfelProtoBank::build();
+        let cam = MobaCamera {
+            target: Vec3::new(0.0, 2.0, 0.0),
+            yaw: 0.42,
+            pitch: 0.58,
+            dist: 52.0,
+            fov_y: 38.0_f32.to_radians(),
+            ortho: false,
+        };
+        let mats = cam.compute_matrices(1920.0, 1080.0, Vec3::new(0.4, 0.8, 0.4).normalize());
+
+        for player_count in [48usize, 64usize] {
+            let ent = make_mock_entities(player_count);
+            let frame = assemble_live_frame(
+                &world,
+                None,
+                Some(&ent),
+                &surfels,
+                &mats,
+                cam.target,
+                cam.dist,
+                3.25,
+                0,
+                None,
+            );
+
+            let per_arch = player_count / 4;
+            assert_eq!(frame.mesh_batches[MeshKind::HeroStrider as usize].len(), per_arch);
+            assert_eq!(frame.mesh_batches[MeshKind::HeroSkywing as usize].len(), per_arch);
+            assert_eq!(frame.mesh_batches[MeshKind::SkywingWingL as usize].len(), per_arch);
+            assert_eq!(frame.mesh_batches[MeshKind::SkywingWingR as usize].len(), per_arch);
+            assert_eq!(frame.mesh_batches[MeshKind::HeroTidekin as usize].len(), per_arch);
+            assert_eq!(frame.mesh_batches[MeshKind::HeroStalker as usize].len(), per_arch);
+            assert!(frame.mesh_batches[MeshKind::GroundRing as usize].len() >= player_count);
+            assert!(!frame.vol_splats.is_empty());
+
+            for batch in &frame.mesh_batches {
+                for inst in batch {
+                    assert!(inst.pos_yaw.iter().all(|v| v.is_finite()));
+                    assert!(inst.scale_pitch.iter().all(|v| v.is_finite()));
+                    assert!(inst.tint_glow.iter().all(|v| v.is_finite()));
+                    assert!(inst.flags.iter().all(|v| v.is_finite()));
+                }
+            }
+            for splat in &frame.vol_splats {
+                assert!(splat.pos_rad.iter().all(|v| v.is_finite()));
+                assert!(splat.color_alpha.iter().all(|v| v.is_finite()));
+                assert!(splat.params.iter().all(|v| v.is_finite()));
+            }
+
+            let hud_batch = build_hud(
+                1920.0,
+                1080.0,
+                &world,
+                None,
+                Some(&ent),
+                &mats,
+                &HudConfig {
+                    show_hud: true,
+                    show_telemetry: true,
+                    show_brain_inspector: true,
+                    brain_selected_idx: None,
+                    selected_element: 0,
+                    focus_radius: 4.0,
+                    style_label: "PIXEL-2XSS",
+                    z16_active: false,
+                    z16_style_label: "NORDIC",
+                    fps: 120.0,
+                    rtt_ms: 2.0,
+                    chat_open: false,
+                    chat_input: "",
+                    chat_shout: true,
+                    show_scoreboard: true,
+                    audio_muted: false,
+                    audio_available: true,
+                    cave_enclosure: 0.0,
+                },
+            );
+            assert!(!hud_batch.vertices.is_empty());
+            for hv in &hud_batch.vertices {
+                assert!(hv.pos[0].is_finite() && hv.pos[1].is_finite());
+                assert!(hv.color.iter().all(|c| c.is_finite()));
+            }
+        }
     }
 }

@@ -389,7 +389,8 @@ impl Z16World {
                         break;
                     }
                     if fluid > 72 && solid < 110 {
-                        let bright = if iy >= 7 { 48 } else { 0 };
+                        let wf_y = (d * 7) / 16;
+                        let bright = if iy >= wf_y { 48 } else { 0 };
                         rgb = [
                             (34u16 + bright).min(255) as u8,
                             (126u16 + bright).min(255) as u8,
@@ -402,8 +403,9 @@ impl Z16World {
                         let ar = self.albedo_thermal[bi] as f32;
                         let ag = self.albedo_thermal[bi + 1] as f32;
                         let ab = self.albedo_thermal[bi + 2] as f32;
-                        // Alpine snow highlight on high ridges
-                        if iy >= 10 && ar > 70.0 && ab > 70.0 {
+                        // Alpine snow highlight on high ridges (scales seamlessly for Z=16..32!)
+                        let snow_y = (d * 10) / 16;
+                        if iy >= snow_y && ar > 70.0 && ab > 70.0 {
                             rgb = [214, 228, 242];
                         } else {
                             rgb = [
@@ -477,7 +479,8 @@ impl Z16World {
                         fire_cnt += glow as f32 / 255.0;
                     }
                     let fluid = self.density_mat[bi + 1];
-                    if iy >= 5 && iy <= 9 && fluid > 90 && waterfalls.len() < 4 {
+                    let wf_hi = d.saturating_sub(3).max(9);
+                    if iy >= 5 && iy <= wf_hi && fluid > 90 && waterfalls.len() < 4 {
                         let (wx, wz) = self.grid_to_world_xz(ix as f32 + 0.5, iz as f32 + 0.5);
                         waterfalls.push(Vec3::new(wx, iy as f32 + 0.5, wz));
                     }
@@ -529,7 +532,10 @@ impl Z16World {
                         let sxi = gx as usize;
                         let szi = gz as usize;
                         if let Some(wy) = self.find_column_surface_y(sxi, szi) {
-                            if wy >= 4.4 && wy <= 12.2 {
+                            let max_pine_y = (d as f32 - 3.2).max(12.2);
+                            let ridge_y = (d as f32 * 0.54).max(8.6);
+                            let snow_y = (d as f32 * 0.55).max(8.8);
+                            if wy >= 4.4 && wy <= max_pine_y {
                                 let iy_s = (wy.floor() as usize).min(d - 1);
                                 let iy_u = (iy_s + 1).min(d - 1);
                                 let bi_s = self.byte_index(sxi, iy_s, szi);
@@ -544,7 +550,7 @@ impl Z16World {
                                 let ag = self.albedo_thermal[bi_s + 1] as f32;
                                 let ab = self.albedo_thermal[bi_s + 2] as f32;
                                 let is_forested_green = ag > ar * 1.06 && ag > ab * 1.04 && ag > 40.0;
-                                let is_alpine_ridge = wy >= 8.6 && h0 > 0.62;
+                                let is_alpine_ridge = wy >= ridge_y && h0 > 0.62;
 
                                 if no_fluid && no_fire && (is_forested_green || is_alpine_ridge) {
                                     // Gentle slope check so pines stand naturally on slopes
@@ -553,7 +559,7 @@ impl Z16World {
                                     let hz0 = self.find_column_surface_y(sxi, szi.saturating_sub(2)).unwrap_or(wy);
                                     let hz1 = self.find_column_surface_y(sxi, (szi + 2).min(h - 1)).unwrap_or(wy);
                                     if (hx1 - hx0).abs() <= 2.6 && (hz1 - hz0).abs() <= 2.6 {
-                                        let snowy = wy >= 8.8 || (ny < 0.28 && wy >= 7.6);
+                                        let snowy = wy >= snow_y || (ny < 0.28 && wy >= snow_y - 1.2);
                                         let scale = (0.72 + h3 * 0.36) * if snowy { 0.90 } else { 1.02 };
                                         let tv = 0.88 + h1 * 0.20;
                                         let tint = if snowy {
@@ -621,6 +627,115 @@ impl Z16World {
             None
         };
         (best_wf, nearby_fire)
+    }
+
+    /// Physical 3D Cave & Archway Acoustic Enclosure probe at server grid `(gx, gy, gz)`
+    /// (`gx` = East, `gy` = South, `gz` = Altitude UP).
+    ///
+    /// Samples `solid_density` across a `3×3` overhead ceiling ring `2.0..6.0m` above `(gx, gy, gz)`
+    /// plus 4 horizontal wall probes at `4.0m` radius, returning `0.0` (open sky) → `1.0` (deep vaulted cave).
+    pub fn sample_cave_enclosure(&self, gx: f32, gy: f32, gz: f32) -> f32 {
+        if self.width < 4 || self.height < 4 || self.depth < 4 {
+            return 0.0;
+        }
+        let max_z = self.depth as f32 - 0.1;
+        let sample_bounded = |x: f32, y: f32, z: f32| -> f32 {
+            if z < 0.0 || z >= max_z {
+                0.0
+            } else {
+                self.sample_solid_density_3d(x, y, z)
+            }
+        };
+
+        // 1. 3×3 overhead ceiling ring 2.0..6.0m above the listener
+        let offsets = [-2.0f32, 0.0, 2.0];
+        let heights = [2.0f32, 3.0, 4.0, 5.0, 6.0];
+        let mut ceil_sum = 0.0f32;
+        for &dy in &offsets {
+            for &dx in &offsets {
+                let mut col_max = 0.0f32;
+                for &dz in &heights {
+                    let s = sample_bounded(gx + dx, gy + dy, gz + dz);
+                    if s > col_max {
+                        col_max = s;
+                    }
+                }
+                // Map solid density [0.35..0.65] cleanly to [0..1]
+                let occ = ((col_max - 0.35) / 0.30).clamp(0.0, 1.0);
+                ceil_sum += occ;
+            }
+        }
+        let ceil_cov = ceil_sum / 9.0;
+
+        // 2. 4 horizontal wall probes at 4.0m radius (plus inner 2.5m check for tight caverns)
+        let wall_dirs = [(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)];
+        let probe_z = gz + 1.25;
+        let mut wall_sum = 0.0f32;
+        for &(dx, dy) in &wall_dirs {
+            let s_far = sample_bounded(gx + dx * 4.0, gy + dy * 4.0, probe_z);
+            let s_mid = sample_bounded(gx + dx * 2.5, gy + dy * 2.5, probe_z);
+            let occ = ((s_far.max(s_mid) - 0.35) / 0.30).clamp(0.0, 1.0);
+            wall_sum += occ;
+        }
+        let wall_cov = wall_sum / 4.0;
+
+        // Under a full roof without walls -> ~0.78 (>0.7); deep cave with roof + walls -> 1.0;
+        // open sky (even beside a cliff) -> <0.09!
+        let enc = ceil_cov * 0.78 + wall_cov * 0.22 * (0.28 + 0.72 * ceil_cov);
+        enc.clamp(0.0, 1.0)
+    }
+
+    /// Detects whether solid terrain blocks the hero from above (`> gz + 2.5m`) or along the
+    /// hero-to-camera line-of-sight above `gz + 2.2m`, triggering Smart 3D Cave/Bridge Ceiling Cutaway.
+    pub fn should_cutaway_ceiling(&self, gx: f32, gy: f32, gz: f32, cam_world: Vec3) -> bool {
+        if self.width < 4 || self.height < 4 || self.depth < 4 {
+            return false;
+        }
+        let max_z = self.depth as f32 - 0.1;
+        // 1. Direct overhead roof check above `gz + 2.5m`
+        let mut z = gz + 2.5;
+        while z < max_z {
+            if self.sample_solid_density_3d(gx, gy, z) >= ISO
+                || self.sample_solid_density_3d(gx + 1.2, gy, z) >= ISO
+                || self.sample_solid_density_3d(gx - 1.2, gy, z) >= ISO
+                || self.sample_solid_density_3d(gx, gy + 1.2, z) >= ISO
+                || self.sample_solid_density_3d(gx, gy - 1.2, z) >= ISO
+            {
+                return true;
+            }
+            z += 0.85;
+        }
+        // 2. Raymarched camera-to-hero LOS check for overhanging arches/caves blocking the view
+        let cam_gx = cam_world.x + (self.width as f32) * 0.5;
+        let cam_gy = cam_world.z + (self.height as f32) * 0.5;
+        let cam_gz = cam_world.y;
+        let dx = cam_gx - gx;
+        let dy = cam_gy - gy;
+        let dz = cam_gz - (gz + 1.2);
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-3);
+        let steps = (dist.min(48.0) / 1.25).ceil() as usize;
+        for s in 2..=steps {
+            let t = (s as f32 * 1.25) / dist;
+            if t >= 0.98 {
+                break;
+            }
+            let qz = (gz + 1.2) + dz * t;
+            if qz <= gz + 2.2 {
+                continue;
+            }
+            if qz >= max_z {
+                break;
+            }
+            let qx = gx + dx * t;
+            let qy = gy + dy * t;
+            if qx < 0.0 || qy < 0.0 || qx >= self.width as f32 || qy >= self.height as f32 {
+                break;
+            }
+            if self.sample_solid_density_3d(qx, qy, qz) >= ISO {
+                return true;
+            }
+        }
+        false
     }
 
     // =========================================================================
@@ -987,4 +1102,69 @@ fn extract_brick(dm: &[u8], w: usize, d: usize, h: usize, bx: usize, bz: usize) 
     }
 
     BrickMesh { vertices, indices }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_z32_surface_nets_extract() {
+        let (w, h, d) = (32usize, 32usize, 32usize);
+        let mut world = Z16World::new(w, h, d);
+        assert_eq!(world.depth, 32);
+        assert_eq!(world.occ_by, 4, "32m altitude should use 4 coarse 8x8x8 occupancy bricks");
+
+        let mut dm = vec![0u8; w * d * h * 4];
+        let mut at = vec![0u8; w * d * h * 4];
+
+        // Sculpt a 28m towering mountain peak + vaulted cave tunnel + arched bridge at Z=32!
+        for iz in 0..h {
+            for ix in 0..w {
+                let dx = ix as f32 - 16.0;
+                let dz = iz as f32 - 16.0;
+                let r = dx.hypot(dz);
+                let ridge_h = (27.0 - r * 1.15).clamp(4.0, 28.0);
+                for iy in 0..d {
+                    let y = iy as f32 + 0.5;
+                    let mut solid = if y <= ridge_h { 245u8 } else { 0u8 };
+                    // Carve a subterranean vaulted cave chamber at y in 4..10 near center
+                    if r < 6.5 && y > 3.5 && y < 9.5 {
+                        solid = 0;
+                    }
+                    let off = ((iz * d + iy) * w + ix) * 4;
+                    dm[off] = solid;
+                    dm[off + 3] = 200; // roughness
+                    if solid > 0 {
+                        at[off] = 96;
+                        at[off + 1] = 138;
+                        at[off + 2] = 104;
+                    }
+                }
+            }
+        }
+
+        let all_bricks = vec![(0, 0), (1, 0), (0, 1), (1, 1)];
+        let (rebuilt, _ms) = world.apply_dirty_bricks(&dm, &at, &all_bricks);
+        assert_eq!(rebuilt, 4);
+        assert!(world.total_triangles() > 200, "Z=32 Surface-Nets must emit watertight triangles");
+        assert!(world.flat_verts.iter().all(|v| {
+            v.pos[0].is_finite()
+                && v.pos[1].is_finite()
+                && v.pos[2].is_finite()
+                && v.pos[1] >= 0.0
+                && v.pos[1] <= d as f32
+        }));
+        let max_y = world
+            .flat_verts
+            .iter()
+            .map(|v| v.pos[1])
+            .fold(0.0f32, f32::max);
+        assert!(max_y > 22.0, "Z=32 mountain peak must reach >22m, got {max_y}");
+        // Verify vaulted cave enclosure inside the chamber vs high open sky on top of peak!
+        let enc_cave = world.sample_cave_enclosure(16.0, 16.0, 5.0);
+        let enc_sky = world.sample_cave_enclosure(16.0, 16.0, 28.5);
+        assert!(enc_cave > 0.7, "Inside Z=32 vaulted cave should have enclosure > 0.7, got {enc_cave}");
+        assert!(enc_sky < 0.1, "Above Z=32 mountain peak should have enclosure < 0.1, got {enc_sky}");
+    }
 }

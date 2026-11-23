@@ -1,16 +1,29 @@
-//! Frostmarsh Iteration 9C: True 3D `Z=16` WebGPU Browser Client (`wasm32-unknown-unknown`).
+//! Frostmarsh Wave 12C: True 3D `Z=16..32` WebGPU Browser Client (`wasm32-unknown-unknown`).
 //!
-//! Powered by Smooth Surface-Nets + Direct 3D-Texture Shading + Raymarched Volumetric Fluid/Gas
-//! Overlay + 3D Hero Knights + Continuous `∇solid_density` 3D Capsule Walk Mode + `Pixel-2×SS`
-//! ↔ `Clean-3D` live toggle.
+//! Powered by Smooth Surface-Nets + Client-Side WGSL 4-Style Neural Compute (`Y`-Key)
+//! + Triplanar Painterly Micro-Detail + Smart 3D Cave Ceiling Cutaway (`C`-Key Capsule Walk Mode)
+//! + Depth-Tested Raymarched Volumetric Fluid/Gas Overlay + Live Binary WebSocket Multiplayer
+//! Receiver (`0x01` Incremental Brick3D + `0x02` Live Entities) + `Pixel-2×SS` ↔ `Clean-3D` toggle.
 
 pub mod camera;
 pub mod collision;
 pub mod hero_mesh;
+pub mod live_entities;
 #[cfg(target_arch = "wasm32")]
 pub mod renderer;
 pub mod surface_nets_3d;
 pub mod volume;
+
+pub const STYLE_NAMES: [&str; 4] = [
+    "NORDIC",
+    "VOLCANIC EMBER",
+    "ARCANE THERMAL",
+    "EMERALD CAVERN",
+];
+
+pub fn style_name_for(mode: u32) -> &'static str {
+    STYLE_NAMES[(mode % 4) as usize]
+}
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_app {
@@ -18,10 +31,14 @@ mod wasm_app {
     use crate::collision::{
         step_capsule_3d, CAPSULE_EYE_HEIGHT, DEFAULT_CAPSULE_HEIGHT, DEFAULT_CAPSULE_RADIUS,
     };
-    use crate::hero_mesh::{build_hero_knight_mesh, showcase_hero_instances};
+    use crate::hero_mesh::{
+        build_hero_knight_mesh, build_projectile_orb_mesh, showcase_hero_instances, HeroInstance,
+    };
+    use crate::live_entities::parse_live_entities_json;
     use crate::renderer::WebRenderer;
+    use crate::style_name_for;
     use crate::surface_nets_3d::SurfaceNetsWorld;
-    use crate::volume::WorldVolume3D;
+    use crate::volume::{BrickOccupancy3D, WorldVolume3D};
     use glam::Vec3;
     use std::collections::HashSet;
     use wasm_bindgen::prelude::*;
@@ -53,29 +70,39 @@ mod wasm_app {
     #[wasm_bindgen]
     pub struct FrostmarshApp {
         volume: WorldVolume3D,
+        bricks: BrickOccupancy3D,
+        sn_world: SurfaceNetsWorld,
         renderer: WebRenderer,
         cam: Camera3D,
         keys: HashSet<String>,
         pixel_art: bool,
+        style_mode: u32,
         capsule_mode: bool,
         capsule_pos: Vec3,
         capsule_vel: Vec3,
         capsule_grounded: bool,
+        capsule_cam_dist: f32,
         sim_time: f32,
         fps_smooth: f32,
         frame_ms_smooth: f32,
         volume_source: String,
         volume_ms: f64,
         sn_build_ms: f64,
-        non_empty_bricks: usize,
-        total_bricks: usize,
+        base_heroes: Vec<HeroInstance>,
+        live_projectiles: Vec<HeroInstance>,
+        live_entities_active: bool,
+        live_tick: u64,
+        live_server_tps: f32,
+        live_status: String,
+        live_bricks_rx: u32,
+        last_brick_rebuild_ms: f64,
     }
 
     #[wasm_bindgen]
     impl FrostmarshApp {
         /// Create and initialize the Frostmarsh WebGPU application on the given `<canvas>` id.
-        /// If `fm3d_bytes` is provided, parses it as an `FM3D` volume; otherwise generates the
-        /// built-in isotropic `256×256×16` Frostmarsh True-3D world instantaneously in WASM.
+        /// If `fm3d_bytes` is provided, parses it as an `FM3D` volume (`Z=16..32+`); otherwise
+        /// generates the built-in isotropic `256×256×16` Frostmarsh True-3D world in WASM.
         pub async fn create(
             canvas_id: String,
             fm3d_bytes: Option<js_sys::Uint8Array>,
@@ -116,7 +143,8 @@ mod wasm_app {
             let sn_build_ms = (perf_now_ms() - t_sn).max(0.0);
 
             let hero_mesh = build_hero_knight_mesh();
-            let hero_instances = showcase_hero_instances();
+            let orb_mesh = build_projectile_orb_mesh();
+            let base_heroes = showcase_hero_instances();
 
             let renderer = WebRenderer::from_canvas(
                 canvas,
@@ -126,7 +154,8 @@ mod wasm_app {
                 &bricks,
                 &sn_world,
                 &hero_mesh,
-                &hero_instances,
+                &base_heroes,
+                &orb_mesh,
             )
             .await
             .map_err(|e| JsValue::from_str(&e))?;
@@ -136,22 +165,32 @@ mod wasm_app {
 
             Ok(FrostmarshApp {
                 volume,
+                bricks,
+                sn_world,
                 renderer,
                 cam,
                 keys: HashSet::new(),
                 pixel_art: false,
+                style_mode: 0,
                 capsule_mode: false,
                 capsule_pos,
                 capsule_vel: Vec3::ZERO,
                 capsule_grounded: false,
+                capsule_cam_dist: 6.5,
                 sim_time: 0.0,
                 fps_smooth: 60.0,
                 frame_ms_smooth: 16.6,
                 volume_source,
                 volume_ms,
                 sn_build_ms,
-                non_empty_bricks: bricks.non_empty_bricks,
-                total_bricks: bricks.total_bricks,
+                base_heroes,
+                live_projectiles: Vec::new(),
+                live_entities_active: false,
+                live_tick: 0,
+                live_server_tps: 0.0,
+                live_status: "Offline".to_string(),
+                live_bricks_rx: 0,
+                last_brick_rebuild_ms: 0.0,
             })
         }
 
@@ -178,8 +217,8 @@ mod wasm_app {
 
         pub fn zoom_wheel(&mut self, delta_y: f32) {
             if self.capsule_mode {
-                let fov_deg = (self.cam.fov_y.to_degrees() + delta_y * 0.025).clamp(32.0, 78.0);
-                self.cam.fov_y = fov_deg.to_radians();
+                // Smoothly zoom between 0.0m (first-person) and 16.0m (3rd-person cave cutaway view)
+                self.capsule_cam_dist = (self.capsule_cam_dist + delta_y * 0.012).clamp(0.0, 16.0);
             } else {
                 let fwd = self.cam.forward();
                 let step = (-delta_y * 0.018).clamp(-6.0, 6.0);
@@ -194,6 +233,7 @@ mod wasm_app {
                 2 => Camera3D::preset_cave_mouth(),
                 _ => Camera3D::preset_bridge_waterfall(),
             };
+            self.sync_entities_to_gpu();
         }
 
         /// Toggle stylized `Pixel-2×SS` ↔ `Clean-3D` (`T`-key). Returns `true` when `Pixel-2×SS` is active.
@@ -202,11 +242,27 @@ mod wasm_app {
             self.pixel_art
         }
 
-        /// Toggle 3D Capsule Collision Walk Mode (`C`-key). Returns `true` when Capsule Walk is active.
+        /// Cycle live client-side WGSL 4-Style Neural Compute (`Y`-key):
+        /// `0 = NORDIC`, `1 = VOLCANIC EMBER`, `2 = ARCANE THERMAL`, `3 = EMERALD CAVERN`.
+        pub fn cycle_style_mode(&mut self) -> u32 {
+            self.style_mode = (self.style_mode + 1) % 4;
+            self.style_mode
+        }
+
+        pub fn set_style_mode(&mut self, mode: u32) -> u32 {
+            self.style_mode = mode % 4;
+            self.style_mode
+        }
+
+        pub fn get_style_name(&self) -> String {
+            style_name_for(self.style_mode).to_string()
+        }
+
+        /// Toggle 3D Capsule Collision Walk Mode (`C`-key) with Smart 3D Cave Ceiling Cutaway.
+        /// Returns `true` when Capsule Walk is active.
         pub fn toggle_capsule_mode(&mut self) -> bool {
             self.capsule_mode = !self.capsule_mode;
             if self.capsule_mode {
-                // Place capsule smoothly below current camera eye (or onto bridge deck if flying high)
                 let foot_y = (self.cam.pos.y - CAPSULE_EYE_HEIGHT)
                     .clamp(1.2, self.volume.depth as f32 - DEFAULT_CAPSULE_HEIGHT - 0.2);
                 self.capsule_pos = Vec3::new(
@@ -215,7 +271,6 @@ mod wasm_app {
                     self.cam.pos.z.clamp(2.0, self.volume.height as f32 - 2.0),
                 );
                 self.capsule_vel = Vec3::ZERO;
-                // Settle one quick step so we start cleanly above solid isosurface
                 let res = step_capsule_3d(
                     &self.volume,
                     self.capsule_pos,
@@ -227,12 +282,47 @@ mod wasm_app {
                 self.capsule_pos = res.pos;
                 self.capsule_vel = res.vel;
                 self.capsule_grounded = res.grounded;
-                self.cam.pos = self.capsule_pos + Vec3::new(0.0, CAPSULE_EYE_HEIGHT, 0.0);
+                self.update_capsule_camera();
             }
+            self.sync_entities_to_gpu();
             self.capsule_mode
         }
 
-        /// Hot-swap to an external `FM3D` neural volume in browser.
+        fn update_capsule_camera(&mut self) {
+            let eye = self.capsule_pos + Vec3::new(0.0, CAPSULE_EYE_HEIGHT, 0.0);
+            if self.capsule_cam_dist <= 0.2 {
+                self.cam.pos = eye;
+            } else {
+                let fwd = self.cam.forward();
+                let lift = (self.capsule_cam_dist * 0.28).min(4.2);
+                self.cam.pos = eye - fwd * self.capsule_cam_dist + Vec3::new(0.0, lift, 0.0);
+                self.cam.pos.y = self.cam.pos.y.max(1.0);
+            }
+        }
+
+        fn sync_entities_to_gpu(&mut self) {
+            if self.capsule_mode && self.capsule_cam_dist > 0.6 {
+                let mut combined = Vec::with_capacity(self.base_heroes.len() + 1);
+                combined.extend_from_slice(&self.base_heroes);
+                // Render the player's own Hero Knight figurine inside Capsule Walk Mode
+                combined.push(HeroInstance {
+                    pos_yaw: [
+                        self.capsule_pos.x,
+                        self.capsule_pos.y,
+                        self.capsule_pos.z,
+                        self.cam.yaw - std::f32::consts::FRAC_PI_2,
+                    ],
+                    faction_scale: [0.34, 0.86, 1.00, 1.0],
+                });
+                self.renderer
+                    .update_entities(&combined, &self.live_projectiles);
+            } else {
+                self.renderer
+                    .update_entities(&self.base_heroes, &self.live_projectiles);
+            }
+        }
+
+        /// Hot-swap to an external `FM3D` neural volume (`Z=16..32+`) in browser.
         pub fn load_fm3d_volume(
             &mut self,
             bytes: js_sys::Uint8Array,
@@ -247,28 +337,106 @@ mod wasm_app {
             let t_sn = perf_now_ms();
             let sn_world = SurfaceNetsWorld::build_all(&volume);
             self.sn_build_ms = (perf_now_ms() - t_sn).max(0.0);
-            self.non_empty_bricks = bricks.non_empty_bricks;
-            self.total_bricks = bricks.total_bricks;
             self.renderer.upload_volume(&volume, &bricks, &sn_world);
             self.volume = volume;
+            self.bricks = bricks;
+            self.sn_world = sn_world;
             self.volume_source = label;
             Ok(())
         }
 
         /// Hot-swap back to the built-in procedural isotropic `256×256×16` showcase world.
         pub fn load_procedural_showcase(&mut self) {
+            self.load_procedural_showcase_depth(16);
+        }
+
+        /// Generate and hot-swap a procedural isotropic `256×256×D` (`D = 16..=32`) showcase world.
+        pub fn load_procedural_showcase_depth(&mut self, depth: u32) {
+            let d = (depth as usize).clamp(16, 32);
             let t0 = perf_now_ms();
-            let volume = WorldVolume3D::generate_showcase();
+            let volume = WorldVolume3D::generate_showcase_with_depth(d);
             self.volume_ms = (perf_now_ms() - t0).max(0.0);
             let bricks = volume.build_brick_occupancy();
             let t_sn = perf_now_ms();
             let sn_world = SurfaceNetsWorld::build_all(&volume);
             self.sn_build_ms = (perf_now_ms() - t_sn).max(0.0);
-            self.non_empty_bricks = bricks.non_empty_bricks;
-            self.total_bricks = bricks.total_bricks;
             self.renderer.upload_volume(&volume, &bricks, &sn_world);
             self.volume = volume;
-            self.volume_source = "Procedural Showcase (WASM)".to_string();
+            self.bricks = bricks;
+            self.sn_world = sn_world;
+            self.volume_source = format!("Procedural Showcase Z={d} (WASM)");
+        }
+
+        /// Apply a live binary `0x01` `16×16×D` (`D = 16..=32`) volumetric brick from WebSocket!
+        /// Performs incremental Surface-Nets brick rebuild + GPU `queue.write_texture` sub-brick upload.
+        /// Returns elapsed rebuild+upload time in milliseconds.
+        pub fn apply_brick3d_raw(
+            &mut self,
+            bx: u16,
+            by: u16,
+            depth: u8,
+            density_rgba: &[u8],
+            albedo_rgba: &[u8],
+        ) -> Result<f64, JsValue> {
+            let t0 = perf_now_ms();
+            let patch = self
+                .volume
+                .apply_brick3d_raw(
+                    bx as usize,
+                    by as usize,
+                    depth as usize,
+                    density_rgba,
+                    albedo_rgba,
+                )
+                .map_err(|e| JsValue::from_str(&e))?;
+
+            if patch.resized_depth {
+                self.bricks = self.volume.build_brick_occupancy();
+                self.sn_world = SurfaceNetsWorld::build_all(&self.volume);
+                self.renderer
+                    .upload_volume(&self.volume, &self.bricks, &self.sn_world);
+            } else {
+                let occ_sub = self.volume.update_brick_occupancy_region(
+                    &mut self.bricks,
+                    bx as usize,
+                    by as usize,
+                );
+                self.sn_world
+                    .rebuild_brick_and_neighbors(&self.volume, bx as usize, by as usize);
+                self.renderer.upload_brick_subregion(
+                    &self.volume,
+                    &self.bricks,
+                    &self.sn_world,
+                    patch,
+                    occ_sub,
+                );
+            }
+
+            let elapsed_ms = (perf_now_ms() - t0).max(0.0);
+            self.live_bricks_rx = self.live_bricks_rx.saturating_add(1);
+            self.last_brick_rebuild_ms = elapsed_ms;
+            self.volume_source = format!("Live WS Stream (Z={})", self.volume.depth);
+            Ok(elapsed_ms)
+        }
+
+        /// Apply a live `0x02` multiplayer JSON entity & telemetry frame from WebSocket!
+        /// Updates live multiplayer hero figurines, glowing projectiles, and telemetry HUD.
+        /// Returns total active rendered entities (`players + projectiles`).
+        pub fn apply_live_entities_json(&mut self, json_str: &str) -> Result<u32, JsValue> {
+            let parsed =
+                parse_live_entities_json(json_str).map_err(|e| JsValue::from_str(&e))?;
+            self.base_heroes = parsed.heroes;
+            self.live_projectiles = parsed.projectiles;
+            self.live_entities_active = true;
+            self.live_tick = parsed.tick;
+            self.live_server_tps = parsed.server_tps;
+            if let Some(st) = parsed.status {
+                self.live_status = st;
+            } else {
+                self.live_status = "Live WS".to_string();
+            }
+            self.sync_entities_to_gpu();
+            Ok((self.base_heroes.len() + self.live_projectiles.len()) as u32)
         }
 
         pub fn tick_and_render(&mut self, dt_sec: f32) {
@@ -322,7 +490,8 @@ mod wasm_app {
                 self.capsule_pos = res.pos;
                 self.capsule_vel = res.vel;
                 self.capsule_grounded = res.grounded;
-                self.cam.pos = self.capsule_pos + Vec3::new(0.0, CAPSULE_EYE_HEIGHT, 0.0);
+                self.update_capsule_camera();
+                self.sync_entities_to_gpu();
             } else {
                 let fly_speed = if sprint { 24.0 } else { 11.5 };
                 let fwd = self.cam.forward();
@@ -348,8 +517,20 @@ mod wasm_app {
                 self.clamp_cam_bounds();
             }
 
-            self.renderer
-                .render_frame(&self.cam, self.sim_time, self.pixel_art);
+            let player_cutaway = [
+                self.capsule_pos.x,
+                self.capsule_pos.y,
+                self.capsule_pos.z,
+                if self.capsule_mode { 1.0 } else { 0.0 },
+            ];
+
+            self.renderer.render_frame(
+                &self.cam,
+                self.sim_time,
+                self.pixel_art,
+                self.style_mode,
+                player_cutaway,
+            );
         }
 
         fn clamp_cam_bounds(&mut self) {
@@ -388,14 +569,25 @@ mod wasm_app {
                     "\"non_empty_bricks\":{},",
                     "\"total_bricks\":{},",
                     "\"style\":\"{}\",",
+                    "\"style_mode\":{},",
+                    "\"neural_style\":\"{}\",",
                     "\"walk_mode\":\"{}\",",
                     "\"grounded\":{},",
+                    "\"cutaway_active\":{},",
                     "\"cam_x\":{:.1},",
                     "\"cam_y\":{:.1},",
                     "\"cam_z\":{:.1},",
                     "\"volume_source\":\"{}\",",
                     "\"volume_ms\":{:.1},",
-                    "\"sn_build_ms\":{:.1}",
+                    "\"sn_build_ms\":{:.1},",
+                    "\"live_active\":{},",
+                    "\"live_players\":{},",
+                    "\"live_projectiles\":{},",
+                    "\"live_bricks_rx\":{},",
+                    "\"last_brick_ms\":{:.3},",
+                    "\"live_tick\":{},",
+                    "\"live_server_tps\":{:.1},",
+                    "\"live_status\":\"{}\"",
                     "}}"
                 ),
                 self.fps_smooth,
@@ -408,17 +600,28 @@ mod wasm_app {
                 self.volume.height,
                 self.volume.depth,
                 voxels,
-                self.non_empty_bricks,
-                self.total_bricks,
+                self.bricks.non_empty_bricks,
+                self.bricks.total_bricks,
                 style,
+                self.style_mode,
+                style_name_for(self.style_mode),
                 walk,
                 self.capsule_grounded,
+                self.capsule_mode,
                 self.cam.pos.x,
                 self.cam.pos.y,
                 self.cam.pos.z,
                 json_escape(&self.volume_source),
                 self.volume_ms,
                 self.sn_build_ms,
+                self.live_entities_active,
+                self.base_heroes.len(),
+                self.live_projectiles.len(),
+                self.live_bricks_rx,
+                self.last_brick_rebuild_ms,
+                self.live_tick,
+                self.live_server_tps,
+                json_escape(&self.live_status),
             )
         }
     }
@@ -430,8 +633,12 @@ pub use wasm_app::FrostmarshApp;
 #[cfg(test)]
 mod tests {
     use crate::collision::{step_capsule_3d, DEFAULT_CAPSULE_HEIGHT, DEFAULT_CAPSULE_RADIUS};
-    use crate::hero_mesh::{build_hero_knight_mesh, showcase_hero_instances};
-    use crate::surface_nets_3d::SurfaceNetsWorld;
+    use crate::hero_mesh::{
+        build_hero_knight_mesh, build_projectile_orb_mesh, showcase_hero_instances,
+    };
+    use crate::live_entities::parse_live_entities_json;
+    use crate::style_name_for;
+    use crate::surface_nets_3d::{extract_brick, SurfaceNetsWorld};
     use crate::volume::WorldVolume3D;
     use glam::Vec3;
 
@@ -450,6 +657,8 @@ mod tests {
 
         let hero = build_hero_knight_mesh();
         assert!(!hero.vertices.is_empty());
+        let orb = build_projectile_orb_mesh();
+        assert_eq!(orb.indices.len(), 24);
         assert_eq!(showcase_hero_instances().len(), 4);
 
         let res = step_capsule_3d(
@@ -464,17 +673,131 @@ mod tests {
     }
 
     #[test]
+    fn test_arbitrary_depth_z16_to_z32_and_incremental_brick_patch() {
+        // Test Z=24 and Z=32 volumes work seamlessly with no hardcoded 16
+        for depth in [16usize, 24, 32] {
+            let mut vol = WorldVolume3D::new_empty(64, depth, 64);
+            // Build a simple horizontal floor at y = 4.0 and high cliff at y = depth - 4
+            for iz in 0..vol.height {
+                for ix in 0..vol.width {
+                    for iy in 0..vol.depth {
+                        let solid = if iy < 4 || (ix > 40 && iy < depth - 4) {
+                            255u8
+                        } else {
+                            0u8
+                        };
+                        let idx = vol.byte_index(ix, iy, iz);
+                        vol.density_mat[idx] = solid;
+                        vol.density_mat[idx + 3] = 200;
+                        vol.albedo_thermal[idx] = 120;
+                        vol.albedo_thermal[idx + 1] = 130;
+                        vol.albedo_thermal[idx + 2] = 140;
+                    }
+                }
+            }
+
+            let mut occ = vol.build_brick_occupancy();
+            assert_eq!(occ.by_count, depth.div_ceil(8));
+            let mut sn = SurfaceNetsWorld::build_all(&vol);
+            assert!(sn.total_triangles() > 0);
+
+            // Patch brick (1, 1) with a glowing magma pillar up to depth - 2
+            let n = depth * 16 * 16 * 4;
+            let mut den = vec![0u8; n];
+            let mut alb = vec![0u8; n];
+            for alt in 0..(depth - 2) {
+                for dy in 4..12 {
+                    for dx in 4..12 {
+                        let off = ((alt * 16 + dy) * 16 + dx) * 4;
+                        den[off] = 255;
+                        den[off + 3] = 90;
+                        alb[off] = 255;
+                        alb[off + 1] = 120;
+                        alb[off + 2] = 30;
+                        alb[off + 3] = 240;
+                    }
+                }
+            }
+            let patch = vol
+                .apply_brick3d_raw(1, 1, depth, &den, &alb)
+                .expect("apply_brick3d_raw");
+            assert!(!patch.resized_depth);
+            assert_eq!((patch.cw, patch.ch, patch.depth), (16, 16, depth));
+
+            let occ_sub = vol.update_brick_occupancy_region(&mut occ, 1, 1);
+            assert!(occ_sub.cw > 0 && occ_sub.ch > 0);
+            let rebuilt = sn.rebuild_brick_and_neighbors(&vol, 1, 1);
+            assert_eq!(rebuilt, 9);
+
+            // Single-brick extraction check
+            let single = extract_brick(&vol, 1, 1);
+            assert!(!single.indices.is_empty());
+
+            let (sub_dm, sub_at) = vol.pack_brick_subregion(patch.x0, patch.z0, patch.cw, patch.ch);
+            assert_eq!(sub_dm.len(), n);
+            assert_eq!(sub_at.len(), n);
+        }
+
+        // Test live Z=16 -> Z=32 depth upgrade via apply_brick3d_raw
+        let mut vol = WorldVolume3D::new_empty(32, 16, 32);
+        let n32 = 32 * 16 * 16 * 4;
+        let den32 = vec![200u8; n32];
+        let alb32 = vec![150u8; n32];
+        let patch = vol
+            .apply_brick3d_raw(0, 0, 32, &den32, &alb32)
+            .expect("live depth upgrade to Z=32");
+        assert!(patch.resized_depth);
+        assert_eq!(vol.depth, 32);
+        assert_eq!(vol.density_mat.len(), 32 * 32 * 32 * 4);
+    }
+
+    #[test]
+    fn test_live_entities_json_parser_and_styles() {
+        assert_eq!(style_name_for(0), "NORDIC");
+        assert_eq!(style_name_for(1), "VOLCANIC EMBER");
+        assert_eq!(style_name_for(2), "ARCANE THERMAL");
+        assert_eq!(style_name_for(3), "EMERALD CAVERN");
+        assert_eq!(style_name_for(4), "NORDIC");
+
+        let json = r#"{
+            "tick": 420,
+            "world_day": 3,
+            "players": [
+                {"id": 1, "x": 126.5, "y": 9.04, "z": 128.8, "yaw": 1.15, "color": [0.16, 0.52, 0.98], "scale": 1.0},
+                {"id": 2, "gx": 113.5, "gy": 128.0, "gz": 4.02, "facing": -0.5, "faction": 1}
+            ],
+            "projectiles": [
+                {"id": 99, "x": 128.0, "y": 11.2, "z": 126.0, "color": [1.0, 0.45, 0.12], "radius": 0.42}
+            ],
+            "telemetry": {
+                "server_tps": 29.8,
+                "online_players": 2,
+                "status": "Live WS Demo"
+            }
+        }"#;
+        let parsed = parse_live_entities_json(json).expect("parse live entities");
+        assert_eq!(parsed.tick, 420);
+        assert_eq!(parsed.world_day, 3);
+        assert_eq!(parsed.heroes.len(), 2);
+        assert_eq!(parsed.projectiles.len(), 1);
+        assert!((parsed.heroes[1].pos_yaw[1] - 4.02).abs() < 1e-4);
+        assert!((parsed.projectiles[0].faction_scale[3] - 0.42).abs() < 1e-4);
+        assert!((parsed.server_tps - 29.8).abs() < 1e-3);
+        assert_eq!(parsed.status.as_deref(), Some("Live WS Demo"));
+    }
+
+    #[test]
     fn test_fm3d_memory_parser() {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"FM3D");
         buf.extend_from_slice(&4u32.to_le_bytes());
         buf.extend_from_slice(&4u32.to_le_bytes());
-        buf.extend_from_slice(&2u32.to_le_bytes());
-        let n = 4 * 4 * 2 * 4;
+        buf.extend_from_slice(&32u32.to_le_bytes());
+        let n = 4 * 4 * 32 * 4;
         buf.extend(vec![128u8; n]);
         buf.extend(vec![200u8; n]);
-        let vol = WorldVolume3D::from_fm3d_bytes(&buf).expect("parse FM3D");
-        assert_eq!((vol.width, vol.height, vol.depth), (4, 4, 2));
+        let vol = WorldVolume3D::from_fm3d_bytes(&buf).expect("parse FM3D Z=32");
+        assert_eq!((vol.width, vol.height, vol.depth), (4, 4, 32));
         assert_eq!(vol.density_mat[0], 128);
         assert_eq!(vol.albedo_thermal[0], 200);
     }

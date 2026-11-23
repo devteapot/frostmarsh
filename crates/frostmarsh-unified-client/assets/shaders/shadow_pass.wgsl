@@ -39,9 +39,13 @@ fn vs_mesh_shadow(
     let inst = instances[iid];
     let local_p = pos * inst.scale_pitch.xyz;
 
+    let cr = cos(inst.flags.z);
+    let sr = sin(inst.flags.z);
+    let p_rolled = vec3<f32>(local_p.x * cr - local_p.y * sr, local_p.x * sr + local_p.y * cr, local_p.z);
+
     let cp = cos(inst.scale_pitch.w);
     let sp = sin(inst.scale_pitch.w);
-    let p_pitched = vec3<f32>(local_p.x, local_p.y * cp - local_p.z * sp, local_p.y * sp + local_p.z * cp);
+    let p_pitched = vec3<f32>(p_rolled.x, p_rolled.y * cp - p_rolled.z * sp, p_rolled.y * sp + p_rolled.z * cp);
 
     let cy = cos(inst.pos_yaw.w);
     let sy = sin(inst.pos_yaw.w);

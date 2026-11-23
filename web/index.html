@@ -3,17 +3,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Frostmarsh 3D — WebGPU Surface-Nets + Volumetric Overlay</title>
+  <title>Frostmarsh 3D — Wave 12C WebGPU Neural Style Swap + Live WS Multiplayer</title>
   <style>
     :root {
       --bg: #080c14;
-      --panel: rgba(10, 15, 26, 0.78);
-      --panel-border: rgba(125, 170, 230, 0.22);
+      --panel: rgba(10, 15, 26, 0.80);
+      --panel-border: rgba(125, 170, 230, 0.24);
       --text: #edf4ff;
       --muted: #93a7c4;
       --accent: #56b9ff;
       --accent-green: #58e39a;
       --accent-amber: #ffae4d;
+      --accent-violet: #b68aff;
       --danger: #ff6b72;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
@@ -59,8 +60,8 @@
       top: 16px;
       left: 16px;
       padding: 13px 16px;
-      min-width: 295px;
-      max-width: 350px;
+      min-width: 305px;
+      max-width: 365px;
     }
 
     .hud-header {
@@ -129,15 +130,73 @@
       color: var(--accent-green);
     }
 
-    #hud-toolbar {
+    #hud-right-stack {
+      position: fixed;
       top: 16px;
       right: 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 10px;
+      max-width: 590px;
+      pointer-events: none;
+    }
+
+    #hud-toolbar {
+      position: static;
       padding: 10px;
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      max-width: 520px;
       justify-content: flex-end;
+    }
+
+    #hud-ws {
+      position: static;
+      padding: 8px 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .ws-input {
+      background: rgba(8, 13, 24, 0.85);
+      border: 1px solid rgba(148, 184, 232, 0.28);
+      border-radius: 8px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      padding: 6px 9px;
+      width: 215px;
+      outline: none;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+
+    .ws-input:focus {
+      border-color: var(--accent);
+    }
+
+    .ws-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+    }
+
+    .ws-dot.connected {
+      background: var(--accent-green);
+      box-shadow: 0 0 8px rgba(88, 227, 154, 0.8);
+    }
+
+    .ws-dot.connecting {
+      background: var(--accent-amber);
+    }
+
+    .ws-dot.error {
+      background: var(--danger);
     }
 
     .btn {
@@ -176,6 +235,18 @@
       background: rgba(255, 174, 77, 0.22);
       border-color: var(--accent-amber);
       color: #fff6e8;
+    }
+
+    .btn.active-violet {
+      background: rgba(182, 138, 255, 0.24);
+      border-color: var(--accent-violet);
+      color: #f6efff;
+    }
+
+    .btn.active-green {
+      background: rgba(88, 227, 154, 0.22);
+      border-color: var(--accent-green);
+      color: #e9fff4;
     }
 
     .kbd {
@@ -299,11 +370,17 @@
       <span class="stat-label">8³ Bricks</span>
       <span id="stat-bricks" class="stat-val">-- / --</span>
 
-      <span class="stat-label">Render Style</span>
+      <span class="stat-label">Neural Style</span>
+      <span id="stat-neural" class="stat-val">NORDIC</span>
+
+      <span class="stat-label">Render Mode</span>
       <span id="stat-style" class="stat-val">Clean-3D</span>
 
       <span class="stat-label">Navigation</span>
       <span id="stat-walk" class="stat-val">Free-Fly</span>
+
+      <span class="stat-label">Live WS</span>
+      <span id="stat-ws" class="stat-val">Offline</span>
 
       <span class="stat-label">Camera XYZ</span>
       <span id="stat-cam" class="stat-val">--</span>
@@ -313,35 +390,59 @@
     </div>
   </div>
 
-  <div id="hud-toolbar" class="hud-card">
-    <button id="btn-preset-1" class="btn active" title="Arched Stone Bridge & Alpine Waterfall">
-      <span class="kbd">1</span> Bridge
-    </button>
-    <button id="btn-preset-2" class="btn" title="Vaulted Basalt Cave & Magma Fissure">
-      <span class="kbd">2</span> Cave
-    </button>
-    <button id="btn-style" class="btn" title="Toggle Stylized Pixel-2xSS vs Clean-3D">
-      <span class="kbd">T</span> <span id="lbl-style">Clean-3D</span>
-    </button>
-    <button id="btn-capsule" class="btn" title="Toggle Continuous ∇solid_density 3D Capsule Walk Mode">
-      <span class="kbd">C</span> <span id="lbl-capsule">Free-Fly</span>
-    </button>
-    <button id="btn-volume" class="btn" title="Switch between Procedural Showcase and Neural FM3D volume">
-      <span class="kbd">V</span> <span id="lbl-volume">Load FM3D</span>
-    </button>
+  <div id="hud-right-stack">
+    <div id="hud-toolbar" class="hud-card">
+      <button id="btn-preset-1" class="btn active" title="Arched Stone Bridge & Alpine Waterfall">
+        <span class="kbd">1</span> Bridge
+      </button>
+      <button id="btn-preset-2" class="btn" title="Vaulted Basalt Cave & Magma Fissure">
+        <span class="kbd">2</span> Cave
+      </button>
+      <button id="btn-neural-style" class="btn active-violet" title="Live Client-Side WGSL 4-Style Neural Swap (Nordic / Volcanic / Arcane / Emerald)">
+        <span class="kbd">Y</span> <span id="lbl-neural-style">NORDIC</span>
+      </button>
+      <button id="btn-style" class="btn" title="Toggle Stylized Pixel-2xSS vs Clean-3D">
+        <span class="kbd">T</span> <span id="lbl-style">Clean-3D</span>
+      </button>
+      <button id="btn-capsule" class="btn" title="Toggle 3D Capsule Walk Mode with Smart Cave Ceiling Cutaway">
+        <span class="kbd">C</span> <span id="lbl-capsule">Free-Fly</span>
+      </button>
+      <button id="btn-depth" class="btn" title="Cycle Procedural Showcase Altitude Depth (Z=16 / Z=24 / Z=32)">
+        <span class="kbd">Z</span> <span id="lbl-depth">Z=16</span>
+      </button>
+      <button id="btn-volume" class="btn" title="Switch between Procedural Showcase and Neural FM3D volume">
+        <span class="kbd">V</span> <span id="lbl-volume">Neural FM3D</span>
+      </button>
+    </div>
+
+    <div id="hud-ws" class="hud-card">
+      <span id="ws-dot" class="ws-dot" title="WebSocket Status"></span>
+      <input
+        id="ws-url"
+        class="ws-input"
+        type="text"
+        value="ws://127.0.0.1:8765"
+        placeholder="ws://127.0.0.1:8765"
+        aria-label="Live WebSocket URL"
+      />
+      <button id="btn-ws" class="btn" title="Connect to Live Binary WebSocket Multiplayer Stream (0x01 Brick3D + 0x02 Entities)">
+        <span id="lbl-ws">Connect Live (WS)</span>
+      </button>
+    </div>
   </div>
 
   <div id="hud-controls" class="hud-card">
     <span><span class="kbd">WASD</span> Move</span>
-    <span><span class="kbd">Q</span>/<span class="kbd">E</span> Fly Down/Up</span>
+    <span><span class="kbd">Q</span>/<span class="kbd">E</span> Fly</span>
     <span><span class="kbd">Space</span> Jump / Up</span>
     <span><span class="kbd">Shift</span> Sprint</span>
     <span><span class="kbd">Drag</span> Orbit</span>
     <span><span class="kbd">Scroll</span> Zoom</span>
-    <span><span class="kbd">1</span>/<span class="kbd">2</span> Presets</span>
+    <span><span class="kbd">Y</span> Neural Style</span>
     <span><span class="kbd">T</span> Pixel-2×SS</span>
-    <span><span class="kbd">C</span> 3D Capsule Walk</span>
-    <span><span class="kbd">Drop .bin</span> Load FM3D</span>
+    <span><span class="kbd">C</span> Capsule + Cutaway</span>
+    <span><span class="kbd">Z</span> Depth 16..32</span>
+    <span><span class="kbd">Drop .bin</span> FM3D</span>
   </div>
 
   <div id="overlay-status">
@@ -369,19 +470,33 @@
     const statMesh = document.getElementById("stat-mesh");
     const statVoxels = document.getElementById("stat-voxels");
     const statBricks = document.getElementById("stat-bricks");
+    const statNeural = document.getElementById("stat-neural");
     const statStyle = document.getElementById("stat-style");
     const statWalk = document.getElementById("stat-walk");
+    const statWs = document.getElementById("stat-ws");
     const statCam = document.getElementById("stat-cam");
     const statSource = document.getElementById("stat-source");
 
     const btnPreset1 = document.getElementById("btn-preset-1");
     const btnPreset2 = document.getElementById("btn-preset-2");
+    const btnNeuralStyle = document.getElementById("btn-neural-style");
+    const lblNeuralStyle = document.getElementById("lbl-neural-style");
     const btnStyle = document.getElementById("btn-style");
     const lblStyle = document.getElementById("lbl-style");
     const btnCapsule = document.getElementById("btn-capsule");
     const lblCapsule = document.getElementById("lbl-capsule");
+    const btnDepth = document.getElementById("btn-depth");
+    const lblDepth = document.getElementById("lbl-depth");
     const btnVolume = document.getElementById("btn-volume");
     const lblVolume = document.getElementById("lbl-volume");
+
+    const wsDot = document.getElementById("ws-dot");
+    const wsUrlInput = document.getElementById("ws-url");
+    const btnWs = document.getElementById("btn-ws");
+    const lblWs = document.getElementById("lbl-ws");
+
+    const STYLE_LABELS = ["NORDIC", "VOLCANIC", "ARCANE", "EMERALD"];
+    const DEPTH_PRESETS = [16, 24, 32];
 
     function showFatal(title, message, detail) {
       statusSpinner.style.display = "none";
@@ -441,6 +556,10 @@
 
       const params = new URLSearchParams(window.location.search);
       const wantFm3dFirst = params.get("volume") === "fm3d";
+      const wsParam = params.get("ws");
+      const depthParam = parseInt(params.get("depth") || "16", 10);
+      const styleParam = parseInt(params.get("style") || "0", 10);
+
       let initialFm3d = null;
       let usingFm3d = false;
 
@@ -449,7 +568,7 @@
         initialFm3d = await tryFetchDemoVolume();
         usingFm3d = initialFm3d !== null;
       } else {
-        statusMsg.textContent = "Generating isotropic 256×256×16 Frostmarsh world & Surface-Nets mesh in WASM…";
+        statusMsg.textContent = "Generating isotropic Frostmarsh 3D world & Surface-Nets mesh in WASM…";
       }
 
       let app;
@@ -462,6 +581,29 @@
           err
         );
         return;
+      }
+
+      let depthIdx = 0;
+      if (!usingFm3d && !Number.isNaN(depthParam) && depthParam >= 16 && depthParam <= 32 && depthParam !== 16) {
+        app.load_procedural_showcase_depth(depthParam);
+        const foundIdx = DEPTH_PRESETS.indexOf(depthParam);
+        depthIdx = foundIdx >= 0 ? foundIdx : 0;
+        lblDepth.textContent = `Z=${depthParam}`;
+      }
+
+      function updateNeuralStyleButton(mode) {
+        const m = mode % 4;
+        lblNeuralStyle.textContent = STYLE_LABELS[m] || "NORDIC";
+        btnNeuralStyle.classList.toggle("active-violet", m === 2);
+        btnNeuralStyle.classList.toggle("active-amber", m === 1);
+        btnNeuralStyle.classList.toggle("active-green", m === 3);
+        btnNeuralStyle.classList.toggle("active", m === 0);
+      }
+
+      if (!Number.isNaN(styleParam) && styleParam >= 0) {
+        updateNeuralStyleButton(app.set_style_mode(styleParam));
+      } else {
+        updateNeuralStyleButton(0);
       }
 
       lblVolume.textContent = usingFm3d ? "Showcase" : "Neural FM3D";
@@ -484,11 +626,22 @@
         btnPreset2.classList.toggle("active", id === 2);
       }
 
+      function cycleDepthPreset() {
+        depthIdx = (depthIdx + 1) % DEPTH_PRESETS.length;
+        const nextDepth = DEPTH_PRESETS[depthIdx];
+        app.load_procedural_showcase_depth(nextDepth);
+        usingFm3d = false;
+        lblDepth.textContent = `Z=${nextDepth}`;
+        lblVolume.textContent = "Neural FM3D";
+        btnVolume.classList.remove("active");
+      }
+
       async function toggleVolumeSource() {
         btnVolume.disabled = true;
         try {
           if (usingFm3d) {
-            app.load_procedural_showcase();
+            const d = DEPTH_PRESETS[depthIdx];
+            app.load_procedural_showcase_depth(d);
             usingFm3d = false;
             lblVolume.textContent = "Neural FM3D";
             btnVolume.classList.remove("active");
@@ -512,11 +665,132 @@
         }
       }
 
+      // Live Binary WebSocket Multiplayer Receiver
+      // Frame 0x01: [u8=1, u16 bx (LE), u16 by (LE), u8 depth, u32 den_len (LE), density_bytes..., albedo_bytes...]
+      // Frame 0x02: [u8=2, utf8_json_bytes...]
+      const textDecoder = new TextDecoder("utf-8");
+      let liveWs = null;
+      let wsStateText = "Offline";
+
+      function setWsUi(state, label) {
+        wsStateText = label;
+        wsDot.className = `ws-dot ${state}`;
+        if (state === "connected") {
+          lblWs.textContent = "Disconnect WS";
+          btnWs.classList.add("active-green");
+        } else if (state === "connecting") {
+          lblWs.textContent = "Connecting…";
+          btnWs.classList.remove("active-green");
+        } else {
+          lblWs.textContent = "Connect Live (WS)";
+          btnWs.classList.remove("active-green");
+        }
+      }
+
+      function disconnectWs() {
+        if (liveWs) {
+          try {
+            liveWs.onclose = null;
+            liveWs.onerror = null;
+            liveWs.onmessage = null;
+            liveWs.close();
+          } catch {
+            // ignore close error
+          }
+          liveWs = null;
+        }
+        setWsUi("", "Offline");
+      }
+
+      function connectWs(url) {
+        disconnectWs();
+        const trimmed = (url || "").trim();
+        if (!trimmed) return;
+        setWsUi("connecting", "Connecting…");
+        try {
+          const ws = new WebSocket(trimmed);
+          ws.binaryType = "arraybuffer";
+          liveWs = ws;
+
+          ws.onopen = () => {
+            if (liveWs !== ws) return;
+            setWsUi("connected", "Connected");
+          };
+
+          ws.onmessage = (ev) => {
+            if (liveWs !== ws) return;
+            try {
+              if (typeof ev.data === "string") {
+                app.apply_live_entities_json(ev.data);
+                return;
+              }
+              if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength < 2) return;
+              const dv = new DataView(ev.data);
+              const frameType = dv.getUint8(0);
+              if (frameType === 0x01) {
+                // [u8=1, u16 bx, u16 by, u8 depth, u32 den_len, density..., albedo...]
+                if (ev.data.byteLength < 10) return;
+                const bx = dv.getUint16(1, true);
+                const by = dv.getUint16(3, true);
+                const depth = dv.getUint8(5);
+                const denLen = dv.getUint32(6, true);
+                if (ev.data.byteLength < 10 + denLen * 2) return;
+                const densityBytes = new Uint8Array(ev.data, 10, denLen);
+                const albedoBytes = new Uint8Array(ev.data, 10 + denLen, denLen);
+                app.apply_brick3d_raw(bx, by, depth, densityBytes, albedoBytes);
+              } else if (frameType === 0x02) {
+                // [u8=2, utf8_json_bytes...]
+                const jsonStr = textDecoder.decode(new Uint8Array(ev.data, 1));
+                app.apply_live_entities_json(jsonStr);
+              }
+            } catch (err) {
+              console.warn("WS frame decode error:", err);
+            }
+          };
+
+          ws.onerror = () => {
+            if (liveWs !== ws) return;
+            setWsUi("error", "WS Error");
+          };
+
+          ws.onclose = () => {
+            if (liveWs !== ws) return;
+            liveWs = null;
+            setWsUi("", "Offline");
+          };
+        } catch (err) {
+          console.error("WebSocket connect failed:", err);
+          setWsUi("error", "Invalid URL");
+        }
+      }
+
+      btnWs.addEventListener("click", () => {
+        if (liveWs) {
+          disconnectWs();
+        } else {
+          connectWs(wsUrlInput.value);
+        }
+      });
+
+      wsUrlInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          connectWs(wsUrlInput.value);
+          wsUrlInput.blur();
+        }
+      });
+
+      if (wsParam) {
+        wsUrlInput.value = wsParam;
+        connectWs(wsParam);
+      }
+
       // Toolbar button bindings
       btnPreset1.addEventListener("click", () => selectPreset(1));
       btnPreset2.addEventListener("click", () => selectPreset(2));
+      btnNeuralStyle.addEventListener("click", () => updateNeuralStyleButton(app.cycle_style_mode()));
       btnStyle.addEventListener("click", () => updateStyleButtons(app.toggle_pixel_style()));
       btnCapsule.addEventListener("click", () => updateCapsuleButtons(app.toggle_capsule_mode()));
+      btnDepth.addEventListener("click", cycleDepthPreset);
       btnVolume.addEventListener("click", toggleVolumeSource);
 
       // Keyboard input
@@ -529,8 +803,10 @@
         if (!e.repeat) {
           if (e.code === "Digit1") selectPreset(1);
           else if (e.code === "Digit2") selectPreset(2);
+          else if (e.code === "KeyY") updateNeuralStyleButton(app.cycle_style_mode());
           else if (e.code === "KeyT") updateStyleButtons(app.toggle_pixel_style());
           else if (e.code === "KeyC") updateCapsuleButtons(app.toggle_capsule_mode());
+          else if (e.code === "KeyZ") cycleDepthPreset();
           else if (e.code === "KeyV") toggleVolumeSource();
         }
       });
@@ -582,7 +858,7 @@
         { passive: false }
       );
 
-      // Drag-and-drop any FM3D .bin volume onto the viewport
+      // Drag-and-drop any FM3D .bin volume (Z=16..32+) onto the viewport
       window.addEventListener("dragover", (e) => e.preventDefault());
       window.addEventListener("drop", async (e) => {
         e.preventDefault();
@@ -623,11 +899,21 @@
           statMesh.textContent = `${s.triangles.toLocaleString()} tris (${s.sn_build_ms.toFixed(0)} ms)`;
           statVoxels.textContent = `${s.vol_w}×${s.vol_h}×${s.vol_d} (${(s.voxels / 1e6).toFixed(2)}M)`;
           statBricks.textContent = `${s.non_empty_bricks} / ${s.total_bricks} active`;
+          statNeural.textContent = s.neural_style;
           statStyle.textContent = s.style;
+          lblDepth.textContent = `Z=${s.vol_d}`;
           statWalk.textContent =
             s.walk_mode === "Capsule-3D"
-              ? `Capsule-3D (${s.grounded ? "Grounded" : "Airborne"})`
+              ? `Capsule-3D (${s.grounded ? "Grounded" : "Airborne"} · Cutaway)`
               : "Free-Fly";
+          if (liveWs && liveWs.readyState === WebSocket.OPEN) {
+            const brkInfo = s.live_bricks_rx > 0
+              ? ` · ${s.live_bricks_rx} brk (${s.last_brick_ms.toFixed(2)}ms)`
+              : "";
+            statWs.textContent = `${s.live_players}H/${s.live_projectiles}P${brkInfo}`;
+          } else {
+            statWs.textContent = wsStateText;
+          }
           statCam.textContent = `${s.cam_x.toFixed(1)}, ${s.cam_y.toFixed(1)}, ${s.cam_z.toFixed(1)}`;
           statSource.textContent = `${s.volume_source}`;
         }

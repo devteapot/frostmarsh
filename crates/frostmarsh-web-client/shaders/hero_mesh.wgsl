@@ -1,17 +1,21 @@
-// Depth-Tested 3D Parametric Hero Knight Shader (WebGPU Linear HDR Output)
-// Receives exact 3D-texture raymarched sun shadows, 3D-texture cave AO, and local emissive bounce.
+// Depth-Tested 3D Parametric Hero Knight & Live Projectile Orb Shader (WebGPU Linear HDR Output)
+// Receives exact 3D-texture raymarched sun shadows, 3D-texture cave AO, and style-aware local emissive bounce.
 
 struct SceneUniforms {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
-    cam_pos: vec4<f32>,
-    sun_dir: vec4<f32>,
-    sun_col: vec4<f32>,
-    sky_top: vec4<f32>,
-    sky_horizon: vec4<f32>,
-    vol_dims: vec4<f32>,
-    brick_dims: vec4<f32>,
-    viewport: vec4<f32>,
+    cam_pos: vec4<f32>,         // xyz = cam_pos, w = sim_time
+    sun_dir: vec4<f32>,         // xyz = sun_dir, w = exposure
+    sun_col: vec4<f32>,         // rgb = sun_col, w = style_mode (0..3)
+    sky_top: vec4<f32>,         // rgb = sky_top, w = stylized
+    sky_horizon: vec4<f32>,     // rgb = sky_horizon, w = neural_style_strength
+    vol_dims: vec4<f32>,        // xyz = (W, D, H), w = 1.0 / D
+    brick_dims: vec4<f32>,      // xyz = (bx, by, bz), w = brick_size
+    viewport: vec4<f32>,        // xy = (w, h), zw = (1/w, 1/h)
+    player_cutaway: vec4<f32>,  // xyz = capsule_pos, w = cutaway_enabled
+    style_weights_a: vec4<f32>,
+    style_weights_b: vec4<f32>,
+    style_weights_c: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: SceneUniforms;
@@ -34,6 +38,7 @@ struct VsOut {
     @location(0) world_pos: vec3<f32>,
     @location(1) world_normal: vec3<f32>,
     @location(2) albedo_rough: vec4<f32>,
+    @location(3) emissive: f32,
 };
 
 @vertex
@@ -63,6 +68,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.world_pos = wp;
     out.world_normal = wn;
     out.albedo_rough = vec4<f32>(base_col, in.color_rough.a);
+    out.emissive = in.flags.y;
     return out;
 }
 
@@ -74,8 +80,22 @@ fn sample_albedo(p: vec3<f32>) -> vec4<f32> {
     return textureSampleLevel(albedo_tex, vol_samp, p / u.vol_dims.xyz, 0.0);
 }
 
-fn blackbody_ramp(temp: f32, tint: vec3<f32>) -> vec3<f32> {
+fn blackbody_ramp(temp: f32, tint: vec3<f32>, style_id: i32) -> vec3<f32> {
     let t = clamp(temp, 0.0, 1.0);
+    if (style_id == 2) {
+        let low = vec3<f32>(0.14, 0.78, 1.00);
+        let mid = vec3<f32>(1.00, 0.18, 0.74);
+        let hi  = vec3<f32>(1.00, 0.96, 0.80);
+        let bb = select(mix(mid, hi, (t - 0.5) * 2.0), mix(low, mid, t * 2.0), t < 0.5);
+        return mix(bb, tint * 1.35, 0.35) * (t * t * 3.8);
+    }
+    if (style_id == 3) {
+        let low = vec3<f32>(0.04, 0.68, 0.36);
+        let mid = vec3<f32>(0.22, 1.00, 0.60);
+        let hi  = vec3<f32>(0.86, 1.00, 0.88);
+        let bb = select(mix(mid, hi, (t - 0.5) * 2.0), mix(low, mid, t * 2.0), t < 0.5);
+        return mix(bb, tint * 1.35, 0.32) * (t * t * 3.6);
+    }
     let low = vec3<f32>(0.95, 0.14, 0.02);
     let mid = vec3<f32>(1.00, 0.52, 0.08);
     let hi  = vec3<f32>(1.00, 0.94, 0.72);
@@ -90,7 +110,7 @@ fn compute_sun_shadow_hero(p: vec3<f32>) -> f32 {
     let bsize = u.brick_dims.w;
     var t = 0.45;
     var vis = 1.0;
-    for (var i = 0; i < 20; i = i + 1) {
+    for (var i = 0; i < 24; i = i + 1) {
         let sp = p + l * t;
         if (sp.y >= dims.y || sp.x <= 0.0 || sp.x >= dims.x || sp.z <= 0.0 || sp.z >= dims.z) {
             break;
@@ -117,6 +137,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let v = normalize(u.cam_pos.xyz - p);
     let l = u.sun_dir.xyz;
     let h = normalize(l + v);
+    let style_id = i32(round(u.sun_col.w));
+
+    let lin_albedo = pow(clamp(in.albedo_rough.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
+    if (in.emissive > 0.5) {
+        let ndv_orb = max(dot(n, v), 0.0);
+        let core = mix(vec3<f32>(1.0, 0.98, 0.92), lin_albedo, 0.55);
+        let orb_hdr = core * (2.6 + 2.2 * pow(ndv_orb, 1.6)) + lin_albedo * 1.4;
+        return vec4<f32>(orb_hdr, 1.0);
+    }
 
     let ndl = max(dot(n, l), 0.0);
     let ndh = max(dot(n, h), 0.0);
@@ -126,7 +155,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let shadow = compute_sun_shadow_hero(p + n * 0.2);
     let roof_occ = sample_density(p + vec3<f32>(0.0, 3.2, 0.0)).r * 0.45
         + sample_density(p + vec3<f32>(0.0, 5.2, 0.0)).r * 0.30;
-    let ao = clamp(1.0 - roof_occ, 0.25, 1.0);
+    let ao = clamp(1.0 - roof_occ, 0.28, 1.0);
 
     var bounce = vec3<f32>(0.0);
     let offsets = array<vec3<f32>, 4>(
@@ -138,7 +167,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     for (var i = 0; i < 4; i = i + 1) {
         let s = sample_albedo(p + offsets[i]);
         if (s.a > 0.08) {
-            bounce += blackbody_ramp(s.a, s.rgb) * 0.22;
+            bounce += blackbody_ramp(s.a, s.rgb, style_id) * 0.24;
         }
     }
 
@@ -147,8 +176,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let shininess = mix(110.0, 12.0, rough);
     let spec_w = mix(0.95, 0.06, rough);
     let spec = pow(ndh, shininess) * spec_w * ndl * (0.25 + 0.75 * shadow);
-    let rim = pow(1.0 - ndv, 3.2) * (u.sky_horizon.rgb * 0.25 * ao + bounce * 0.45);
-    let lin_albedo = pow(clamp(in.albedo_rough.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
+    let rim = pow(1.0 - ndv, 3.2) * (u.sky_horizon.rgb * 0.28 * ao + bounce * 0.48);
 
     let hdr = lin_albedo * (u.sun_col.rgb * ndl * shadow + ambient + bounce)
         + u.sun_col.rgb * spec + rim;

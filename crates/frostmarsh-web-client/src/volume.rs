@@ -1,18 +1,44 @@
-//! True 3D `256×256×16` Isotropic (`1m × 1m × 1m`) World Volume Format,
+//! True 3D `256×256×D` (`D = 16..=32`) Isotropic (`1m × 1m × 1m`) World Volume Format,
 //! Procedural Alpine/Bridge/Cave/Waterfall/Wildfire Scene Generator,
-//! `FM3D` Binary Parser (in-memory for WASM/HTTP), and `8×8×8` Sparse Brick Occupancy Builder.
+//! `FM3D` Binary Parser (in-memory for WASM/HTTP), Incremental `16×16×D` Brick Patching,
+//! and `8×8×8` Sparse Brick Occupancy Builder.
 
 use glam::Vec3;
 
 pub const DEFAULT_WIDTH: usize = 256;
 pub const DEFAULT_HEIGHT: usize = 256;
 pub const DEFAULT_DEPTH: usize = 16;
+pub const MIN_SHOWCASE_DEPTH: usize = 16;
+pub const MAX_SHOWCASE_DEPTH: usize = 32;
 pub const BRICK_SIZE: usize = 8;
+pub const STREAM_BRICK_XY: usize = 16;
+
+/// Sub-region descriptor returned by [`WorldVolume3D::apply_brick3d_raw`] for incremental GPU uploads.
+#[derive(Clone, Copy, Debug)]
+pub struct BrickPatchResult {
+    pub bx: usize,
+    pub by: usize,
+    pub x0: usize,
+    pub z0: usize,
+    pub cw: usize,
+    pub ch: usize,
+    pub depth: usize,
+    pub resized_depth: bool,
+}
+
+/// Affected coarse `8×8×8` occupancy sub-region for incremental GPU texture upload.
+#[derive(Clone, Copy, Debug)]
+pub struct OccupancySubregion {
+    pub x0: usize,
+    pub z0: usize,
+    pub cw: usize,
+    pub ch: usize,
+}
 
 /// World volume storing two `RGBA8Unorm` 3D textures in GPU-ready `(X=width, Y=depth, Z=height)` order.
 pub struct WorldVolume3D {
     pub width: usize,  // X (256)
-    pub depth: usize,  // Y altitude (16)
+    pub depth: usize,  // Y altitude (16..=32+)
     pub height: usize, // Z (256)
     /// `[Z][Y][X][4]` -> R: solid_density, G: fluid_density, B: gas_optical_density, A: roughness_wetness
     pub density_mat: Vec<u8>,
@@ -20,7 +46,7 @@ pub struct WorldVolume3D {
     pub albedo_thermal: Vec<u8>,
 }
 
-/// Coarse `8×8×8` brick occupancy 3D texture (`32 × 2 × 32` for `256 × 16 × 256` world).
+/// Coarse `8×8×8` brick occupancy 3D texture (`W/8 × ceil(D/8) × H/8`).
 pub struct BrickOccupancy3D {
     pub bx_count: usize,
     pub by_count: usize,
@@ -327,12 +353,209 @@ impl WorldVolume3D {
         }
     }
 
+    /// Incrementally patch one live `16×16×D` (`D = 16..=32`, up to `128`) brick `(bx, by)`
+    /// from raw Z-major `[alt][dy][dx][4]` RGBA8 `density_rgba` and `albedo_rgba` slices.
+    ///
+    /// Automatically resizes the volume altitude if `brick_depth != self.depth` (preserving
+    /// overlapping altitude layers) so live `Z=16..32` upgrades work seamlessly!
+    pub fn apply_brick3d_raw(
+        &mut self,
+        bx: usize,
+        by: usize,
+        brick_depth: usize,
+        density_rgba: &[u8],
+        albedo_rgba: &[u8],
+    ) -> Result<BrickPatchResult, String> {
+        if !(2..=128).contains(&brick_depth) {
+            return Err(format!("Unsupported brick depth: {brick_depth} (expected 2..=128)"));
+        }
+        let x0 = bx.saturating_mul(STREAM_BRICK_XY);
+        let z0 = by.saturating_mul(STREAM_BRICK_XY);
+        if x0 >= self.width || z0 >= self.height {
+            return Err(format!(
+                "Brick ({bx}, {by}) out of bounds for {}x{} volume",
+                self.width, self.height
+            ));
+        }
+
+        let cw = STREAM_BRICK_XY.min(self.width - x0);
+        let ch = STREAM_BRICK_XY.min(self.height - z0);
+        let full_len = brick_depth * STREAM_BRICK_XY * STREAM_BRICK_XY * 4;
+        let clipped_len = brick_depth * ch * cw * 4;
+
+        let (src_w, src_h) = if density_rgba.len() == full_len && albedo_rgba.len() == full_len {
+            (STREAM_BRICK_XY, STREAM_BRICK_XY)
+        } else if density_rgba.len() == clipped_len && albedo_rgba.len() == clipped_len {
+            (cw, ch)
+        } else {
+            return Err(format!(
+                "Brick ({bx},{by}) payload size mismatch: got den={} alb={}, expected {} (full) or {} (clipped)",
+                density_rgba.len(),
+                albedo_rgba.len(),
+                full_len,
+                clipped_len
+            ));
+        };
+
+        let mut resized_depth = false;
+        if brick_depth != self.depth {
+            let old_d = self.depth;
+            let copy_d = old_d.min(brick_depth);
+            let mut new_dm = vec![0u8; self.width * brick_depth * self.height * 4];
+            let mut new_at = vec![0u8; self.width * brick_depth * self.height * 4];
+            let row_bytes = self.width * 4;
+            for iz in 0..self.height {
+                for iy in 0..copy_d {
+                    let src_off = (iz * old_d + iy) * row_bytes;
+                    let dst_off = (iz * brick_depth + iy) * row_bytes;
+                    new_dm[dst_off..dst_off + row_bytes]
+                        .copy_from_slice(&self.density_mat[src_off..src_off + row_bytes]);
+                    new_at[dst_off..dst_off + row_bytes]
+                        .copy_from_slice(&self.albedo_thermal[src_off..src_off + row_bytes]);
+                }
+            }
+            self.depth = brick_depth;
+            self.density_mat = new_dm;
+            self.albedo_thermal = new_at;
+            resized_depth = true;
+        }
+
+        let d = self.depth;
+        let w = self.width;
+        let copy_row = cw * 4;
+        for alt in 0..d {
+            for dy in 0..ch {
+                let iz = z0 + dy;
+                let src_off = ((alt * src_h + dy) * src_w) * 4;
+                let dst_off = ((iz * d + alt) * w + x0) * 4;
+                self.density_mat[dst_off..dst_off + copy_row]
+                    .copy_from_slice(&density_rgba[src_off..src_off + copy_row]);
+                self.albedo_thermal[dst_off..dst_off + copy_row]
+                    .copy_from_slice(&albedo_rgba[src_off..src_off + copy_row]);
+            }
+        }
+
+        Ok(BrickPatchResult {
+            bx,
+            by,
+            x0,
+            z0,
+            cw,
+            ch,
+            depth: d,
+            resized_depth,
+        })
+    }
+
+    /// Pack a contiguous GPU sub-brick `[dz=0..ch][iy=0..depth][dx=0..cw][4]` ready for
+    /// `queue.write_texture` at `Origin3d { x: x0, y: 0, z: z0 }`.
+    pub fn pack_brick_subregion(&self, x0: usize, z0: usize, cw: usize, ch: usize) -> (Vec<u8>, Vec<u8>) {
+        let d = self.depth;
+        let w = self.width;
+        let row_bytes = cw * 4;
+        let total = cw * d * ch * 4;
+        let mut dm = vec![0u8; total];
+        let mut at = vec![0u8; total];
+        for dz in 0..ch {
+            let iz = z0 + dz;
+            for iy in 0..d {
+                let src_off = ((iz * d + iy) * w + x0) * 4;
+                let dst_off = (dz * d + iy) * row_bytes;
+                dm[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&self.density_mat[src_off..src_off + row_bytes]);
+                at[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&self.albedo_thermal[src_off..src_off + row_bytes]);
+            }
+        }
+        (dm, at)
+    }
+
+    /// Incrementally update the coarse `8×8×8` occupancy bricks affected by a `16×16×D` brick
+    /// `(bx16, by16)` (including its 1-voxel dilation halo).
+    pub fn update_brick_occupancy_region(
+        &self,
+        occ: &mut BrickOccupancy3D,
+        bx16: usize,
+        by16: usize,
+    ) -> OccupancySubregion {
+        let ox0 = (bx16 * STREAM_BRICK_XY / BRICK_SIZE).saturating_sub(1);
+        let ox1 = ((bx16 + 1) * STREAM_BRICK_XY)
+            .div_ceil(BRICK_SIZE)
+            .saturating_add(1)
+            .min(occ.bx_count);
+        let oz0 = (by16 * STREAM_BRICK_XY / BRICK_SIZE).saturating_sub(1);
+        let oz1 = ((by16 + 1) * STREAM_BRICK_XY)
+            .div_ceil(BRICK_SIZE)
+            .saturating_add(1)
+            .min(occ.bz_count);
+
+        for bz in oz0..oz1 {
+            let z0 = (bz * BRICK_SIZE).saturating_sub(1);
+            let z1 = ((bz + 1) * BRICK_SIZE + 1).min(self.height);
+            for by in 0..occ.by_count {
+                let y0 = (by * BRICK_SIZE).saturating_sub(1);
+                let y1 = ((by + 1) * BRICK_SIZE + 1).min(self.depth);
+                for bx in ox0..ox1 {
+                    let x0 = (bx * BRICK_SIZE).saturating_sub(1);
+                    let x1 = ((bx + 1) * BRICK_SIZE + 1).min(self.width);
+
+                    let mut max_s = 0u8;
+                    let mut max_f = 0u8;
+                    let mut max_g = 0u8;
+                    let mut max_t = 0u8;
+                    for iz in z0..z1 {
+                        for iy in y0..y1 {
+                            let row = ((iz * self.depth + iy) * self.width) * 4;
+                            for ix in x0..x1 {
+                                let i = row + ix * 4;
+                                max_s = max_s.max(self.density_mat[i]);
+                                max_f = max_f.max(self.density_mat[i + 1]);
+                                max_g = max_g.max(self.density_mat[i + 2]);
+                                max_t = max_t.max(self.albedo_thermal[i + 3]);
+                            }
+                        }
+                    }
+
+                    let bi = ((bz * occ.by_count + by) * occ.bx_count + bx) * 4;
+                    let was_active = occ.data[bi] > 2 || occ.data[bi + 1] > 2 || occ.data[bi + 2] > 2;
+                    let now_active = max_s > 2 || max_f > 2 || max_g > 2;
+                    occ.data[bi] = max_s;
+                    occ.data[bi + 1] = max_f;
+                    occ.data[bi + 2] = max_g;
+                    occ.data[bi + 3] = max_t;
+                    if now_active && !was_active {
+                        occ.non_empty_bricks += 1;
+                    } else if !now_active && was_active {
+                        occ.non_empty_bricks = occ.non_empty_bricks.saturating_sub(1);
+                    }
+                }
+            }
+        }
+
+        OccupancySubregion {
+            x0: ox0,
+            z0: oz0,
+            cw: ox1.saturating_sub(ox0),
+            ch: oz1.saturating_sub(oz0),
+        }
+    }
+
     /// Generate the rich procedural isotropic `256×256×16` Frostmarsh True-3D showcase world.
     pub fn generate_showcase() -> Self {
+        Self::generate_showcase_with_depth(DEFAULT_DEPTH)
+    }
+
+    /// Generate the procedural isotropic `256×256×D` (`D = 16..=32`) Frostmarsh True-3D showcase world.
+    /// Higher depths (`Z > 16`) extend alpine mountain peaks, towering conifer spires, and cave massifs!
+    pub fn generate_showcase_with_depth(depth: usize) -> Self {
         let w = DEFAULT_WIDTH;
-        let d = DEFAULT_DEPTH;
+        let d = depth.clamp(MIN_SHOWCASE_DEPTH, MAX_SHOWCASE_DEPTH);
         let h = DEFAULT_HEIGHT;
         let mut vol = Self::new_empty(w, d, h);
+        let extra_y = (d as f32 - 16.0).max(0.0);
+        let peak_boost = 1.0 + extra_y * 0.095;
+        let max_ground = (d as f32 - 0.9).max(15.1);
+        let max_tree_y = (d as f32 - 1.2).max(14.8);
 
         let cave_pts = cave_centerline_points();
 
@@ -442,7 +665,7 @@ impl WorldVolume3D {
                         ((wx - 137.0).powi(2) + (wz - 82.0).powi(2)).sqrt(),
                     ))
                     * 6.6;
-                ground += mtn_ridge * 5.0 + peak_left + peak_right + peak_mid;
+                ground += (mtn_ridge * 5.0 + peak_left + peak_right + peak_mid) * peak_boost;
 
                 let basin_dx = (wx - 138.0) / 10.5;
                 let basin_dz = (wz - 93.0) / 7.5;
@@ -464,7 +687,7 @@ impl WorldVolume3D {
                 let cave_mtn_dz = (wz - 159.0) / 22.0;
                 let cave_mtn_r = (cave_mtn_dx * cave_mtn_dx + cave_mtn_dz * cave_mtn_dz).sqrt();
                 let cave_mtn_w = 1.0 - smoothstep(0.45, 1.08, cave_mtn_r);
-                let cave_mtn_h = 13.6 + n_med * 0.95 + (1.0 - cave_mtn_r.min(1.0)) * 1.4;
+                let cave_mtn_h = 13.6 + extra_y * 0.42 + n_med * 0.95 + (1.0 - cave_mtn_r.min(1.0)) * (1.4 + extra_y * 0.35);
                 ground = ground.max(ground * (1.0 - cave_mtn_w) + cave_mtn_h * cave_mtn_w);
 
                 let apron_dx = (wx - 106.0) / 7.5;
@@ -481,7 +704,7 @@ impl WorldVolume3D {
                 let outer_fade = smoothstep(58.0, 88.0, (wx - 128.0).hypot(wz - 128.0));
                 ground =
                     ground * (1.0 - outer_fade * 0.45) + (4.5 + n_big * 1.2) * (outer_fade * 0.45);
-                ground = ground.clamp(1.2, 15.1);
+                ground = ground.clamp(1.2, max_ground);
 
                 base_h[iz * w + ix] = ground;
             }
@@ -692,7 +915,7 @@ impl WorldVolume3D {
                             let t_base =
                                 base_h[(tz as usize).min(h - 1) * w + (tx as usize).min(w - 1)]
                                     - 0.6;
-                            let top_y = (t_base + tree_h).min(14.8);
+                            let top_y = (t_base + tree_h + extra_y * 0.14).min(max_tree_y);
                             let rel_y = wy - t_base;
                             if rel_y >= -0.8 && wy <= top_y + 0.4 {
                                 let r_xz = dist2.sqrt();

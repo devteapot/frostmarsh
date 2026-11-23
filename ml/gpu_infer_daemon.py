@@ -66,6 +66,17 @@ try:
 except Exception:
     ActuatorPolicyNet = None  # type: ignore[assignment]
 
+try:
+    from actuator_policy_v3 import (  # type: ignore  # noqa: E402
+        ACT3D_DIM,
+        ActuatorPolicyNetV3,
+        adapt_bot_feats_168,
+    )
+except Exception:
+    ActuatorPolicyNetV3 = None  # type: ignore[assignment]
+    adapt_bot_feats_168 = None  # type: ignore[assignment]
+    ACT3D_DIM = 12
+
 HEADER_STRUCT = struct.Struct("<BBHHHII")
 HEADER_SIZE = HEADER_STRUCT.size  # 16 bytes
 
@@ -77,10 +88,12 @@ OP_ACOUSTIC_STEP = 6
 OP_ACTUATOR_POLICY = 7
 OP_WORLD_3D_STEP = 8
 OP_WORLD_DT_STEP = 9
+OP_ACTUATOR_V3 = 10
 
 Z_FLUX_CH = 5
 ACTUATOR_OUT_DIM = 10
 ACTUATOR_INSPECT_OUT_DIM = ACTUATOR_OUT_DIM + 16  # 26 floats per bot
+ACTUATOR_V3_INSPECT_OUT_DIM = ACT3D_DIM + 16      # 28 floats per bot
 
 STATUS_OK = 0
 STATUS_BAD_REQUEST = 1
@@ -749,8 +762,10 @@ class InferenceEngine:
         use_sparse_eco: bool | None = None,
         acoustic_pt: Path | None = None,
         actuator_pt: Path | None = None,
+        actuator_v3_pt: Path | None = None,
         world_3d_pt: Path | None = None,
         world_dt_pt: Path | None = None,
+        world_v5_pt: Path | None = None,
         enable_system2_slm: bool = False,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -810,6 +825,24 @@ class InferenceEngine:
                 )
                 self.actuator_policy = None
 
+        self.actuator_policy_v3: Any = None
+        act_v3_path = actuator_v3_pt if actuator_v3_pt is not None else (_SCRIPT_DIR / "actuator_policy_v3_rl.pt")
+        if ActuatorPolicyNetV3 is not None and act_v3_path.exists():
+            try:
+                sd_v3 = _load_state_dict(act_v3_path)
+                ap3 = ActuatorPolicyNetV3().eval()
+                ap3.load_state_dict(sd_v3)
+                ap3.to(self.device)
+                self.actuator_policy_v3 = ap3
+                print(f"[gpu_infer_daemon] Loaded True-3D ActuatorPolicyNetV3 from {act_v3_path}", flush=True)
+            except Exception as exc:
+                print(
+                    f"[gpu_infer_daemon] ActuatorPolicyNetV3 load failed ({exc}); using Actuator v2 fallback",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.actuator_policy_v3 = None
+
         self.use_sparse_world: bool = bool(use_sparse_world and SparseWorldRunner is not None)
         self._sparse_runners: dict[tuple[int, int, int], _SparseWorldAdapter] = {}
         self.use_sparse_eco: bool = bool(use_sparse_eco and SparseEcoRunner is not None)
@@ -841,26 +874,46 @@ class InferenceEngine:
                 self.world_model_3d = None
                 self._sparse_3d_runner_cls = None
 
-        # Optional WorldModelDT (`op=9` continuous per-voxel local_dt Time-Dilation Domes)
+        # Optional WorldModelDT / WorldModel3D-v5 (`op=9` continuous per-voxel local_dt + 16x16x8 3D sparse bricks!)
         self.world_model_dt: Any = None
         self._sparse_dt_runner_cls: Any = None
         self._sparse_dt_runners: dict[tuple[int, int, int], _SparseWorldDTAdapter] = {}
-        if world_dt_pt is not None and world_dt_pt.exists():
+        self.world_model_v5_active: bool = False
+        dt_candidate = world_v5_pt if (world_v5_pt is not None and world_v5_pt.exists()) else world_dt_pt
+        if dt_candidate is not None and dt_candidate.exists():
             try:
-                from world_model_dt import WorldModelDT  # noqa: E402
-                from sparse_world_3d_runner import SparseWorldDTRunner  # noqa: E402
+                sd_dt = _load_state_dict(dt_candidate)
+                is_v5 = any(k.startswith("blocks.4.conv3d.") or k.startswith("h_lat_in.") for k in sd_dt)
+                if is_v5:
+                    from world_model_3d_v5 import SparseWorld3DV5Runner, WorldModel3DV5  # noqa: E402
 
-                wmdt = WorldModelDT(in_ch=18, out_ch=17, width=48, num_res=5, z_flux_ch=Z_FLUX_CH).eval()
-                wmdt.load_state_dict(_load_state_dict(world_dt_pt))
-                wmdt.to(self.device)
-                self.world_model_dt = wmdt
-                self._sparse_dt_runner_cls = SparseWorldDTRunner
-                if self.device.type == "cuda" and use_sparse_world:
-                    torch.backends.cudnn.benchmark = False
-                print(f"[gpu_infer_daemon] Loaded WorldModelDT from {world_dt_pt}", flush=True)
+                    wmv5 = WorldModel3DV5(in_ch=18, out_ch=17, width=48, z_flux_ch=Z_FLUX_CH).eval()
+                    wmv5.load_state_dict(sd_dt)
+                    wmv5.to(self.device)
+                    self.world_model_dt = wmv5
+                    self._sparse_dt_runner_cls = SparseWorld3DV5Runner
+                    self.world_model_v5_active = True
+                    # Also back op=8 with WorldModel3DV5 when loaded
+                    self.world_model_3d = wmv5
+                    self._sparse_3d_runner_cls = SparseWorld3DV5Runner
+                    if self.device.type == "cuda" and use_sparse_world:
+                        torch.backends.cudnn.benchmark = False
+                    print(f"[gpu_infer_daemon] Loaded Conservation-Distilled WorldModel3D-v5 (16x16x8 3D sparse!) from {dt_candidate}", flush=True)
+                else:
+                    from world_model_dt import WorldModelDT  # noqa: E402
+                    from sparse_world_3d_runner import SparseWorldDTRunner  # noqa: E402
+
+                    wmdt = WorldModelDT(in_ch=18, out_ch=17, width=48, num_res=5, z_flux_ch=Z_FLUX_CH).eval()
+                    wmdt.load_state_dict(sd_dt)
+                    wmdt.to(self.device)
+                    self.world_model_dt = wmdt
+                    self._sparse_dt_runner_cls = SparseWorldDTRunner
+                    if self.device.type == "cuda" and use_sparse_world:
+                        torch.backends.cudnn.benchmark = False
+                    print(f"[gpu_infer_daemon] Loaded WorldModelDT from {dt_candidate}", flush=True)
             except Exception as exc:
                 print(
-                    f"[gpu_infer_daemon] WorldModelDT load failed ({exc}); op=9 disabled",
+                    f"[gpu_infer_daemon] WorldModelDT/v5 load failed ({exc}); op=9 disabled",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1717,9 +1770,65 @@ class InferenceEngine:
             infer_us = int((time.perf_counter() - t0) * 1_000_000)
         return out_np.tobytes(), infer_us
 
+    def infer_actuators_v3(self, n_bots: int, raw_bytes: bytes) -> tuple[bytes, int]:
+        """True 3D Volumetric ActuatorPolicyNetV3 (`op=10`): zero-copy over native Z_world_3d [L, 48, H, W]."""
+        if self.actuator_policy_v3 is None or adapt_bot_feats_168 is None:
+            raise RuntimeError("actuator_policy_v3_rl.pt not loaded")
+        arr = np.frombuffer(raw_bytes, dtype=np.float32).reshape(n_bots, BOT_FEAT_DIM).copy()
+        with self.lock:
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                z_w = self.last_z_world  # native [L, 48, H, W] (L=16 or L=32, zero pooling!)
+                L, _, H, W = z_w.shape
+                bf = torch.from_numpy(arr).to(self.device, non_blocking=False)
+                pos_xyz, self_feat, tokens, token_mask = adapt_bot_feats_168(bf, W, H, L)
+                if self.use_fp16:
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                        out = self.actuator_policy_v3(
+                            z_w,
+                            pos_xyz,
+                            self_feat,
+                            tokens,
+                            token_mask=token_mask,
+                            z_eco=self.last_z_eco,
+                            return_saliency=True,
+                        )
+                else:
+                    out = self.actuator_policy_v3(
+                        z_w,
+                        pos_xyz,
+                        self_feat,
+                        tokens,
+                        token_mask=token_mask,
+                        z_eco=self.last_z_eco,
+                        return_saliency=True,
+                    )
+                out_t = torch.cat([out["mean"].float(), out["saliency_4x4"].float()], dim=-1)  # [N, 28]
+                out_np = out_t.cpu().numpy().astype(np.float32, copy=False)
+            infer_us = int((time.perf_counter() - t0) * 1_000_000)
+        return out_np.tobytes(), infer_us
+
     def infer_actuators(self, n_bots: int, raw_bytes: bytes) -> tuple[bytes, int]:
-        if self.actuator_policy is None and self.bot_policy is None:
-            raise RuntimeError("neither actuator_policy_rl.pt nor bot_policy.pt loaded")
+        if self.actuator_policy_v3 is None and self.actuator_policy is None and self.bot_policy is None:
+            raise RuntimeError("neither actuator_policy_v3_rl.pt, actuator_policy_rl.pt nor bot_policy.pt loaded")
+        # Transparently use True-3D ActuatorPolicyNetV3 when loaded on native Z>=8 worlds!
+        if self.actuator_policy_v3 is not None and adapt_bot_feats_168 is not None and self.last_z_world.shape[0] >= 8:
+            raw_v3, infer_us = self.infer_actuators_v3(n_bots, raw_bytes)
+            arr_v3 = np.frombuffer(raw_v3, dtype=np.float32).reshape(n_bots, ACTUATOR_V3_INSPECT_OUT_DIM)
+            # Project 12D 3D actuators -> 10D op=7 wire format + preserve exact 16D saliency
+            out_10 = np.empty((n_bots, ACTUATOR_INSPECT_OUT_DIM), dtype=np.float32)
+            out_10[:, 0] = arr_v3[:, 0]                    # move_x
+            out_10[:, 1] = arr_v3[:, 1]                    # move_y
+            out_10[:, 2] = arr_v3[:, 3]                    # aim_dx
+            out_10[:, 3] = arr_v3[:, 4]                    # aim_dy
+            out_10[:, 4] = arr_v3[:, 6]                    # thermal_flux
+            out_10[:, 5] = arr_v3[:, 7]                    # emit_water
+            out_10[:, 6] = arr_v3[:, 8]                    # emit_oil
+            out_10[:, 7] = arr_v3[:, 9]                    # emit_smoke
+            out_10[:, 8] = arr_v3[:, 10]                   # focus_radius
+            out_10[:, 9] = np.clip(arr_v3[:, 11], 0.0, 1.0)  # kinetic impulse
+            out_10[:, 10:26] = arr_v3[:, 12:28]            # 4x4 saliency
+            return out_10.tobytes(), infer_us
         arr = np.frombuffer(raw_bytes, dtype=np.float32).reshape(n_bots, BOT_FEAT_DIM).copy()
         with self.lock:
             t0 = time.perf_counter()
@@ -1975,6 +2084,35 @@ class GPUInferDaemon:
                     conn.sendall(out_bytes)
                     continue
 
+                if op == OP_ACTUATOR_V3:
+                    n_bots = int(height)
+                    expected_bytes = n_bots * BOT_FEAT_DIM * 4
+                    if (
+                        self.engine.actuator_policy_v3 is None
+                        or n_bots <= 0
+                        or width != BOT_FEAT_DIM
+                        or payload_bytes != expected_bytes
+                    ):
+                        if 0 < payload_bytes <= 16 * 1024 * 1024:
+                            _recv_exact(conn, memoryview(bytearray(payload_bytes)))
+                        self._send_error(conn, STATUS_BAD_REQUEST, height, width)
+                        continue
+                    raw_in = bytearray(payload_bytes)
+                    if not _recv_exact(conn, memoryview(raw_in)):
+                        break
+                    try:
+                        out_bytes, infer_us = self.engine.infer_actuators_v3(n_bots, bytes(raw_in))
+                    except Exception as exc:
+                        print(f"[gpu_infer_daemon] ActuatorV3 op=10 error: {exc}", file=sys.stderr)
+                        self._send_error(conn, STATUS_INTERNAL_ERROR, height, width)
+                        continue
+                    resp_hdr = HEADER_STRUCT.pack(
+                        STATUS_OK, 1, 1, n_bots, ACTUATOR_V3_INSPECT_OUT_DIM, len(out_bytes), infer_us
+                    )
+                    conn.sendall(resp_hdr)
+                    conn.sendall(out_bytes)
+                    continue
+
                 if op == OP_ACTUATOR_POLICY:
                     n_bots = int(height)
                     expected_bytes = n_bots * BOT_FEAT_DIM * 4
@@ -2092,6 +2230,12 @@ def main() -> None:
         help="Optional WorldModelDT checkpoint path for op=9 spatial time-dilation domes",
     )
     parser.add_argument(
+        "--world-model-v5",
+        type=Path,
+        default=_SCRIPT_DIR / "world_model_3d_v5.pt",
+        help="Optional conservation-distilled WorldModel3D-v5 checkpoint (auto-overrides op=8/op=9 with 16x16x8 3D sparse bricks!)",
+    )
+    parser.add_argument(
         "--system2-slm",
         action="store_true",
         default=False,
@@ -2100,6 +2244,7 @@ def main() -> None:
     parser.add_argument("--eco-model", type=Path, default=_SCRIPT_DIR / "ecosystem_model.pt")
     parser.add_argument("--bot-policy", type=Path, default=_SCRIPT_DIR / "bot_policy.pt")
     parser.add_argument("--actuator-policy", type=Path, default=_SCRIPT_DIR / "actuator_policy_rl.pt")
+    parser.add_argument("--actuator-policy-v3", type=Path, default=_SCRIPT_DIR / "actuator_policy_v3_rl.pt")
     parser.add_argument("--acoustic-ckpt", type=Path, default=_SCRIPT_DIR / "acoustic_comm_live.pt")
     parser.add_argument(
         "--sparse-world",
@@ -2127,8 +2272,10 @@ def main() -> None:
         use_sparse_eco=use_sparse_eco,
         acoustic_pt=args.acoustic_ckpt,
         actuator_pt=args.actuator_policy,
+        actuator_v3_pt=args.actuator_policy_v3,
         world_3d_pt=args.world_model_3d,
         world_dt_pt=args.world_model_dt,
+        world_v5_pt=args.world_model_v5,
         enable_system2_slm=args.system2_slm,
     )
     daemon = GPUInferDaemon(host, port, engine, unix_sock=args.unix_sock)
@@ -2146,9 +2293,11 @@ def main() -> None:
         f"[gpu_infer_daemon] Ready on {host}:{daemon.actual_port}{unix_info} | device={dev_name} | "
         f"fp16={engine.use_fp16} | world_3d={engine.world_model_3d is not None} | "
         f"world_dt={engine.world_model_dt is not None} | "
+        f"world_v5={engine.world_model_v5_active} | "
         f"system2_slm={args.system2_slm} | "
         f"neural_bots={engine.bot_policy is not None} | "
         f"actuator_policy={engine.actuator_policy is not None} | "
+        f"actuator_v3={engine.actuator_policy_v3 is not None} | "
         f"sparse_world={engine.use_sparse_world} | sparse_eco={engine.use_sparse_eco} | "
         f"acoustics={'neural' if engine.acoustic_engine is not None else 'physical-fallback'}",
         flush=True,

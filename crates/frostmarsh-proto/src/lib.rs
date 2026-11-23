@@ -15,9 +15,13 @@ pub const CHUNK_SIZE: usize = 16;
 pub const CHUNKS_X: usize = GRID_W / CHUNK_SIZE;
 pub const CHUNKS_Y: usize = GRID_H / CHUNK_SIZE;
 
-pub const CLASS_WARDEN: u8 = 0; // Frost Warden (Knight)
-pub const CLASS_ALCHEMIST: u8 = 1; // Pyro Alchemist (Mage)
-pub const CLASS_RANGER: u8 = 2; // Marsh Ranger (Scout)
+pub const CLASS_WARDEN: u8 = 0; // Frost Warden / Strider (Heavy Walker, Squad Anchor)
+pub const CLASS_ALCHEMIST: u8 = 1; // Pyro Alchemist / Skywing (3D Flyer & Thermal Glider)
+pub const CLASS_RANGER: u8 = 2; // Marsh Ranger / Tidekin (Amphibious Swimmer & Diver)
+pub const CLASS_STRIDER: u8 = 0;
+pub const CLASS_SKYWING: u8 = 1;
+pub const CLASS_TIDEKIN: u8 = 2;
+pub const CLASS_EMBERSTALKER: u8 = 3; // Solo Cavern Climber & Raider
 
 pub const STATUS_BURNING: u8 = 1 << 0;
 pub const STATUS_CHILLED: u8 = 1 << 1;
@@ -66,6 +70,10 @@ pub enum ClientReliable {
     },
     /// Place or clear a spatial `WorldModelDT` time-dilation dome (`mode`: 0=clear, 1=0.15x Stasis, 2=3.0x Haste).
     PlaceTimeDome { gx: f32, gy: f32, mode: u8 },
+    /// Cycle the authoritative 3D world through the 5 true-3D biomes (`0..=4`) and trigger full brick re-sync.
+    CycleBiome,
+    /// Cycle the evolving 3D world speed (`1x -> 4x -> 12x -> 1x`).
+    CycleEvolutionSpeed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -414,28 +422,42 @@ mod tests {
 
     #[test]
     fn test_brick3d_lz4_and_datagram_roundtrip() {
-        let len = 16 * 16 * 16 * 4;
-        let mut dm = vec![0u8; len];
-        let mut at = vec![0u8; len];
-        dm[0..4].copy_from_slice(&[255, 0, 0, 200]);
-        dm[len - 4..len].copy_from_slice(&[0, 128, 64, 30]);
-        at[0..4].copy_from_slice(&[90, 95, 105, 0]);
-        at[len - 4..len].copy_from_slice(&[255, 140, 20, 240]);
+        for &depth in &[16u8, 32u8] {
+            let len = 16 * 16 * (depth as usize) * 4;
+            let mut dm = vec![0u8; len];
+            let mut at = vec![0u8; len];
+            dm[0..4].copy_from_slice(&[255, 0, 0, 200]);
+            dm[len - 4..len].copy_from_slice(&[0, 128, 64, 30]);
+            at[0..4].copy_from_slice(&[90, 95, 105, 0]);
+            at[len - 4..len].copy_from_slice(&[255, 140, 20, 240]);
 
-        let payload = encode_brick3d_lz4(42, 3, 5, 16, &dm, &at);
-        assert!(payload.density_mat_lz4.len() < len);
-        assert!(payload.albedo_thermal_lz4.len() < len);
+            let payload = encode_brick3d_lz4(42, 3, 5, depth, &dm, &at);
+            assert!(payload.density_mat_lz4.len() < len);
+            assert!(payload.albedo_thermal_lz4.len() < len);
 
-        let wire = encode_server_datagram(&ServerDatagram::VolumetricBrick3D(payload));
-        let decoded = decode_server_datagram(&wire).expect("decode ServerDatagram::VolumetricBrick3D");
-        match decoded {
-            ServerDatagram::VolumetricBrick3D(b) => {
-                assert_eq!((b.brick_id, b.bx, b.by, b.depth), (42, 3, 5, 16));
-                let (dm2, at2) = decode_brick3d_lz4(&b).expect("decompress brick3d");
-                assert_eq!(dm2, dm);
-                assert_eq!(at2, at);
+            let wire = encode_server_datagram(&ServerDatagram::VolumetricBrick3D(payload));
+            let decoded = decode_server_datagram(&wire).expect("decode ServerDatagram::VolumetricBrick3D");
+            match decoded {
+                ServerDatagram::VolumetricBrick3D(b) => {
+                    assert_eq!((b.brick_id, b.bx, b.by, b.depth), (42, 3, 5, depth));
+                    let (dm2, at2) = decode_brick3d_lz4(&b).expect("decompress brick3d");
+                    assert_eq!(dm2, dm);
+                    assert_eq!(at2, at);
+                }
+                other => panic!("unexpected variant: {:?}", other),
             }
-            other => panic!("unexpected variant: {:?}", other),
         }
+        // Verify CycleBiome & CycleEvolutionSpeed reliable control messages roundtrip
+        let cb_wire = encode_msg(&ClientReliable::CycleBiome);
+        assert!(matches!(decode_msg::<ClientReliable>(&cb_wire), Some(ClientReliable::CycleBiome)));
+        let ce_wire = encode_msg(&ClientReliable::CycleEvolutionSpeed);
+        assert!(matches!(
+            decode_msg::<ClientReliable>(&ce_wire),
+            Some(ClientReliable::CycleEvolutionSpeed)
+        ));
+        assert_eq!(CLASS_WARDEN, CLASS_STRIDER);
+        assert_eq!(CLASS_ALCHEMIST, CLASS_SKYWING);
+        assert_eq!(CLASS_RANGER, CLASS_TIDEKIN);
+        assert_eq!(CLASS_EMBERSTALKER, 3);
     }
 }

@@ -59,6 +59,7 @@ struct AudioShared {
     fire_pan: AtomicU32,
     weather_kind: AtomicU8,
     wind_strength: AtomicU32,
+    cave_enclosure_bits: AtomicU32,
     // Lock-free SPSC ring buffer (main thread -> audio callback thread)
     q_write: AtomicUsize,
     q_read: AtomicUsize,
@@ -76,6 +77,7 @@ impl AudioShared {
             fire_pan: AtomicU32::new(0.0f32.to_bits()),
             weather_kind: AtomicU8::new(0),
             wind_strength: AtomicU32::new(0.65f32.to_bits()),
+            cave_enclosure_bits: AtomicU32::new(0.0f32.to_bits()),
             q_write: AtomicUsize::new(0),
             q_read: AtomicUsize::new(0),
             q_word0: std::array::from_fn(|_| AtomicU32::new(0)),
@@ -217,6 +219,15 @@ impl SpatialAudioEngine {
             .store(wind_strength.clamp(0.0, 2.5).to_bits(), Ordering::Relaxed);
     }
 
+    /// Updates physical 3D cave enclosure (`0.0` open sky → `1.0` deep vaulted cavern) lock-free
+    /// to drive the real-time Schroeder stereo cave reverb (`wet = enclosure * 0.42`).
+    pub fn set_cave_enclosure(&self, enc: f32) {
+        let clamped = if enc.is_finite() { enc.clamp(0.0, 1.0) } else { 0.0 };
+        self.shared
+            .cave_enclosure_bits
+            .store(clamped.to_bits(), Ordering::Relaxed);
+    }
+
     pub fn trigger_sfx(&self, kind: SfxKind, param: u8, gain: f32, pan: f32) {
         if gain > 0.02 {
             self.shared.push_event(kind, param, gain, pan, 0.0);
@@ -281,6 +292,99 @@ impl Default for OneShotVoice {
     }
 }
 
+#[inline]
+fn flush_denormal(x: f32) -> f32 {
+    if x.is_finite() && x.abs() >= 1e-20 {
+        x
+    } else {
+        0.0
+    }
+}
+
+/// Pure-Rust zero-allocation Schroeder Stereo Cave Reverb (~16.2 KB fixed ring buffers):
+/// 4 tuned prime-length damped feedback comb filters + 2 short stereo allpass diffusers.
+pub(crate) struct SchroederCaveReverb {
+    comb0: [f32; 677],
+    comb1: [f32; 797],
+    comb2: [f32; 919],
+    comb3: [f32; 1049],
+    comb_idx: [usize; 4],
+    comb_lp: [f32; 4],
+    ap0_l: [f32; 113],
+    ap1_l: [f32; 179],
+    ap0_r: [f32; 127],
+    ap1_r: [f32; 193],
+    ap_idx: [usize; 4],
+}
+
+impl SchroederCaveReverb {
+    pub(crate) fn new() -> Box<Self> {
+        Box::new(Self {
+            comb0: [0.0; 677],
+            comb1: [0.0; 797],
+            comb2: [0.0; 919],
+            comb3: [0.0; 1049],
+            comb_idx: [0; 4],
+            comb_lp: [0.0; 4],
+            ap0_l: [0.0; 113],
+            ap1_l: [0.0; 179],
+            ap0_r: [0.0; 127],
+            ap1_r: [0.0; 193],
+            ap_idx: [0; 4],
+        })
+    }
+
+    #[inline]
+    fn step_comb(buf: &mut [f32], idx: &mut usize, lp: &mut f32, input: f32, fb: f32, damp: f32) -> f32 {
+        let i = *idx;
+        let out = buf[i];
+        *lp = flush_denormal(out * (1.0 - damp) + *lp * damp);
+        buf[i] = flush_denormal(input + *lp * fb);
+        let next = i + 1;
+        *idx = if next >= buf.len() { 0 } else { next };
+        out
+    }
+
+    #[inline]
+    fn step_allpass(buf: &mut [f32], idx: &mut usize, input: f32, g: f32) -> f32 {
+        let i = *idx;
+        let delayed = buf[i];
+        let out = flush_denormal(delayed - input * g);
+        buf[i] = flush_denormal(input + delayed * g);
+        let next = i + 1;
+        *idx = if next >= buf.len() { 0 } else { next };
+        out
+    }
+
+    #[inline]
+    pub(crate) fn process(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        let il = if in_l.is_finite() { in_l.clamp(-4.0, 4.0) } else { 0.0 };
+        let ir = if in_r.is_finite() { in_r.clamp(-4.0, 4.0) } else { 0.0 };
+
+        // Decorrelated stereo feeds into 4 prime-length damped feedback comb filters
+        let x0 = il * 0.72 + ir * 0.28;
+        let x1 = ir * 0.72 + il * 0.28;
+        let x2 = il * 0.65 + ir * 0.35;
+        let x3 = ir * 0.65 + il * 0.35;
+
+        let c0 = Self::step_comb(&mut self.comb0, &mut self.comb_idx[0], &mut self.comb_lp[0], x0, 0.79, 0.28);
+        let c1 = Self::step_comb(&mut self.comb1, &mut self.comb_idx[1], &mut self.comb_lp[1], x1, 0.80, 0.30);
+        let c2 = Self::step_comb(&mut self.comb2, &mut self.comb_idx[2], &mut self.comb_lp[2], x2, 0.81, 0.32);
+        let c3 = Self::step_comb(&mut self.comb3, &mut self.comb_idx[3], &mut self.comb_lp[3], x3, 0.82, 0.34);
+
+        let sum_l = 0.32 * (c0 + c2) + 0.18 * (c1 - c3);
+        let sum_r = 0.32 * (c1 + c3) + 0.18 * (c0 - c2);
+
+        // 2 cascaded short prime-length allpass diffusers per channel for lush rocky cave tail
+        let dl0 = Self::step_allpass(&mut self.ap0_l, &mut self.ap_idx[0], sum_l, 0.50);
+        let dl1 = Self::step_allpass(&mut self.ap1_l, &mut self.ap_idx[1], dl0, 0.46);
+        let dr0 = Self::step_allpass(&mut self.ap0_r, &mut self.ap_idx[2], sum_r, 0.50);
+        let dr1 = Self::step_allpass(&mut self.ap1_r, &mut self.ap_idx[3], dr0, 0.46);
+
+        (dl1, dr1)
+    }
+}
+
 struct DspState {
     inv_sr: f32,
     rng: u32,
@@ -292,6 +396,7 @@ struct DspState {
     fire_pan: f32,
     wind_gain: f32,
     wind_freq: f32,
+    cave_enclosure: f32,
     // Pink noise state (Paul Kellet 3-pole economy filter)
     pink_b0: f32,
     pink_b1: f32,
@@ -308,6 +413,8 @@ struct DspState {
     wind_lfo1: f32,
     wind_lfo2: f32,
     ember_lp: f32,
+    // Pure-Rust ~16 KB Schroeder Cave Reverb
+    cave_reverb: Box<SchroederCaveReverb>,
     // Polyphonic spatial one-shot voice pool
     voices: [OneShotVoice; MAX_VOICES],
     next_voice_rr: usize,
@@ -325,6 +432,7 @@ impl DspState {
             fire_pan: 0.0,
             wind_gain: 0.03,
             wind_freq: 280.0,
+            cave_enclosure: 0.0,
             pink_b0: 0.0,
             pink_b1: 0.0,
             pink_b2: 0.0,
@@ -339,6 +447,7 @@ impl DspState {
             wind_lfo1: 0.0,
             wind_lfo2: 0.0,
             ember_lp: 0.0,
+            cave_reverb: SchroederCaveReverb::new(),
             voices: [OneShotVoice::default(); MAX_VOICES],
             next_voice_rr: 0,
         }
@@ -432,11 +541,13 @@ impl DspState {
         let tgt_fi_p = f32::from_bits(shared.fire_pan.load(Ordering::Relaxed));
         let weather = shared.weather_kind.load(Ordering::Relaxed);
         let wind_str = f32::from_bits(shared.wind_strength.load(Ordering::Relaxed));
+        let tgt_cave = f32::from_bits(shared.cave_enclosure_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0);
 
         self.wf_gain += (tgt_wf_g - self.wf_gain) * 0.0008;
         self.wf_pan += (tgt_wf_p - self.wf_pan) * 0.0008;
         self.fire_gain += (tgt_fi_g - self.fire_gain) * 0.0008;
         self.fire_pan += (tgt_fi_p - self.fire_pan) * 0.0008;
+        self.cave_enclosure += (tgt_cave - self.cave_enclosure) * 0.0008;
 
         let (tgt_wg, tgt_wf) = match weather {
             WEATHER_BLIZZARD => (0.115 * (0.7 + 0.3 * wind_str), 620.0),
@@ -495,8 +606,9 @@ impl DspState {
         let wind_pan_lfo = 0.22 * (self.wind_lfo1 * TAU).cos();
         let (wn_l, wn_r) = equal_power_pan(wind_pan_lfo);
 
-        let mut out_l = wf_sig * wf_l + fire_sig * fi_l + wind_sig * wn_l;
-        let mut out_r = wf_sig * wf_r + fire_sig * fi_r + wind_sig * wn_r;
+        let wind_shelter = 1.0 - self.cave_enclosure * 0.62;
+        let mut out_l = wf_sig * wf_l + fire_sig * fi_l + wind_sig * wind_shelter * wn_l;
+        let mut out_r = wf_sig * wf_r + fire_sig * fi_r + wind_sig * wind_shelter * wn_r;
 
         // 4. Spatialized Polyphonic One-Shot SFX & SNR-Filtered Neural-Voice Chirps
         let inv_sr = self.inv_sr;
@@ -642,6 +754,13 @@ impl DspState {
             out_r += scaled * v.pan_r;
         }
 
+        // 5. Physical 3D Schroeder Cave Reverb (mixed cleanly at `wet = enclosure * 0.42`)
+        let (rev_l, rev_r) = self.cave_reverb.process(out_l, out_r);
+        let wet = self.cave_enclosure * 0.42;
+        let dry = 1.0 - wet * 0.22;
+        out_l = out_l * dry + rev_l * wet;
+        out_r = out_r * dry + rev_r * wet;
+
         // Master gain + smooth soft limiter (`tanh`)
         let l = (out_l * self.master_gain).tanh();
         let r = (out_r * self.master_gain).tanh();
@@ -695,5 +814,57 @@ impl DspState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::z16_world::Z16World;
+
+    #[test]
+    fn test_cave_enclosure_and_schroeder_reverb_finite() {
+        // 1. Verify 3D cave enclosure: > 0.7 under a stone roof vs < 0.1 under open sky
+        let mut world = Z16World::new(32, 32, 16);
+        let (w, d) = (world.width, world.depth);
+        for iz in 4..20 {
+            for ix in 4..20 {
+                // Solid floor at iy=0..2 and solid vaulted roof at iy=6..10
+                for iy in [0usize, 1, 6, 7, 8, 9] {
+                    let off = ((iz * d + iy) * w + ix) * 4;
+                    world.density_mat[off] = 255;
+                }
+            }
+        }
+        let enc_roof = world.sample_cave_enclosure(12.0, 12.0, 2.5);
+        let enc_sky = world.sample_cave_enclosure(26.0, 26.0, 2.5);
+        assert!(
+            enc_roof > 0.7,
+            "Expected cave enclosure > 0.7 under solid roof, got {enc_roof}"
+        );
+        assert!(
+            enc_sky < 0.1,
+            "Expected cave enclosure < 0.1 under open sky, got {enc_sky}"
+        );
+
+        // 2. Verify pure-Rust Schroeder Cave Reverb produces finite, non-NaN stereo reverberation
+        let mut reverb = SchroederCaveReverb::new();
+        let mut tail_energy = 0.0f32;
+        for i in 0..8192 {
+            let (in_l, in_r) = if i == 0 {
+                (1.0, 0.75)
+            } else if i == 120 {
+                (-0.5, 0.9)
+            } else {
+                (0.0, 0.0)
+            };
+            let (out_l, out_r) = reverb.process(in_l, in_r);
+            assert!(out_l.is_finite() && out_r.is_finite(), "Reverb produced non-finite sample at {i}");
+            assert!(out_l.abs() < 4.0 && out_r.abs() < 4.0, "Reverb blew up at {i}: ({out_l}, {out_r})");
+            if i > 600 {
+                tail_energy += out_l * out_l + out_r * out_r;
+            }
+        }
+        assert!(tail_energy > 0.01, "Expected audible cave reverb tail energy, got {tail_energy}");
     }
 }

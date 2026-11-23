@@ -24,11 +24,12 @@ struct SceneUniforms {
 
 struct Z16Uniforms {
     inv_vp: mat4x4<f32>,
-    vol_dims: vec4<f32>,      // xyz = (W, D, H), w = style_mode (0=NORDIC, 1=VOLCANIC, 2=ARCANE)
+    vol_dims: vec4<f32>,      // xyz = (W, D, H), w = style_mode (0=NORDIC, 1=VOLCANIC, 2=ARCANE, 3=EMERALD)
     brick_dims: vec4<f32>,    // xyz = (occ_bx, occ_by, occ_bz), w = 8.0
     world_offset: vec4<f32>,  // xyz = (W*0.5, 0.0, H*0.5), w = stylized (1.0=PIXEL-2XSS, 0.0=CLEAN-3D)
     sky_top: vec4<f32>,       // rgb = linear sky top, w = sim_time
     sky_horizon: vec4<f32>,   // rgb = linear sky horizon, w = exposure
+    hero_world_pos: vec4<f32>, // xyz = local player 3D world pos, w = cutaway enabled (0.0..1.0)
 };
 
 @group(0) @binding(0) var<uniform> u: SceneUniforms;
@@ -99,6 +100,13 @@ fn blackbody_ramp(temp: f32, tint: vec3<f32>, style_id: i32) -> vec3<f32> {
         let hi  = vec3<f32>(1.00, 0.96, 0.80);
         let bb = select(mix(mid, hi, (t - 0.5) * 2.0), mix(low, mid, t * 2.0), t < 0.5);
         return mix(bb, tint * 1.4, 0.35) * (t * t * 3.8);
+    }
+    if (style_id == 3) {
+        let low = vec3<f32>(0.06, 0.68, 0.44);
+        let mid = vec3<f32>(0.24, 1.00, 0.66);
+        let hi  = vec3<f32>(0.86, 1.00, 0.92);
+        let bb = select(mix(mid, hi, (t - 0.5) * 2.0), mix(low, mid, t * 2.0), t < 0.5);
+        return mix(bb, tint * 1.35, 0.35) * (t * t * 3.6);
     }
     let low = vec3<f32>(0.95, 0.14, 0.02);
     let mid = vec3<f32>(1.00, 0.52, 0.08);
@@ -213,8 +221,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
                 // --- Fluid volume: flowing river, glacial basin & plunging 3D waterfall ---
                 if (occ.g > 0.02 && dm.g > 0.12) {
-                    let at = sample_albedo(p);
-                    let is_waterfall = p.y > 4.2 && p.y < 10.2;
+                    let at = sample_albedo(p); // Pre-styled by `neural_style_z16.wgsl`!
+                    let is_waterfall = p.y > 4.2 && p.y < max(dims.y - 2.0, 10.2);
                     if (!in_fluid && dm.g >= 0.28) {
                         in_fluid = true;
                         let fn_w = sample_fluid_normal(p, sim_t);
@@ -229,20 +237,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                         trans *= (1.0 - fres * 0.62);
                     }
 
-                    // Style-aware fluid appearance (0=glacial azure, 1=molten lava, 2=arcane plasma)
+                    // Animated flow shimmer layered on top of neural-styled fluid albedo/glow
                     var fluid_rgb = at.rgb;
                     var fluid_glow = at.a;
                     if (style_id == 1) {
                         let lava_pulse = 0.72 + 0.28 * sin(p.x * 0.7 + p.z * 0.9 - sim_t * 2.4);
-                        fluid_rgb = mix(vec3<f32>(0.92, 0.22, 0.04), vec3<f32>(1.00, 0.76, 0.18), lava_pulse * select(0.55, 0.92, is_waterfall));
-                        fluid_glow = max(fluid_glow, 0.72 + select(0.0, 0.22, is_waterfall));
+                        fluid_rgb = mix(fluid_rgb, vec3<f32>(1.00, 0.76, 0.18), lava_pulse * select(0.28, 0.62, is_waterfall));
+                        fluid_glow = max(fluid_glow, 0.70 + select(0.0, 0.22, is_waterfall));
                     } else if (style_id == 2) {
                         let arc_pulse = 0.70 + 0.30 * sin(p.z * 1.1 - p.y * 1.4 - sim_t * 3.0);
-                        fluid_rgb = mix(vec3<f32>(0.08, 0.76, 1.00), vec3<f32>(0.68, 0.28, 1.00), arc_pulse * 0.45);
-                        fluid_glow = max(fluid_glow, 0.56 + select(0.0, 0.28, is_waterfall));
+                        fluid_rgb = mix(fluid_rgb, vec3<f32>(0.68, 0.28, 1.00), arc_pulse * 0.32);
+                        fluid_glow = max(fluid_glow, 0.54 + select(0.0, 0.26, is_waterfall));
+                    } else if (style_id == 3) {
+                        let jade_pulse = 0.70 + 0.30 * sin(p.y * 2.2 - sim_t * 3.2 + p.x * 0.9);
+                        fluid_rgb = mix(fluid_rgb, vec3<f32>(0.36, 1.00, 0.76), jade_pulse * select(0.25, 0.55, is_waterfall));
+                        fluid_glow = max(fluid_glow, 0.36 + select(0.0, 0.22, is_waterfall));
                     } else if (is_waterfall) {
                         let streak = 0.5 + 0.5 * sin(p.y * 3.6 + sim_t * 9.0 + p.x * 1.8);
-                        fluid_rgb = mix(vec3<f32>(0.42, 0.84, 0.98), vec3<f32>(0.92, 0.98, 1.00), 0.55 + streak * 0.35);
+                        fluid_rgb = mix(fluid_rgb, vec3<f32>(0.92, 0.98, 1.00), 0.35 + streak * 0.35);
                     }
 
                     let lin_w = srgb_to_linear(fluid_rgb);
@@ -269,7 +281,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     let at = sample_albedo(p);
                     let ext = dm.b * 0.80 * dt;
                     let step_t = exp(-ext);
-                    let sun_vis = 0.55 + 0.45 * clamp(p.y / 14.0, 0.0, 1.0);
+                    let sun_vis = 0.55 + 0.45 * clamp(p.y / max(dims.y - 2.0, 1.0), 0.0, 1.0);
                     let lin_g = srgb_to_linear(at.rgb);
                     let scatter = lin_g * (u.sun_col.rgb * 0.62 * sun_vis + z16.sky_horizon.rgb * 0.42);
                     var emit = vec3<f32>(0.0);

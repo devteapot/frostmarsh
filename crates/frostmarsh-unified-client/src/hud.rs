@@ -9,6 +9,10 @@
 //! - World-Space Overhead HP Bars & Floating Damage/Combo Popups
 
 use crate::camera::CameraMatrices;
+use crate::mesh_gen::{
+    archetype_color, archetype_is_solo, archetype_tag, CLASS_EMBERSTALKER, CLASS_SKYWING,
+    CLASS_STRIDER, CLASS_TIDEKIN,
+};
 use crate::net::LiveEntityState;
 use crate::world_bridge::LiveApproach4World;
 use crate::z16_world::Z16World;
@@ -44,6 +48,7 @@ pub struct HudConfig<'a> {
     pub show_scoreboard: bool,
     pub audio_muted: bool,
     pub audio_available: bool,
+    pub cave_enclosure: f32,
 }
 
 pub struct HudBatch {
@@ -53,7 +58,7 @@ pub struct HudBatch {
 impl HudBatch {
     pub fn new() -> Self {
         Self {
-            vertices: Vec::with_capacity(8192),
+            vertices: Vec::with_capacity(16_384),
         }
     }
 
@@ -199,7 +204,7 @@ pub fn build_hud(
             world.sample_3d_y(gx, gy, gz)
         }
     };
-    let ui = (sh / 1080.0).clamp(0.75, 2.0);
+    let ui = (sh / 1080.0).min(sw / 1920.0).clamp(0.68, 2.0);
     let panel_bg = [0.08, 0.07, 0.16, 0.82];
     let panel_border = [0.36, 0.34, 0.58, 0.85];
     let text_hi = [0.98, 0.96, 0.88, 1.0];
@@ -210,34 +215,117 @@ pub fn build_hud(
 
     // ------------------------------------------------------------------
     // 1. WORLD-SPACE OVERHEAD HP BARS + FLOATING COMBAT POPUPS
+    //    40–64 Player LOD: when players.len() > 16, render full nameplates
+    //    for the closest 14 players + local player + relic carrier, and crisp
+    //    compact team-colored HP pips for distant players!
     // ------------------------------------------------------------------
     if let Some(ent) = entities {
-        for p in &ent.players {
+        let mut proj_players: Vec<(usize, f32, f32, f32, bool)> =
+            Vec::with_capacity(ent.players.len());
+        for (idx, p) in ent.players.iter().enumerate() {
             let (wx, wz) = grid_to_xz(p.x, p.y);
             let gy = sample_e_y(p.x, p.y, p.z);
             let rel = Vec3::new(wx, gy + 3.65, wz) - mats.origin;
             if let Some((sx, sy)) = project_world(rel, mats, sw, sh) {
-                let bw = 54.0 * ui;
-                let bh = 6.0 * ui;
-                let bx = sx - bw * 0.5;
-                let by = sy - bh;
-                let hp_frac = (p.hp as f32 / p.max_hp.max(1) as f32).clamp(0.0, 1.0);
-                let is_self = p.id == ent.your_player_id;
-                let bar_c = if is_self {
-                    [0.32, 0.96, 0.52, 0.96]
-                } else if p.team == 0 {
-                    west_col
-                } else {
-                    east_col
-                };
-                b.rect(bx - 1.5 * ui, by - 1.5 * ui, bw + 3.0 * ui, bh + 3.0 * ui, [0.05, 0.04, 0.10, 0.85]);
-                b.rect(bx, by, bw, bh, [0.16, 0.14, 0.24, 0.9]);
-                b.rect(bx, by, bw * hp_frac, bh, bar_c);
-                let tag = format!("L{} {}", p.level, &p.name[..p.name.len().min(10)]);
-                let sc = 1.45 * ui;
-                let tw = HudBatch::text_width(&tag, sc);
-                b.text_shadow(sx - tw * 0.5, by - 13.0 * ui, sc, if is_self { gold_col } else { text_hi }, &tag);
+                let d2 = rel.distance_squared(mats.rel_eye);
+                let is_priority = p.id == ent.your_player_id || p.carrying_relic;
+                proj_players.push((idx, sx, sy, d2, is_priority));
             }
+        }
+
+        let use_lod = ent.players.len() > 16;
+        let mut full_mask = vec![!use_lod; ent.players.len()];
+        if use_lod {
+            let mut non_prio: Vec<(usize, f32)> = proj_players
+                .iter()
+                .filter_map(|&(idx, _, _, d2, is_prio)| {
+                    if is_prio {
+                        full_mask[idx] = true;
+                        None
+                    } else {
+                        Some((idx, d2))
+                    }
+                })
+                .collect();
+            non_prio.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            for &(idx, _) in non_prio.iter().take(14) {
+                full_mask[idx] = true;
+            }
+        }
+
+        // Pass 1A: Crisp compact team-colored HP pips for distant players (zero text clutter!)
+        if use_lod {
+            for &(idx, sx, sy, _, _) in &proj_players {
+                if full_mask[idx] {
+                    continue;
+                }
+                let p = &ent.players[idx];
+                let hp_frac = (p.hp as f32 / p.max_hp.max(1) as f32).clamp(0.0, 1.0);
+                let bar_c = if p.team == 0 { west_col } else { east_col };
+                let arch_c = archetype_color(p.class_id);
+                let pw = 18.0 * ui;
+                let ph = 4.0 * ui;
+                let px = sx - pw * 0.5;
+                let py = sy - ph;
+                b.rect(px - 1.0 * ui, py - 1.0 * ui, pw + 2.0 * ui, ph + 2.0 * ui, [0.05, 0.04, 0.10, 0.80]);
+                b.rect(px, py, pw, ph, [0.16, 0.14, 0.24, 0.85]);
+                b.rect(px, py, pw * hp_frac, ph, bar_c);
+                // Crisp 2.5px archetype/solo accent pip on left edge
+                b.rect(px - 3.5 * ui, py, 2.5 * ui, ph, arch_c);
+            }
+        }
+
+        // Pass 1B: Full nameplates (far-to-near so closest heroes & local player stay crisp on top!)
+        let mut full_list: Vec<(usize, f32, f32, f32)> = proj_players
+            .into_iter()
+            .filter(|&(idx, _, _, _, _)| full_mask[idx])
+            .map(|(idx, sx, sy, d2, _)| (idx, sx, sy, d2))
+            .collect();
+        full_list.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (idx, sx, sy, _) in full_list {
+            let p = &ent.players[idx];
+            let bw = 58.0 * ui;
+            let bh = 6.0 * ui;
+            let bx = sx - bw * 0.5;
+            let by = sy - bh;
+            let hp_frac = (p.hp as f32 / p.max_hp.max(1) as f32).clamp(0.0, 1.0);
+            let is_self = p.id == ent.your_player_id;
+            let is_solo = archetype_is_solo(p.class_id);
+            let arch = archetype_tag(p.class_id);
+            let arch_c = archetype_color(p.class_id);
+            let bar_c = if is_self {
+                [0.32, 0.96, 0.52, 0.96]
+            } else if p.team == 0 {
+                west_col
+            } else {
+                east_col
+            };
+            let border_c = if is_self || p.carrying_relic {
+                gold_col
+            } else if is_solo {
+                [1.0, 0.42, 0.18, 0.92]
+            } else {
+                [0.05, 0.04, 0.10, 0.85]
+            };
+            b.rect(bx - 1.5 * ui, by - 1.5 * ui, bw + 3.0 * ui, bh + 3.0 * ui, border_c);
+            b.rect(bx, by, bw, bh, [0.16, 0.14, 0.24, 0.92]);
+            b.rect(bx, by, bw * hp_frac, bh, bar_c);
+            // Archetype indicator swatch on left edge of HP bar
+            b.rect(bx - 5.5 * ui, by, 3.2 * ui, bh, arch_c);
+
+            let short_name: String = p.name.chars().take(8).collect();
+            let tag = format!("L{} {} {}", p.level, arch, short_name);
+            let sc = 1.32 * ui;
+            let tw = HudBatch::text_width(&tag, sc);
+            let name_col = if is_self {
+                gold_col
+            } else if is_solo {
+                [1.0, 0.80, 0.66, 1.0]
+            } else {
+                text_hi
+            };
+            b.text_shadow(sx - tw * 0.5, by - 12.5 * ui, sc, name_col, &tag);
         }
 
         // Shrine world labels
@@ -346,12 +434,16 @@ pub fn build_hud(
                 let mut cy = (sy - card_h - 10.0 * ui).clamp(safe_min_y, (safe_max_y - card_h).max(safe_min_y));
 
                 // Avoid top-left telemetry & top-right minimap / brain inspector
-                if cfg.show_telemetry && cx < 428.0 * ui && cy < 204.0 * ui {
-                    cx = 430.0 * ui;
+                if cfg.show_telemetry && cx < 444.0 * ui && cy < 224.0 * ui {
+                    cx = 446.0 * ui;
                 }
                 let right_guard_h = if cfg.show_brain_inspector { 442.0 * ui } else { 226.0 * ui };
                 if cx + card_w > sw - 256.0 * ui && cy < right_guard_h {
                     cx = (sw - 258.0 * ui - card_w).max(safe_min_x);
+                }
+                // Avoid bottom-left acoustic transcript log
+                if cx < 458.0 * ui && cy + card_h > sh - 266.0 * ui {
+                    cy = (sh - 270.0 * ui - card_h).max(safe_min_y);
                 }
 
                 // De-overlap against previously placed bubbles
@@ -553,26 +645,52 @@ pub fn build_hud(
         let ry = mm_y + (ent.relic_y / gh) * mm_sz;
         b.rect(rx - 3.5 * ui, ry - 3.5 * ui, 7.0 * ui, 7.0 * ui, gold_col);
 
-        // Heroes / Bots
-        for p in &ent.players {
-            let px = mm_x + (p.x / gw) * mm_sz;
-            let py = mm_y + (p.y / gh) * mm_sz;
-            let is_self = p.id == ent.your_player_id;
-            let sz = if is_self { 6.5 * ui } else { 4.2 * ui };
-            let col = if is_self {
-                [0.35, 1.0, 0.55, 1.0]
-            } else if p.team == 0 {
-                west_col
-            } else {
-                east_col
-            };
-            b.rect(px - sz * 0.5, py - sz * 0.5, sz, sz, col);
+        // Heroes / Bots on minimap (scales cleanly up to 64 players; self & relic carrier drawn on top!)
+        let crowded = ent.players.len() > 24;
+        let base_dot = if crowded { 3.1 * ui } else { 4.2 * ui };
+        for pass in 0..2 {
+            for p in &ent.players {
+                let is_self = p.id == ent.your_player_id;
+                let is_top = is_self || p.carrying_relic;
+                if (pass == 0 && is_top) || (pass == 1 && !is_top) {
+                    continue;
+                }
+                let sz = if is_self {
+                    6.4 * ui
+                } else if p.carrying_relic {
+                    5.4 * ui
+                } else {
+                    base_dot
+                };
+                let half = sz * 0.5;
+                let px = (mm_x + (p.x / gw).clamp(0.0, 1.0) * mm_sz)
+                    .clamp(mm_x + half, mm_x + mm_sz - half);
+                let py = (mm_y + (p.y / gh).clamp(0.0, 1.0) * mm_sz)
+                    .clamp(mm_y + half, mm_y + mm_sz - half);
+                let col = if is_self {
+                    [0.35, 1.0, 0.55, 1.0]
+                } else if p.team == 0 {
+                    west_col
+                } else {
+                    east_col
+                };
+                if archetype_is_solo(p.class_id) && !is_self {
+                    b.rect(px - half - 0.8 * ui, py - half - 0.8 * ui, sz + 1.6 * ui, sz + 1.6 * ui, [1.0, 0.42, 0.14, 0.92]);
+                }
+                b.rect(px - half, py - half, sz, sz, col);
+                if is_self {
+                    b.rect_outline(px - half, py - half, sz, sz, 1.0 * ui, text_hi);
+                } else if p.carrying_relic {
+                    b.rect_outline(px - half - 1.0 * ui, py - half - 1.0 * ui, sz + 2.0 * ui, sz + 2.0 * ui, 1.1 * ui, gold_col);
+                }
+            }
         }
     }
+    let player_cnt = entities.map(|e| e.players.len()).unwrap_or(0);
     let mm_lbl = if cfg.z16_active {
-        format!("3D-Z16 {}X{}X{}", gw_u, gh_u, gd_u)
+        format!("3D-Z{} {}X{} ({}P)", gd_u, gw_u, gh_u, player_cnt)
     } else {
-        format!("3D REACH {}X{}X{}", gw_u, gh_u, gd_u)
+        format!("REACH {}X{}X{} ({}P)", gw_u, gh_u, gd_u, player_cnt)
     };
     b.text_shadow(mm_x + 4.0 * ui, mm_y + mm_sz + 5.0 * ui, 1.25 * ui, if cfg.z16_active { [0.38, 0.94, 1.0, 1.0] } else { text_dim }, &mm_lbl);
 
@@ -622,11 +740,7 @@ pub fn build_hud(
                     .unwrap_or("L1");
                 let raw_name = bot_snap
                     .map(|p| p.name.as_str())
-                    .unwrap_or(match brain.class_id {
-                        CLASS_WARDEN => "WARDEN",
-                        CLASS_ALCHEMIST => "PYRO",
-                        _ => "RANGER",
-                    });
+                    .unwrap_or_else(|| archetype_tag(brain.class_id));
                 let short_name: String = raw_name.chars().take(12).collect();
                 let title = format!("BRAIN: {} {}", layer_tag, short_name);
 
@@ -721,12 +835,10 @@ pub fn build_hud(
                     "TGT:ROAM".to_string()
                 };
                 b.text(ex, ey + 4.0 * ui, 1.00 * ui, gold_col, &tgt_str);
-                let cls_tag = match brain.class_id {
-                    CLASS_WARDEN => "CLS:WARDEN",
-                    CLASS_ALCHEMIST => "CLS:ALCHEM",
-                    _ => "CLS:RANGER",
-                };
-                b.text(ex, ey + 18.0 * ui, 1.00 * ui, text_dim, cls_tag);
+                let arch_tag = archetype_tag(brain.class_id);
+                let role_tag = if archetype_is_solo(brain.class_id) { "SOLO" } else { "SQD" };
+                let cls_tag = format!("{} [{}]", arch_tag, role_tag);
+                b.text(ex, ey + 18.0 * ui, 1.00 * ui, archetype_color(brain.class_id), &cls_tag);
 
                 // Bottom: 5 Ability / Actuator Intent Bars
                 let ab_y = bi_y + 136.0 * ui;
@@ -820,12 +932,12 @@ pub fn build_hud(
     if cfg.show_telemetry {
         let tx = 14.0 * ui;
         let ty = 14.0 * ui;
-        let tw = 408.0 * ui;
-        let th = 174.0 * ui;
+        let tw = 424.0 * ui;
+        let th = 194.0 * ui;
         b.rect(tx, ty, tw, th, panel_bg);
         b.rect_outline(tx, ty, tw, th, 1.5 * ui, panel_border);
 
-        let sc = 1.45 * ui;
+        let sc = 1.40 * ui;
         if let Some(ent) = entities {
             let t = &ent.telemetry;
             let l1 = format!(
@@ -877,7 +989,15 @@ pub fn build_hud(
             let dome_cnt = (t.active_time_domes as usize).max(ent.time_domes.len());
             let slm_tag = if t.system2_slm_active { "SLM:ON" } else { "SLM:OFF" };
             let l8 = if cfg.z16_active {
-                format!("[Y] STYLE:{}  3D-Z16  DOME:{}/4", cfg.z16_style_label, dome_cnt)
+                if cfg.cave_enclosure >= 0.12 {
+                    format!(
+                        "[Y] STYLE:{}  CAVE ECHO {:.0}%",
+                        cfg.z16_style_label,
+                        (cfg.cave_enclosure * 100.0).clamp(0.0, 100.0)
+                    )
+                } else {
+                    format!("[Y] STYLE:{}  3D-Z{}  DOME:{}/4", cfg.z16_style_label, gd_u, dome_cnt)
+                }
             } else {
                 format!("[J] DOME:{}/4 (SHIFT+J CLR)  {}", dome_cnt, slm_tag)
             };
@@ -885,6 +1005,7 @@ pub fn build_hud(
                 match cfg.z16_style_label {
                     "VOLCANIC" => [1.00, 0.52, 0.22, 1.0],
                     "ARCANE" => [0.58, 0.88, 1.00, 1.0],
+                    "EMERALD" => [0.24, 0.98, 0.54, 1.0],
                     _ => [0.34, 0.98, 0.86, 1.0],
                 }
             } else if t.system2_slm_active {
@@ -923,7 +1044,20 @@ pub fn build_hud(
                 &l6,
             );
             b.text_shadow(tx + 10.0 * ui, ty + 130.0 * ui, sc, l7_col, &l7);
+            let mut arch_counts = [0usize; 4];
+            for p in &ent.players {
+                arch_counts[(p.class_id as usize).min(3)] += 1;
+            }
+            let l9 = format!(
+                "P:{:02} STR:{} SKY:{} TID:{} STK:{} [F4]",
+                ent.players.len(),
+                arch_counts[0],
+                arch_counts[1],
+                arch_counts[2],
+                arch_counts[3],
+            );
             b.text_shadow(tx + 10.0 * ui, ty + 150.0 * ui, sc, l8_col, &l8);
+            b.text_shadow(tx + 10.0 * ui, ty + 170.0 * ui, sc, [0.76, 0.88, 1.0, 1.0], &l9);
         }
 
         // Compact Shrine / Combo / Weather Feed right below telemetry (kills live in dedicated right-edge Kill Feed)
@@ -954,7 +1088,7 @@ pub fn build_hud(
     // ------------------------------------------------------------------
     // 5. BOTTOM-CENTER ACTION-MMO HERO PLATE & 5-SLOT SPELL HOTBAR
     // ------------------------------------------------------------------
-    let hud_w = 560.0 * ui;
+    let hud_w = 584.0 * ui;
     let hud_h = 114.0 * ui;
     let hx = (sw - hud_w) * 0.5;
     let hy = sh - hud_h - 14.0 * ui;
@@ -969,23 +1103,34 @@ pub fn build_hud(
     });
 
     if let Some(p) = self_p {
-        let cls_name = match p.class_id {
-            CLASS_WARDEN => "FROST WARDEN",
-            CLASS_ALCHEMIST => "PYRO ALCHEMIST",
-            _ => "MARSH RANGER",
+        let arch_name = archetype_tag(p.class_id);
+        let arch_col = archetype_color(p.class_id);
+        let is_solo = archetype_is_solo(p.class_id);
+        let role_lbl = if is_solo { "SOLO" } else { "SQUAD" };
+        let role_col = if is_solo {
+            [1.00, 0.42, 0.18, 1.0]
+        } else {
+            [0.36, 0.86, 1.00, 1.0]
         };
         let alt_tag = if cfg.z16_active {
             format!("Z:{:.1}M", p.z)
+        } else if p.class_id == CLASS_SKYWING && p.z >= 1.35 {
+            "AIR".to_string()
         } else if p.z >= 1.55 {
-            "L2 HIGH".to_string()
+            "L2".to_string()
         } else {
-            "L1 GND".to_string()
+            "L1".to_string()
         };
-        let header = format!(
-            "LV.{} {} [{}] K:{} D:{}",
-            p.level, cls_name, alt_tag, p.kills, p.deaths
-        );
-        b.text_shadow(hx + 14.0 * ui, hy + 10.0 * ui, 1.65 * ui, gold_col, &header);
+        let header = format!("LV.{} {} [{}] K:{} D:{}", p.level, arch_name, alt_tag, p.kills, p.deaths);
+        b.text_shadow(hx + 14.0 * ui, hy + 10.0 * ui, 1.60 * ui, arch_col, &header);
+
+        // Squad / Solo role indicator pill right after the archetype header
+        let hdr_w = HudBatch::text_width(&header, 1.60 * ui);
+        let rp_x = hx + 22.0 * ui + hdr_w;
+        let rp_w = HudBatch::text_width(role_lbl, 1.18 * ui) + 10.0 * ui;
+        b.rect(rp_x, hy + 8.5 * ui, rp_w, 15.0 * ui, [role_col[0] * 0.24, role_col[1] * 0.24, role_col[2] * 0.24, 0.92]);
+        b.rect_outline(rp_x, hy + 8.5 * ui, rp_w, 15.0 * ui, 1.1 * ui, role_col);
+        b.text(rp_x + 5.0 * ui, hy + 11.5 * ui, 1.18 * ui, role_col, role_lbl);
 
         // Active status pills on top-right of hero plate
         let mut sx = hx + hud_w - 14.0 * ui;
@@ -1033,19 +1178,19 @@ pub fn build_hud(
         // Controls hint bar at bottom
         let hint_bar = if cfg.z16_active {
             if phys_native {
-                format!("1-3 MAT  [/] R={:.1}  Y STYLE  T PIXEL  J DOME  P MODE", cfg.focus_radius)
+                format!("1-3 MAT [/] R={:.1} Y STYLE F1-F3/F8 ARCH F4 TELEM", cfg.focus_radius)
             } else {
-                "1-3 ELEM  Y STYLE  T PIXEL  J DOME  P MODE  ENTER CHAT".to_string()
+                "1-3 ELEM  Y STYLE  F1-F3/F8 ARCH  F4 TELEM  F7 BIOME".to_string()
             }
         } else if phys_native {
-            format!("1-3 MAT  [/] R={:.1}  J DOME  K TIME  P MODE  ENTER CHAT", cfg.focus_radius)
+            format!("1-3 MAT [/] R={:.1} J DOME K TIME F1-F3/F8 ARCH F4", cfg.focus_radius)
         } else {
-            "1-3 ELEM  J DOME  K TIME  P MODE  F1-F3 CLS  ENTER CHAT".to_string()
+            "1-3 ELEM  J DOME  K TIME  F1-F3/F8 ARCH  F4 TELEM  CHAT".to_string()
         };
         b.text(
             bar_x,
             hy + 92.0 * ui,
-            1.05 * ui,
+            1.02 * ui,
             text_dim,
             &hint_bar,
         );
@@ -1053,7 +1198,7 @@ pub fn build_hud(
         // 5-Slot Action Hotbar (right side of hero plate: Continuous Actuators or Classic Spells)
         let slot_sz = 54.0 * ui;
         let slot_gap = 8.0 * ui;
-        let sx0 = hx + 244.0 * ui;
+        let sx0 = hx + 266.0 * ui;
         let sy0 = hy + 32.0 * ui;
         let slots: [(&str, &str, [f32; 4], f32); 5] = if phys_native {
             let matter_lbl = match cfg.selected_element % 3 {
@@ -1075,13 +1220,17 @@ pub fn build_hud(
                 _ => ("OIL", [0.78, 0.36, 0.96, 1.0]),
             };
             let e_lbl = match p.class_id {
-                CLASS_WARDEN => "BRIDGE",
-                CLASS_ALCHEMIST => "OILFAN",
+                CLASS_STRIDER => "BRIDGE",
+                CLASS_SKYWING => "UPDRAFT",
+                CLASS_TIDEKIN => "SURGE",
+                CLASS_EMBERSTALKER => "SHADOW",
                 _ => "SPRINT",
             };
             let r_lbl = match p.class_id {
-                CLASS_WARDEN => "NOVA",
-                CLASS_ALCHEMIST => "METEOR",
+                CLASS_STRIDER => "NOVA",
+                CLASS_SKYWING => "METEOR",
+                CLASS_TIDEKIN => "TIDAL",
+                CLASS_EMBERSTALKER => "BLADES",
                 _ => "SURGE",
             };
             [
@@ -1269,6 +1418,7 @@ pub fn build_hud(
             let style_col = match cfg.z16_style_label {
                 "VOLCANIC" => [1.00, 0.48, 0.18, 1.0],
                 "ARCANE" => [0.56, 0.88, 1.00, 1.0],
+                "EMERALD" => [0.24, 0.98, 0.54, 1.0],
                 _ => [0.34, 0.96, 0.84, 1.0],
             };
             let st_lbl = format!("[Y] STYLE:{}", cfg.z16_style_label);
@@ -1280,14 +1430,26 @@ pub fn build_hud(
                 b.text_shadow(st_x + 7.0 * ui, py + 6.0 * ui, sc, style_col, &st_lbl);
                 cursor_x = st_x;
             }
-            let z_lbl = "3D-Z16";
-            let z_w = HudBatch::text_width(z_lbl, sc) + 14.0 * ui;
+            if cfg.cave_enclosure >= 0.12 {
+                let echo_lbl = format!("CAVE ECHO {:.0}%", (cfg.cave_enclosure * 100.0).clamp(0.0, 100.0));
+                let echo_w = HudBatch::text_width(&echo_lbl, sc) + 14.0 * ui;
+                let echo_x = cursor_x - echo_w - 8.0 * ui;
+                if echo_x > hx + hud_w + 8.0 * ui {
+                    let echo_col = [0.46, 0.88, 1.00, 1.0];
+                    b.rect(echo_x, py, echo_w, pill_h, [0.06, 0.10, 0.20, 0.90]);
+                    b.rect_outline(echo_x, py, echo_w, pill_h, 1.3 * ui, echo_col);
+                    b.text_shadow(echo_x + 7.0 * ui, py + 6.0 * ui, sc, echo_col, &echo_lbl);
+                    cursor_x = echo_x;
+                }
+            }
+            let z_lbl = format!("3D-Z{}", gd_u);
+            let z_w = HudBatch::text_width(&z_lbl, sc) + 14.0 * ui;
             let z_x = cursor_x - z_w - 8.0 * ui;
             if z_x > hx + hud_w + 8.0 * ui {
                 let z_col = [0.38, 0.94, 1.0, 1.0];
                 b.rect(z_x, py, z_w, pill_h, [0.06, 0.10, 0.18, 0.88]);
                 b.rect_outline(z_x, py, z_w, pill_h, 1.3 * ui, z_col);
-                b.text_shadow(z_x + 7.0 * ui, py + 6.0 * ui, sc, z_col, z_lbl);
+                b.text_shadow(z_x + 7.0 * ui, py + 6.0 * ui, sc, z_col, &z_lbl);
             }
         }
     }
@@ -1357,7 +1519,7 @@ pub fn build_hud(
     }
 
     // ------------------------------------------------------------------
-    // 8. LIVE [TAB] 6v6 MATCH SCOREBOARD OVERLAY
+    // 8. LIVE [TAB] MATCH SCOREBOARD OVERLAY (SCALES CLEANLY TO 64 PLAYERS!)
     // ------------------------------------------------------------------
     if cfg.show_scoreboard {
         if let Some(ent) = entities {
@@ -1374,13 +1536,29 @@ pub fn build_hud(
             west_team.sort_by(sort_players);
             east_team.sort_by(sort_players);
 
-            let max_rows = west_team.len().max(east_team.len()).clamp(1, 7);
-            let row_h = 25.0 * ui;
-            let sb_w = (800.0 * ui).min(sw - 32.0 * ui);
-            let sb_h = (118.0 + max_rows as f32 * 25.0) * ui;
+            let team_max = west_team.len().max(east_team.len()).clamp(1, 32);
+            let top_guard = by + banner_h + 30.0 * ui;
+            let bot_guard = hy - 12.0 * ui;
+            let avail_h = (bot_guard - top_guard).max(220.0 * ui);
+            let chrome_h = 104.0 * ui;
+            let rows_avail_h = (avail_h - chrome_h).max(110.0 * ui);
+
+            let (row_h, rsc) = if team_max <= 8 {
+                (24.0 * ui, 1.12 * ui)
+            } else if team_max <= 16 {
+                (19.5 * ui, 1.00 * ui)
+            } else if team_max <= 24 {
+                (17.0 * ui, 0.92 * ui)
+            } else {
+                (15.2 * ui, 0.85 * ui)
+            };
+            let visible_rows = ((rows_avail_h / row_h).floor() as usize)
+                .clamp(6, 32)
+                .min(team_max);
+            let sb_w = (880.0 * ui).min(sw - 32.0 * ui);
+            let sb_h = (chrome_h + visible_rows as f32 * row_h).min(avail_h);
             let sb_x = (sw - sb_w) * 0.5;
-            let max_sb_y = (hy - sb_h - 14.0 * ui).max(78.0 * ui);
-            let sb_y = ((sh - sb_h) * 0.5 - 12.0 * ui).clamp(78.0 * ui, max_sb_y);
+            let sb_y = (top_guard + (avail_h - sb_h) * 0.5).max(top_guard);
 
             // Sleek centered modal card
             b.rect(sb_x, sb_y, sb_w, sb_h, [0.05, 0.04, 0.13, 0.94]);
@@ -1390,11 +1568,21 @@ pub fn build_hud(
             let west_shrines = ent.shrines.iter().filter(|s| s.owner < 0).count();
             let east_shrines = ent.shrines.iter().filter(|s| s.owner > 0).count();
 
-            // Header bar
-            let hdr_y = sb_y + 12.0 * ui;
-            let w_hdr = format!("WEST FROST  {:03} ({} SHR)", ent.telemetry.score_west, west_shrines);
-            let e_hdr = format!("({} SHR) {:03}  EAST EMBER", east_shrines, ent.telemetry.score_east);
-            let hsc = 1.65 * ui;
+            // Header bar with live team counts
+            let hdr_y = sb_y + 11.0 * ui;
+            let w_hdr = format!(
+                "WEST [{}] {:03} ({} SHR)",
+                west_team.len(),
+                ent.telemetry.score_west,
+                west_shrines
+            );
+            let e_hdr = format!(
+                "({} SHR) {:03} [{}] EAST",
+                east_shrines,
+                ent.telemetry.score_east,
+                east_team.len()
+            );
+            let hsc = 1.55 * ui;
             b.text_shadow(sb_x + 16.0 * ui, hdr_y, hsc, west_col, &w_hdr);
             let ew = HudBatch::text_width(&e_hdr, hsc);
             b.text_shadow(sb_x + sb_w - ew - 16.0 * ui, hdr_y, hsc, east_col, &e_hdr);
@@ -1403,16 +1591,17 @@ pub fn build_hud(
                 format!("NEXT MATCH {:02}S", ent.match_time_left_s)
             } else {
                 format!(
-                    "{:02}:{:02} LEFT",
+                    "{:02}:{:02} LEFT ({}P)",
                     ent.match_time_left_s / 60,
-                    ent.match_time_left_s % 60
+                    ent.match_time_left_s % 60,
+                    ent.players.len()
                 )
             };
-            let cw = HudBatch::text_width(&clk_str, 1.55 * ui);
-            b.text_shadow(sb_x + (sb_w - cw) * 0.5, hdr_y + 1.0 * ui, 1.55 * ui, gold_col, &clk_str);
+            let cw = HudBatch::text_width(&clk_str, 1.45 * ui);
+            b.text_shadow(sb_x + (sb_w - cw) * 0.5, hdr_y + 1.0 * ui, 1.45 * ui, gold_col, &clk_str);
 
             // Divider below header
-            let table_y = sb_y + 38.0 * ui;
+            let table_y = sb_y + 36.0 * ui;
             b.rect(sb_x + 12.0 * ui, table_y - 4.0 * ui, sb_w - 24.0 * ui, 1.5 * ui, panel_border);
 
             let col_gap = 14.0 * ui;
@@ -1424,7 +1613,7 @@ pub fn build_hud(
                 left_x + half_w + col_gap * 0.5 - 0.75 * ui,
                 table_y,
                 1.5 * ui,
-                sb_h - 74.0 * ui,
+                (sb_h - 68.0 * ui).max(40.0 * ui),
                 panel_border,
             );
 
@@ -1436,24 +1625,39 @@ pub fn build_hud(
 
             for (team_list, tx, tcol) in teams_draw {
                 // Column labels
-                let csc = 1.05 * ui;
-                let off_cls = half_w * 0.41;
-                let off_lv = half_w * 0.53;
+                let csc = 1.00 * ui;
+                let off_arch = half_w * 0.34;
+                let off_lv = half_w * 0.54;
                 let off_kd = half_w * 0.62;
-                let off_scr = half_w * 0.76;
-                let off_tag = half_w * 0.87;
+                let off_scr = half_w * 0.74;
+                let off_tag = half_w * 0.85;
 
                 b.text(tx + 8.0 * ui, table_y + 2.0 * ui, csc, tcol, "NAME");
-                b.text(tx + off_cls, table_y + 2.0 * ui, csc, text_dim, "CLS");
+                b.text(tx + off_arch, table_y + 2.0 * ui, csc, text_dim, "ARCH");
                 b.text(tx + off_lv, table_y + 2.0 * ui, csc, text_dim, "LV");
                 b.text(tx + off_kd, table_y + 2.0 * ui, csc, text_dim, "K/D");
                 b.text(tx + off_scr, table_y + 2.0 * ui, csc, text_dim, "SCR");
-                b.text(tx + off_tag, table_y + 2.0 * ui, csc, text_dim, "TAG");
+                b.text(tx + off_tag, table_y + 2.0 * ui, csc, text_dim, "ROLE");
 
-                let mut ry = table_y + 18.0 * ui;
-                let rsc = 1.15 * ui;
-                for (ri, p) in team_list.iter().take(7).enumerate() {
+                // Pin local player into last visible slot if viewport is small and player is below cutoff
+                let mut rows_to_show: Vec<&PlayerSnap> =
+                    team_list.iter().take(visible_rows).copied().collect();
+                if team_list.len() > visible_rows && visible_rows >= 2 {
+                    let self_in_shown = rows_to_show.iter().any(|p| p.id == ent.your_player_id);
+                    if !self_in_shown {
+                        if let Some(self_row) =
+                            team_list.iter().find(|p| p.id == ent.your_player_id)
+                        {
+                            rows_to_show[visible_rows - 1] = self_row;
+                        }
+                    }
+                }
+
+                let mut ry = table_y + 17.0 * ui;
+                let txt_off_y = ((row_h - 7.0 * rsc) * 0.48).max(2.0 * ui);
+                for (ri, p) in rows_to_show.iter().enumerate() {
                     let is_self = p.id == ent.your_player_id;
+                    let is_solo = archetype_is_solo(p.class_id);
                     let row_bg = if is_self {
                         [0.24, 0.20, 0.10, 0.88]
                     } else if ri % 2 == 0 {
@@ -1461,54 +1665,56 @@ pub fn build_hud(
                     } else {
                         [0.07, 0.06, 0.15, 0.68]
                     };
-                    b.rect(tx, ry, half_w, row_h - 2.0 * ui, row_bg);
+                    let inner_h = (row_h - 1.5 * ui).max(8.0 * ui);
+                    b.rect(tx, ry, half_w, inner_h, row_bg);
                     if is_self {
-                        b.rect(tx, ry, 3.0 * ui, row_h - 2.0 * ui, gold_col);
-                        b.rect_outline(tx, ry, half_w, row_h - 2.0 * ui, 1.0 * ui, gold_col);
+                        b.rect(tx, ry, 3.0 * ui, inner_h, gold_col);
+                        b.rect_outline(tx, ry, half_w, inner_h, 1.0 * ui, gold_col);
+                    } else if is_solo {
+                        b.rect(tx, ry, 2.5 * ui, inner_h, [1.0, 0.42, 0.16, 1.0]);
                     } else {
-                        b.rect(tx, ry, 2.5 * ui, row_h - 2.0 * ui, tcol);
+                        b.rect(tx, ry, 2.5 * ui, inner_h, tcol);
                     }
 
-                    let name_s: String = p.name.chars().take(12).collect();
-                    let (cls_s, cls_c) = match p.class_id {
-                        CLASS_WARDEN => ("WRD", [0.46, 0.90, 1.0, 1.0]),
-                        CLASS_ALCHEMIST => ("ALC", [1.0, 0.56, 0.22, 1.0]),
-                        _ => ("RNG", [0.44, 0.96, 0.58, 1.0]),
-                    };
+                    let name_s: String = p.name.chars().take(10).collect();
+                    let arch_s = archetype_tag(p.class_id);
+                    let arch_c = archetype_color(p.class_id);
                     let lv_s = format!("L{}", p.level);
                     let kd_s = format!("{}/{}", p.kills, p.deaths);
                     let scr_s = format!("{}", p.score);
                     let (tag_s, tag_c) = if !p.is_bot {
                         ("HUMAN", gold_col)
+                    } else if is_solo {
+                        ("SOLO", [1.0, 0.44, 0.18, 1.0])
                     } else if neural_on {
                         ("RL-Z", [0.24, 0.94, 0.92, 1.0])
                     } else {
                         ("BOT", text_dim)
                     };
 
-                    let ty_txt = ry + 7.0 * ui;
-                    b.text_shadow(tx + 8.0 * ui, ty_txt, rsc, if is_self { gold_col } else { text_hi }, &name_s);
-                    b.text(tx + off_cls, ty_txt, rsc, cls_c, cls_s);
+                    let ty_txt = ry + txt_off_y;
+                    b.text_shadow(tx + 7.0 * ui, ty_txt, rsc, if is_self { gold_col } else { text_hi }, &name_s);
+                    b.text(tx + off_arch, ty_txt, rsc, arch_c, arch_s);
                     b.text(tx + off_lv, ty_txt, rsc, text_dim, &lv_s);
                     b.text(tx + off_kd, ty_txt, rsc, text_hi, &kd_s);
                     b.text_shadow(tx + off_scr, ty_txt, rsc, gold_col, &scr_s);
 
                     // Compact role badge pill
-                    let bsc = 0.95 * ui;
-                    let bw = HudBatch::text_width(tag_s, bsc) + 6.0 * ui;
+                    let bsc = (rsc * 0.84).max(0.72 * ui);
+                    let bw = HudBatch::text_width(tag_s, bsc) + 5.0 * ui;
                     let bx_p = (tx + off_tag - 2.0 * ui).min(tx + half_w - bw - 3.0 * ui);
-                    let by_p = ry + 4.5 * ui;
-                    let bh_p = 13.5 * ui;
+                    let bh_p = (inner_h - 3.0 * ui).clamp(9.5 * ui, 13.5 * ui);
+                    let by_p = ry + (inner_h - bh_p) * 0.5;
                     b.rect(bx_p, by_p, bw, bh_p, [tag_c[0] * 0.22, tag_c[1] * 0.22, tag_c[2] * 0.22, 0.94]);
                     b.rect_outline(bx_p, by_p, bw, bh_p, 1.0 * ui, tag_c);
-                    b.text(bx_p + 3.0 * ui, by_p + 3.2 * ui, bsc, tag_c, tag_s);
+                    b.text(bx_p + 2.5 * ui, by_p + ((bh_p - 7.0 * bsc) * 0.5).max(1.0 * ui), bsc, tag_c, tag_s);
 
                     ry += row_h;
                 }
             }
 
-            // Footer: Shrine control + Match target
-            let foot_y = sb_y + sb_h - 26.0 * ui;
+            // Footer: Shrine control + hidden-row note (if viewport constrained) + Match target
+            let foot_y = sb_y + sb_h - 24.0 * ui;
             b.rect(sb_x + 12.0 * ui, foot_y - 5.0 * ui, sb_w - 24.0 * ui, 1.2 * ui, panel_border);
             let mut sx_f = sb_x + 16.0 * ui;
             for s in ent.shrines.iter().take(3) {
@@ -1518,11 +1724,17 @@ pub fn build_hud(
                 sx_f += 14.0 * ui;
                 let sn: String = s.name.chars().take(14).collect();
                 b.text(sx_f, foot_y + 3.5 * ui, 1.05 * ui, scol, &sn);
-                sx_f += HudBatch::text_width(&sn, 1.05 * ui) + 20.0 * ui;
+                sx_f += HudBatch::text_width(&sn, 1.05 * ui) + 18.0 * ui;
             }
-            let goal_txt = "FIRST TO 500 PTS OR 5:00";
-            let gw_t = HudBatch::text_width(goal_txt, 1.05 * ui);
-            b.text(sb_x + sb_w - gw_t - 16.0 * ui, foot_y + 3.5 * ui, 1.05 * ui, text_dim, goal_txt);
+            let hidden_cnt = west_team.len().saturating_sub(visible_rows)
+                + east_team.len().saturating_sub(visible_rows);
+            let goal_txt = if hidden_cnt > 0 {
+                format!("+{} MORE | {} PLAYERS | FIRST TO 500", hidden_cnt, ent.players.len())
+            } else {
+                format!("{} PLAYERS | FIRST TO 500 PTS OR 5:00", ent.players.len())
+            };
+            let gw_t = HudBatch::text_width(&goal_txt, 1.02 * ui);
+            b.text(sb_x + sb_w - gw_t - 16.0 * ui, foot_y + 3.5 * ui, 1.02 * ui, text_dim, &goal_txt);
         }
     }
 

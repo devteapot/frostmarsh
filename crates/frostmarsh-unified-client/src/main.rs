@@ -19,6 +19,7 @@ mod camera;
 mod hud;
 mod mesh_gen;
 mod net;
+mod neural_style;
 mod palette;
 mod parametric;
 mod renderer;
@@ -31,6 +32,7 @@ use crate::camera::MobaCamera;
 use crate::hud::{build_hud, HudConfig};
 use crate::mesh_gen::StaticMeshBank;
 use crate::net::QuicClientHandle;
+use crate::neural_style::NUM_Z16_STYLES;
 use crate::renderer::{z16_style_label, Approach4Renderer, Atmosphere, RenderStyle};
 use crate::surfel_gen::SurfelProtoBank;
 use crate::world_bridge::{assemble_live_frame, AimReticle, LiveApproach4World, SP_ICE, SP_ROCK, SP_WOOD};
@@ -280,6 +282,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
 
     renderer.set_z16_mode(z16_active, 0);
+    renderer.set_z16_hero_cutaway(Vec3::ZERO, 0.0);
     if let Some(ref mut z16w) = z16_world {
         renderer.upload_z16_world(z16w);
         renderer.upload_minimap(z16w.width as u32, z16w.height as u32, &z16w.minimap_rgba);
@@ -288,12 +291,13 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Heroic 3D Volumetric Vista:
-    // - Z=16 mode: frames the 3-Span Arched Stone & Timber Bridge, river canyon, North alpine waterfall,
+    // - Z=16..32 mode: frames the 3-Span Arched Stone & Timber Bridge, river canyon, North alpine waterfall,
     //   SW cave massif, Hard-Z sculpted pines, and live multiplayer heroes!
     // - L4 mode: frames Layer 2 Highland Plateaus, Plunging 3D Waterfalls, Stone Sky-Arch & Central Spire!
     let cam_main = if z16_active {
+        let target_y = (gd as f32 * 0.35).clamp(5.6, 11.5);
         MobaCamera {
-            target: Vec3::new(0.0, 5.6, -4.0),
+            target: Vec3::new(0.0, target_y, -4.0),
             yaw: 0.46,
             pitch: 0.42,
             dist: (gw as f32 * 0.46).clamp(48.0, 96.0),
@@ -363,6 +367,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 show_scoreboard: false,
                 audio_muted: true,
                 audio_available: false,
+                cave_enclosure: 0.0,
             },
         );
         let (p50, p99, mean) = renderer.benchmark_gpu(
@@ -426,6 +431,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             show_scoreboard: false,
             audio_muted: true,
             audio_available: false,
+            cave_enclosure: 0.0,
         },
     );
     let (rgba_main, _, _) = renderer.render_to_rgba(
@@ -442,41 +448,42 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&args.out_dir)?;
     save_rgba_png(&args.out_dir.join("unified_live_1080p_hud.png"), 1920, 1080, &rgba_main)?;
 
-    // Capture 2: 2×2 Multi-Angle & Live Style-Swap Orbit Showcase (960×540 per panel -> 1920×1080)
+    // Capture 2: 2×2 Live WGSL 4-Style Neural Compute Showcase (960×540 per panel -> 1920×1080)
     let views: [(MobaCamera, RenderStyle, bool, u8, u32); 4] = if z16_active {
         let base_d = (gw as f32 * 0.44).clamp(46.0, 92.0);
+        let ty = (gd as f32 * 0.35).clamp(5.6, 11.5);
         [
-            // Top-left: NORDIC PIXEL-2XSS Bridge & Waterfall Vista + HUD
+            // Top-left: Style 0 — NORDIC (PIXEL-2XSS) + Full HUD
             (
-                MobaCamera { target: Vec3::new(0.0, 5.6, -4.0), yaw: 0.46, pitch: 0.42, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
+                MobaCamera { target: Vec3::new(0.0, ty, -4.0), yaw: 0.46, pitch: 0.42, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
                 RenderStyle::pixel_art(1),
                 true,
                 0u8,
                 0u32,
             ),
-            // Top-right: Low dramatic angle looking UNDER the 3-Span Stone Archway & River!
+            // Top-right: Style 1 — VOLCANIC EMBER (PIXEL-2XSS)
             (
-                MobaCamera { target: Vec3::new(-4.0, 4.6, 0.0), yaw: 0.34, pitch: 0.24, dist: base_d * 0.56, fov_y: 36.0_f32.to_radians(), ortho: false },
-                RenderStyle::pixel_art(1),
-                false,
-                0u8,
-                0u32,
-            ),
-            // Bottom-left: Live Y-Key Client Style 1 — VOLCANIC EMBER (PIXEL-2XSS)!
-            (
-                MobaCamera { target: Vec3::new(0.0, 5.6, -4.0), yaw: -0.52, pitch: 0.40, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
+                MobaCamera { target: Vec3::new(0.0, ty, -4.0), yaw: -0.52, pitch: 0.40, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
                 RenderStyle::pixel_art(1),
                 false,
                 0u8,
                 1u32,
             ),
-            // Bottom-right: Live Y-Key Client Style 2 — ARCANE THERMAL (CLEAN-3D)!
+            // Bottom-left: Style 2 — ARCANE THERMAL (CLEAN-3D)
             (
-                MobaCamera { target: Vec3::new(0.0, 5.6, -4.0), yaw: 0.58, pitch: 0.44, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
+                MobaCamera { target: Vec3::new(0.0, ty, -4.0), yaw: 0.58, pitch: 0.44, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
                 RenderStyle::clean_3d(),
                 false,
                 0u8,
                 2u32,
+            ),
+            // Bottom-right: Style 3 — EMERALD CAVERN (Low dramatic angle under the 3-Span Arch!)
+            (
+                MobaCamera { target: Vec3::new(-4.0, (gd as f32 * 0.28).clamp(4.6, 9.0), 0.0), yaw: 0.34, pitch: 0.24, dist: base_d * 0.56, fov_y: 36.0_f32.to_radians(), ortho: false },
+                RenderStyle::pixel_art(1),
+                false,
+                0u8,
+                3u32,
             ),
         ]
     } else {
@@ -553,6 +560,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     show_scoreboard: false,
                     audio_muted: true,
                     audio_available: false,
+                    cave_enclosure: 0.0,
                 },
             ))
         } else {
@@ -623,9 +631,10 @@ struct PendingMoveInput {
 
 fn hero_class_base_speed(class_id: u8) -> f32 {
     match class_id {
-        CLASS_WARDEN => 15.5,
-        CLASS_ALCHEMIST => 16.0,
-        _ => 18.8,
+        CLASS_WARDEN => 15.5,    // Strider (Heavy Walker / Squad Anchor)
+        CLASS_ALCHEMIST => 16.0, // Skywing (3D Flyer / Thermal Glider)
+        CLASS_RANGER => 18.8,    // Tidekin (Amphibious Swimmer / Diver)
+        _ => 19.2,               // Emberstalker (Solo Cavern Climber / Raider)
     }
 }
 
@@ -823,6 +832,9 @@ struct InteractiveApp {
     z16_world: Z16World,
     z16_active: bool,
     z16_style_mode: u32,
+    z16_cam_framed: bool,
+    cave_enclosure_ema: f32,
+    cutaway_weight: f32,
     camera: MobaCamera,
     style_clean: bool,
     layer_slice_mode: u8,
@@ -899,6 +911,9 @@ impl InteractiveApp {
             z16_world: Z16World::new(128, 128, 16),
             z16_active: false,
             z16_style_mode: 0,
+            z16_cam_framed: false,
+            cave_enclosure_ema: 0.0,
+            cutaway_weight: 0.0,
             camera: MobaCamera {
                 target: Vec3::new(0.0, 1.6, 0.0),
                 yaw: 0.42,
@@ -987,6 +1002,12 @@ impl InteractiveApp {
             self.world.resize_if_needed(gw, gh, gd);
             if gd >= 16 || st.has_z16_bricks {
                 self.z16_active = true;
+                if !self.z16_cam_framed {
+                    // Heroic auto-framing for Z=16..32 caves, arched bridges & towering 32m mountains
+                    self.camera.dist = 36.0;
+                    self.camera.pitch = 0.58;
+                    self.z16_cam_framed = true;
+                }
                 self.z16_world.resize_if_needed(gw, gh, gd);
                 let dirty_z16 = st.take_dirty_z16_bricks();
                 if !dirty_z16.is_empty() {
@@ -1278,7 +1299,11 @@ impl InteractiveApp {
                 } else {
                     self.world.sample_3d_y(me.x, me.y, me.z)
                 };
-                let desired = Vec3::new(wx, gy + 0.8, wz);
+                let desired = if self.z16_active {
+                    Vec3::new(wx, gy + 1.0, wz)
+                } else {
+                    Vec3::new(wx, gy + 0.8, wz)
+                };
                 let cam_alpha = 1.0 - (-12.0 * dt).exp();
                 self.camera.target = self.camera.target.lerp(desired, cam_alpha);
             }
@@ -1324,8 +1349,45 @@ impl InteractiveApp {
         let sun_dir = Approach4Renderer::sun_dir(atmo);
         let mats = self.camera.compute_matrices(out_w as f32, out_h as f32, sun_dir);
 
-        // Update Real-Time 3D Spatial Audio Engine (ambient waterfalls/wildfire/wind + spatial one-shots + SNR voice chirps)
+        // Sample local hero 3D position for Cave Acoustic Enclosure (Schroeder Reverb + HUD)
+        // AND Smart 3D Cave & Under-Bridge Ceiling Cutaway!
+        let (hero_gx, hero_gy, hero_gz, hero_team, hero_stamina, hero_hp) = entities
+            .as_ref()
+            .and_then(|e| e.players.iter().find(|p| p.id == e.your_player_id))
+            .map(|me| (me.x, me.y, me.z, me.team, me.stamina, me.hp))
+            .unwrap_or((self.world.grid_w as f32 * 0.5, self.world.grid_h as f32 * 0.5, 1.0, 0, 100, 100));
+
+        if self.z16_active {
+            let (hwx, hwz) = self.z16_world.grid_to_world_xz(hero_gx, hero_gy);
+            let hero_world_pos = Vec3::new(hwx, hero_gz, hwz);
+            let cam_world_pos = mats.origin + mats.rel_eye;
+
+            let raw_enc = self.z16_world.sample_cave_enclosure(hero_gx, hero_gy, hero_gz);
+            let enc_alpha = 1.0 - (-8.0 * dt).exp();
+            self.cave_enclosure_ema += (raw_enc - self.cave_enclosure_ema) * enc_alpha;
+            if self.cave_enclosure_ema < 0.005 {
+                self.cave_enclosure_ema = 0.0;
+            }
+
+            let want_cutaway = self
+                .z16_world
+                .should_cutaway_ceiling(hero_gx, hero_gy, hero_gz, cam_world_pos);
+            let cut_tgt = if want_cutaway { 1.0 } else { 0.0 };
+            let cut_alpha = 1.0 - (-10.0 * dt).exp();
+            self.cutaway_weight += (cut_tgt - self.cutaway_weight) * cut_alpha;
+            if self.cutaway_weight < 0.005 {
+                self.cutaway_weight = 0.0;
+            }
+            renderer.set_z16_hero_cutaway(hero_world_pos, self.cutaway_weight);
+        } else {
+            self.cave_enclosure_ema = 0.0;
+            self.cutaway_weight = 0.0;
+            renderer.set_z16_hero_cutaway(Vec3::ZERO, 0.0);
+        }
+
+        // Update Real-Time 3D Spatial Audio Engine (ambient waterfalls/wildfire/wind + cave reverb + spatial SFX)
         if let Some(ref audio) = self.audio {
+            audio.set_cave_enclosure(self.cave_enclosure_ema);
             let fwd_xz = Vec3::new(mats.fwd.x, 0.0, mats.fwd.z).normalize_or(Vec3::NEG_Z);
             let right_xz = Vec3::new(-fwd_xz.z, 0.0, fwd_xz.x);
             let listener_pos = self.camera.target;
@@ -1426,11 +1488,6 @@ impl InteractiveApp {
         // Compute exact every-frame mouse-ray cursor aiming on the hero's actual 3D altitude plane!
         let fwd_xz = Vec3::new(mats.fwd.x, 0.0, mats.fwd.z).normalize_or(Vec3::NEG_Z);
         let right_xz = Vec3::new(-fwd_xz.z, 0.0, fwd_xz.x);
-        let (hero_gx, hero_gy, hero_gz, hero_team, hero_stamina, hero_hp) = entities
-            .as_ref()
-            .and_then(|e| e.players.iter().find(|p| p.id == e.your_player_id))
-            .map(|me| (me.x, me.y, me.z, me.team, me.stamina, me.hp))
-            .unwrap_or((self.world.grid_w as f32 * 0.5, self.world.grid_h as f32 * 0.5, 1.0, 0, 100, 100));
         let hero_plane_y = if self.z16_active {
             hero_gz
         } else {
@@ -1694,6 +1751,7 @@ impl InteractiveApp {
                 show_scoreboard: !self.chat_open && self.keys.contains(&KeyCode::Tab),
                 audio_muted: self.audio_muted,
                 audio_available: self.audio.is_some(),
+                cave_enclosure: self.cave_enclosure_ema,
             },
         );
 
@@ -1809,7 +1867,7 @@ impl ApplicationHandler for InteractiveApp {
                 if self.mouse_mid {
                     if let Some((lx, ly)) = self.last_mouse_drag {
                         self.camera.yaw -= (nx - lx) * 0.006;
-                        self.camera.pitch = (self.camera.pitch + (ny - ly) * 0.005).clamp(0.32, 1.32);
+                        self.camera.pitch = (self.camera.pitch + (ny - ly) * 0.005).clamp(0.22, 1.32);
                     }
                     self.last_mouse_drag = Some((nx, ny));
                 } else {
@@ -1848,7 +1906,7 @@ impl ApplicationHandler for InteractiveApp {
                     MouseScrollDelta::LineDelta(_, y) => y * 4.5,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.08,
                 };
-                self.camera.dist = (self.camera.dist - dy).clamp(18.0, 145.0);
+                self.camera.dist = (self.camera.dist - dy).clamp(14.0, 180.0);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -1973,9 +2031,9 @@ impl ApplicationHandler for InteractiveApp {
                                 KeyCode::KeyR => self.pending_ult_r = true,
                                 KeyCode::KeyT => self.style_clean = !self.style_clean,
                                 KeyCode::KeyY => {
-                                    self.z16_style_mode = (self.z16_style_mode + 1) % 3;
+                                    self.z16_style_mode = (self.z16_style_mode + 1) % NUM_Z16_STYLES;
                                     println!(
-                                        "[Unified] Switched client visual style -> {} [Y]",
+                                        "[Unified] Switched client WGSL neural style -> {} [Y]",
                                         z16_style_label(self.z16_style_mode)
                                     );
                                 }
@@ -2002,6 +2060,11 @@ impl ApplicationHandler for InteractiveApp {
                                 KeyCode::F3 => {
                                     if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::SelectClass { class_id: CLASS_RANGER });
+                                    }
+                                }
+                                KeyCode::F8 => {
+                                    if let Some(ref q) = self.quic {
+                                        q.send_reliable_detached(ClientReliable::SelectClass { class_id: 3 });
                                     }
                                 }
                                 KeyCode::KeyM => {
@@ -2048,6 +2111,18 @@ impl ApplicationHandler for InteractiveApp {
                                 KeyCode::F5 => {
                                     if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::ResetWorld);
+                                    }
+                                }
+                                KeyCode::F7 => {
+                                    if let Some(ref q) = self.quic {
+                                        q.send_reliable_detached(ClientReliable::CycleBiome);
+                                        println!("[Unified] Cycling 3D server biome [F7]");
+                                    }
+                                }
+                                KeyCode::F9 => {
+                                    if let Some(ref q) = self.quic {
+                                        q.send_reliable_detached(ClientReliable::CycleEvolutionSpeed);
+                                        println!("[Unified] Cycling Evolving World speed [F9]");
                                     }
                                 }
                                 _ => {}

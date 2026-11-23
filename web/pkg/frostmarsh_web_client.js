@@ -1,3 +1,5 @@
+/* @ts-self-types="./frostmarsh_web_client.d.ts" */
+
 export class FrostmarshApp {
     static __wrap(ptr) {
         const obj = Object.create(FrostmarshApp.prototype);
@@ -15,13 +17,67 @@ export class FrostmarshApp {
         const ptr = this.__destroy_into_raw();
         wasm.__wbg_frostmarshapp_free(ptr, 0);
     }
+    /**
+     * Apply a live binary `0x01` `16×16×D` (`D = 16..=32`) volumetric brick from WebSocket!
+     * Performs incremental Surface-Nets brick rebuild + GPU `queue.write_texture` sub-brick upload.
+     * Returns elapsed rebuild+upload time in milliseconds.
+     * @param {number} bx
+     * @param {number} by
+     * @param {number} depth
+     * @param {Uint8Array} density_rgba
+     * @param {Uint8Array} albedo_rgba
+     * @returns {number}
+     */
+    apply_brick3d_raw(bx, by, depth, density_rgba, albedo_rgba) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(density_rgba, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passArray8ToWasm0(albedo_rgba, wasm.__wbindgen_export);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.frostmarshapp_apply_brick3d_raw(retptr, this.__wbg_ptr, bx, by, depth, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getFloat64(retptr + 8 * 0, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            if (r3) {
+                throw takeObject(r2);
+            }
+            return r0;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Apply a live `0x02` multiplayer JSON entity & telemetry frame from WebSocket!
+     * Updates live multiplayer hero figurines, glowing projectiles, and telemetry HUD.
+     * Returns total active rendered entities (`players + projectiles`).
+     * @param {string} json_str
+     * @returns {number}
+     */
+    apply_live_entities_json(json_str) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(json_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.frostmarshapp_apply_live_entities_json(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return r0 >>> 0;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
     clear_keys() {
         wasm.frostmarshapp_clear_keys(this.__wbg_ptr);
     }
     /**
      * Create and initialize the Frostmarsh WebGPU application on the given `<canvas>` id.
-     * If `fm3d_bytes` is provided, parses it as an `FM3D` volume; otherwise generates the
-     * built-in isotropic `256×256×16` Frostmarsh True-3D world instantaneously in WASM.
+     * If `fm3d_bytes` is provided, parses it as an `FM3D` volume (`Z=16..32+`); otherwise
+     * generates the built-in isotropic `256×256×16` Frostmarsh True-3D world in WASM.
      * @param {string} canvas_id
      * @param {Uint8Array | null} [fm3d_bytes]
      * @returns {Promise<FrostmarshApp>}
@@ -31,6 +87,15 @@ export class FrostmarshApp {
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.frostmarshapp_create(ptr0, len0, isLikeNone(fm3d_bytes) ? 0 : addHeapObject(fm3d_bytes));
         return takeObject(ret);
+    }
+    /**
+     * Cycle live client-side WGSL 4-Style Neural Compute (`Y`-key):
+     * `0 = NORDIC`, `1 = VOLCANIC EMBER`, `2 = ARCANE THERMAL`, `3 = EMERALD CAVERN`.
+     * @returns {number}
+     */
+    cycle_style_mode() {
+        const ret = wasm.frostmarshapp_cycle_style_mode(this.__wbg_ptr);
+        return ret >>> 0;
     }
     /**
      * Return compact JSON telemetry for the browser HUD overlay.
@@ -53,7 +118,26 @@ export class FrostmarshApp {
         }
     }
     /**
-     * Hot-swap to an external `FM3D` neural volume in browser.
+     * @returns {string}
+     */
+    get_style_name() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.frostmarshapp_get_style_name(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Hot-swap to an external `FM3D` neural volume (`Z=16..32+`) in browser.
      * @param {Uint8Array} bytes
      * @param {string} label
      */
@@ -77,6 +161,13 @@ export class FrostmarshApp {
      */
     load_procedural_showcase() {
         wasm.frostmarshapp_load_procedural_showcase(this.__wbg_ptr);
+    }
+    /**
+     * Generate and hot-swap a procedural isotropic `256×256×D` (`D = 16..=32`) showcase world.
+     * @param {number} depth
+     */
+    load_procedural_showcase_depth(depth) {
+        wasm.frostmarshapp_load_procedural_showcase_depth(this.__wbg_ptr, depth);
     }
     /**
      * @param {number} dx
@@ -108,13 +199,22 @@ export class FrostmarshApp {
         wasm.frostmarshapp_set_key(this.__wbg_ptr, ptr0, len0, pressed);
     }
     /**
+     * @param {number} mode
+     * @returns {number}
+     */
+    set_style_mode(mode) {
+        const ret = wasm.frostmarshapp_set_style_mode(this.__wbg_ptr, mode);
+        return ret >>> 0;
+    }
+    /**
      * @param {number} dt_sec
      */
     tick_and_render(dt_sec) {
         wasm.frostmarshapp_tick_and_render(this.__wbg_ptr, dt_sec);
     }
     /**
-     * Toggle 3D Capsule Collision Walk Mode (`C`-key). Returns `true` when Capsule Walk is active.
+     * Toggle 3D Capsule Collision Walk Mode (`C`-key) with Smart 3D Cave Ceiling Cutaway.
+     * Returns `true` when Capsule Walk is active.
      * @returns {boolean}
      */
     toggle_capsule_mode() {
@@ -1078,7 +1178,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_6575(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_6614(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -2016,23 +2116,23 @@ function __wbg_get_imports() {
             getObject(arg0).writeTexture(getObject(arg1), getArrayU8FromWasm0(arg2, arg3), getObject(arg4), getObject(arg5));
         }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2048, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_6554);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2049, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_6593);
             return addHeapObject(ret);
         },
         __wbindgen_generic_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUDevice")], shim_idx: 42, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_782);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUDevice")], shim_idx: 45, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_821);
             return addHeapObject(ret);
         },
         __wbindgen_generic_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("any")], shim_idx: 42, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_782_16);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("any")], shim_idx: 45, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_821_22);
             return addHeapObject(ret);
         },
         __wbindgen_generic_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("undefined")], shim_idx: 42, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_782_17);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("undefined")], shim_idx: 45, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_821_23);
             return addHeapObject(ret);
         },
         __wbindgen_generic_0000000000000005: function(arg0) {
@@ -2094,14 +2194,14 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_6575(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_6575(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_6614(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_6614(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
-function __wasm_bindgen_func_elem_6554(arg0, arg1, arg2) {
+function __wasm_bindgen_func_elem_6593(arg0, arg1, arg2) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-        wasm.__wasm_bindgen_func_elem_6554(retptr, arg0, arg1, addHeapObject(arg2));
+        wasm.__wasm_bindgen_func_elem_6593(retptr, arg0, arg1, addHeapObject(arg2));
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         if (r1) {
@@ -2112,10 +2212,10 @@ function __wasm_bindgen_func_elem_6554(arg0, arg1, arg2) {
     }
 }
 
-function __wasm_bindgen_func_elem_782(arg0, arg1, arg2) {
+function __wasm_bindgen_func_elem_821(arg0, arg1, arg2) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-        wasm.__wasm_bindgen_func_elem_782(retptr, arg0, arg1, addHeapObject(arg2));
+        wasm.__wasm_bindgen_func_elem_821(retptr, arg0, arg1, addHeapObject(arg2));
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         if (r1) {
@@ -2126,10 +2226,10 @@ function __wasm_bindgen_func_elem_782(arg0, arg1, arg2) {
     }
 }
 
-function __wasm_bindgen_func_elem_782_16(arg0, arg1, arg2) {
+function __wasm_bindgen_func_elem_821_22(arg0, arg1, arg2) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-        wasm.__wasm_bindgen_func_elem_782_16(retptr, arg0, arg1, addHeapObject(arg2));
+        wasm.__wasm_bindgen_func_elem_821_22(retptr, arg0, arg1, addHeapObject(arg2));
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         if (r1) {
@@ -2140,10 +2240,10 @@ function __wasm_bindgen_func_elem_782_16(arg0, arg1, arg2) {
     }
 }
 
-function __wasm_bindgen_func_elem_782_17(arg0, arg1, arg2) {
+function __wasm_bindgen_func_elem_821_23(arg0, arg1, arg2) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-        wasm.__wasm_bindgen_func_elem_782_17(retptr, arg0, arg1, addHeapObject(arg2));
+        wasm.__wasm_bindgen_func_elem_821_23(retptr, arg0, arg1, addHeapObject(arg2));
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         if (r1) {
@@ -2480,6 +2580,13 @@ function makeMutClosure(arg0, arg1, f) {
     };
     CLOSURE_DTORS.register(real, state, state);
     return real;
+}
+
+function passArray8ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 1, 1) >>> 0;
+    getUint8ArrayMemory0().set(arg, ptr / 1);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
 }
 
 function passStringToWasm0(arg, malloc, realloc) {

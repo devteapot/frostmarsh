@@ -12,6 +12,8 @@
 use crate::camera::{CameraMatrices, MobaCamera};
 use crate::hud::{HudBatch, HudVertex};
 use crate::mesh_gen::{MeshInstance, MeshSlice, MeshVertex, StaticMeshBank, MESH_KIND_COUNT};
+use crate::neural_style::{build_neural_style_weights, NUM_Z16_STYLES};
+pub use crate::neural_style::z16_style_label;
 use crate::palette::{palette_resolve_64, palette_tex_bytes_at};
 use crate::surfel_gen::{SplatPlacement, SplatProto, SplatRef, SurfelProtoBank};
 use crate::world_bridge::{AssembledFrame, VolSplat};
@@ -79,15 +81,19 @@ struct Z16Uniforms {
     world_offset: [f32; 4],
     sky_top: [f32; 4],
     sky_horizon: [f32; 4],
+    hero_world_pos: [f32; 4],
 }
 
-pub fn z16_style_label(style_mode: u32) -> &'static str {
-    match style_mode % 3 {
-        1 => "VOLCANIC",
-        2 => "ARCANE",
-        _ => "NORDIC",
-    }
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct StyleComputeParams {
+    vol_dims: [u32; 4],
+    region_min: [u32; 4],
+    region_size: [u32; 4],
 }
+
+const STYLE_PARAMS_STRIDE: u64 = 256;
+const MAX_STYLE_DIRTY_BRICKS: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Atmosphere {
@@ -285,6 +291,7 @@ pub struct Approach4Renderer {
     pipe_hud: wgpu::RenderPipeline,
     pipe_field_z16: wgpu::RenderPipeline,
     pipe_vol_z16: wgpu::RenderPipeline,
+    pipe_neural_style_z16: wgpu::ComputePipeline,
 
     shadow_bgl: wgpu::BindGroupLayout,
     mesh_bgl: wgpu::BindGroupLayout,
@@ -295,19 +302,29 @@ pub struct Approach4Renderer {
     hud_bgl: wgpu::BindGroupLayout,
     z16_mesh_bgl: wgpu::BindGroupLayout,
     z16_vol_bgl: wgpu::BindGroupLayout,
+    z16_style_bgl: wgpu::BindGroupLayout,
 
     z16_active: bool,
     z16_style_mode: u32,
+    z16_style_computed_for: Option<u32>,
+    z16_style_full_dirty: bool,
+    z16_style_dirty_bricks: Vec<(u32, u32, u32, u32)>,
+    z16_hero_world_pos: [f32; 4],
     z16_dims: (u32, u32, u32),
     z16_occ_dims: (u32, u32, u32),
     z16_density_tex: Option<wgpu::Texture>,
     z16_density_view: Option<wgpu::TextureView>,
     z16_albedo_tex: Option<wgpu::Texture>,
     z16_albedo_view: Option<wgpu::TextureView>,
+    z16_styled_albedo_tex: Option<wgpu::Texture>,
+    z16_styled_albedo_view: Option<wgpu::TextureView>,
+    z16_styled_albedo_storage_view: Option<wgpu::TextureView>,
     z16_occ_tex: Option<wgpu::Texture>,
     z16_occ_view: Option<wgpu::TextureView>,
     z16_vol_samp: wgpu::Sampler,
     z16_ubuf: wgpu::Buffer,
+    z16_style_params_buf: wgpu::Buffer,
+    z16_style_weights_buf: wgpu::Buffer,
     z16_vbuf: Option<wgpu::Buffer>,
     z16_vcap: usize,
     z16_ibuf: Option<wgpu::Buffer>,
@@ -514,6 +531,12 @@ impl Approach4Renderer {
             label: Some("volumetric_overlay_z16"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
                 "../assets/shaders/volumetric_overlay_z16.wgsl"
+            ))),
+        });
+        let neural_style_z16_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("neural_style_z16"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                "../assets/shaders/neural_style_z16.wgsl"
             ))),
         });
 
@@ -872,6 +895,64 @@ impl Approach4Renderer {
             ],
         });
 
+        let z16_style_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("z16_style_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<StyleComputeParams>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
         let depth_opaque = Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
@@ -1176,6 +1257,34 @@ impl Approach4Renderer {
             cache: None,
         });
 
+        let pipe_neural_style_z16 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("pipe_neural_style_z16"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("z16_style_pl"),
+                bind_group_layouts: &[Some(&z16_style_bgl)],
+                immediate_size: 0,
+            })),
+            module: &neural_style_z16_mod,
+            entry_point: Some("cs_style_z16"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let z16_style_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("z16_style_params_ubuf"),
+            size: STYLE_PARAMS_STRIDE * MAX_STYLE_DIRTY_BRICKS as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let style_weights = build_neural_style_weights();
+        let z16_style_weights_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("z16_neural_style_weights_4kb_x4"),
+            size: (style_weights.len() * std::mem::size_of::<[f32; 4]>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&z16_style_weights_buf, 0, bytemuck::cast_slice(&style_weights));
+
         let z16_vol_samp = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("z16_vol_trilinear_samp"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -1226,11 +1335,11 @@ impl Approach4Renderer {
 
         let terrain_vcap = 131_072;
         let terrain_icap = 524_288;
-        let mesh_inst_cap = 16_384;
+        let mesh_inst_cap = 32_768;
         let place_cap = 16_384;
         let ref_cap = 524_288;
-        let vol_cap = 8_192;
-        let hud_vcap = 32_768;
+        let vol_cap = 16_384;
+        let hud_vcap = 65_536;
 
         let terrain_vbuf = mk_buf(terrain_vcap * std::mem::size_of::<MeshVertex>(), wgpu::BufferUsages::VERTEX);
         let terrain_ibuf = mk_buf(terrain_icap * 4, wgpu::BufferUsages::INDEX);
@@ -1257,6 +1366,7 @@ impl Approach4Renderer {
             pipe_hud,
             pipe_field_z16,
             pipe_vol_z16,
+            pipe_neural_style_z16,
             shadow_bgl,
             mesh_bgl,
             surfel_bgl,
@@ -1266,18 +1376,28 @@ impl Approach4Renderer {
             hud_bgl,
             z16_mesh_bgl,
             z16_vol_bgl,
+            z16_style_bgl,
             z16_active: false,
             z16_style_mode: 0,
+            z16_style_computed_for: None,
+            z16_style_full_dirty: true,
+            z16_style_dirty_bricks: Vec::new(),
+            z16_hero_world_pos: [0.0; 4],
             z16_dims: (0, 0, 0),
             z16_occ_dims: (0, 0, 0),
             z16_density_tex: None,
             z16_density_view: None,
             z16_albedo_tex: None,
             z16_albedo_view: None,
+            z16_styled_albedo_tex: None,
+            z16_styled_albedo_view: None,
+            z16_styled_albedo_storage_view: None,
             z16_occ_tex: None,
             z16_occ_view: None,
             z16_vol_samp,
             z16_ubuf,
+            z16_style_params_buf,
+            z16_style_weights_buf,
             z16_vbuf: None,
             z16_vcap: 0,
             z16_ibuf: None,
@@ -1350,7 +1470,18 @@ impl Approach4Renderer {
 
     pub fn set_z16_mode(&mut self, active: bool, style_mode: u32) {
         self.z16_active = active;
-        self.z16_style_mode = style_mode % 3;
+        self.z16_style_mode = style_mode % NUM_Z16_STYLES;
+    }
+
+    /// Sets the local player's 3D world position and cutaway strength (`0.0` disabled .. `1.0` active)
+    /// for the Smart 3D Cave & Under-Bridge Ceiling Cutaway in `field_mesh_z16.wgsl`.
+    pub fn set_z16_hero_cutaway(&mut self, world_pos: Vec3, enabled: f32) {
+        self.z16_hero_world_pos = [
+            world_pos.x,
+            world_pos.y,
+            world_pos.z,
+            enabled.clamp(0.0, 1.0),
+        ];
     }
 
     /// Lazily allocate/resize the 3D `Rgba8Unorm` GPU textures (`z16_density_tex`, `z16_albedo_tex`,
@@ -1384,14 +1515,42 @@ impl Approach4Renderer {
             (tex, view)
         };
 
-        if self.z16_dims != dims || self.z16_density_tex.is_none() {
+        if self.z16_dims != dims || self.z16_density_tex.is_none() || self.z16_styled_albedo_tex.is_none() {
             let (dt, dv) = mk_d3(&self.device, "z16_density_tex", dims);
             let (at, av) = mk_d3(&self.device, "z16_albedo_tex", dims);
+            let styled_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("z16_styled_albedo_tex"),
+                size: wgpu::Extent3d {
+                    width: dims.0,
+                    height: dims.1,
+                    depth_or_array_layers: dims.2,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+                view_formats: &[],
+            });
+            let styled_view = styled_tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
+            let styled_storage_view = styled_tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
             self.z16_density_tex = Some(dt);
             self.z16_density_view = Some(dv);
             self.z16_albedo_tex = Some(at);
             self.z16_albedo_view = Some(av);
+            self.z16_styled_albedo_tex = Some(styled_tex);
+            self.z16_styled_albedo_view = Some(styled_view);
+            self.z16_styled_albedo_storage_view = Some(styled_storage_view);
             self.z16_dims = dims;
+            self.z16_style_computed_for = None;
+            self.z16_style_full_dirty = true;
+            self.z16_style_dirty_bricks.clear();
             z16.gpu_tex_full_dirty = true;
         }
         if self.z16_occ_dims != occ_dims || self.z16_occ_tex.is_none() {
@@ -1422,6 +1581,8 @@ impl Approach4Renderer {
             }
             z16.gpu_tex_full_dirty = false;
             z16.gpu_dirty_bricks.clear();
+            self.z16_style_full_dirty = true;
+            self.z16_style_dirty_bricks.clear();
         } else if !z16.gpu_dirty_bricks.is_empty() {
             let dirty = std::mem::take(&mut z16.gpu_dirty_bricks);
             let w = z16.width;
@@ -1436,6 +1597,14 @@ impl Approach4Renderer {
                 let ch = SN_BRICK_SIZE.min(h.saturating_sub(z0));
                 if cw == 0 || ch == 0 {
                     continue;
+                }
+                if !self.z16_style_full_dirty {
+                    if self.z16_style_dirty_bricks.len() < MAX_STYLE_DIRTY_BRICKS {
+                        self.z16_style_dirty_bricks.push((x0 as u32, z0 as u32, cw as u32, ch as u32));
+                    } else {
+                        self.z16_style_full_dirty = true;
+                        self.z16_style_dirty_bricks.clear();
+                    }
                 }
                 let row_bytes = cw * 4;
                 tmp_dm.clear();
@@ -1749,9 +1918,10 @@ impl Approach4Renderer {
         let mut bounce_col = cur_atmo.bounce_col;
         let mut fog_col = cur_atmo.fog_col;
 
-        // Style-aware sky/atmosphere harmonization when live Z=16 client style swap (`Y`-key) is active!
+        // Style-aware sky/atmosphere harmonization when live Z=16..32 client WGSL neural style swap (`Y`-key) is active!
+        let active_style_id = self.z16_style_mode % NUM_Z16_STYLES;
         let (z16_sky_top, z16_sky_hor, z16_bg_srgb) = if self.z16_active {
-            match self.z16_style_mode % 3 {
+            match active_style_id {
                 1 => {
                     // Style 1: VOLCANIC EMBER — blazing fiery amber sun, smoky crimson-charcoal sky
                     sun_col = [1.45, 0.72, 0.34];
@@ -1767,6 +1937,14 @@ impl Approach4Renderer {
                     bounce_col = [0.12, 0.14, 0.36];
                     fog_col = [0.06, 0.10, 0.22];
                     ([0.04, 0.09, 0.28], [0.11, 0.24, 0.44], [0.06, 0.10, 0.22])
+                }
+                3 => {
+                    // Style 3: EMERALD CAVERN — luminous jade mist, deep emerald-teal twilight sky
+                    sun_col = [0.82, 1.32, 0.96];
+                    sky_col = [0.12, 0.44, 0.36];
+                    bounce_col = [0.09, 0.28, 0.22];
+                    fog_col = [0.07, 0.18, 0.15];
+                    ([0.04, 0.20, 0.16], [0.12, 0.38, 0.30], [0.07, 0.18, 0.15])
                 }
                 _ => {
                     // Style 0: NORDIC — crisp alpine sky modulated by live diurnal/weather atmosphere
@@ -1809,6 +1987,8 @@ impl Approach4Renderer {
         let z16_ready = self.z16_active
             && self.z16_density_view.is_some()
             && self.z16_albedo_view.is_some()
+            && self.z16_styled_albedo_view.is_some()
+            && self.z16_styled_albedo_storage_view.is_some()
             && self.z16_occ_view.is_some();
 
         if z16_ready {
@@ -1818,7 +1998,7 @@ impl Approach4Renderer {
                     self.z16_dims.0 as f32,
                     self.z16_dims.1 as f32,
                     self.z16_dims.2 as f32,
-                    (self.z16_style_mode % 3) as f32,
+                    active_style_id as f32,
                 ],
                 brick_dims: [
                     self.z16_occ_dims.0 as f32,
@@ -1834,6 +2014,7 @@ impl Approach4Renderer {
                 ],
                 sky_top: [z16_sky_top[0], z16_sky_top[1], z16_sky_top[2], sim_time],
                 sky_horizon: [z16_sky_hor[0], z16_sky_hor[1], z16_sky_hor[2], cur_atmo.exposure * 1.05],
+                hero_world_pos: self.z16_hero_world_pos,
             };
             self.queue.write_buffer(&self.z16_ubuf, 0, bytemuck::bytes_of(&z16_u));
         }
@@ -1962,7 +2143,7 @@ impl Approach4Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(self.z16_albedo_view.as_ref().unwrap()),
+                        resource: wgpu::BindingResource::TextureView(self.z16_styled_albedo_view.as_ref().unwrap()),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -1990,7 +2171,7 @@ impl Approach4Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(self.z16_albedo_view.as_ref().unwrap()),
+                        resource: wgpu::BindingResource::TextureView(self.z16_styled_albedo_view.as_ref().unwrap()),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -2011,6 +2192,101 @@ impl Approach4Renderer {
         };
 
         let mut enc = self.device.create_command_encoder(&Default::default());
+
+        // PASS 0 (Z=16..32): Live Client-Side WGSL Neural Style Compute (`neural_style_z16.wgsl`)
+        // Runs ONLY on dirty bricks OR instantaneously on `Y`-key style swap (0 ms overhead on steady frames!).
+        if z16_ready {
+            let need_full = self.z16_style_full_dirty
+                || self.z16_style_computed_for != Some(active_style_id);
+            let dirty_bricks = if need_full {
+                self.z16_style_dirty_bricks.clear();
+                Vec::new()
+            } else {
+                std::mem::take(&mut self.z16_style_dirty_bricks)
+            };
+
+            if need_full || !dirty_bricks.is_empty() {
+                let style_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("z16_style_bg"),
+                    layout: &self.z16_style_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &self.z16_style_params_buf,
+                                offset: 0,
+                                size: std::num::NonZeroU64::new(
+                                    std::mem::size_of::<StyleComputeParams>() as u64,
+                                ),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                self.z16_density_view.as_ref().unwrap(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(
+                                self.z16_albedo_view.as_ref().unwrap(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.z16_style_weights_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(
+                                self.z16_styled_albedo_storage_view.as_ref().unwrap(),
+                            ),
+                        },
+                    ],
+                });
+
+                let (vw, vd, vh) = self.z16_dims;
+                if need_full {
+                    let p = StyleComputeParams {
+                        vol_dims: [vw, vd, vh, active_style_id],
+                        region_min: [0, 0, 0, 0],
+                        region_size: [vw, vd, vh, 0],
+                    };
+                    self.queue.write_buffer(&self.z16_style_params_buf, 0, bytemuck::bytes_of(&p));
+                    let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("neural_style_z16_full_pass"),
+                        timestamp_writes: None,
+                    });
+                    cp.set_pipeline(&self.pipe_neural_style_z16);
+                    cp.set_bind_group(0, &style_bg, &[0]);
+                    cp.dispatch_workgroups(vw.div_ceil(8), vd.div_ceil(4), vh.div_ceil(8));
+                    self.z16_style_full_dirty = false;
+                    self.z16_style_computed_for = Some(active_style_id);
+                } else {
+                    for (i, &(x0, z0, cw, ch)) in dirty_bricks.iter().enumerate() {
+                        let p = StyleComputeParams {
+                            vol_dims: [vw, vd, vh, active_style_id],
+                            region_min: [x0, 0, z0, 0],
+                            region_size: [cw, vd, ch, 0],
+                        };
+                        self.queue.write_buffer(
+                            &self.z16_style_params_buf,
+                            i as u64 * STYLE_PARAMS_STRIDE,
+                            bytemuck::bytes_of(&p),
+                        );
+                    }
+                    let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("neural_style_z16_bricks_pass"),
+                        timestamp_writes: None,
+                    });
+                    cp.set_pipeline(&self.pipe_neural_style_z16);
+                    for (i, &(_x0, _z0, cw, ch)) in dirty_bricks.iter().enumerate() {
+                        cp.set_bind_group(0, &style_bg, &[(i as u32) * (STYLE_PARAMS_STRIDE as u32)]);
+                        cp.dispatch_workgroups(cw.div_ceil(8), vd.div_ceil(4), ch.div_ceil(8));
+                    }
+                }
+            }
+        }
 
         // PASS 1: Shadow Map
         if style.shadows {

@@ -1,0 +1,770 @@
+{
+  "wave": "11A",
+  "device": "NVIDIA A100-SXM4-40GB",
+  "model_class": "WorldModel3DV5",
+  "checkpoint": "/content/world_model_3d_v5.pt",
+  "visualization": "/content/world_3d_v5_viz.png",
+  "arch": {
+    "in_ch": 18,
+    "out_ch": 17,
+    "width": 48,
+    "z_flux_ch": 5,
+    "dt_dim": 16,
+    "mid_3d": 32,
+    "halo_xy": 6,
+    "halo_z": 3,
+    "brick_size": [
+      8,
+      16,
+      16
+    ]
+  },
+  "n_params_v5": 158374,
+  "n_params_dt_baseline": 132324,
+  "biomes": [
+    "nordic_viaduct",
+    "volcanic_caldera",
+    "sinkhole_caverns",
+    "shattered_glacier_gorge",
+    "geothermal_mist_basin"
+  ],
+  "train_steps": 2600,
+  "train_time_s": 522.23,
+  "eval_z16_5biomes": {
+    "world_model_3d_v5": {
+      "grid": "128x128x16",
+      "proj_active_pct": 5.851,
+      "proj_active_2e3_pct": 85.59,
+      "donor_clamp_pct": 12.302,
+      "heat_clamp_pct": 0.002,
+      "rxn_clamp_pct": 84.95,
+      "horizontal": {
+        "all": {
+          "mae": 0.005818,
+          "rmse": 0.126641,
+          "r2": -0.00109
+        },
+        "flux": {
+          "mae": 0.000585,
+          "rmse": 0.006512,
+          "r2": -2.30804
+        },
+        "heat": {
+          "mae": 0.003505,
+          "rmse": 0.036399,
+          "r2": -0.00459
+        },
+        "rxn": {
+          "mae": 0.003448,
+          "rmse": 0.032353,
+          "r2": 0.13332
+        }
+      },
+      "vertical_3d": {
+        "gravity_water": {
+          "mae": 0.00378,
+          "rmse": 0.006332,
+          "r2": 0.9801
+        },
+        "gravity_oil": {
+          "mae": 0.000158,
+          "rmse": 0.000482,
+          "r2": -0.75882
+        },
+        "buoyancy_steam": {
+          "mae": 0.001787,
+          "rmse": 0.00492,
+          "r2": 0.96952
+        },
+        "buoyancy_smoke": {
+          "mae": 0.000565,
+          "rmse": 0.001982,
+          "r2": 0.98143
+        },
+        "vertical_heat": {
+          "mae": 6.8e-05,
+          "rmse": 0.000129,
+          "r2": 0.31953
+        },
+        "mean_vertical_r2": 0.49835
+      },
+      "hydrologic_cycle": {
+        "cloud_condensation": {
+          "mae": 0.03759,
+          "rmse": 0.109674,
+          "r2": 0.2678
+        },
+        "cloud_precipitation": {
+          "mae": 0.004425,
+          "rmse": 0.006736,
+          "r2": 0.98596
+        },
+        "mean_hydro_r2": 0.62688
+      },
+      "continuous_dt": {
+        "0.15": {
+          "horiz_mae": 0.000927,
+          "horiz_r2": 0.00359,
+          "vert_mae": 0.000223,
+          "vert_r2": 0.98353,
+          "mean_r2": 0.49356
+        },
+        "0.50": {
+          "horiz_mae": 0.003008,
+          "horiz_r2": 0.00306,
+          "vert_mae": 0.000742,
+          "vert_r2": 0.98406,
+          "mean_r2": 0.49356
+        },
+        "1.00": {
+          "horiz_mae": 0.006144,
+          "horiz_r2": 0.00338,
+          "vert_mae": 0.001573,
+          "vert_r2": 0.97941,
+          "mean_r2": 0.4914
+        },
+        "2.00": {
+          "horiz_mae": 0.011131,
+          "horiz_r2": 0.00234,
+          "vert_mae": 0.003619,
+          "vert_r2": 0.97448,
+          "mean_r2": 0.48841
+        },
+        "4.00": {
+          "horiz_mae": 0.02096,
+          "horiz_r2": 0.0021,
+          "vert_mae": 0.009807,
+          "vert_r2": 0.93897,
+          "mean_r2": 0.47053
+        },
+        "spatial_dome_015_400": {
+          "horiz_mae": 0.011909,
+          "horiz_r2": 0.00125,
+          "vert_mae": 0.004073,
+          "vert_r2": 0.93223,
+          "mean_r2": 0.46674
+        }
+      },
+      "per_biome": {
+        "nordic_viaduct": {
+          "proj_active_pct": 4.913,
+          "horiz_r2": 0.00381,
+          "horiz_mae": 0.002766,
+          "vert_water_r2": 0.95278,
+          "vert_steam_r2": -1.70075,
+          "vert_heat_r2": -0.91064
+        },
+        "volcanic_caldera": {
+          "proj_active_pct": 7.929,
+          "horiz_r2": 0.00523,
+          "horiz_mae": 0.009916,
+          "vert_water_r2": 0.94946,
+          "vert_steam_r2": 0.9824,
+          "vert_heat_r2": 0.70704
+        },
+        "sinkhole_caverns": {
+          "proj_active_pct": 1.969,
+          "horiz_r2": 0.00418,
+          "horiz_mae": 0.003724,
+          "vert_water_r2": 0.9783,
+          "vert_steam_r2": 0.8946,
+          "vert_heat_r2": -0.64797
+        },
+        "shattered_glacier_gorge": {
+          "proj_active_pct": 2.706,
+          "horiz_r2": -0.31027,
+          "horiz_mae": 0.003518,
+          "vert_water_r2": 0.89306,
+          "vert_steam_r2": -6.97798,
+          "vert_heat_r2": -7.86322
+        },
+        "geothermal_mist_basin": {
+          "proj_active_pct": 11.739,
+          "horiz_r2": 0.0099,
+          "horiz_mae": 0.009167,
+          "vert_water_r2": 0.99124,
+          "vert_steam_r2": 0.97238,
+          "vert_heat_r2": -0.01795
+        }
+      }
+    },
+    "world_model_dt_z4_baseline": {
+      "grid": "128x128x16",
+      "proj_active_pct": 40.93,
+      "proj_active_2e3_pct": 83.073,
+      "donor_clamp_pct": 73.261,
+      "heat_clamp_pct": 35.626,
+      "rxn_clamp_pct": 13.419,
+      "horizontal": {
+        "all": {
+          "mae": 0.017994,
+          "rmse": 7.423874,
+          "r2": -3439.22922
+        },
+        "flux": {
+          "mae": 0.001686,
+          "rmse": 0.085596,
+          "r2": -570.59265
+        },
+        "heat": {
+          "mae": 0.011964,
+          "rmse": 2.09171,
+          "r2": -3316.49588
+        },
+        "rxn": {
+          "mae": 0.007589,
+          "rmse": 2.971946,
+          "r2": -7312.41368
+        }
+      },
+      "vertical_3d": {
+        "gravity_water": {
+          "mae": 0.01722,
+          "rmse": 0.386021,
+          "r2": -72.94267
+        },
+        "gravity_oil": {
+          "mae": 0.001957,
+          "rmse": 0.102942,
+          "r2": -80386.21944
+        },
+        "buoyancy_steam": {
+          "mae": 0.005904,
+          "rmse": 0.142433,
+          "r2": -24.54552
+        },
+        "buoyancy_smoke": {
+          "mae": 0.003435,
+          "rmse": 0.077507,
+          "r2": -27.40089
+        },
+        "vertical_heat": {
+          "mae": 0.000245,
+          "rmse": 0.004642,
+          "r2": -878.3872
+        },
+        "mean_vertical_r2": -16277.89914
+      },
+      "hydrologic_cycle": {
+        "cloud_condensation": {
+          "mae": 0.035372,
+          "rmse": 0.1,
+          "r2": 0.39127
+        },
+        "cloud_precipitation": {
+          "mae": 0.010393,
+          "rmse": 0.031498,
+          "r2": 0.69296
+        },
+        "mean_hydro_r2": 0.54212
+      },
+      "continuous_dt": {
+        "0.15": {
+          "horiz_mae": 0.001389,
+          "horiz_r2": -0.26644,
+          "vert_mae": 0.000865,
+          "vert_r2": 0.273,
+          "mean_r2": 0.00328
+        },
+        "0.50": {
+          "horiz_mae": 0.004782,
+          "horiz_r2": -0.25211,
+          "vert_mae": 0.002891,
+          "vert_r2": 0.33604,
+          "mean_r2": 0.04197
+        },
+        "1.00": {
+          "horiz_mae": 0.010468,
+          "horiz_r2": -0.69318,
+          "vert_mae": 0.005831,
+          "vert_r2": 0.20647,
+          "mean_r2": -0.24336
+        },
+        "2.00": {
+          "horiz_mae": 0.017366,
+          "horiz_r2": 0.11873,
+          "vert_mae": 0.012056,
+          "vert_r2": 0.36963,
+          "mean_r2": 0.24418
+        },
+        "4.00": {
+          "horiz_mae": 0.032481,
+          "horiz_r2": 0.20054,
+          "vert_mae": 0.024,
+          "vert_r2": 0.36423,
+          "mean_r2": 0.28238
+        },
+        "spatial_dome_015_400": {
+          "horiz_mae": 0.017789,
+          "horiz_r2": -0.24889,
+          "vert_mae": 0.011061,
+          "vert_r2": 0.21507,
+          "mean_r2": -0.01691
+        }
+      },
+      "per_biome": {
+        "nordic_viaduct": {
+          "proj_active_pct": 28.157,
+          "horiz_r2": -12.27781,
+          "horiz_mae": 0.008212,
+          "vert_water_r2": -11.66749,
+          "vert_steam_r2": -19.84179,
+          "vert_heat_r2": -28.5834
+        },
+        "volcanic_caldera": {
+          "proj_active_pct": 43.53,
+          "horiz_r2": -3.44093,
+          "horiz_mae": 0.025715,
+          "vert_water_r2": 0.53752,
+          "vert_steam_r2": 0.83014,
+          "vert_heat_r2": -1.86951
+        },
+        "sinkhole_caverns": {
+          "proj_active_pct": 41.097,
+          "horiz_r2": 0.79123,
+          "horiz_mae": 0.00628,
+          "vert_water_r2": -0.85898,
+          "vert_steam_r2": 0.5852,
+          "vert_heat_r2": -14.23528
+        },
+        "shattered_glacier_gorge": {
+          "proj_active_pct": 56.969,
+          "horiz_r2": -160130.15767,
+          "horiz_mae": 0.040349,
+          "vert_water_r2": -1372.6116,
+          "vert_steam_r2": -36097.55061,
+          "vert_heat_r2": -34013.52664
+        },
+        "geothermal_mist_basin": {
+          "proj_active_pct": 34.895,
+          "horiz_r2": 0.60481,
+          "horiz_mae": 0.009413,
+          "vert_water_r2": 0.64224,
+          "vert_steam_r2": 0.86524,
+          "vert_heat_r2": -5.28089
+        }
+      }
+    },
+    "proj_active_reduction_abs_pct": 35.079,
+    "proj_active_reduction_factor_x": 7.0
+  },
+  "eval_z32_5biomes": {
+    "world_model_3d_v5": {
+      "grid": "96x96x32",
+      "proj_active_pct": 6.597,
+      "proj_active_2e3_pct": 91.412,
+      "donor_clamp_pct": 11.204,
+      "heat_clamp_pct": 0.005,
+      "rxn_clamp_pct": 91.036,
+      "horizontal": {
+        "all": {
+          "mae": 0.006816,
+          "rmse": 0.22967,
+          "r2": -0.51412
+        },
+        "flux": {
+          "mae": 0.000589,
+          "rmse": 0.07685,
+          "r2": -479.26809
+        },
+        "heat": {
+          "mae": 0.004537,
+          "rmse": 0.064853,
+          "r2": -0.43854
+        },
+        "rxn": {
+          "mae": 0.002917,
+          "rmse": 0.034393,
+          "r2": -0.12284
+        }
+      },
+      "vertical_3d": {
+        "gravity_water": {
+          "mae": 0.004266,
+          "rmse": 0.041706,
+          "r2": -0.13839
+        },
+        "gravity_oil": {
+          "mae": 0.000182,
+          "rmse": 0.002964,
+          "r2": -4.69549
+        },
+        "buoyancy_steam": {
+          "mae": 0.001712,
+          "rmse": 0.026426,
+          "r2": 0.31553
+        },
+        "buoyancy_smoke": {
+          "mae": 0.000627,
+          "rmse": 0.013886,
+          "r2": 0.22113
+        },
+        "vertical_heat": {
+          "mae": 6.4e-05,
+          "rmse": 0.0006,
+          "r2": -21.88984
+        },
+        "mean_vertical_r2": -5.23741
+      },
+      "hydrologic_cycle": {
+        "cloud_condensation": {
+          "mae": 0.03729,
+          "rmse": 0.086488,
+          "r2": -0.06455
+        },
+        "cloud_precipitation": {
+          "mae": 0.004578,
+          "rmse": 0.005252,
+          "r2": 0.99267
+        },
+        "mean_hydro_r2": 0.46406
+      },
+      "continuous_dt": {
+        "0.15": {
+          "horiz_mae": 0.001018,
+          "horiz_r2": 0.00182,
+          "vert_mae": 0.000235,
+          "vert_r2": 0.97637,
+          "mean_r2": 0.4891
+        },
+        "0.50": {
+          "horiz_mae": 0.003302,
+          "horiz_r2": 0.00152,
+          "vert_mae": 0.000786,
+          "vert_r2": 0.97571,
+          "mean_r2": 0.48861
+        },
+        "1.00": {
+          "horiz_mae": 0.006721,
+          "horiz_r2": 0.00174,
+          "vert_mae": 0.001606,
+          "vert_r2": 0.97006,
+          "mean_r2": 0.4859
+        },
+        "2.00": {
+          "horiz_mae": 0.012344,
+          "horiz_r2": 0.00095,
+          "vert_mae": 0.003841,
+          "vert_r2": 0.95967,
+          "mean_r2": 0.48031
+        },
+        "4.00": {
+          "horiz_mae": 0.023608,
+          "horiz_r2": 0.00069,
+          "vert_mae": 0.010142,
+          "vert_r2": 0.91897,
+          "mean_r2": 0.45983
+        },
+        "spatial_dome_015_400": {
+          "horiz_mae": 0.011069,
+          "horiz_r2": 0.00072,
+          "vert_mae": 0.003833,
+          "vert_r2": 0.89808,
+          "mean_r2": 0.4494
+        }
+      },
+      "per_biome": {
+        "nordic_viaduct": {
+          "proj_active_pct": 3.826,
+          "horiz_r2": 0.00305,
+          "horiz_mae": 0.002503,
+          "vert_water_r2": 0.94331,
+          "vert_steam_r2": -0.81745,
+          "vert_heat_r2": -1.88222
+        },
+        "volcanic_caldera": {
+          "proj_active_pct": 9.692,
+          "horiz_r2": 0.00123,
+          "horiz_mae": 0.01604,
+          "vert_water_r2": 0.90099,
+          "vert_steam_r2": 0.98125,
+          "vert_heat_r2": 0.57613
+        },
+        "sinkhole_caverns": {
+          "proj_active_pct": 5.387,
+          "horiz_r2": 0.00384,
+          "horiz_mae": 0.004067,
+          "vert_water_r2": 0.98368,
+          "vert_steam_r2": 0.94688,
+          "vert_heat_r2": -1.35091
+        },
+        "shattered_glacier_gorge": {
+          "proj_active_pct": 1.876,
+          "horiz_r2": -32.0854,
+          "horiz_mae": 0.003566,
+          "vert_water_r2": -19.3395,
+          "vert_steam_r2": -295.31878,
+          "vert_heat_r2": -960.83098
+        },
+        "geothermal_mist_basin": {
+          "proj_active_pct": 12.204,
+          "horiz_r2": 0.00358,
+          "horiz_mae": 0.007903,
+          "vert_water_r2": 0.99269,
+          "vert_steam_r2": 0.97338,
+          "vert_heat_r2": -0.62017
+        }
+      }
+    }
+  },
+  "invariants": {
+    "exact_zero_dt_stasis_max_abs": 0.0,
+    "closed_hydrologic_30t": {
+      "Z16": {
+        "ticks": 30,
+        "total_cloud_condensed_mass": 2725588.5,
+        "total_rain_precipitated_mass": 17378066.1,
+        "max_rel_mass_err": 8.204438748427151e-10,
+        "mass_conserved_lt_1e8": true
+      },
+      "Z32": {
+        "ticks": 30,
+        "total_cloud_condensed_mass": 2257621.7,
+        "total_rain_precipitated_mass": 14793769.8,
+        "max_rel_mass_err": 5.887179191068714e-10,
+        "mass_conserved_lt_1e8": true
+      }
+    },
+    "structural_collapse_16t": {
+      "collapsed_deck_mass": 45798.0,
+      "max_rel_mass_err": 2.0827735669971953e-10,
+      "max_rel_energy_err": 1.6564437034369692e-09,
+      "conserved_lt_1e8": true
+    },
+    "fp32_sparse_vs_dense_parity_z16": {
+      "L": 16,
+      "H": 64,
+      "W": 64,
+      "active_brick_frac": 0.5625,
+      "max_abs_diff_horiz": 1.1641532182693481e-10,
+      "max_abs_diff_z_flux": 0.0,
+      "max_abs_diff_z_world": 0.0,
+      "max_abs_diff_all": 1.1641532182693481e-10
+    },
+    "fp32_sparse_vs_dense_parity_z32": {
+      "L": 32,
+      "H": 64,
+      "W": 64,
+      "active_brick_frac": 0.5625,
+      "max_abs_diff_horiz": 1.1641532182693481e-10,
+      "max_abs_diff_z_flux": 0.0,
+      "max_abs_diff_z_world": 0.0,
+      "max_abs_diff_all": 1.1641532182693481e-10
+    }
+  },
+  "latency_fp16_brick_scaling": {
+    "256x256x16_1.05M": {
+      "L": 16,
+      "H": 256,
+      "W": 256,
+      "voxels": 1048576,
+      "total_bricks_16x16x8": 512,
+      "dense_v5_fp16": {
+        "p50_ms": 29.27,
+        "p95_ms": 29.306,
+        "mean_ms": 29.27,
+        "hz": 34.2
+      },
+      "dense_dt_baseline_fp16": {
+        "p50_ms": 23.588,
+        "p95_ms": 23.609,
+        "mean_ms": 23.591,
+        "hz": 42.4
+      },
+      "sparse_16x16x8_fp16": {
+        "sparse_10pct": {
+          "p50_ms": 18.316,
+          "p95_ms": 18.521,
+          "mean_ms": 18.339,
+          "hz": 54.6,
+          "active_bricks": 51,
+          "total_bricks": 512,
+          "actual_active_pct": 9.96,
+          "speedup_vs_dense_x": 1.6
+        },
+        "sparse_20pct": {
+          "p50_ms": 31.626,
+          "p95_ms": 31.691,
+          "mean_ms": 31.628,
+          "hz": 31.6,
+          "active_bricks": 102,
+          "total_bricks": 512,
+          "actual_active_pct": 19.92,
+          "speedup_vs_dense_x": 0.93
+        }
+      }
+    },
+    "256x256x32_2.10M": {
+      "L": 32,
+      "H": 256,
+      "W": 256,
+      "voxels": 2097152,
+      "total_bricks_16x16x8": 1024,
+      "dense_v5_fp16": {
+        "p50_ms": 57.073,
+        "p95_ms": 57.271,
+        "mean_ms": 57.101,
+        "hz": 17.5
+      },
+      "dense_dt_baseline_fp16": {
+        "p50_ms": 46.197,
+        "p95_ms": 46.278,
+        "mean_ms": 46.208,
+        "hz": 21.6
+      },
+      "sparse_16x16x8_fp16": {
+        "sparse_10pct": {
+          "p50_ms": 31.928,
+          "p95_ms": 32.093,
+          "mean_ms": 31.938,
+          "hz": 31.3,
+          "active_bricks": 102,
+          "total_bricks": 1024,
+          "actual_active_pct": 9.96,
+          "speedup_vs_dense_x": 1.79
+        },
+        "sparse_20pct": {
+          "p50_ms": 52.2,
+          "p95_ms": 52.376,
+          "mean_ms": 52.22,
+          "hz": 19.2,
+          "active_bricks": 205,
+          "total_bricks": 1024,
+          "actual_active_pct": 20.02,
+          "speedup_vs_dense_x": 1.09
+        }
+      }
+    },
+    "512x512x16_4.19M": {
+      "L": 16,
+      "H": 512,
+      "W": 512,
+      "voxels": 4194304,
+      "total_bricks_16x16x8": 2048,
+      "dense_v5_fp16": {
+        "p50_ms": 113.808,
+        "p95_ms": 113.918,
+        "mean_ms": 113.811,
+        "hz": 8.8
+      },
+      "dense_dt_baseline_fp16": {
+        "p50_ms": 91.504,
+        "p95_ms": 91.568,
+        "mean_ms": 91.5,
+        "hz": 10.9
+      },
+      "sparse_16x16x8_fp16": {
+        "sparse_10pct": {
+          "p50_ms": 53.203,
+          "p95_ms": 53.537,
+          "mean_ms": 53.267,
+          "hz": 18.8,
+          "active_bricks": 205,
+          "total_bricks": 2048,
+          "actual_active_pct": 10.01,
+          "speedup_vs_dense_x": 2.14
+        },
+        "sparse_20pct": {
+          "p50_ms": 93.844,
+          "p95_ms": 94.059,
+          "mean_ms": 93.854,
+          "hz": 10.7,
+          "active_bricks": 410,
+          "total_bricks": 2048,
+          "actual_active_pct": 20.02,
+          "speedup_vs_dense_x": 1.21
+        }
+      }
+    }
+  },
+  "history": [
+    {
+      "step": 325,
+      "elapsed_s": 75.4,
+      "loss": 3.8385,
+      "val_proj_active_pct": 2.304,
+      "val_horiz_r2": 0.00132,
+      "val_vert_mean_r2": -0.85363,
+      "val_hydro_mean_r2": 0.2778,
+      "val_dt015_r2": 0.41844,
+      "val_dt400_r2": 0.40019
+    },
+    {
+      "step": 650,
+      "elapsed_s": 142.4,
+      "loss": 10.0883,
+      "val_proj_active_pct": 0.702,
+      "val_horiz_r2": 0.0005,
+      "val_vert_mean_r2": -0.66715,
+      "val_hydro_mean_r2": 0.3437,
+      "val_dt015_r2": 0.43663,
+      "val_dt400_r2": 0.38706
+    },
+    {
+      "step": 975,
+      "elapsed_s": 204.9,
+      "loss": 2.5032,
+      "val_proj_active_pct": 0.515,
+      "val_horiz_r2": 0.0011,
+      "val_vert_mean_r2": 0.60375,
+      "val_hydro_mean_r2": 0.33921,
+      "val_dt015_r2": 0.48162,
+      "val_dt400_r2": 0.45254
+    },
+    {
+      "step": 1300,
+      "elapsed_s": 267.1,
+      "loss": 5.7083,
+      "val_proj_active_pct": 1.076,
+      "val_horiz_r2": 0.00011,
+      "val_vert_mean_r2": 0.54272,
+      "val_hydro_mean_r2": 0.34416,
+      "val_dt015_r2": 0.45541,
+      "val_dt400_r2": 0.43501
+    },
+    {
+      "step": 1625,
+      "elapsed_s": 328.9,
+      "loss": 31.9489,
+      "val_proj_active_pct": 0.904,
+      "val_horiz_r2": 0.0013,
+      "val_vert_mean_r2": 0.34123,
+      "val_hydro_mean_r2": 0.3501,
+      "val_dt015_r2": 0.48689,
+      "val_dt400_r2": 0.45978
+    },
+    {
+      "step": 1950,
+      "elapsed_s": 391.1,
+      "loss": 2.1979,
+      "val_proj_active_pct": 4.143,
+      "val_horiz_r2": 0.00232,
+      "val_vert_mean_r2": 0.69648,
+      "val_hydro_mean_r2": 0.39215,
+      "val_dt015_r2": 0.49175,
+      "val_dt400_r2": 0.46877
+    },
+    {
+      "step": 2275,
+      "elapsed_s": 453.4,
+      "loss": 2.388,
+      "val_proj_active_pct": 7.883,
+      "val_horiz_r2": 0.00395,
+      "val_vert_mean_r2": 0.75184,
+      "val_hydro_mean_r2": 0.46952,
+      "val_dt015_r2": 0.49413,
+      "val_dt400_r2": 0.47479
+    },
+    {
+      "step": 2600,
+      "elapsed_s": 515.3,
+      "loss": 1.9484,
+      "val_proj_active_pct": 17.464,
+      "val_horiz_r2": 0.00624,
+      "val_vert_mean_r2": 0.78629,
+      "val_hydro_mean_r2": 0.57486,
+      "val_dt015_r2": 0.49515,
+      "val_dt400_r2": 0.47588
+    }
+  ]
+}

@@ -1864,9 +1864,10 @@ impl VolumeField {
                 if (ny - 0.22).abs() > 0.022 {
                     continue;
                 }
+                let spring_hw = (w / 128).clamp(2, 6);
                 for &nx_src in &[0.26f32, 0.74f32] {
                     let cx = (nx_src * wf) as usize;
-                    for x in cx.saturating_sub(2)..=(cx + 2).min(w - 3) {
+                    for x in cx.saturating_sub(spring_hw)..=(cx + spring_hw).min(w - 3) {
                         let idx = y * w + x;
                         let cur = l2.mass[SP_WATER][idx];
                         if cur < 1000 && l2.mass[SP_ROCK][idx] < 500 {
@@ -2216,5 +2217,37 @@ mod tests {
         }
         assert!(total_grav > 0, "expected 3D waterfall gravity transport L2->L1->L0");
         assert!(total_buoy > 0, "expected 3D buoyant steam/smoke rise L1->L2->L3");
+    }
+
+    #[test]
+    fn test_volume_512_init_and_step_conservation() {
+        let mut vf = VolumeField::new_shattered_reach_3d(512, 512, 4);
+        assert_eq!(vf.width, 512);
+        assert_eq!(vf.height, 512);
+        assert_eq!(vf.depth, 4);
+        assert_eq!(vf.layers.len(), 4);
+        assert_eq!(vf.layers[1].mass[SP_WATER].len(), 512 * 512);
+
+        // Verify proportional geometry at 512x512x4:
+        // L2 stone sky-arch around y=0.29, x=0.50; timber skybridge around y=0.67, x=0.50
+        let arch_idx = vf.layers[2].idx(256, (512.0 * 0.29) as usize);
+        let bridge_idx = vf.layers[2].idx(256, (512.0 * 0.67) as usize);
+        assert!(vf.layers[2].mass[SP_SOIL][arch_idx] > 0, "L2 stone sky-arch missing at 512x512");
+        assert!(vf.layers[2].mass[SP_WOOD][bridge_idx] > 0, "L2 timber skybridge missing at 512x512");
+        // L1 fjord water directly beneath L2 skybridge
+        assert!(vf.layers[1].mass[SP_WATER][bridge_idx] > 0, "L1 river under skybridge missing at 512x512");
+
+        // Trigger 3D spell + 2 full conservation steps on 1,048,576 voxels
+        vf.apply_steam_burst_3d(256, 256, 1, 4);
+        let mut total_grav = 0i64;
+        for tick in 0..2 {
+            vf.apply_weather_and_springs_3d((tick % 4) as u8, tick);
+            let raws = vf.refsim_raw_outputs_all();
+            let stats = vf.step_3d(&raws);
+            assert_eq!(stats.mass_error, 0, "512x512x4 mass error at tick {}", tick);
+            assert_eq!(stats.energy_error, 0, "512x512x4 energy error at tick {}", tick);
+            total_grav += stats.vertical_gravity_mass;
+        }
+        assert!(total_grav > 0, "expected 3D waterfall gravity transport at 512x512x4");
     }
 }

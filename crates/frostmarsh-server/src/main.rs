@@ -193,6 +193,284 @@ impl CudaRpcClient {
         }
         res
     }
+
+    fn call_json(
+        &mut self,
+        op: u8,
+        json_req: &str,
+    ) -> Result<(String, f32), Box<dyn std::error::Error>> {
+        self.seq = self.seq.wrapping_add(1);
+        let seq = self.seq;
+        let payload = json_req.as_bytes();
+        let payload_bytes = payload.len() as u32;
+        let mut hdr = [0u8; 16];
+        hdr[0] = op;
+        hdr[1] = 1;
+        hdr[2..4].copy_from_slice(&1u16.to_le_bytes());
+        hdr[4..6].copy_from_slice(&0u16.to_le_bytes());
+        hdr[6..8].copy_from_slice(&0u16.to_le_bytes());
+        hdr[8..12].copy_from_slice(&payload_bytes.to_le_bytes());
+        hdr[12..16].copy_from_slice(&seq.to_le_bytes());
+
+        let res = (|| -> Result<(String, f32), Box<dyn std::error::Error>> {
+            let s = self.ensure_connected()?;
+            s.write_all(&hdr)?;
+            s.write_all(payload)?;
+
+            let mut rhdr = [0u8; 16];
+            s.read_exact(&mut rhdr)?;
+            let status = rhdr[0];
+            if status != 0 {
+                return Err(format!("CUDA daemon op={} returned error status {}", op, status).into());
+            }
+            let rlen = u32::from_le_bytes(rhdr[8..12].try_into().unwrap()) as usize;
+            let infer_us = u32::from_le_bytes(rhdr[12..16].try_into().unwrap());
+            let mut rbuf = vec![0u8; rlen];
+            s.read_exact(&mut rbuf)?;
+            let text = String::from_utf8(rbuf)?;
+            Ok((text, infer_us as f32 / 1000.0))
+        })();
+
+        if res.is_err() {
+            self.stream = None;
+        }
+        res
+    }
+}
+
+// ---------------- Minimal Zero-Dependency JSON Codec for op=6 Acoustics ----------------
+
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum JsonVal {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    Arr(Vec<JsonVal>),
+    Obj(HashMap<String, JsonVal>),
+}
+
+impl JsonVal {
+    fn as_f32(&self) -> Option<f32> {
+        match self {
+            JsonVal::Num(n) => Some(*n as f32),
+            _ => None,
+        }
+    }
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            JsonVal::Num(n) => Some(n.round() as i64),
+            _ => None,
+        }
+    }
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            JsonVal::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+    fn as_arr(&self) -> Option<&[JsonVal]> {
+        match self {
+            JsonVal::Arr(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+    fn get(&self, key: &str) -> Option<&JsonVal> {
+        match self {
+            JsonVal::Obj(m) => m.get(key),
+            _ => None,
+        }
+    }
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn parse(input: &'a str) -> Option<JsonVal> {
+        let mut p = Self { bytes: input.as_bytes(), pos: 0 };
+        p.parse_val()
+    }
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+    fn parse_val(&mut self) -> Option<JsonVal> {
+        self.skip_ws();
+        match self.peek()? {
+            b'"' => self.parse_str().map(JsonVal::Str),
+            b'{' => self.parse_obj(),
+            b'[' => self.parse_arr(),
+            b't' => {
+                if self.bytes[self.pos..].starts_with(b"true") {
+                    self.pos += 4;
+                    Some(JsonVal::Bool(true))
+                } else {
+                    None
+                }
+            }
+            b'f' => {
+                if self.bytes[self.pos..].starts_with(b"false") {
+                    self.pos += 5;
+                    Some(JsonVal::Bool(false))
+                } else {
+                    None
+                }
+            }
+            b'n' => {
+                if self.bytes[self.pos..].starts_with(b"null") {
+                    self.pos += 4;
+                    Some(JsonVal::Null)
+                } else {
+                    None
+                }
+            }
+            b'-' | b'0'..=b'9' => self.parse_num().map(JsonVal::Num),
+            _ => None,
+        }
+    }
+    fn parse_str(&mut self) -> Option<String> {
+        if self.peek()? != b'"' {
+            return None;
+        }
+        self.pos += 1;
+        let mut out = String::new();
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            self.pos += 1;
+            if b == b'"' {
+                return Some(out);
+            }
+            if b == b'\\' {
+                if self.pos >= self.bytes.len() {
+                    return None;
+                }
+                let esc = self.bytes[self.pos];
+                self.pos += 1;
+                match esc {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        if self.pos + 4 <= self.bytes.len() {
+                            if let Ok(hex) = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4]) {
+                                if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                                    if let Some(ch) = char::from_u32(cp) {
+                                        out.push(ch);
+                                    }
+                                }
+                            }
+                            self.pos += 4;
+                        }
+                    }
+                    other => out.push(other as char),
+                }
+            } else if b < 0x80 {
+                out.push(b as char);
+            } else {
+                // Multi-byte UTF-8 sequence
+                let start = self.pos - 1;
+                while self.pos < self.bytes.len() && (self.bytes[self.pos] & 0xC0) == 0x80 {
+                    self.pos += 1;
+                }
+                if let Ok(s) = std::str::from_utf8(&self.bytes[start..self.pos]) {
+                    out.push_str(s);
+                }
+            }
+        }
+        None
+    }
+    fn parse_num(&mut self) -> Option<f64> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        while let Some(b) = self.peek() {
+            if b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        std::str::from_utf8(&self.bytes[start..self.pos]).ok()?.parse::<f64>().ok()
+    }
+    fn parse_arr(&mut self) -> Option<JsonVal> {
+        self.pos += 1; // '['
+        let mut items = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(b']') {
+                self.pos += 1;
+                return Some(JsonVal::Arr(items));
+            }
+            items.push(self.parse_val()?);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
+                    self.pos += 1;
+                    return Some(JsonVal::Arr(items));
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn parse_obj(&mut self) -> Option<JsonVal> {
+        self.pos += 1; // '{'
+        let mut map = HashMap::new();
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+                return Some(JsonVal::Obj(map));
+            }
+            let k = self.parse_str()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return None;
+            }
+            self.pos += 1;
+            let v = self.parse_val()?;
+            map.insert(k, v);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Some(JsonVal::Obj(map));
+                }
+                _ => return None,
+            }
+        }
+    }
 }
 
 #[cfg(feature = "onnx")]
@@ -463,6 +741,27 @@ struct ClientPeer {
     macro_cursor: usize,
 }
 
+#[derive(Clone, Debug)]
+struct PendingChat {
+    text: String,
+    x: f32,
+    y: f32,
+    layer: f32,
+    volume: f32,
+    team: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BotCommandOverride {
+    move_x: f32,
+    move_y: f32,
+    elem: Option<u8>,
+    ability: Option<u8>,
+    #[allow(dead_code)]
+    snr_db: f32,
+    expires_tick: u64,
+}
+
 struct GameState {
     grid_w: usize,
     grid_h: usize,
@@ -477,6 +776,8 @@ struct GameState {
     ecosystem_on: bool,
     neural_bots_on: bool,
     bot_infer_ms: f32,
+    acoustic_ms: f32,
+    world_sparse_pct: f32,
     bot_rpc: Option<CudaRpcClient>,
     sim_tick: u64,
     start_instant: Instant,
@@ -494,6 +795,9 @@ struct GameState {
     events: VecDeque<(u64, CombatEvent)>,
     bot_brains: Vec<BotBrainSnap>,
     kill_feed: VecDeque<KillFeedEntry>,
+    speech_bubbles: VecDeque<(u64, SpeechBubbleSnap)>,
+    pending_chat: Option<PendingChat>,
+    bot_overrides: HashMap<u32, BotCommandOverride>,
     peers: HashMap<u32, ClientPeer>,
     hazard_layers: Vec<Vec<u8>>,
     weather_kind: u8,
@@ -560,6 +864,8 @@ impl GameState {
             ecosystem_on: true,
             neural_bots_on: use_cuda,
             bot_infer_ms: 0.0,
+            acoustic_ms: 0.0,
+            world_sparse_pct: 100.0,
             bot_rpc: if use_cuda { Some(CudaRpcClient::new(cuda_addr)) } else { None },
             sim_tick: 0,
             start_instant: Instant::now(),
@@ -577,6 +883,9 @@ impl GameState {
             events: VecDeque::with_capacity(48),
             bot_brains: Vec::new(),
             kill_feed: VecDeque::with_capacity(8),
+            speech_bubbles: VecDeque::with_capacity(6),
+            pending_chat: None,
+            bot_overrides: HashMap::new(),
             peers: HashMap::new(),
             weather_kind: WEATHER_CLEAR,
             day_time: 0.25,
@@ -618,6 +927,267 @@ impl GameState {
         ));
         while self.events.len() > 28 {
             self.events.pop_front();
+        }
+    }
+
+    fn push_speech_bubble(&mut self, bubble: SpeechBubbleSnap) {
+        // Keep one active bubble per speaker so no single bot floods the 5-bubble cap
+        self.speech_bubbles
+            .retain(|(_, b)| b.speaker_id != bubble.speaker_id);
+        self.speech_bubbles.push_back((self.sim_tick + 120, bubble));
+        while self.speech_bubbles.len() > 5 {
+            self.speech_bubbles.pop_front();
+        }
+    }
+
+    /// Calls `op=6` (`OP_ACOUSTIC_STEP`) on `CudaRpcClient` (~10 Hz or immediately on `ChatCommand`),
+    /// ingesting emergent bot speech bubbles, per-bot `g_i` command overrides, `acoustic_ms`, and `sparse_pct`.
+    fn step_acoustics_rpc(&mut self) {
+        let pending = self.pending_chat.take();
+        let gw = self.grid_w as f32;
+        let gh = self.grid_h as f32;
+        let surf_z = self.surf_layer() as f32;
+
+        let listener = self
+            .players
+            .values()
+            .find(|p| !p.is_bot)
+            .map(|p| (p.x, p.y, p.z))
+            .unwrap_or((gw * 0.5, gh * 0.5, surf_z));
+
+        let bots: Vec<(u32, String, u8, u8, f32, f32, f32, f32, bool)> = self
+            .players
+            .values()
+            .filter(|p| p.is_bot)
+            .map(|p| {
+                (
+                    p.id,
+                    p.name.clone(),
+                    p.team,
+                    p.class_id,
+                    p.x,
+                    p.y,
+                    p.z,
+                    (p.hp as f32 / p.max_hp.max(1) as f32).clamp(0.0, 1.0),
+                    p.carrying_relic,
+                )
+            })
+            .collect();
+
+        if self.bot_rpc.is_none() {
+            // Lightweight offline/refsim fallback when a human sends a chat command without CUDA RPC
+            if let Some(chat) = pending {
+                self.apply_local_chat_fallback(&chat, &bots, listener);
+            }
+            return;
+        }
+
+        // Build UTF-8 JSON request payload
+        let mut req = String::with_capacity(1024);
+        req.push_str("{\"bots\":[");
+        for (i, (id, name, team, cls, x, y, z, hp_frac, relic)) in bots.iter().enumerate() {
+            if i > 0 {
+                req.push(',');
+            }
+            req.push_str(&format!(
+                "{{\"id\":{},\"name\":{},\"team\":{},\"class_id\":{},\"x\":{:.2},\"y\":{:.2},\"z\":{:.2},\"hp_frac\":{:.2},\"carrying_relic\":{}}}",
+                id,
+                json_escape_str(name),
+                team,
+                cls,
+                x,
+                y,
+                z,
+                hp_frac,
+                if *relic { "true" } else { "false" }
+            ));
+        }
+        req.push_str(&format!(
+            "],\"listener\":[{:.2},{:.2},{:.2}],\"grid_w\":{},\"grid_h\":{},\"grid_d\":{},\"chat\":",
+            listener.0, listener.1, listener.2, self.grid_w, self.grid_h, self.grid_d
+        ));
+        if let Some(ref c) = pending {
+            req.push_str(&format!(
+                "{{\"text\":{},\"x\":{:.2},\"y\":{:.2},\"layer\":{:.2},\"volume\":{:.2},\"team\":{}}}",
+                json_escape_str(&c.text),
+                c.x,
+                c.y,
+                c.layer,
+                c.volume,
+                c.team
+            ));
+        } else {
+            req.push_str("null");
+        }
+        req.push('}');
+
+        let rpc_res = if let Some(ref mut rpc) = self.bot_rpc {
+            rpc.call_json(6, &req)
+        } else {
+            return;
+        };
+
+        let (resp_str, rpc_ms) = match rpc_res {
+            Ok(v) => v,
+            Err(_) => {
+                if let Some(chat) = pending {
+                    self.apply_local_chat_fallback(&chat, &bots, listener);
+                }
+                return;
+            }
+        };
+
+        let Some(root) = JsonParser::parse(&resp_str) else {
+            return;
+        };
+        self.acoustic_ms = root
+            .get("acoustic_ms")
+            .and_then(|v| v.as_f32())
+            .unwrap_or(rpc_ms);
+        if let Some(sp) = root.get("sparse_pct").and_then(|v| v.as_f32()) {
+            if sp.is_finite() && sp > 0.0 {
+                self.world_sparse_pct = sp.clamp(0.0, 100.0);
+            }
+        }
+
+        let tick_now = self.sim_tick;
+        if let Some(bubbles) = root.get("bubbles").and_then(|v| v.as_arr()) {
+            for b in bubbles {
+                let text = b.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let speaker_id = b.get("speaker_id").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+                let speaker_name = b
+                    .get("speaker_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("BOT")
+                    .to_string();
+                let team = b.get("team").and_then(|v| v.as_i64()).unwrap_or(0) as u8;
+                let x = b.get("x").and_then(|v| v.as_f32()).unwrap_or(listener.0);
+                let y = b.get("y").and_then(|v| v.as_f32()).unwrap_or(listener.1);
+                let z = b.get("z").and_then(|v| v.as_f32()).unwrap_or(surf_z);
+                let snr_db = b.get("snr_db").and_then(|v| v.as_f32()).unwrap_or(10.0);
+                let symbol_id = b.get("symbol_id").and_then(|v| v.as_i64()).unwrap_or(0) as u8;
+                self.push_speech_bubble(SpeechBubbleSnap {
+                    speaker_id,
+                    speaker_name,
+                    team,
+                    x,
+                    y,
+                    z,
+                    snr_db,
+                    symbol_id,
+                    text: text.chars().take(64).collect(),
+                    tick: tick_now as u32,
+                });
+            }
+        }
+
+        if let Some(overrides) = root.get("overrides").and_then(|v| v.as_arr()) {
+            for ov in overrides {
+                let bot_id = ov.get("bot_id").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+                if bot_id == 0 {
+                    continue;
+                }
+                let move_x = ov.get("move_x").and_then(|v| v.as_f32()).unwrap_or(0.0);
+                let move_y = ov.get("move_y").and_then(|v| v.as_f32()).unwrap_or(0.0);
+                let elem = ov
+                    .get("elem")
+                    .and_then(|v| v.as_i64())
+                    .and_then(|e| if (0..=2).contains(&e) { Some(e as u8) } else { None });
+                let ability = ov
+                    .get("ability")
+                    .and_then(|v| v.as_i64())
+                    .and_then(|a| if (0..=5).contains(&a) { Some(a as u8) } else { None });
+                let snr_db = ov.get("snr_db").and_then(|v| v.as_f32()).unwrap_or(10.0);
+                let ttl = ov.get("ttl_ticks").and_then(|v| v.as_i64()).unwrap_or(60).clamp(15, 180) as u64;
+                self.bot_overrides.insert(
+                    bot_id,
+                    BotCommandOverride {
+                        move_x,
+                        move_y,
+                        elem,
+                        ability,
+                        snr_db,
+                        expires_tick: tick_now + ttl,
+                    },
+                );
+            }
+        }
+    }
+
+    fn apply_local_chat_fallback(
+        &mut self,
+        chat: &PendingChat,
+        bots: &[(u32, String, u8, u8, f32, f32, f32, f32, bool)],
+        listener: (f32, f32, f32),
+    ) {
+        let txt = chat.text.to_ascii_lowercase();
+        let gw = self.grid_w as f32;
+        let gh = self.grid_h as f32;
+        let elem = if txt.contains("freeze") || txt.contains("frost") || txt.contains("ice") {
+            Some(1u8)
+        } else if txt.contains("oil") || txt.contains("slick") {
+            Some(2u8)
+        } else if txt.contains("fire") || txt.contains("burn") || txt.contains("ignite") {
+            Some(0u8)
+        } else {
+            None
+        };
+        let (tx, ty) = if txt.contains("north") {
+            (gw * 0.50, gh * 0.28)
+        } else if txt.contains("south") {
+            (gw * 0.50, gh * 0.72)
+        } else if txt.contains("east") {
+            (gw * 0.75, gh * 0.50)
+        } else if txt.contains("west") {
+            (gw * 0.25, gh * 0.50)
+        } else {
+            (gw * 0.50, gh * 0.50)
+        };
+        let src_spl = 56.0 + 38.0 * chat.volume.clamp(0.1, 1.0);
+        let tick_now = self.sim_tick;
+        let mut replies = 0usize;
+        for &(bid, ref bname, bteam, _, bx, by, bz, _, _) in bots {
+            if bteam != chat.team {
+                continue;
+            }
+            let dist = (bx - chat.x).hypot(by - chat.y).hypot((bz - chat.layer) * 6.0);
+            let snr = src_spl - 20.0 * (dist * 0.45 + 1.0).max(1.0).log10() - 42.0;
+            if snr >= 0.0 {
+                let dx = tx - bx;
+                let dy = ty - by;
+                let mag = dx.hypot(dy).max(1e-3);
+                self.bot_overrides.insert(
+                    bid,
+                    BotCommandOverride {
+                        move_x: dx / mag,
+                        move_y: dy / mag,
+                        elem,
+                        ability: Some(2),
+                        snr_db: snr,
+                        expires_tick: tick_now + 60,
+                    },
+                );
+                if replies < 2 {
+                    let ldist = (bx - listener.0).hypot(by - listener.1).hypot((bz - listener.2) * 6.0);
+                    let lsnr = 88.0 - 20.0 * (ldist * 0.45 + 1.0).max(1.0).log10() - 42.0;
+                    self.push_speech_bubble(SpeechBubbleSnap {
+                        speaker_id: bid,
+                        speaker_name: bname.clone(),
+                        team: bteam,
+                        x: bx,
+                        y: by,
+                        z: bz,
+                        snr_db: (lsnr * 10.0).round() / 10.0,
+                        symbol_id: elem.unwrap_or(0) + 1,
+                        text: format!("COPY! MOVING ON ORDER"),
+                        tick: tick_now as u32,
+                    });
+                    replies += 1;
+                }
+            }
         }
     }
 
@@ -1198,7 +1768,7 @@ impl GameState {
             } else {
                 2
             };
-            let inp = ClientInputDatagram {
+            let mut inp = ClientInputDatagram {
                 seq: tick as u32,
                 move_x: a[0],
                 move_y: a[1],
@@ -1213,6 +1783,46 @@ impl GameState {
                 bolt_element: elem,
                 client_time_ms: 0,
             };
+            let mut elem_probs = [to_u8(a[10]), to_u8(a[11]), to_u8(a[12])];
+            let mut ability_probs = [
+                to_u8(a[4]),
+                to_u8(a[5]),
+                to_u8(a[6]),
+                to_u8(a[7]),
+                to_u8(a[8]),
+                to_u8(a[9]),
+            ];
+            // Apply live acoustic human command override (g_i) if this bot physically heard the order!
+            if let Some(&ov) = self.bot_overrides.get(&bid) {
+                if tick <= ov.expires_tick {
+                    if ov.move_x.hypot(ov.move_y) > 0.05 {
+                        inp.move_x = ov.move_x;
+                        inp.move_y = ov.move_y;
+                        inp.aim_x = ov.move_x;
+                        inp.aim_y = ov.move_y;
+                    }
+                    if let Some(oe) = ov.elem {
+                        inp.bolt_element = oe % 3;
+                        elem_probs = [35, 35, 35];
+                        elem_probs[(oe % 3) as usize] = 245;
+                        if tick % 9 == 0 {
+                            inp.cast_bolt = true;
+                            ability_probs[2] = ability_probs[2].max(220);
+                        }
+                    }
+                    if let Some(ab) = ov.ability {
+                        match ab {
+                            0 => { inp.dash = true; ability_probs[0] = 230; }
+                            1 => { inp.melee = true; ability_probs[1] = 230; }
+                            2 => { inp.cast_bolt = true; ability_probs[2] = 235; }
+                            3 => { inp.carve_ice = true; ability_probs[3] = 230; }
+                            4 => { inp.cast_ability_e = true; ability_probs[4] = 240; }
+                            5 => { inp.cast_ultimate_r = true; ability_probs[5] = 245; }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             if let Some(p) = self.players.get(&bid) {
                 let mut z_heatmap_4x4 = [0u8; 16];
                 if has_saliency {
@@ -1225,15 +1835,8 @@ impl GameState {
                     class_id: p.class_id,
                     team: p.team,
                     target_id: nearest_enemy_ids[bi],
-                    elem_probs: [to_u8(a[10]), to_u8(a[11]), to_u8(a[12])],
-                    ability_probs: [
-                        to_u8(a[4]),
-                        to_u8(a[5]),
-                        to_u8(a[6]),
-                        to_u8(a[7]),
-                        to_u8(a[8]),
-                        to_u8(a[9]),
-                    ],
+                    elem_probs,
+                    ability_probs,
                     z_heatmap_4x4,
                 });
             }
@@ -1302,7 +1905,7 @@ impl GameState {
                 _ => ((tick / 15 + bid as u64) % 3) as u8,
             };
 
-            let inp = ClientInputDatagram {
+            let mut inp = ClientInputDatagram {
                 seq: tick as u32,
                 move_x: tx - mx,
                 move_y: ty - my,
@@ -1317,6 +1920,33 @@ impl GameState {
                 cast_ultimate_r: (tick + bid as u64 * 41) % 390 == 0 && edist < 26.0,
                 client_time_ms: 0,
             };
+            if let Some(&ov) = self.bot_overrides.get(&bid) {
+                if tick <= ov.expires_tick {
+                    if ov.move_x.hypot(ov.move_y) > 0.05 {
+                        inp.move_x = ov.move_x;
+                        inp.move_y = ov.move_y;
+                        inp.aim_x = ov.move_x;
+                        inp.aim_y = ov.move_y;
+                    }
+                    if let Some(oe) = ov.elem {
+                        inp.bolt_element = oe % 3;
+                        if tick % 9 == 0 {
+                            inp.cast_bolt = true;
+                        }
+                    }
+                    if let Some(ab) = ov.ability {
+                        match ab {
+                            0 => inp.dash = true,
+                            1 => inp.melee = true,
+                            2 => inp.cast_bolt = true,
+                            3 => inp.carve_ice = true,
+                            4 => inp.cast_ability_e = true,
+                            5 => inp.cast_ultimate_r = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
             self.apply_input(bid, &inp);
         }
     }
@@ -1354,6 +1984,12 @@ impl GameState {
 
         while let Some(&(exp, _)) = self.events.front() {
             if tick > exp { self.events.pop_front(); } else { break; }
+        }
+        self.speech_bubbles.retain(|(exp, _)| tick <= *exp);
+        self.bot_overrides.retain(|_, ov| tick <= ov.expires_tick);
+
+        if self.pending_chat.is_some() || (tick % 3 == 0 && self.neural_bots_on) {
+            self.step_acoustics_rpc();
         }
 
         if tick % 3 == 0 {
@@ -1783,9 +2419,13 @@ impl GameState {
             wind_y: self.wind_y,
             score_west: self.score_west,
             score_east: self.score_east,
+            acoustic_ms: self.acoustic_ms,
+            world_sparse_pct: self.world_sparse_pct,
         };
         let match_secs = self.start_instant.elapsed().as_secs() as u32;
         let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
+        let speech_bubbles: Vec<SpeechBubbleSnap> =
+            self.speech_bubbles.iter().map(|(_, b)| b.clone()).collect();
 
         let mut dead = Vec::new();
         let mut total_bytes = 0u64;
@@ -1806,6 +2446,7 @@ impl GameState {
                 telemetry: telemetry.clone(),
                 bot_brains: self.bot_brains.clone(),
                 kill_feed: kill_feed.clone(),
+                speech_bubbles: speech_bubbles.clone(),
             };
             let raw = encode_server_datagram(&msg);
             total_bytes += raw.len() as u64;
@@ -2270,6 +2911,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             ClientReliable::RequestFullSync => {
                                 if let Some(peer) = gs.peers.get_mut(&pid) { peer.needs_full_sync = true; }
+                            }
+                            ClientReliable::ChatCommand { text, volume } => {
+                                let clean: String = text
+                                    .trim()
+                                    .chars()
+                                    .filter(|c| !c.is_control())
+                                    .take(72)
+                                    .collect();
+                                if !clean.is_empty() {
+                                    let vol = volume.clamp(0.1, 1.0);
+                                    if let Some((px, py, pz, team)) = gs
+                                        .players
+                                        .get(&pid)
+                                        .map(|p| (p.x, p.y, p.z, p.team))
+                                    {
+                                        let tick_u32 = gs.sim_tick as u32;
+                                        gs.push_speech_bubble(SpeechBubbleSnap {
+                                            speaker_id: pid,
+                                            speaker_name: "YOU".to_string(),
+                                            team,
+                                            x: px,
+                                            y: py,
+                                            z: pz,
+                                            snr_db: if vol >= 0.6 { 24.0 } else { 12.0 },
+                                            symbol_id: if vol >= 0.6 { 1 } else { 0 },
+                                            text: format!("YOU: {}", clean),
+                                            tick: tick_u32,
+                                        });
+                                        gs.pending_chat = Some(PendingChat {
+                                            text: clean,
+                                            x: px,
+                                            y: py,
+                                            layer: pz,
+                                            volume: vol,
+                                            team,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }

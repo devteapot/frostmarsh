@@ -1,0 +1,1468 @@
+{
+  "hardware": "NVIDIA GB10",
+  "artifacts": {
+    "sparse_world_runner": "/home/gooning/.t3/scratch/frostmarsh-ml/sparse_world_runner.py",
+    "live_acoustics": "/home/gooning/.t3/scratch/frostmarsh-ml/live_acoustics.py",
+    "checkpoint": "/home/gooning/.t3/scratch/frostmarsh-ml/acoustic_comm_live.pt",
+    "checkpoint_bytes": 1165397
+  },
+  "deliverable1_sparse_world_runner": {
+    "device": "NVIDIA GB10",
+    "tile_size": 16,
+    "halo": 6,
+    "sparse_threshold": 0.42,
+    "grids": {
+      "256x256x4": {
+        "grid": "256x256x4",
+        "voxels": 262144,
+        "dense_fp16_with_z_p50_ms": 11.729,
+        "dense_fp16_with_z_p95_ms": 22.808,
+        "rates": {
+          "dirty_20pct": {
+            "target_rate": 0.2,
+            "actual_active_frac": 0.2021,
+            "first_call_active_frac": 1.0,
+            "out_shape": [
+              4,
+              17,
+              256,
+              256
+            ],
+            "z_world_shape": [
+              4,
+              48,
+              256,
+              256
+            ],
+            "z_world_shape_matches_dense": true,
+            "sparse_fp16_p50_ms": 3.002,
+            "sparse_fp16_p95_ms": 7.851,
+            "speedup_vs_dense": 3.907,
+            "max_abs_diff_fp32_out_active_interior": 0.0,
+            "max_abs_diff_fp32_z_active_interior": 0.0,
+            "max_abs_diff_fp32_out_all_interior": 0.0,
+            "max_abs_diff_fp32_z_all_interior": 0.0,
+            "max_abs_diff_fp16_out_active_interior": 0.003906,
+            "max_abs_diff_fp16_z_active_interior": 0.003906
+          },
+          "dirty_30pct": {
+            "target_rate": 0.3,
+            "actual_active_frac": 0.2998,
+            "first_call_active_frac": 1.0,
+            "out_shape": [
+              4,
+              17,
+              256,
+              256
+            ],
+            "z_world_shape": [
+              4,
+              48,
+              256,
+              256
+            ],
+            "z_world_shape_matches_dense": true,
+            "sparse_fp16_p50_ms": 4.805,
+            "sparse_fp16_p95_ms": 11.967,
+            "speedup_vs_dense": 2.441,
+            "max_abs_diff_fp32_out_active_interior": 0.0,
+            "max_abs_diff_fp32_z_active_interior": 0.0,
+            "max_abs_diff_fp32_out_all_interior": 0.0,
+            "max_abs_diff_fp32_z_all_interior": 0.0,
+            "max_abs_diff_fp16_out_active_interior": 0.005859,
+            "max_abs_diff_fp16_z_active_interior": 0.003906
+          }
+        }
+      },
+      "512x512x4": {
+        "grid": "512x512x4",
+        "voxels": 1048576,
+        "dense_fp16_with_z_p50_ms": 51.096,
+        "dense_fp16_with_z_p95_ms": 73.571,
+        "rates": {
+          "dirty_20pct": {
+            "target_rate": 0.2,
+            "actual_active_frac": 0.2,
+            "first_call_active_frac": 1.0,
+            "out_shape": [
+              4,
+              17,
+              512,
+              512
+            ],
+            "z_world_shape": [
+              4,
+              48,
+              512,
+              512
+            ],
+            "z_world_shape_matches_dense": true,
+            "sparse_fp16_p50_ms": 17.316,
+            "sparse_fp16_p95_ms": 32.201,
+            "speedup_vs_dense": 2.951,
+            "max_abs_diff_fp32_out_active_interior": 0.0,
+            "max_abs_diff_fp32_z_active_interior": 0.0,
+            "max_abs_diff_fp32_out_all_interior": 0.0,
+            "max_abs_diff_fp32_z_all_interior": 0.0,
+            "max_abs_diff_fp16_out_active_interior": 0.002197,
+            "max_abs_diff_fp16_z_active_interior": 0.005859
+          },
+          "dirty_30pct": {
+            "target_rate": 0.3,
+            "actual_active_frac": 0.3,
+            "first_call_active_frac": 1.0,
+            "out_shape": [
+              4,
+              17,
+              512,
+              512
+            ],
+            "z_world_shape": [
+              4,
+              48,
+              512,
+              512
+            ],
+            "z_world_shape_matches_dense": true,
+            "sparse_fp16_p50_ms": 27.223,
+            "sparse_fp16_p95_ms": 44.712,
+            "speedup_vs_dense": 1.877,
+            "max_abs_diff_fp32_out_active_interior": 0.0,
+            "max_abs_diff_fp32_z_active_interior": 0.0,
+            "max_abs_diff_fp32_out_all_interior": 0.0,
+            "max_abs_diff_fp32_z_all_interior": 0.0,
+            "max_abs_diff_fp16_out_active_interior": 0.003906,
+            "max_abs_diff_fp16_z_active_interior": 0.003906
+          }
+        }
+      }
+    }
+  },
+  "deliverable2_live_acoustics": {
+    "training_meta": {
+      "version": "live_acoustics_v1",
+      "device": "NVIDIA GB10",
+      "train_elapsed_sec": 23.67,
+      "val_joint_coord_acc": 0.7467,
+      "val_joint_coord_acc_hi_snr": 0.8372,
+      "val_viewer_event_acc": 0.9217,
+      "val_viewer_event_acc_hi_snr": 0.985,
+      "human_cmd_probe_acc": 1.0
+    },
+    "latency_benchmarks_ms": {
+      "256x256x4_speech_only": {
+        "gpu_p50_ms": 1.133,
+        "gpu_p95_ms": 3.2,
+        "wall_p50_ms": 1.144,
+        "wall_p95_ms": 3.213
+      },
+      "256x256x4_with_human_chat": {
+        "gpu_p50_ms": 1.172,
+        "gpu_p95_ms": 5.767,
+        "wall_p50_ms": 1.182,
+        "wall_p95_ms": 5.795
+      },
+      "512x512x4_speech_only": {
+        "gpu_p50_ms": 1.443,
+        "gpu_p95_ms": 7.747,
+        "wall_p50_ms": 1.454,
+        "wall_p95_ms": 7.762
+      },
+      "512x512x4_with_human_chat": {
+        "gpu_p50_ms": 1.478,
+        "gpu_p95_ms": 2.968,
+        "wall_p50_ms": 1.489,
+        "wall_p95_ms": 2.978
+      }
+    },
+    "under_1_5ms_target": {
+      "256x256x4_wall_p50_pass": true,
+      "512x512x4_wall_p50_pass": true
+    },
+    "human_command_verifications": [
+      {
+        "command": {
+          "text": "ignite oil at central spire",
+          "x": 0.5,
+          "y": 0.52,
+          "layer": 1,
+          "volume": 0.8,
+          "team": 0
+        },
+        "decoded_intent": {
+          "text": "ignite oil at central spire",
+          "intent": "IGNITE_OIL_SPIRE",
+          "elem_override": 0,
+          "elem_name": "Fire",
+          "primary_ability": "cast_bolt",
+          "action_summary": "Igniting oil at Central Spire",
+          "g_vec": [
+            -0.999,
+            -0.9999,
+            -1.0,
+            0.9983,
+            1.0,
+            -1.0,
+            -0.9701,
+            -1.0,
+            -0.9934,
+            -0.9983,
+            -1.0,
+            -1.0,
+            -1.0,
+            0.9986,
+            0.9979,
+            1.0
+          ],
+          "source_pos": [
+            127.5,
+            132.6,
+            1
+          ],
+          "volume": 0.8
+        },
+        "overrides_count": 4,
+        "human_overrides": [
+          {
+            "bot_id": 1,
+            "bot_name": "Pyra",
+            "team": 0,
+            "snr_db": 30.69,
+            "snr_gain": 1.0,
+            "g_vec": [
+              -0.999,
+              -0.9999,
+              -1.0,
+              0.9983,
+              1.0,
+              -1.0,
+              -0.9701,
+              -1.0,
+              -0.9934,
+              -0.9983,
+              -1.0,
+              -1.0,
+              -1.0,
+              0.9986,
+              0.9979,
+              1.0
+            ],
+            "move_x": 0.3328,
+            "move_y": -0.943,
+            "target_xy_norm": [
+              0.501,
+              0.5
+            ],
+            "elem_override": 0,
+            "elem_name": "Fire",
+            "ability_boost": [
+              0.0001,
+              0.0001,
+              1.0,
+              0.0001,
+              0.0,
+              0.0003
+            ],
+            "primary_ability": "cast_bolt",
+            "intent": "IGNITE_OIL_SPIRE",
+            "reply_text": "Copy (+31dB)! Igniting oil at Central Spire!"
+          },
+          {
+            "bot_id": 2,
+            "bot_name": "Glacius",
+            "team": 0,
+            "snr_db": 38.47,
+            "snr_gain": 1.0,
+            "g_vec": [
+              -0.999,
+              -0.9999,
+              -1.0,
+              0.9983,
+              1.0,
+              -1.0,
+              -0.9701,
+              -1.0,
+              -0.9934,
+              -0.9983,
+              -1.0,
+              -1.0,
+              -1.0,
+              0.9986,
+              0.9979,
+              1.0
+            ],
+            "move_x": -0.2994,
+            "move_y": 0.9541,
+            "target_xy_norm": [
+              0.501,
+              0.5
+            ],
+            "elem_override": 0,
+            "elem_name": "Fire",
+            "ability_boost": [
+              0.0001,
+              0.0001,
+              1.0,
+              0.0001,
+              0.0,
+              0.0003
+            ],
+            "primary_ability": "cast_bolt",
+            "intent": "IGNITE_OIL_SPIRE",
+            "reply_text": "Copy (+38dB)! Igniting oil at Central Spire!"
+          },
+          {
+            "bot_id": 3,
+            "bot_name": "Kael",
+            "team": 0,
+            "snr_db": 24.18,
+            "snr_gain": 0.999,
+            "g_vec": [
+              -0.999,
+              -0.9999,
+              -1.0,
+              0.9983,
+              1.0,
+              -1.0,
+              -0.9701,
+              -1.0,
+              -0.9934,
+              -0.9983,
+              -1.0,
+              -1.0,
+              -1.0,
+              0.9986,
+              0.9979,
+              1.0
+            ],
+            "move_x": 0.0042,
+            "move_y": 1.0,
+            "target_xy_norm": [
+              0.501,
+              0.5
+            ],
+            "elem_override": 0,
+            "elem_name": "Fire",
+            "ability_boost": [
+              0.0001,
+              0.0001,
+              1.0,
+              0.0001,
+              0.0,
+              0.0003
+            ],
+            "primary_ability": "cast_bolt",
+            "intent": "IGNITE_OIL_SPIRE",
+            "reply_text": "Copy (+24dB)! Igniting oil at Central Spire!"
+          },
+          {
+            "bot_id": 6,
+            "bot_name": "Nyx",
+            "team": 0,
+            "snr_db": 16.33,
+            "snr_gain": 0.992,
+            "g_vec": [
+              -0.999,
+              -0.9999,
+              -1.0,
+              0.9983,
+              1.0,
+              -1.0,
+              -0.9701,
+              -1.0,
+              -0.9934,
+              -0.9983,
+              -1.0,
+              -1.0,
+              -1.0,
+              0.9986,
+              0.9979,
+              1.0
+            ],
+            "move_x": -0.9992,
+            "move_y": -0.0398,
+            "target_xy_norm": [
+              0.501,
+              0.5
+            ],
+            "elem_override": 0,
+            "elem_name": "Fire",
+            "ability_boost": [
+              0.0001,
+              0.0001,
+              1.0,
+              0.0001,
+              0.0,
+              0.0003
+            ],
+            "primary_ability": "cast_bolt",
+            "intent": "IGNITE_OIL_SPIRE",
+            "reply_text": "Copy (+16dB)! Igniting oil at Central Spire!"
+          }
+        ],
+        "human_replies": [
+          {
+            "bot_id": 1,
+            "bot_name": "Pyra",
+            "team": 0,
+            "snr_db": 30.69,
+            "tier": "clear",
+            "cause": "1 basalt wall",
+            "heard": true,
+            "reply_text": "Copy (+31dB)! Igniting oil at Central Spire!"
+          },
+          {
+            "bot_id": 2,
+            "bot_name": "Glacius",
+            "team": 0,
+            "snr_db": 38.47,
+            "tier": "clear",
+            "cause": "distance attenuation",
+            "heard": true,
+            "reply_text": "Copy (+38dB)! Igniting oil at Central Spire!"
+          },
+          {
+            "bot_id": 3,
+            "bot_name": "Kael",
+            "team": 0,
+            "snr_db": 24.18,
+            "tier": "clear",
+            "cause": "distance attenuation",
+            "heard": true,
+            "reply_text": "Copy (+24dB)! Igniting oil at Central Spire!"
+          },
+          {
+            "bot_id": 4,
+            "bot_name": "Mire",
+            "team": 0,
+            "snr_db": -26.31,
+            "tier": "inaudible",
+            "cause": "L2\u2192L1 plunging waterfall roar",
+            "heard": false,
+            "reply_text": "[inaudible -26dB \u2014 drowned out by L2\u2192L1 plunging waterfall roar]"
+          },
+          {
+            "bot_id": 5,
+            "bot_name": "Bram",
+            "team": 0,
+            "snr_db": -11.99,
+            "tier": "inaudible",
+            "cause": "L0 rock ceiling + 2 basalt walls",
+            "heard": false,
+            "reply_text": "[inaudible -12dB \u2014 drowned out by L0 rock ceiling + 2 basalt walls]"
+          },
+          {
+            "bot_id": 6,
+            "bot_name": "Nyx",
+            "team": 0,
+            "snr_db": 16.33,
+            "tier": "clear",
+            "cause": "1 basalt wall",
+            "heard": true,
+            "reply_text": "Copy (+16dB)! Igniting oil at Central Spire!"
+          }
+        ],
+        "enemy_eavesdropped": [
+          {
+            "bot_id": 8,
+            "bot_name": "Rime",
+            "team": 1,
+            "snr_db": 24.63,
+            "alert": "Enemy Rime overheard human comms (+24.6 dB)!"
+          },
+          {
+            "bot_id": 9,
+            "bot_name": "Cinder",
+            "team": 1,
+            "snr_db": 40.64,
+            "alert": "Enemy Cinder overheard human comms (+40.6 dB)!"
+          },
+          {
+            "bot_id": 11,
+            "bot_name": "Orin",
+            "team": 1,
+            "snr_db": 22.38,
+            "alert": "Enemy Orin overheard human comms (+22.4 dB)!"
+          },
+          {
+            "bot_id": 12,
+            "bot_name": "Dusk",
+            "team": 1,
+            "snr_db": 19.4,
+            "alert": "Enemy Dusk overheard human comms (+19.4 dB)!"
+          }
+        ]
+      },
+      {
+        "command": {
+          "text": "freeze north bridge",
+          "x": 0.5,
+          "y": 0.48,
+          "layer": 1,
+          "volume": 0.72,
+          "team": 0
+        },
+        "decoded_intent": {
+          "text": "freeze north bridge",
+          "intent": "FREEZE_NORTH_BRIDGE",
+          "elem_override": 1,
+          "elem_name": "Frost",
+          "primary_ability": "carve_ice",
+          "action_summary": "Freezing North Bridge",
+          "g_vec": [
+            -1.0,
+            1.0,
+            0.9986,
+            0.9988,
+            -1.0,
+            -0.9996,
+            0.9998,
+            0.9994,
+            -0.9996,
+            1.0,
+            -0.9979,
+            0.9999,
+            1.0,
+            0.9999,
+            -1.0,
+            1.0
+          ],
+          "source_pos": [
+            127.5,
+            122.4,
+            1
+          ],
+          "volume": 0.72
+        },
+        "overrides_count": 4,
+        "human_overrides": [
+          {
+            "bot_id": 1,
+            "bot_name": "Pyra",
+            "team": 0,
+            "snr_db": 23.43,
+            "snr_gain": 0.999,
+            "g_vec": [
+              -1.0,
+              1.0,
+              0.9986,
+              0.9988,
+              -1.0,
+              -0.9996,
+              0.9998,
+              0.9994,
+              -0.9996,
+              1.0,
+              -0.9979,
+              0.9999,
+              1.0,
+              0.9999,
+              -1.0,
+              1.0
+            ],
+            "move_x": 0.0647,
+            "move_y": -0.9979,
+            "target_xy_norm": [
+              0.501,
+              0.239
+            ],
+            "elem_override": 1,
+            "elem_name": "Frost",
+            "ability_boost": [
+              0.0038,
+              0.0001,
+              0.0002,
+              0.9925,
+              0.0019,
+              0.0
+            ],
+            "primary_ability": "carve_ice",
+            "intent": "FREEZE_NORTH_BRIDGE",
+            "reply_text": "Copy (+23dB)! Freezing North Bridge!"
+          },
+          {
+            "bot_id": 2,
+            "bot_name": "Glacius",
+            "team": 0,
+            "snr_db": 39.65,
+            "snr_gain": 1.0,
+            "g_vec": [
+              -1.0,
+              1.0,
+              0.9986,
+              0.9988,
+              -1.0,
+              -0.9996,
+              0.9998,
+              0.9994,
+              -0.9996,
+              1.0,
+              -0.9979,
+              0.9999,
+              1.0,
+              0.9999,
+              -1.0,
+              1.0
+            ],
+            "move_x": -0.0953,
+            "move_y": -0.9954,
+            "target_xy_norm": [
+              0.501,
+              0.239
+            ],
+            "elem_override": 1,
+            "elem_name": "Frost",
+            "ability_boost": [
+              0.0038,
+              0.0001,
+              0.0002,
+              0.9925,
+              0.0019,
+              0.0
+            ],
+            "primary_ability": "carve_ice",
+            "intent": "FREEZE_NORTH_BRIDGE",
+            "reply_text": "Copy (+40dB)! Freezing North Bridge!"
+          },
+          {
+            "bot_id": 3,
+            "bot_name": "Kael",
+            "team": 0,
+            "snr_db": 22.33,
+            "snr_gain": 0.999,
+            "g_vec": [
+              -1.0,
+              1.0,
+              0.9986,
+              0.9988,
+              -1.0,
+              -0.9996,
+              0.9998,
+              0.9994,
+              -0.9996,
+              1.0,
+              -0.9979,
+              0.9999,
+              1.0,
+              0.9999,
+              -1.0,
+              1.0
+            ],
+            "move_x": 0.0748,
+            "move_y": 0.9972,
+            "target_xy_norm": [
+              0.501,
+              0.239
+            ],
+            "elem_override": 1,
+            "elem_name": "Frost",
+            "ability_boost": [
+              0.0038,
+              0.0001,
+              0.0002,
+              0.9925,
+              0.0019,
+              0.0
+            ],
+            "primary_ability": "carve_ice",
+            "intent": "FREEZE_NORTH_BRIDGE",
+            "reply_text": "Copy (+22dB)! Freezing North Bridge!"
+          },
+          {
+            "bot_id": 6,
+            "bot_name": "Nyx",
+            "team": 0,
+            "snr_db": 17.75,
+            "snr_gain": 0.995,
+            "g_vec": [
+              -1.0,
+              1.0,
+              0.9986,
+              0.9988,
+              -1.0,
+              -0.9996,
+              0.9998,
+              0.9994,
+              -0.9996,
+              1.0,
+              -0.9979,
+              0.9999,
+              1.0,
+              0.9999,
+              -1.0,
+              1.0
+            ],
+            "move_x": -0.7388,
+            "move_y": -0.6739,
+            "target_xy_norm": [
+              0.501,
+              0.239
+            ],
+            "elem_override": 1,
+            "elem_name": "Frost",
+            "ability_boost": [
+              0.0038,
+              0.0001,
+              0.0002,
+              0.9925,
+              0.0019,
+              0.0
+            ],
+            "primary_ability": "carve_ice",
+            "intent": "FREEZE_NORTH_BRIDGE",
+            "reply_text": "Copy (+18dB)! Freezing North Bridge!"
+          }
+        ],
+        "human_replies": [
+          {
+            "bot_id": 1,
+            "bot_name": "Pyra",
+            "team": 0,
+            "snr_db": 23.43,
+            "tier": "clear",
+            "cause": "1 basalt wall",
+            "heard": true,
+            "reply_text": "Copy (+23dB)! Freezing North Bridge!"
+          },
+          {
+            "bot_id": 2,
+            "bot_name": "Glacius",
+            "team": 0,
+            "snr_db": 39.65,
+            "tier": "clear",
+            "cause": "distance attenuation",
+            "heard": true,
+            "reply_text": "Copy (+40dB)! Freezing North Bridge!"
+          },
+          {
+            "bot_id": 3,
+            "bot_name": "Kael",
+            "team": 0,
+            "snr_db": 22.33,
+            "tier": "clear",
+            "cause": "distance attenuation",
+            "heard": true,
+            "reply_text": "Copy (+22dB)! Freezing North Bridge!"
+          },
+          {
+            "bot_id": 4,
+            "bot_name": "Mire",
+            "team": 0,
+            "snr_db": -28.47,
+            "tier": "inaudible",
+            "cause": "L2\u2192L1 plunging waterfall roar",
+            "heard": false,
+            "reply_text": "[inaudible -28dB \u2014 drowned out by L2\u2192L1 plunging waterfall roar]"
+          },
+          {
+            "bot_id": 5,
+            "bot_name": "Bram",
+            "team": 0,
+            "snr_db": -15.47,
+            "tier": "inaudible",
+            "cause": "L0 rock ceiling + 2 basalt walls",
+            "heard": false,
+            "reply_text": "[inaudible -15dB \u2014 drowned out by L0 rock ceiling + 2 basalt walls]"
+          },
+          {
+            "bot_id": 6,
+            "bot_name": "Nyx",
+            "team": 0,
+            "snr_db": 17.75,
+            "tier": "clear",
+            "cause": "1 basalt wall",
+            "heard": true,
+            "reply_text": "Copy (+18dB)! Freezing North Bridge!"
+          }
+        ],
+        "enemy_eavesdropped": [
+          {
+            "bot_id": 8,
+            "bot_name": "Rime",
+            "team": 1,
+            "snr_db": 19.83,
+            "alert": "Enemy Rime overheard human comms (+19.8 dB)!"
+          },
+          {
+            "bot_id": 9,
+            "bot_name": "Cinder",
+            "team": 1,
+            "snr_db": 35.83,
+            "alert": "Enemy Cinder overheard human comms (+35.8 dB)!"
+          },
+          {
+            "bot_id": 11,
+            "bot_name": "Orin",
+            "team": 1,
+            "snr_db": 20.02,
+            "alert": "Enemy Orin overheard human comms (+20.0 dB)!"
+          },
+          {
+            "bot_id": 12,
+            "bot_name": "Dusk",
+            "team": 1,
+            "snr_db": 16.98,
+            "alert": "Enemy Dusk overheard human comms (+17.0 dB)!"
+          }
+        ]
+      },
+      {
+        "command": {
+          "text": "retreat to sanctuary",
+          "x": 0.46,
+          "y": 0.54,
+          "layer": 1,
+          "volume": 0.35,
+          "team": 0
+        },
+        "decoded_intent": {
+          "text": "retreat to sanctuary",
+          "intent": "RETREAT_SANCTUARY",
+          "elem_override": 1,
+          "elem_name": "Frost",
+          "primary_ability": "dash",
+          "action_summary": "Retreating to Sanctuary",
+          "g_vec": [
+            1.0,
+            0.9988,
+            -0.9952,
+            -0.9999,
+            -0.9995,
+            -0.9997,
+            -1.0,
+            0.9998,
+            -1.0,
+            0.9994,
+            0.9998,
+            0.9998,
+            0.9999,
+            0.9996,
+            -0.9998,
+            0.9999
+          ],
+          "source_pos": [
+            117.3,
+            137.7,
+            1
+          ],
+          "volume": 0.35
+        },
+        "overrides_count": 3,
+        "human_overrides": [
+          {
+            "bot_id": 1,
+            "bot_name": "Pyra",
+            "team": 0,
+            "snr_db": 16.35,
+            "snr_gain": 0.992,
+            "g_vec": [
+              1.0,
+              0.9988,
+              -0.9952,
+              -0.9999,
+              -0.9995,
+              -0.9997,
+              -1.0,
+              0.9998,
+              -1.0,
+              0.9994,
+              0.9998,
+              0.9998,
+              0.9999,
+              0.9996,
+              -0.9998,
+              0.9999
+            ],
+            "move_x": -0.9849,
+            "move_y": -0.1732,
+            "target_xy_norm": [
+              0.14,
+              0.5
+            ],
+            "elem_override": 1,
+            "elem_name": "Frost",
+            "ability_boost": [
+              0.9932,
+              0.0004,
+              0.0024,
+              0.0029,
+              0.0007,
+              0.001
+            ],
+            "primary_ability": "dash",
+            "intent": "RETREAT_SANCTUARY",
+            "reply_text": "Copy (+16dB)! Retreating to Sanctuary!"
+          },
+          {
+            "bot_id": 2,
+            "bot_name": "Glacius",
+            "team": 0,
+            "snr_db": 18.78,
+            "snr_gain": 0.996,
+            "g_vec": [
+              1.0,
+              0.9988,
+              -0.9952,
+              -0.9999,
+              -0.9995,
+              -0.9997,
+              -1.0,
+              0.9998,
+              -1.0,
+              0.9994,
+              0.9998,
+              0.9998,
+              0.9999,
+              0.9996,
+              -0.9998,
+              0.9999
+            ],
+            "move_x": -0.9877,
+            "move_y": 0.1564,
+            "target_xy_norm": [
+              0.14,
+              0.5
+            ],
+            "elem_override": 1,
+            "elem_name": "Frost",
+            "ability_boost": [
+              0.9932,
+              0.0004,
+              0.0024,
+              0.0029,
+              0.0007,
+              0.001
+            ],
+            "primary_ability": "dash",
+            "intent": "RETREAT_SANCTUARY",
+            "reply_text": "Copy (+19dB)! Retreating to Sanctuary!"
+          },
+          {
+            "bot_id": 3,
+            "bot_name": "Kael",
+            "team": 0,
+            "snr_db": 6.48,
+            "snr_gain": 0.816,
+            "g_vec": [
+              1.0,
+              0.9988,
+              -0.9952,
+              -0.9999,
+              -0.9995,
+              -0.9997,
+              -1.0,
+              0.9998,
+              -1.0,
+              0.9994,
+              0.9998,
+              0.9998,
+              0.9999,
+              0.9996,
+              -0.9998,
+              0.9999
+            ],
+            "move_x": -0.7986,
+            "move_y": 0.6019,
+            "target_xy_norm": [
+              0.14,
+              0.5
+            ],
+            "elem_override": 1,
+            "elem_name": "Frost",
+            "ability_boost": [
+              0.9932,
+              0.0004,
+              0.0024,
+              0.0029,
+              0.0007,
+              0.001
+            ],
+            "primary_ability": "dash",
+            "intent": "RETREAT_SANCTUARY",
+            "reply_text": "Copy through static (+6dB, distance attenuation) \u2014 Retreating to Sanctuary!"
+          }
+        ],
+        "human_replies": [
+          {
+            "bot_id": 1,
+            "bot_name": "Pyra",
+            "team": 0,
+            "snr_db": 16.35,
+            "tier": "clear",
+            "cause": "1 basalt wall",
+            "heard": true,
+            "reply_text": "Copy (+16dB)! Retreating to Sanctuary!"
+          },
+          {
+            "bot_id": 2,
+            "bot_name": "Glacius",
+            "team": 0,
+            "snr_db": 18.78,
+            "tier": "clear",
+            "cause": "distance attenuation",
+            "heard": true,
+            "reply_text": "Copy (+19dB)! Retreating to Sanctuary!"
+          },
+          {
+            "bot_id": 3,
+            "bot_name": "Kael",
+            "team": 0,
+            "snr_db": 6.48,
+            "tier": "partial",
+            "cause": "distance attenuation",
+            "heard": true,
+            "reply_text": "Copy through static (+6dB, distance attenuation) \u2014 Retreating to Sanctuary!"
+          },
+          {
+            "bot_id": 4,
+            "bot_name": "Mire",
+            "team": 0,
+            "snr_db": -43.54,
+            "tier": "inaudible",
+            "cause": "L2\u2192L1 plunging waterfall roar",
+            "heard": false,
+            "reply_text": "[inaudible -44dB \u2014 drowned out by L2\u2192L1 plunging waterfall roar]"
+          },
+          {
+            "bot_id": 5,
+            "bot_name": "Bram",
+            "team": 0,
+            "snr_db": -35.6,
+            "tier": "inaudible",
+            "cause": "L0 rock ceiling + 3 basalt walls",
+            "heard": false,
+            "reply_text": "[inaudible -36dB \u2014 drowned out by L0 rock ceiling + 3 basalt walls]"
+          },
+          {
+            "bot_id": 6,
+            "bot_name": "Nyx",
+            "team": 0,
+            "snr_db": -1.83,
+            "tier": "muffled",
+            "cause": "1 basalt wall",
+            "heard": false,
+            "reply_text": "[muffled -2dB] Say again?! (1 basalt wall)"
+          }
+        ],
+        "enemy_eavesdropped": [
+          {
+            "bot_id": 8,
+            "bot_name": "Rime",
+            "team": 1,
+            "snr_db": 11.42,
+            "alert": "Enemy Rime overheard human comms (+11.4 dB)!"
+          },
+          {
+            "bot_id": 9,
+            "bot_name": "Cinder",
+            "team": 1,
+            "snr_db": 19.91,
+            "alert": "Enemy Cinder overheard human comms (+19.9 dB)!"
+          }
+        ]
+      }
+    ],
+    "bot_speech_snr_samples": {
+      "near_oil_clear": {
+        "listener_pos": [
+          0.8197592262199496,
+          0.5320179116459445,
+          1
+        ],
+        "ambient_stats": {
+          "listener_noise_db": 32.0,
+          "listener_noise_cause": "distance attenuation"
+        },
+        "speech_bubbles": [
+          {
+            "bot_id": 7,
+            "bot_name": "Vex",
+            "team": 1,
+            "cls": "Pyromancer",
+            "pos": [
+              62.9,
+              211.3,
+              1
+            ],
+            "symbol_id": 0,
+            "volume": 1.0,
+            "snr_db": -1.99,
+            "tier": "muffled",
+            "cause": "3 basalt walls",
+            "event": "FROZEN_RIVER_BRIDGE",
+            "sector": "SE Shrine Valley",
+            "element": "Fire",
+            "tactic": "SHATTER_BRIDGE",
+            "urgency": 0.937,
+            "walls_crossed": 3.0,
+            "ceiling_muffled": false,
+            "text": "[Vex @ L1 (SHOUT) | -2.0 dB, muffled by 3 basalt walls] \"...ice bridge... [muffled] ...Fire...\""
+          },
+          {
+            "bot_id": 6,
+            "bot_name": "Nyx",
+            "team": 0,
+            "cls": "Shadow-Flanker",
+            "pos": [
+              203.9,
+              130.6,
+              1
+            ],
+            "symbol_id": 2,
+            "volume": 1.0,
+            "snr_db": 53.05,
+            "tier": "clear",
+            "cause": "distance attenuation",
+            "event": "OIL_SLICK_IGNITE",
+            "sector": "SE Shrine Valley",
+            "element": "Fire",
+            "tactic": "IGNITE_TRAP",
+            "urgency": 0.896,
+            "walls_crossed": 0.0,
+            "ceiling_muffled": false,
+            "text": "[Nyx @ L1 (SHOUT) | +53.0 dB] \"Oil slick pooled across SE Shrine Valley \u2014 ignite it with Fire now!\""
+          }
+        ]
+      },
+      "mid_valley_partial": {
+        "listener_pos": [
+          0.5,
+          0.5,
+          1
+        ],
+        "ambient_stats": {
+          "listener_noise_db": 32.0,
+          "listener_noise_cause": "distance attenuation"
+        },
+        "speech_bubbles": [
+          {
+            "bot_id": 7,
+            "bot_name": "Vex",
+            "team": 1,
+            "cls": "Pyromancer",
+            "pos": [
+              62.9,
+              211.3,
+              1
+            ],
+            "symbol_id": 0,
+            "volume": 1.0,
+            "snr_db": 9.23,
+            "tier": "partial",
+            "cause": "2 basalt walls",
+            "event": "WILDFIRE_FLANK",
+            "sector": "SW Oil Basin",
+            "element": "Frost",
+            "tactic": "SUPPRESS_FLANK",
+            "urgency": 0.897,
+            "walls_crossed": 2.0,
+            "ceiling_muffled": false,
+            "text": "[Vex @ L1 (SHOUT) | +9.2 dB, partial 2 basalt walls] \"Wildfire on the flank... SW Oil Basin... hit it with Frost!\""
+          },
+          {
+            "bot_id": 6,
+            "bot_name": "Nyx",
+            "team": 0,
+            "cls": "Shadow-Flanker",
+            "pos": [
+              203.9,
+              130.6,
+              1
+            ],
+            "symbol_id": 2,
+            "volume": 1.0,
+            "snr_db": 23.93,
+            "tier": "clear",
+            "cause": "1 basalt wall",
+            "event": "OIL_SLICK_IGNITE",
+            "sector": "SE Shrine Valley",
+            "element": "Fire",
+            "tactic": "IGNITE_TRAP",
+            "urgency": 0.892,
+            "walls_crossed": 1.0,
+            "ceiling_muffled": false,
+            "text": "[Nyx @ L1 (SHOUT) | +23.9 dB] \"Oil slick pooled across SE Shrine Valley \u2014 ignite it with Fire now!\""
+          }
+        ]
+      },
+      "behind_waterfall_lo": {
+        "listener_pos": [
+          0.36,
+          0.18245310533528905,
+          1
+        ],
+        "ambient_stats": {
+          "listener_noise_db": 85.0,
+          "listener_noise_cause": "L2\u2192L1 plunging waterfall roar"
+        },
+        "speech_bubbles": [
+          {
+            "bot_id": 7,
+            "bot_name": "Vex",
+            "team": 1,
+            "cls": "Pyromancer",
+            "pos": [
+              62.9,
+              211.3,
+              1
+            ],
+            "symbol_id": 0,
+            "volume": 1.0,
+            "snr_db": -35.63,
+            "tier": "inaudible",
+            "cause": "1 basalt wall + L2\u2192L1 plunging waterfall roar",
+            "event": "FROZEN_RIVER_BRIDGE",
+            "sector": "NW Highland",
+            "element": "Fire",
+            "tactic": "SHATTER_BRIDGE",
+            "urgency": 0.968,
+            "walls_crossed": 1.0,
+            "ceiling_muffled": false,
+            "text": "[Vex @ L1 (SHOUT) | -35.6 dB] [inaudible \u2014 drowned out by 1 basalt wall + L2\u2192L1 plunging waterfall roar]"
+          },
+          {
+            "bot_id": 6,
+            "bot_name": "Nyx",
+            "team": 0,
+            "cls": "Shadow-Flanker",
+            "pos": [
+              203.9,
+              130.6,
+              1
+            ],
+            "symbol_id": 2,
+            "volume": 1.0,
+            "snr_db": -22.13,
+            "tier": "inaudible",
+            "cause": "L2\u2192L1 plunging waterfall roar",
+            "event": "FROZEN_RIVER_BRIDGE",
+            "sector": "NW Highland",
+            "element": "Fire",
+            "tactic": "SHATTER_BRIDGE",
+            "urgency": 0.96,
+            "walls_crossed": 0.0,
+            "ceiling_muffled": false,
+            "text": "[Nyx @ L1 (SHOUT) | -22.1 dB] [inaudible \u2014 drowned out by L2\u2192L1 plunging waterfall roar]"
+          }
+        ]
+      },
+      "deep_cavern_l0": {
+        "listener_pos": [
+          0.86,
+          0.14,
+          0
+        ],
+        "ambient_stats": {
+          "listener_noise_db": 28.0,
+          "listener_noise_cause": "distance attenuation"
+        },
+        "speech_bubbles": [
+          {
+            "bot_id": 7,
+            "bot_name": "Vex",
+            "team": 1,
+            "cls": "Pyromancer",
+            "pos": [
+              62.9,
+              211.3,
+              1
+            ],
+            "symbol_id": 0,
+            "volume": 1.0,
+            "snr_db": -19.04,
+            "tier": "inaudible",
+            "cause": "L0 rock ceiling + 3 basalt walls",
+            "event": "FROZEN_RIVER_BRIDGE",
+            "sector": "NW Highland",
+            "element": "Fire",
+            "tactic": "SHATTER_BRIDGE",
+            "urgency": 0.952,
+            "walls_crossed": 3.0,
+            "ceiling_muffled": true,
+            "text": "[Vex @ L1 (SHOUT) | -19.0 dB] [inaudible \u2014 drowned out by L0 rock ceiling + 3 basalt walls]"
+          },
+          {
+            "bot_id": 6,
+            "bot_name": "Nyx",
+            "team": 0,
+            "cls": "Shadow-Flanker",
+            "pos": [
+              203.9,
+              130.6,
+              1
+            ],
+            "symbol_id": 2,
+            "volume": 1.0,
+            "snr_db": 7.99,
+            "tier": "partial",
+            "cause": "L0 rock ceiling + 1 basalt wall",
+            "event": "OIL_SLICK_IGNITE",
+            "sector": "SE Shrine Valley",
+            "element": "Fire",
+            "tactic": "IGNITE_TRAP",
+            "urgency": 0.942,
+            "walls_crossed": 1.0,
+            "ceiling_muffled": true,
+            "text": "[Nyx @ L1 (SHOUT) | +8.0 dB, partial L0 rock ceiling + 1 basalt wall] \"Oil slick... SE Shrine Valley... light it up with Fire!\""
+          }
+        ]
+      }
+    },
+    "grid_512x512x4_live_sample": {
+      "grid": [
+        4,
+        512,
+        512
+      ],
+      "ambient_stats": {
+        "listener_noise_db": 32.0,
+        "listener_noise_cause": "distance attenuation"
+      },
+      "speech_bubbles": [
+        {
+          "bot_id": 7,
+          "bot_name": "Vex",
+          "team": 1,
+          "cls": "Pyromancer",
+          "pos": [
+            126.0,
+            423.4,
+            1
+          ],
+          "symbol_id": 0,
+          "volume": 1.0,
+          "snr_db": 9.23,
+          "tier": "partial",
+          "cause": "2 basalt walls",
+          "event": "WILDFIRE_FLANK",
+          "sector": "SW Oil Basin",
+          "element": "Frost",
+          "tactic": "SUPPRESS_FLANK",
+          "urgency": 0.894,
+          "walls_crossed": 2.0,
+          "ceiling_muffled": false,
+          "text": "[Vex @ L1 (SHOUT) | +9.2 dB, partial 2 basalt walls] \"Wildfire on the flank... SW Oil Basin... hit it with Frost!\""
+        },
+        {
+          "bot_id": 6,
+          "bot_name": "Nyx",
+          "team": 0,
+          "cls": "Shadow-Flanker",
+          "pos": [
+            408.7,
+            261.6,
+            1
+          ],
+          "symbol_id": 2,
+          "volume": 1.0,
+          "snr_db": 23.93,
+          "tier": "clear",
+          "cause": "1 basalt wall",
+          "event": "OIL_SLICK_IGNITE",
+          "sector": "SE Shrine Valley",
+          "element": "Fire",
+          "tactic": "IGNITE_TRAP",
+          "urgency": 0.891,
+          "walls_crossed": 1.0,
+          "ceiling_muffled": false,
+          "text": "[Nyx @ L1 (SHOUT) | +23.9 dB] \"Oil slick pooled across SE Shrine Valley \u2014 ignite it with Fire now!\""
+        }
+      ],
+      "human_intent": {
+        "text": "freeze north bridge",
+        "intent": "FREEZE_NORTH_BRIDGE",
+        "elem_override": 1,
+        "elem_name": "Frost",
+        "primary_ability": "carve_ice",
+        "action_summary": "Freezing North Bridge",
+        "g_vec": [
+          -1.0,
+          1.0,
+          0.9986,
+          0.9988,
+          -1.0,
+          -0.9996,
+          0.9998,
+          0.9994,
+          -0.9996,
+          1.0,
+          -0.9979,
+          0.9999,
+          1.0,
+          0.9999,
+          -1.0,
+          1.0
+        ],
+        "source_pos": [
+          255.5,
+          245.3,
+          1
+        ],
+        "volume": 0.72
+      },
+      "human_overrides_count": 4,
+      "human_replies": [
+        {
+          "bot_id": 1,
+          "bot_name": "Pyra",
+          "team": 0,
+          "snr_db": 23.43,
+          "tier": "clear",
+          "cause": "1 basalt wall",
+          "heard": true,
+          "reply_text": "Copy (+23dB)! Freezing North Bridge!"
+        },
+        {
+          "bot_id": 2,
+          "bot_name": "Glacius",
+          "team": 0,
+          "snr_db": 39.65,
+          "tier": "clear",
+          "cause": "distance attenuation",
+          "heard": true,
+          "reply_text": "Copy (+40dB)! Freezing North Bridge!"
+        },
+        {
+          "bot_id": 3,
+          "bot_name": "Kael",
+          "team": 0,
+          "snr_db": 22.33,
+          "tier": "clear",
+          "cause": "distance attenuation",
+          "heard": true,
+          "reply_text": "Copy (+22dB)! Freezing North Bridge!"
+        },
+        {
+          "bot_id": 4,
+          "bot_name": "Mire",
+          "team": 0,
+          "snr_db": -28.47,
+          "tier": "inaudible",
+          "cause": "L2\u2192L1 plunging waterfall roar",
+          "heard": false,
+          "reply_text": "[inaudible -28dB \u2014 drowned out by L2\u2192L1 plunging waterfall roar]"
+        },
+        {
+          "bot_id": 5,
+          "bot_name": "Bram",
+          "team": 0,
+          "snr_db": -15.47,
+          "tier": "inaudible",
+          "cause": "L0 rock ceiling + 2 basalt walls",
+          "heard": false,
+          "reply_text": "[inaudible -15dB \u2014 drowned out by L0 rock ceiling + 2 basalt walls]"
+        },
+        {
+          "bot_id": 6,
+          "bot_name": "Nyx",
+          "team": 0,
+          "snr_db": 17.75,
+          "tier": "clear",
+          "cause": "1 basalt wall",
+          "heard": true,
+          "reply_text": "Copy (+18dB)! Freezing North Bridge!"
+        }
+      ]
+    }
+  }
+}

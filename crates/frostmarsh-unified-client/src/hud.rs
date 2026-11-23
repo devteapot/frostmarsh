@@ -25,7 +25,7 @@ pub struct HudVertex {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct HudConfig {
+pub struct HudConfig<'a> {
     pub show_hud: bool,
     pub show_telemetry: bool,
     pub show_brain_inspector: bool,
@@ -34,6 +34,9 @@ pub struct HudConfig {
     pub style_label: &'static str,
     pub fps: f32,
     pub rtt_ms: f32,
+    pub chat_open: bool,
+    pub chat_input: &'a str,
+    pub chat_shout: bool,
 }
 
 pub struct HudBatch {
@@ -145,13 +148,23 @@ fn project_world(world_rel: Vec3, mats: &CameraMatrices, sw: f32, sh: f32) -> Op
     Some((sx, sy))
 }
 
+fn snr_badge(snr_db: f32) -> (String, [f32; 4]) {
+    if snr_db >= 10.0 {
+        (format!("+{:.0}DB", snr_db), [0.22, 0.94, 0.56, 1.0])
+    } else if snr_db >= 0.0 {
+        (format!("+{:.0}DB", snr_db), [1.00, 0.84, 0.28, 1.0])
+    } else {
+        (format!("{:.0}DB MUFFLED", snr_db), [0.94, 0.36, 0.38, 1.0])
+    }
+}
+
 pub fn build_hud(
     sw: f32,
     sh: f32,
     world: &LiveApproach4World,
     entities: Option<&LiveEntityState>,
     mats: &CameraMatrices,
-    cfg: &HudConfig,
+    cfg: &HudConfig<'_>,
 ) -> HudBatch {
     let mut b = HudBatch::new();
     if !cfg.show_hud {
@@ -233,6 +246,111 @@ pub fn build_hud(
                     let tw = HudBatch::text_width(&ev.label, sc);
                     b.text_shadow(sx - tw * 0.5, sy - 14.0 * ui, sc, col, &ev.label);
                 }
+            }
+        }
+
+        // 3D Projected In-World Acoustic Speech Bubbles (with team border, SNR pill, & HUD avoidance!)
+        if !ent.speech_bubbles.is_empty() {
+            let mut placed: Vec<(f32, f32, f32, f32)> = Vec::new();
+            let safe_min_x = 16.0 * ui;
+            let safe_max_x = sw - 16.0 * ui;
+            let safe_min_y = 78.0 * ui;
+            let safe_max_y = sh - 144.0 * ui;
+            let hdr_sc = 1.15 * ui;
+            let msg_sc = 1.25 * ui;
+
+            for sb in ent.speech_bubbles.iter().rev().take(5) {
+                let (wx, wz) = world.grid_to_world_xz(sb.x, sb.y);
+                let gy = world.sample_3d_y(sb.x, sb.y, sb.z);
+                let rel = Vec3::new(wx, gy + 5.2, wz) - mats.origin;
+                let Some((sx, sy)) = project_world(rel, mats, sw, sh) else {
+                    continue;
+                };
+
+                let is_self_bubble = sb.speaker_id == ent.your_player_id || sb.speaker_name == "YOU";
+                let border_col = if is_self_bubble {
+                    gold_col
+                } else if sb.team == 0 {
+                    west_col
+                } else {
+                    east_col
+                };
+                let (snr_lbl, snr_col) = snr_badge(sb.snr_db);
+                let spk_short: String = sb.speaker_name.chars().take(16).collect();
+                let msg_short: String = sb.text.chars().take(52).collect();
+
+                let spk_w = HudBatch::text_width(&spk_short, hdr_sc);
+                let snr_w = HudBatch::text_width(&snr_lbl, 1.05 * ui) + 8.0 * ui;
+                let hdr_w = spk_w + 10.0 * ui + snr_w;
+                let msg_w = HudBatch::text_width(&msg_short, msg_sc);
+                let card_w = (hdr_w.max(msg_w) + 18.0 * ui).clamp(150.0 * ui, 430.0 * ui);
+                let card_h = 38.0 * ui;
+
+                let mut cx = (sx - card_w * 0.5).clamp(safe_min_x, (safe_max_x - card_w).max(safe_min_x));
+                let mut cy = (sy - card_h - 10.0 * ui).clamp(safe_min_y, (safe_max_y - card_h).max(safe_min_y));
+
+                // Avoid top-left telemetry & top-right minimap / brain inspector
+                if cfg.show_telemetry && cx < 428.0 * ui && cy < 166.0 * ui {
+                    cx = 430.0 * ui;
+                }
+                let right_guard_h = if cfg.show_brain_inspector { 442.0 * ui } else { 226.0 * ui };
+                if cx + card_w > sw - 256.0 * ui && cy < right_guard_h {
+                    cx = (sw - 258.0 * ui - card_w).max(safe_min_x);
+                }
+
+                // De-overlap against previously placed bubbles
+                for _ in 0..4 {
+                    let mut bumped = false;
+                    for &(px, py, pw, ph) in &placed {
+                        let overlap_x = cx < px + pw + 6.0 * ui && cx + card_w + 6.0 * ui > px;
+                        let overlap_y = cy < py + ph + 5.0 * ui && cy + card_h + 5.0 * ui > py;
+                        if overlap_x && overlap_y {
+                            if cy - (card_h + 6.0 * ui) >= safe_min_y {
+                                cy = py - card_h - 6.0 * ui;
+                            } else {
+                                cy = (py + ph + 6.0 * ui).min(safe_max_y - card_h);
+                            }
+                            bumped = true;
+                        }
+                    }
+                    if !bumped {
+                        break;
+                    }
+                }
+                placed.push((cx, cy, card_w, card_h));
+
+                // Crisp dark rounded-style card (beveled 2px inset corners + team border)
+                let bg = [0.06, 0.05, 0.14, 0.90];
+                let bev = 2.5 * ui;
+                b.rect(cx + bev, cy, card_w - 2.0 * bev, card_h, bg);
+                b.rect(cx, cy + bev, card_w, card_h - 2.0 * bev, bg);
+                b.rect_outline(cx + bev * 0.5, cy + bev * 0.5, card_w - bev, card_h - bev, 1.8 * ui, border_col);
+                // Top accent bar
+                b.rect(cx + bev, cy + 1.5 * ui, card_w - 2.0 * bev, 2.2 * ui, border_col);
+                // Subtle downward pointer notch if bubble is near speaker
+                if (sx - (cx + card_w * 0.5)).abs() < card_w * 0.65 && sy > cy + card_h {
+                    let tx = sx.clamp(cx + 12.0 * ui, cx + card_w - 12.0 * ui);
+                    b.rect(tx - 4.0 * ui, cy + card_h - 1.0 * ui, 8.0 * ui, 4.0 * ui, border_col);
+                    b.rect(tx - 2.0 * ui, cy + card_h + 2.5 * ui, 4.0 * ui, 3.0 * ui, border_col);
+                }
+
+                // Header: speaker name + SNR pill
+                b.text_shadow(cx + 9.0 * ui, cy + 7.0 * ui, hdr_sc, border_col, &spk_short);
+                let pill_x = cx + card_w - snr_w - 7.0 * ui;
+                let pill_y = cy + 5.5 * ui;
+                let pill_h = 12.5 * ui;
+                b.rect(
+                    pill_x,
+                    pill_y,
+                    snr_w,
+                    pill_h,
+                    [snr_col[0] * 0.22, snr_col[1] * 0.22, snr_col[2] * 0.22, 0.94],
+                );
+                b.rect_outline(pill_x, pill_y, snr_w, pill_h, 1.0 * ui, snr_col);
+                b.text(pill_x + 4.0 * ui, pill_y + 2.8 * ui, 1.05 * ui, snr_col, &snr_lbl);
+
+                // Message line
+                b.text_shadow(cx + 9.0 * ui, cy + 22.0 * ui, msg_sc, text_hi, &msg_short);
             }
         }
     }
@@ -558,8 +676,8 @@ pub fn build_hud(
     if cfg.show_telemetry {
         let tx = 14.0 * ui;
         let ty = 14.0 * ui;
-        let tw = 382.0 * ui;
-        let th = 114.0 * ui;
+        let tw = 408.0 * ui;
+        let th = 134.0 * ui;
         b.rect(tx, ty, tw, th, panel_bg);
         b.rect_outline(tx, ty, tw, th, 1.5 * ui, panel_border);
 
@@ -592,6 +710,11 @@ pub fn build_hud(
             } else {
                 format!("AI: SCRIPTED FALLBACK ({} BOTS) [N TOGGLE]", t.active_bots)
             };
+            let sparse_disp = if t.world_sparse_pct > 0.01 { t.world_sparse_pct } else { 100.0 };
+            let l6 = format!(
+                "ACOUSTIC {:.2}MS  SPARSE {:.0}%",
+                t.acoustic_ms, sparse_disp
+            );
             b.text_shadow(tx + 10.0 * ui, ty + 10.0 * ui, sc, gold_col, &l1);
             b.text_shadow(tx + 10.0 * ui, ty + 30.0 * ui, sc, text_hi, &l2);
             b.text_shadow(
@@ -612,6 +735,13 @@ pub fn build_hud(
                 sc,
                 if t.neural_bots_on { [0.32, 0.96, 0.88, 1.0] } else { text_dim },
                 &l5,
+            );
+            b.text_shadow(
+                tx + 10.0 * ui,
+                ty + 110.0 * ui,
+                sc,
+                if sparse_disp < 95.0 { [0.28, 0.96, 0.62, 1.0] } else { [0.76, 0.86, 1.0, 1.0] },
+                &l6,
             );
         }
 
@@ -717,7 +847,7 @@ pub fn build_hud(
             hy + 92.0 * ui,
             1.10 * ui,
             text_dim,
-            "1/2/3 ELEM  F1-F3 CLS  B BRAIN  T STYLE",
+            "1-3 ELEM  F1-F3 CLS  B BRAIN  ENTER CHAT",
         );
 
         // 5-Slot Spell Hotbar (right side of hero plate)
@@ -758,6 +888,134 @@ pub fn build_hud(
             if *cd > 0.01 {
                 let h = slot_sz * cd.clamp(0.0, 1.0);
                 b.rect(x, sy0 + slot_sz - h, slot_sz, h, [0.04, 0.03, 0.10, 0.72]);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 6. BOTTOM-LEFT ACOUSTIC TRANSCRIPT LOG (3 LINES MAX) + CHAT BOX
+    //    Anchored strictly above the action bar height so it never
+    //    overlaps top-left telemetry or the bottom-center hero plate!
+    // ------------------------------------------------------------------
+    {
+        let chat_x = 14.0 * ui;
+        let chat_w = 436.0 * ui;
+        let mut cursor_bottom = hy - 14.0 * ui;
+
+        if cfg.chat_open {
+            let inp_h = 30.0 * ui;
+            let inp_y = cursor_bottom - inp_h;
+            let mode_col = if cfg.chat_shout {
+                [1.00, 0.76, 0.24, 1.0]
+            } else {
+                [0.36, 0.88, 1.00, 1.0]
+            };
+            let mode_lbl = if cfg.chat_shout { "[SHOUT 1.0]" } else { "[WHISPER 0.25]" };
+
+            b.rect(chat_x, inp_y, chat_w, inp_h, [0.06, 0.05, 0.15, 0.94]);
+            b.rect_outline(chat_x, inp_y, chat_w, inp_h, 2.0 * ui, mode_col);
+
+            let msc = 1.20 * ui;
+            let mw = HudBatch::text_width(mode_lbl, msc) + 8.0 * ui;
+            b.rect(
+                chat_x + 5.0 * ui,
+                inp_y + 5.0 * ui,
+                mw,
+                inp_h - 10.0 * ui,
+                [mode_col[0] * 0.22, mode_col[1] * 0.22, mode_col[2] * 0.22, 0.95],
+            );
+            b.text(chat_x + 9.0 * ui, inp_y + 10.0 * ui, msc, mode_col, mode_lbl);
+
+            let max_chars = 32usize;
+            let shown_inp: String = if cfg.chat_input.chars().count() > max_chars {
+                cfg.chat_input
+                    .chars()
+                    .rev()
+                    .take(max_chars)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect()
+            } else {
+                cfg.chat_input.to_string()
+            };
+            let line = format!("{}_", shown_inp);
+            b.text_shadow(
+                chat_x + mw + 12.0 * ui,
+                inp_y + 10.0 * ui,
+                1.30 * ui,
+                text_hi,
+                &line,
+            );
+            let hint = "[TAB] VOL  [ESC]";
+            let hw = HudBatch::text_width(hint, 1.00 * ui);
+            b.text(
+                chat_x + chat_w - hw - 6.0 * ui,
+                inp_y - 11.0 * ui,
+                1.00 * ui,
+                text_dim,
+                hint,
+            );
+            cursor_bottom = inp_y - 16.0 * ui;
+        } else {
+            let hint_h = 18.0 * ui;
+            let hint_y = cursor_bottom - hint_h;
+            let hint_txt = "[ENTER] ACOUSTIC CHAT (SHOUT / WHISPER)";
+            let hw = HudBatch::text_width(hint_txt, 1.10 * ui) + 14.0 * ui;
+            b.rect(chat_x, hint_y, hw, hint_h, [0.06, 0.05, 0.14, 0.68]);
+            b.rect_outline(chat_x, hint_y, hw, hint_h, 1.0 * ui, panel_border);
+            b.text(chat_x + 7.0 * ui, hint_y + 5.0 * ui, 1.10 * ui, text_dim, hint_txt);
+            cursor_bottom = hint_y - 6.0 * ui;
+        }
+
+        if let Some(ent) = entities {
+            if !ent.speech_bubbles.is_empty() {
+                let row_h = 22.0 * ui;
+                let row_gap = 4.0 * ui;
+                let recent: Vec<&SpeechBubbleSnap> = ent.speech_bubbles.iter().rev().take(3).collect();
+                for sb in recent {
+                    let ry = cursor_bottom - row_h;
+                    // Never climb into top-left telemetry zone
+                    if ry < 275.0 * ui {
+                        break;
+                    }
+                    let (snr_lbl, snr_col) = snr_badge(sb.snr_db);
+                    let is_self = sb.speaker_id == ent.your_player_id || sb.speaker_name == "YOU";
+                    let spk_col = if is_self {
+                        gold_col
+                    } else if sb.team == 0 {
+                        west_col
+                    } else {
+                        east_col
+                    };
+                    let spk_short: String = sb.speaker_name.chars().take(13).collect();
+                    let msg_short: String = sb.text.chars().take(44).collect();
+
+                    b.rect(chat_x, ry, chat_w, row_h, [0.06, 0.05, 0.14, 0.82]);
+                    b.rect(chat_x, ry, 3.0 * ui, row_h, spk_col);
+
+                    let bsc = 1.05 * ui;
+                    let bw = HudBatch::text_width(&snr_lbl, bsc) + 7.0 * ui;
+                    b.rect(
+                        chat_x + 7.0 * ui,
+                        ry + 4.0 * ui,
+                        bw,
+                        row_h - 8.0 * ui,
+                        [snr_col[0] * 0.22, snr_col[1] * 0.22, snr_col[2] * 0.22, 0.94],
+                    );
+                    b.rect_outline(chat_x + 7.0 * ui, ry + 4.0 * ui, bw, row_h - 8.0 * ui, 1.0 * ui, snr_col);
+                    b.text(chat_x + 10.5 * ui, ry + 7.0 * ui, bsc, snr_col, &snr_lbl);
+
+                    let mut tx_x = chat_x + 12.0 * ui + bw;
+                    let tsc = 1.15 * ui;
+                    if !is_self {
+                        let spk_tag = format!("{}: ", spk_short);
+                        b.text_shadow(tx_x, ry + 6.5 * ui, tsc, spk_col, &spk_tag);
+                        tx_x += HudBatch::text_width(&spk_tag, tsc) + 2.0 * ui;
+                    }
+                    b.text_shadow(tx_x, ry + 6.5 * ui, tsc, text_hi, &msg_short);
+                    cursor_bottom = ry - row_gap;
+                }
             }
         }
     }
@@ -818,6 +1076,14 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
         ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
         '+' => [0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000],
         '#' => [0b01010, 0b11111, 0b01010, 0b01010, 0b11111, 0b01010, 0b00000],
+        '?' => [0b01110, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100],
+        ',' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00100, 0b00100, 0b01000],
+        '\'' => [0b00100, 0b00100, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000],
+        '"' => [0b01010, 0b01010, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000],
+        '=' => [0b00000, 0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000],
+        '<' => [0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010],
+        '|' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        '@' => [0b01110, 0b10001, 0b10111, 0b10101, 0b10110, 0b10000, 0b01110],
         _ => [0; 7],
     }
 }

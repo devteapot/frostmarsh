@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Live 3D Neural World with Shared-Latent RL Bots & Live Neural-Brain Inspector](models/unified_iter2/unified_live_1080p_hud.png)
+![Frostmarsh Live 512x512x4 (1M Voxels) Sparse Neural World with Live Acoustic Speech & Brain Inspector](models/unified_iter3_512/unified_live_1080p_hud.png)
 
 ---
 
@@ -52,24 +52,28 @@
   - `AcousticField3D` runs `256×256×4` 10-step 3D wave/occlusion conv in **`0.144 ms`** (FP16) with `-12 dB/wall` basalt occlusion and `85 dB` waterfall / `77 dB` wildfire noise floors.
   - Emergent unsupervised neural speech (`K=16` Gumbel-Softmax, zero symbol labels) lifts held-out coordination from `6.2%` (Silent) → **`61.3%`** (`91.2%` at High SNR) with `91.4%` symbol purity (`16/16` active), while learned adaptive volume cuts enemy eavesdropping by **`-31.5 pp`**.
   - A `24.8K`-param Viewer Interpreter decodes neural speech into SNR-degraded text at **`98.5%`** High-SNR accuracy (`0.035 ms`), and a `63.3K`-param `g_i` Goal Injector redirects frozen `BotPolicyNet` on **unseen human paraphrases** at **`96.8%` compliance**.
-- **Live 30 Hz Server Loop (GB10, `256×256×4`, 12 RL bots, Unix Socket IPC + `op=5` Brain Inspector):** `18.41 ms` World + `2.03 ms` Eco + `2.47 ms` RL Bots+Saliency (`mass_err = 0`, `energy_err = 0`).
+- **Live 1,048,576-Voxel (`512×512×4`) Sparse Neural World + Live Acoustics (Iteration 3):**
+  - `SparseWorldRunner` (`ml/sparse_world_runner.py`) with 128-tile bucketing & shrinking-halo (`halo=6`, FP32 `max_abs_diff = 0.0`) runs live **`512×512×4` (`1M` voxels)** on Spark GB10 in **`11.20 ms`** (`SPARSE 8%`, **`4.74×`** faster than `53.12 ms` dense!) with `mass_err = 0`, `energy_err = 0`, and **`100–122 KB/s`** QUIC wire traffic.
+  - `LiveAcousticEngine` (`ml/live_acoustics.py`, `acoustic_comm_live.pt`, `1.18 ms` @ `256²×4` / `1.49 ms` @ `512²×4`) runs live via `op=6` (`OP_ACOUSTIC_STEP`), streaming 3D-projected **SNR-tagged speech bubbles** (`+28 dB` clear replies vs. `-10 dB` waterfall/wall-muffled) and executing live human **`Enter`-key acoustic chat commands** (`SHOUT 1.0` / `WHISPER 0.25`) via `g_i` steering overrides.
+- **Live 30 Hz Server Loop (GB10, `512×512×4` 1M Voxels, 12 RL bots, Unix Socket IPC + `op=5/6`):** `11.20 ms` Sparse World + `11.39 ms` Eco + `4.71 ms` RL Bots+Saliency + `2.34 ms` Live Acoustics (`mass_err = 0`, `energy_err = 0`).
 
-### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC — Iteration 2 with Bot-Brain Inspector & Weather)
+### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
-| Render Mode | Resolution | p50 Frame Time | FPS |
-|---|---|---:|---:|
-| Pixel-2xSS + Vol3DGS + HUD + Brain Inspector | 1920×1080 | `7.80 ms` | **128.3 FPS** |
-| Clean 3D + Vol3DGS + HUD + Brain Inspector | 1920×1080 | `7.96 ms` | **125.6 FPS** |
-| Pixel-2xSS + Vol3DGS + HUD + Brain Inspector | 3840×2160 (4K) | `8.26 ms` | **121.0 FPS** |
-| Clean 3D + Vol3DGS + HUD + Brain Inspector | 3840×2160 (4K) | `9.60 ms` | **104.2 FPS** |
+| World Scale | Render Mode | Resolution | p50 Frame Time | FPS |
+|---|---|---|---:|---:|
+| `256×256×4` (262K vox) | Pixel-2xSS + Vol3DGS + Brain/Speech HUD | 1920×1080 | `7.80–8.54 ms` | **117–128 FPS** |
+| `256×256×4` (262K vox) | Pixel-2xSS + Vol3DGS + Brain/Speech HUD | 3840×2160 (4K) | `8.26–8.79 ms` | **114–121 FPS** |
+| **`512×512×4` (1.05M vox)** | **Pixel-2xSS + Vol3DGS + Brain/Speech HUD** | **1920×1080** | **`13.80–14.33 ms`** | **70–73 FPS** |
+| **`512×512×4` (1.05M vox)** | **Pixel-2xSS + Vol3DGS + Brain/Speech HUD** | **3840×2160 (4K)** | **`13.91 ms`** | **71.9 FPS** |
+| **`512×512×4` (1.05M vox)** | **Clean 3D + Vol3DGS + Brain/Speech HUD** | **3840×2160 (4K)** | **`15.73 ms`** | **63.6 FPS** |
 
 ---
 
 ## Visual Showcase
 
-| 3D Physical Acoustics & Emergent Neural Vocabulary (`256×256×4`) | Live 4-View 3D Orbit (`256×256×4`) |
+| Live `256×256×4` Human Chat → 3D SNR Speech Bubbles (`+17 dB` vs `-10 dB`) | 3D Physical Acoustics & Emergent Neural Vocabulary |
 |---|---|
-| ![3D Acoustics & Emergent Speech](models/acoustic_field_viz.png) | ![Unified 4-View Orbit](models/unified_iter2/unified_orbit_4view.png) |
+| ![Live Acoustic Speech Bubbles](models/unified_iter3_256/unified_live_1080p_hud.png) | ![3D Acoustics & Emergent Speech](models/acoustic_field_viz.png) |
 
 | Tier 1 (`512²` Painterly) | Tier 4 (Multi-Style Client Diffusion) |
 |---|---|
@@ -121,6 +125,7 @@ FROSTMARSH_SERVER=127.0.0.1:4433 ./play_frostmarsh.sh
 | `Space` | Dash |
 | `E` / `R` | Class signature ability & Ultimate |
 | `F1` / `F2` / `F3` | Switch class (**Frost Warden**, **Pyro Alchemist**, **Marsh Ranger**) |
+| **`Enter` / `Tab`** | **Open live in-world Acoustic Chat (`Tab` toggles SHOUT 1.0 ↔ WHISPER 0.25)** |
 | **`N`** | **Live hot-toggle Shared-Latent Neural-Z Bots ↔ Scripted Bots** |
 | **`B`** | **Cycle Live Neural-Brain Inspector (`4×4` `Z_world` heatmap + intents)** |
 | **`V`** / `F6` | **Cycle dynamic weather (`Clear Frost`, `Blizzard`, `Squall`, `Ember Storm`)** |

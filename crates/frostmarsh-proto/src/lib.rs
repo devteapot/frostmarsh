@@ -46,6 +46,7 @@ pub enum ClientReliable {
     CycleWeather,
     ResetWorld,
     RequestFullSync,
+    ChatCommand { text: String, volume: f32 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -173,6 +174,21 @@ pub struct KillFeedEntry {
     pub tick: u32,
 }
 
+/// Live 3D acoustic speech bubble (emergent bot callouts + human chat commands).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SpeechBubbleSnap {
+    pub speaker_id: u32,
+    pub speaker_name: String,
+    pub team: u8,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub snr_db: f32,
+    pub symbol_id: u8,
+    pub text: String,
+    pub tick: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TelemetrySnap {
     pub mode: String,
@@ -200,6 +216,10 @@ pub struct TelemetrySnap {
     pub wind_y: f32,
     pub score_west: u16,
     pub score_east: u16,
+    #[serde(default)]
+    pub acoustic_ms: f32,
+    #[serde(default)]
+    pub world_sparse_pct: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -222,6 +242,8 @@ pub enum ServerDatagram {
         bot_brains: Vec<BotBrainSnap>,
         #[serde(default)]
         kill_feed: Vec<KillFeedEntry>,
+        #[serde(default)]
+        speech_bubbles: Vec<SpeechBubbleSnap>,
     },
     /// 10 Hz single dirty 16×16×1 `A+` volumetric chunk at vertical layer `layer` (`0..grid_d`).
     APlusChunk {

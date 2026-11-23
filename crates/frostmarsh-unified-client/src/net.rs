@@ -76,6 +76,7 @@ pub struct LiveEntityState {
     pub telemetry: TelemetrySnap,
     pub bot_brains: Vec<BotBrainSnap>,
     pub kill_feed: Vec<KillFeedEntry>,
+    pub speech_bubbles: Vec<SpeechBubbleSnap>,
 }
 
 pub struct LiveWorldState {
@@ -222,7 +223,8 @@ impl QuicClientHandle {
                               events: Vec<CombatEvent>,
                               telemetry: TelemetrySnap,
                               bot_brains: Vec<BotBrainSnap>,
-                              kill_feed: Vec<KillFeedEntry>| {
+                              kill_feed: Vec<KillFeedEntry>,
+                              speech_bubbles: Vec<SpeechBubbleSnap>| {
             st.resize_if_needed(
                 telemetry.grid_w as usize,
                 telemetry.grid_h as usize,
@@ -253,6 +255,7 @@ impl QuicClientHandle {
                 telemetry,
                 bot_brains,
                 kill_feed,
+                speech_bubbles,
             });
         };
 
@@ -278,6 +281,7 @@ impl QuicClientHandle {
                             telemetry,
                             bot_brains,
                             kill_feed,
+                            speech_bubbles,
                         }) = decode_server_datagram(&bytes[1..])
                         {
                             let mut st = st_rel.lock().unwrap();
@@ -298,6 +302,7 @@ impl QuicClientHandle {
                                 telemetry,
                                 bot_brains,
                                 kill_feed,
+                                speech_bubbles,
                             );
                         }
                     } else if let Some(ServerReliable::Welcome {
@@ -384,6 +389,7 @@ impl QuicClientHandle {
                         telemetry,
                         bot_brains,
                         kill_feed,
+                        speech_bubbles,
                     } => {
                         let mut st = st_dg.lock().unwrap();
                         apply_snapshot(
@@ -403,6 +409,7 @@ impl QuicClientHandle {
                             telemetry,
                             bot_brains,
                             kill_feed,
+                            speech_bubbles,
                         );
                     }
                 }

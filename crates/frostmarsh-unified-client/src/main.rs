@@ -75,6 +75,9 @@ struct Args {
     /// Headless 10 Hz dirty-chunk observation window (seconds)
     #[arg(long, default_value_t = 4.0)]
     observe_secs: f64,
+    /// Optional chat command automatically sent 1.5s into headless observation (e.g. "freeze north bridge")
+    #[arg(long)]
+    test_chat: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -195,7 +198,21 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut dirty_samples = Vec::new();
     let t_obs = Instant::now();
     let mut last_tick = 0u64;
+    let mut test_chat_sent = false;
     while t_obs.elapsed().as_secs_f64() < args.observe_secs {
+        if !test_chat_sent && t_obs.elapsed().as_secs_f64() >= 1.5 {
+            if let Some(ref text) = args.test_chat {
+                let _ = rt.block_on(QuicClientHandle::send_reliable_on(
+                    &quic.conn,
+                    &ClientReliable::ChatCommand {
+                        text: text.clone(),
+                        volume: 1.0,
+                    },
+                ));
+                println!("[Unified] Sent headless --test-chat: {:?} (SHOUT 1.0)", text);
+            }
+            test_chat_sent = true;
+        }
         let (ft, dirty, snap_layers) = {
             let mut st = quic.state.lock().unwrap();
             let d = st.take_dirty_list();
@@ -286,6 +303,9 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 style_label: st.label,
                 fps: fps_1080,
                 rtt_ms: 1.2,
+                chat_open: false,
+                chat_input: "",
+                chat_shout: true,
             },
         );
         let (p50, p99, mean) = renderer.benchmark_gpu(
@@ -339,6 +359,9 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             style_label: style_main.label,
             fps: fps_1080,
             rtt_ms: 1.2,
+            chat_open: false,
+            chat_input: "",
+            chat_shout: true,
         },
     );
     let (rgba_main, _, _) = renderer.render_to_rgba(
@@ -406,6 +429,9 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     style_label: st.label,
                     fps: fps_1080,
                     rtt_ms: 1.2,
+                    chat_open: false,
+                    chat_input: "",
+                    chat_shout: true,
                 },
             ))
         } else {
@@ -479,6 +505,9 @@ struct InteractiveApp {
     brain_inspector_on: bool,
     brain_selected_idx: Option<usize>,
     selected_element: u8,
+    chat_open: bool,
+    chat_input: String,
+    chat_shout: bool,
     keys: HashSet<KeyCode>,
     mouse_pos: (f32, f32),
     mouse_left: bool,
@@ -531,6 +560,9 @@ impl InteractiveApp {
             brain_inspector_on: true,
             brain_selected_idx: None,
             selected_element: 0,
+            chat_open: false,
+            chat_input: String::new(),
+            chat_shout: true,
             keys: HashSet::new(),
             mouse_pos: (720.0, 450.0),
             mouse_left: false,
@@ -556,12 +588,14 @@ impl InteractiveApp {
         self.fps_ema = self.fps_ema * 0.90 + inst_fps * 0.10;
         let sim_time = self.start_time.elapsed().as_secs_f32();
 
-        // Camera keyboard orbit
-        if self.keys.contains(&KeyCode::KeyQ) {
-            self.camera.yaw -= 1.6 * dt;
-        }
-        if self.keys.contains(&KeyCode::KeyZ) {
-            self.camera.yaw += 1.6 * dt;
+        // Camera keyboard orbit (locked while typing in acoustic chat!)
+        if !self.chat_open {
+            if self.keys.contains(&KeyCode::KeyQ) {
+                self.camera.yaw -= 1.6 * dt;
+            }
+            if self.keys.contains(&KeyCode::KeyZ) {
+                self.camera.yaw += 1.6 * dt;
+            }
         }
 
         // Pull latest 3D volumetric A+ dirty chunks + entities from QUIC
@@ -626,10 +660,12 @@ impl InteractiveApp {
             if let Some(ref quic) = self.quic {
                 let mut f_in = 0.0f32;
                 let mut r_in = 0.0f32;
-                if self.keys.contains(&KeyCode::KeyW) { f_in += 1.0; }
-                if self.keys.contains(&KeyCode::KeyS) { f_in -= 1.0; }
-                if self.keys.contains(&KeyCode::KeyD) { r_in += 1.0; }
-                if self.keys.contains(&KeyCode::KeyA) { r_in -= 1.0; }
+                if !self.chat_open {
+                    if self.keys.contains(&KeyCode::KeyW) { f_in += 1.0; }
+                    if self.keys.contains(&KeyCode::KeyS) { f_in -= 1.0; }
+                    if self.keys.contains(&KeyCode::KeyD) { r_in += 1.0; }
+                    if self.keys.contains(&KeyCode::KeyA) { r_in -= 1.0; }
+                }
 
                 // Project camera forward/right onto XZ grid plane
                 let fwd_xz = Vec3::new(mats.fwd.x, 0.0, mats.fwd.z).normalize_or(Vec3::NEG_Z);
@@ -665,13 +701,13 @@ impl InteractiveApp {
                     move_y: move_v.z,
                     aim_x,
                     aim_y,
-                    dash: self.pending_dash || self.keys.contains(&KeyCode::Space),
-                    melee: self.mouse_right,
-                    cast_bolt: self.mouse_left,
+                    dash: !self.chat_open && (self.pending_dash || self.keys.contains(&KeyCode::Space)),
+                    melee: !self.chat_open && self.mouse_right,
+                    cast_bolt: !self.chat_open && self.mouse_left,
                     bolt_element: self.selected_element,
-                    carve_ice: self.pending_carve,
-                    cast_ability_e: self.pending_ability_e,
-                    cast_ultimate_r: self.pending_ult_r,
+                    carve_ice: !self.chat_open && self.pending_carve,
+                    cast_ability_e: !self.chat_open && self.pending_ability_e,
+                    cast_ultimate_r: !self.chat_open && self.pending_ult_r,
                     client_time_ms: now_ms,
                 };
                 self.pending_dash = false;
@@ -712,6 +748,9 @@ impl InteractiveApp {
                 style_label: style.label,
                 fps: self.fps_ema,
                 rtt_ms,
+                chat_open: self.chat_open,
+                chat_input: &self.chat_input,
+                chat_shout: self.chat_shout,
             },
         );
 
@@ -858,11 +897,58 @@ impl ApplicationHandler for InteractiveApp {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    if self.chat_open {
+                        if event.state == ElementState::Pressed {
+                            match code {
+                                KeyCode::Escape => {
+                                    self.chat_open = false;
+                                    self.chat_input.clear();
+                                }
+                                KeyCode::Tab => {
+                                    if !event.repeat {
+                                        self.chat_shout = !self.chat_shout;
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    self.chat_input.pop();
+                                }
+                                KeyCode::Enter | KeyCode::NumpadEnter => {
+                                    let msg = self.chat_input.trim().to_string();
+                                    if !msg.is_empty() {
+                                        if let Some(ref q) = self.quic {
+                                            let vol = if self.chat_shout { 1.0 } else { 0.25 };
+                                            q.send_reliable_detached(ClientReliable::ChatCommand {
+                                                text: msg,
+                                                volume: vol,
+                                            });
+                                        }
+                                    }
+                                    self.chat_input.clear();
+                                    self.chat_open = false;
+                                }
+                                _ => {
+                                    if let Some(ref txt) = event.text {
+                                        for ch in txt.chars() {
+                                            if ch.is_ascii() && !ch.is_ascii_control() && self.chat_input.len() < 64 {
+                                                self.chat_input.push(ch);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
                     if event.state == ElementState::Pressed {
                         self.keys.insert(code);
                         if !event.repeat {
                             match code {
                                 KeyCode::Escape => event_loop.exit(),
+                                KeyCode::Enter | KeyCode::NumpadEnter => {
+                                    self.chat_open = true;
+                                    self.chat_input.clear();
+                                    self.keys.clear();
+                                }
                                 KeyCode::Digit1 => self.selected_element = 0,
                                 KeyCode::Digit2 => self.selected_element = 1,
                                 KeyCode::Digit3 => self.selected_element = 2,

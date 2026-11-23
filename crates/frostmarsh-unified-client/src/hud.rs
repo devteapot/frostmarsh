@@ -37,6 +37,9 @@ pub struct HudConfig<'a> {
     pub chat_open: bool,
     pub chat_input: &'a str,
     pub chat_shout: bool,
+    pub show_scoreboard: bool,
+    pub audio_muted: bool,
+    pub audio_available: bool,
 }
 
 pub struct HudBatch {
@@ -374,19 +377,33 @@ pub fn build_hud(
         let ew = HudBatch::text_width(&e_str, sc);
         b.text_shadow(bx + banner_w - ew - 16.0 * ui, by + 10.0 * ui, sc, east_col, &e_str);
 
-        // Match timer + weather badge in center
-        let mins = ent.match_time_secs / 60;
-        let secs = ent.match_time_secs % 60;
+        // Match countdown timer + weather badge in center
         let w_label = match tel.weather_kind {
             WEATHER_BLIZZARD => "BLIZZARD",
             WEATHER_SQUALL => "SQUALL",
             WEATHER_EMBER => "EMBER DUSK",
             _ => "CLEAR FROST",
         };
-        let mid_str = format!("{:02}:{:02} {}", mins, secs, w_label);
+        let (mid_str, mid_col) = if ent.match_phase != MATCH_PHASE_ACTIVE {
+            (format!("NEXT {:02}S  {}", ent.match_time_left_s, w_label), gold_col)
+        } else {
+            let secs_disp = if ent.match_time_left_s > 0 || ent.sim_tick > 60 {
+                ent.match_time_left_s as u32
+            } else {
+                ent.match_time_secs
+            };
+            let mins = secs_disp / 60;
+            let secs = secs_disp % 60;
+            let col = if secs_disp <= 30 && ent.match_time_left_s > 0 {
+                [1.0, 0.42, 0.24, 1.0]
+            } else {
+                gold_col
+            };
+            (format!("{:02}:{:02} {}", mins, secs, w_label), col)
+        };
         let msc = 1.45 * ui;
         let mw = HudBatch::text_width(&mid_str, msc);
-        b.text_shadow(bx + (banner_w - mw) * 0.5, by + 9.0 * ui, msc, gold_col, &mid_str);
+        b.text_shadow(bx + (banner_w - mw) * 0.5, by + 9.0 * ui, msc, mid_col, &mid_str);
 
         // 3 Shrine ownership pips
         let pip_sz = 12.0 * ui;
@@ -845,9 +862,9 @@ pub fn build_hud(
         b.text(
             bar_x,
             hy + 92.0 * ui,
-            1.10 * ui,
+            1.05 * ui,
             text_dim,
-            "1-3 ELEM  F1-F3 CLS  B BRAIN  ENTER CHAT",
+            "1-3 ELEM  F1-F3 CLS  TAB SCORE  U SFX  ENTER CHAT",
         );
 
         // 5-Slot Spell Hotbar (right side of hero plate)
@@ -1017,6 +1034,271 @@ pub fn build_hud(
                     cursor_bottom = ry - row_gap;
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 6B. BOTTOM-RIGHT COMPACT SFX & SCOREBOARD STATUS PILLS
+    // ------------------------------------------------------------------
+    {
+        let pill_h = 20.0 * ui;
+        let py = sh - pill_h - 14.0 * ui;
+        let sc = 1.15 * ui;
+
+        let (sfx_lbl, sfx_col) = if !cfg.audio_available {
+            ("SFX:OFF", text_dim)
+        } else if cfg.audio_muted {
+            ("[U] SFX:MUTE", [1.0, 0.44, 0.34, 1.0])
+        } else {
+            ("[U] SFX:ON", [0.30, 0.96, 0.62, 1.0])
+        };
+        let sfx_w = HudBatch::text_width(sfx_lbl, sc) + 14.0 * ui;
+        let sfx_x = sw - sfx_w - 14.0 * ui;
+        b.rect(sfx_x, py, sfx_w, pill_h, [0.06, 0.05, 0.14, 0.82]);
+        b.rect_outline(sfx_x, py, sfx_w, pill_h, 1.2 * ui, sfx_col);
+        b.text_shadow(sfx_x + 7.0 * ui, py + 6.0 * ui, sc, sfx_col, sfx_lbl);
+
+        let tab_lbl = "[TAB] SCORE";
+        let tab_w = HudBatch::text_width(tab_lbl, sc) + 14.0 * ui;
+        let tab_x = sfx_x - tab_w - 8.0 * ui;
+        if tab_x > hx + hud_w + 8.0 * ui {
+            b.rect(tab_x, py, tab_w, pill_h, [0.06, 0.05, 0.14, 0.72]);
+            b.rect_outline(tab_x, py, tab_w, pill_h, 1.0 * ui, panel_border);
+            b.text(tab_x + 7.0 * ui, py + 6.0 * ui, sc, text_dim, tab_lbl);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 7. CENTERED VICTORY / MATCH SUMMARY BANNER (`match_phase != 0`)
+    // ------------------------------------------------------------------
+    if let Some(ent) = entities {
+        if ent.match_phase != MATCH_PHASE_ACTIVE && !cfg.show_scoreboard {
+            let (title, accent) = match ent.match_phase {
+                MATCH_PHASE_WEST_VICTORY => ("WEST VICTORY!", west_col),
+                MATCH_PHASE_EAST_VICTORY => ("EAST VICTORY!", east_col),
+                _ => ("MATCH DRAW!", gold_col),
+            };
+            let vb_w = (540.0 * ui).min(sw - 40.0 * ui);
+            let vb_h = 192.0 * ui;
+            let vx = (sw - vb_w) * 0.5;
+            let vy = ((sh - vb_h) * 0.5 - 24.0 * ui).max(82.0 * ui);
+
+            b.rect(vx, vy, vb_w, vb_h, [0.05, 0.04, 0.12, 0.94]);
+            b.rect(vx, vy, vb_w, 5.0 * ui, accent);
+            b.rect(vx, vy + vb_h - 3.0 * ui, vb_w, 3.0 * ui, accent);
+            b.rect_outline(vx, vy, vb_w, vb_h, 2.2 * ui, accent);
+
+            // Title
+            let tsc = 3.1 * ui;
+            let tw = HudBatch::text_width(title, tsc);
+            b.text_shadow(vx + (vb_w - tw) * 0.5, vy + 22.0 * ui, tsc, accent, title);
+
+            // Final Score
+            let score_line = format!(
+                "WEST {:03}   -   {:03} EAST",
+                ent.telemetry.score_west, ent.telemetry.score_east
+            );
+            let ssc = 2.0 * ui;
+            let sw_txt = HudBatch::text_width(&score_line, ssc);
+            b.text_shadow(vx + (vb_w - sw_txt) * 0.5, vy + 66.0 * ui, ssc, text_hi, &score_line);
+
+            // MVP Callout Strip
+            let mvp_box_x = vx + 26.0 * ui;
+            let mvp_box_y = vy + 102.0 * ui;
+            let mvp_box_w = vb_w - 52.0 * ui;
+            let mvp_box_h = 36.0 * ui;
+            b.rect(mvp_box_x, mvp_box_y, mvp_box_w, mvp_box_h, [0.13, 0.11, 0.24, 0.94]);
+            b.rect_outline(mvp_box_x, mvp_box_y, mvp_box_w, mvp_box_h, 1.5 * ui, gold_col);
+            let mvp_disp = if ent.mvp_name.is_empty() { "NONE" } else { ent.mvp_name.as_str() };
+            let mvp_line = format!("MATCH MVP: {}  ({} PTS)", mvp_disp, ent.mvp_score);
+            let msc = 1.55 * ui;
+            let mw = HudBatch::text_width(&mvp_line, msc);
+            b.text_shadow(
+                mvp_box_x + (mvp_box_w - mw) * 0.5,
+                mvp_box_y + 12.0 * ui,
+                msc,
+                gold_col,
+                &mvp_line,
+            );
+
+            // Next-match countdown
+            let cd_line = format!(
+                "NEXT MATCH IN {:02}S   |   HOLD [TAB] FOR SCOREBOARD",
+                ent.match_time_left_s
+            );
+            let csc = 1.3 * ui;
+            let cw = HudBatch::text_width(&cd_line, csc);
+            b.text_shadow(vx + (vb_w - cw) * 0.5, vy + 156.0 * ui, csc, text_dim, &cd_line);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 8. LIVE [TAB] 6v6 MATCH SCOREBOARD OVERLAY
+    // ------------------------------------------------------------------
+    if cfg.show_scoreboard {
+        if let Some(ent) = entities {
+            let mut west_team: Vec<&PlayerSnap> =
+                ent.players.iter().filter(|p| p.team == 0).collect();
+            let mut east_team: Vec<&PlayerSnap> =
+                ent.players.iter().filter(|p| p.team != 0).collect();
+            let sort_players = |a: &&PlayerSnap, b: &&PlayerSnap| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| b.kills.cmp(&a.kills))
+                    .then_with(|| a.id.cmp(&b.id))
+            };
+            west_team.sort_by(sort_players);
+            east_team.sort_by(sort_players);
+
+            let max_rows = west_team.len().max(east_team.len()).clamp(1, 7);
+            let row_h = 25.0 * ui;
+            let sb_w = (800.0 * ui).min(sw - 32.0 * ui);
+            let sb_h = (118.0 + max_rows as f32 * 25.0) * ui;
+            let sb_x = (sw - sb_w) * 0.5;
+            let max_sb_y = (hy - sb_h - 14.0 * ui).max(78.0 * ui);
+            let sb_y = ((sh - sb_h) * 0.5 - 12.0 * ui).clamp(78.0 * ui, max_sb_y);
+
+            // Sleek centered modal card
+            b.rect(sb_x, sb_y, sb_w, sb_h, [0.05, 0.04, 0.13, 0.94]);
+            b.rect(sb_x, sb_y, sb_w, 3.5 * ui, gold_col);
+            b.rect_outline(sb_x, sb_y, sb_w, sb_h, 2.0 * ui, panel_border);
+
+            let west_shrines = ent.shrines.iter().filter(|s| s.owner < 0).count();
+            let east_shrines = ent.shrines.iter().filter(|s| s.owner > 0).count();
+
+            // Header bar
+            let hdr_y = sb_y + 12.0 * ui;
+            let w_hdr = format!("WEST FROST  {:03} ({} SHR)", ent.telemetry.score_west, west_shrines);
+            let e_hdr = format!("({} SHR) {:03}  EAST EMBER", east_shrines, ent.telemetry.score_east);
+            let hsc = 1.65 * ui;
+            b.text_shadow(sb_x + 16.0 * ui, hdr_y, hsc, west_col, &w_hdr);
+            let ew = HudBatch::text_width(&e_hdr, hsc);
+            b.text_shadow(sb_x + sb_w - ew - 16.0 * ui, hdr_y, hsc, east_col, &e_hdr);
+
+            let clk_str = if ent.match_phase != MATCH_PHASE_ACTIVE {
+                format!("NEXT MATCH {:02}S", ent.match_time_left_s)
+            } else {
+                format!(
+                    "{:02}:{:02} LEFT",
+                    ent.match_time_left_s / 60,
+                    ent.match_time_left_s % 60
+                )
+            };
+            let cw = HudBatch::text_width(&clk_str, 1.55 * ui);
+            b.text_shadow(sb_x + (sb_w - cw) * 0.5, hdr_y + 1.0 * ui, 1.55 * ui, gold_col, &clk_str);
+
+            // Divider below header
+            let table_y = sb_y + 38.0 * ui;
+            b.rect(sb_x + 12.0 * ui, table_y - 4.0 * ui, sb_w - 24.0 * ui, 1.5 * ui, panel_border);
+
+            let col_gap = 14.0 * ui;
+            let half_w = (sb_w - 24.0 * ui - col_gap) * 0.5;
+            let left_x = sb_x + 12.0 * ui;
+            let right_x = left_x + half_w + col_gap;
+            // Center vertical divider
+            b.rect(
+                left_x + half_w + col_gap * 0.5 - 0.75 * ui,
+                table_y,
+                1.5 * ui,
+                sb_h - 74.0 * ui,
+                panel_border,
+            );
+
+            let teams_draw: [(&[&PlayerSnap], f32, [f32; 4]); 2] = [
+                (&west_team, left_x, west_col),
+                (&east_team, right_x, east_col),
+            ];
+            let neural_on = ent.telemetry.neural_bots_on;
+
+            for (team_list, tx, tcol) in teams_draw {
+                // Column labels
+                let csc = 1.05 * ui;
+                let off_cls = half_w * 0.41;
+                let off_lv = half_w * 0.53;
+                let off_kd = half_w * 0.62;
+                let off_scr = half_w * 0.76;
+                let off_tag = half_w * 0.87;
+
+                b.text(tx + 8.0 * ui, table_y + 2.0 * ui, csc, tcol, "NAME");
+                b.text(tx + off_cls, table_y + 2.0 * ui, csc, text_dim, "CLS");
+                b.text(tx + off_lv, table_y + 2.0 * ui, csc, text_dim, "LV");
+                b.text(tx + off_kd, table_y + 2.0 * ui, csc, text_dim, "K/D");
+                b.text(tx + off_scr, table_y + 2.0 * ui, csc, text_dim, "SCR");
+                b.text(tx + off_tag, table_y + 2.0 * ui, csc, text_dim, "TAG");
+
+                let mut ry = table_y + 18.0 * ui;
+                let rsc = 1.15 * ui;
+                for (ri, p) in team_list.iter().take(7).enumerate() {
+                    let is_self = p.id == ent.your_player_id;
+                    let row_bg = if is_self {
+                        [0.24, 0.20, 0.10, 0.88]
+                    } else if ri % 2 == 0 {
+                        [0.09, 0.08, 0.19, 0.78]
+                    } else {
+                        [0.07, 0.06, 0.15, 0.68]
+                    };
+                    b.rect(tx, ry, half_w, row_h - 2.0 * ui, row_bg);
+                    if is_self {
+                        b.rect(tx, ry, 3.0 * ui, row_h - 2.0 * ui, gold_col);
+                        b.rect_outline(tx, ry, half_w, row_h - 2.0 * ui, 1.0 * ui, gold_col);
+                    } else {
+                        b.rect(tx, ry, 2.5 * ui, row_h - 2.0 * ui, tcol);
+                    }
+
+                    let name_s: String = p.name.chars().take(12).collect();
+                    let (cls_s, cls_c) = match p.class_id {
+                        CLASS_WARDEN => ("WRD", [0.46, 0.90, 1.0, 1.0]),
+                        CLASS_ALCHEMIST => ("ALC", [1.0, 0.56, 0.22, 1.0]),
+                        _ => ("RNG", [0.44, 0.96, 0.58, 1.0]),
+                    };
+                    let lv_s = format!("L{}", p.level);
+                    let kd_s = format!("{}/{}", p.kills, p.deaths);
+                    let scr_s = format!("{}", p.score);
+                    let (tag_s, tag_c) = if !p.is_bot {
+                        ("HUMAN", gold_col)
+                    } else if neural_on {
+                        ("RL-Z", [0.24, 0.94, 0.92, 1.0])
+                    } else {
+                        ("BOT", text_dim)
+                    };
+
+                    let ty_txt = ry + 7.0 * ui;
+                    b.text_shadow(tx + 8.0 * ui, ty_txt, rsc, if is_self { gold_col } else { text_hi }, &name_s);
+                    b.text(tx + off_cls, ty_txt, rsc, cls_c, cls_s);
+                    b.text(tx + off_lv, ty_txt, rsc, text_dim, &lv_s);
+                    b.text(tx + off_kd, ty_txt, rsc, text_hi, &kd_s);
+                    b.text_shadow(tx + off_scr, ty_txt, rsc, gold_col, &scr_s);
+
+                    // Compact role badge pill
+                    let bsc = 0.95 * ui;
+                    let bw = HudBatch::text_width(tag_s, bsc) + 6.0 * ui;
+                    let bx_p = (tx + off_tag - 2.0 * ui).min(tx + half_w - bw - 3.0 * ui);
+                    let by_p = ry + 4.5 * ui;
+                    let bh_p = 13.5 * ui;
+                    b.rect(bx_p, by_p, bw, bh_p, [tag_c[0] * 0.22, tag_c[1] * 0.22, tag_c[2] * 0.22, 0.94]);
+                    b.rect_outline(bx_p, by_p, bw, bh_p, 1.0 * ui, tag_c);
+                    b.text(bx_p + 3.0 * ui, by_p + 3.2 * ui, bsc, tag_c, tag_s);
+
+                    ry += row_h;
+                }
+            }
+
+            // Footer: Shrine control + Match target
+            let foot_y = sb_y + sb_h - 26.0 * ui;
+            b.rect(sb_x + 12.0 * ui, foot_y - 5.0 * ui, sb_w - 24.0 * ui, 1.2 * ui, panel_border);
+            let mut sx_f = sb_x + 16.0 * ui;
+            for s in ent.shrines.iter().take(3) {
+                let scol = if s.owner < 0 { west_col } else if s.owner > 0 { east_col } else { [0.60, 0.60, 0.72, 1.0] };
+                b.rect(sx_f, foot_y + 2.0 * ui, 10.0 * ui, 10.0 * ui, scol);
+                b.rect_outline(sx_f, foot_y + 2.0 * ui, 10.0 * ui, 10.0 * ui, 1.0 * ui, text_hi);
+                sx_f += 14.0 * ui;
+                let sn: String = s.name.chars().take(14).collect();
+                b.text(sx_f, foot_y + 3.5 * ui, 1.05 * ui, scol, &sn);
+                sx_f += HudBatch::text_width(&sn, 1.05 * ui) + 20.0 * ui;
+            }
+            let goal_txt = "FIRST TO 500 PTS OR 5:00";
+            let gw_t = HudBatch::text_width(goal_txt, 1.05 * ui);
+            b.text(sb_x + sb_w - gw_t - 16.0 * ui, foot_y + 3.5 * ui, 1.05 * ui, text_dim, goal_txt);
         }
     }
 

@@ -653,6 +653,7 @@ struct PlayerEntity {
     xp: u16,
     kills: u16,
     deaths: u16,
+    score: u32,
     dash_until: u64,
     dash_cd: u64,
     melee_until: u64,
@@ -762,6 +763,10 @@ struct BotCommandOverride {
     expires_tick: u64,
 }
 
+const MATCH_DURATION_SECS: u16 = 300;
+const MATCH_SCORE_LIMIT: u16 = 500;
+const CELEBRATION_SECS: u16 = 10;
+
 struct GameState {
     grid_w: usize,
     grid_h: usize,
@@ -780,7 +785,12 @@ struct GameState {
     world_sparse_pct: f32,
     bot_rpc: Option<CudaRpcClient>,
     sim_tick: u64,
-    start_instant: Instant,
+    match_start_instant: Instant,
+    celebration_started: Option<Instant>,
+    match_phase: u8,
+    match_time_left_s: u16,
+    mvp_name: String,
+    mvp_score: u32,
     next_id: u32,
     next_event_id: u32,
     score_west: u16,
@@ -868,7 +878,12 @@ impl GameState {
             world_sparse_pct: 100.0,
             bot_rpc: if use_cuda { Some(CudaRpcClient::new(cuda_addr)) } else { None },
             sim_tick: 0,
-            start_instant: Instant::now(),
+            match_start_instant: Instant::now(),
+            celebration_started: None,
+            match_phase: MATCH_PHASE_ACTIVE,
+            match_time_left_s: MATCH_DURATION_SECS,
+            mvp_name: String::new(),
+            mvp_score: 0,
             next_id: 1,
             next_event_id: 1,
             score_west: 0,
@@ -1242,6 +1257,7 @@ impl GameState {
                 xp: 0,
                 kills: 0,
                 deaths: 0,
+                score: 0,
                 dash_until: 0,
                 dash_cd: 0,
                 melee_until: 0,
@@ -1331,6 +1347,7 @@ impl GameState {
             if let Some(aid) = attacker {
                 if let Some(a) = self.players.get_mut(&aid) {
                     a.kills += 1;
+                    a.score = a.score.saturating_add(10);
                     k_name = a.name.clone();
                     k_team = a.team;
                     let leveled = a.grant_xp(55);
@@ -1362,6 +1379,17 @@ impl GameState {
     }
 
     fn apply_input(&mut self, pid: u32, inp: &ClientInputDatagram) {
+        if self.match_phase != MATCH_PHASE_ACTIVE {
+            if let Some(p) = self.players.get_mut(&pid) {
+                if inp.seq > p.ack_input_seq || p.is_bot {
+                    p.ack_input_seq = inp.seq;
+                    p.echo_client_time_ms = inp.client_time_ms;
+                }
+                p.vx = 0.0;
+                p.vy = 0.0;
+            }
+            return;
+        }
         let tick = self.sim_tick;
         let gw = self.grid_w as f32;
         let gh = self.grid_h as f32;
@@ -1641,6 +1669,79 @@ impl GameState {
             p.oiled_until = 0;
             p.chilled_until = 0;
         }
+    }
+
+    fn reset_match(&mut self) {
+        let (w, h, d) = (self.grid_w, self.grid_h, self.grid_d);
+        self.volume = VolumeField::new_shattered_reach_3d(w, h, d);
+        self.eco.reset();
+        self.refresh_hazard_grids();
+        self.shrines = GameState::build_shrines(w, h);
+        self.score_west = 0;
+        self.score_east = 0;
+        self.match_phase = MATCH_PHASE_ACTIVE;
+        self.match_time_left_s = MATCH_DURATION_SECS;
+        self.match_start_instant = Instant::now();
+        self.celebration_started = None;
+        self.mvp_name.clear();
+        self.mvp_score = 0;
+        self.relic_carrier = None;
+        self.relic_x = (w as f32) * 0.50;
+        self.relic_y = (h as f32) * 0.50;
+        self.projectiles.clear();
+        self.rafts.clear();
+        self.events.clear();
+        self.kill_feed.clear();
+        self.speech_bubbles.clear();
+        self.bot_overrides.clear();
+        self.pending_chat = None;
+        self.weather_kind = WEATHER_CLEAR;
+
+        let pids: Vec<u32> = self.players.keys().copied().collect();
+        for pid in pids {
+            let team = self.players[&pid].team;
+            let (sx, sy, sz) = self.spawn_point(team, pid);
+            if let Some(p) = self.players.get_mut(&pid) {
+                let (mhp, mmp, mst, _) = PlayerEntity::class_stats(p.class_id, 1);
+                p.x = sx;
+                p.y = sy;
+                p.z = sz;
+                p.vx = 0.0;
+                p.vy = 0.0;
+                p.vz = 0.0;
+                p.aim_x = if p.team == 0 { 1.0 } else { -1.0 };
+                p.aim_y = 0.0;
+                p.level = 1;
+                p.xp = 0;
+                p.kills = 0;
+                p.deaths = 0;
+                p.score = 0;
+                p.max_hp = mhp;
+                p.hp = mhp;
+                p.max_mana = mmp;
+                p.mana = mmp;
+                p.max_stamina = mst;
+                p.stamina = mst;
+                p.dash_until = 0;
+                p.dash_cd = 0;
+                p.melee_until = 0;
+                p.melee_cd = 0;
+                p.bolt_cd = 0;
+                p.ability_e_cd = 0;
+                p.ult_r_cd = 0;
+                p.ult_until = 0;
+                p.shield_until = 0;
+                p.haste_until = 0;
+                p.oiled_until = 0;
+                p.chilled_until = 0;
+                p.carrying_relic = false;
+            }
+        }
+        for peer in self.peers.values_mut() {
+            peer.needs_full_sync = true;
+        }
+        self.push_event(5, (w as f32) * 0.5, (h as f32) * 0.5, 0, 2, "NEW MATCH STARTED!".into());
+        log::info!("Match cleanly reset ({}x{}x{}, {} players)", w, h, d, self.players.len());
     }
 
     fn step_bots(&mut self) {
@@ -1988,6 +2089,21 @@ impl GameState {
         self.speech_bubbles.retain(|(exp, _)| tick <= *exp);
         self.bot_overrides.retain(|_, ov| tick <= ov.expires_tick);
 
+        // Hold victory celebration state for 10 seconds, then cleanly reset for the next match
+        if self.match_phase != MATCH_PHASE_ACTIVE {
+            let celeb_elapsed = self
+                .celebration_started
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(CELEBRATION_SECS as u64);
+            self.match_time_left_s = CELEBRATION_SECS.saturating_sub(celeb_elapsed as u16);
+            if celeb_elapsed >= CELEBRATION_SECS as u64 {
+                self.reset_match();
+            }
+            return;
+        }
+        let elapsed_s = self.match_start_instant.elapsed().as_secs() as u16;
+        self.match_time_left_s = MATCH_DURATION_SECS.saturating_sub(elapsed_s);
+
         if self.pending_chat.is_some() || (tick % 3 == 0 && self.neural_bots_on) {
             self.step_acoustics_rpc();
         }
@@ -2259,12 +2375,31 @@ impl GameState {
         for (sx, sy, team, lbl) in shrine_events {
             if team == 0 { self.score_west = self.score_west.saturating_add(25); }
             else { self.score_east = self.score_east.saturating_add(25); }
+            for p in self.players.values_mut() {
+                if p.team == team && (p.x - sx).hypot(p.y - sy) <= 14.0 {
+                    p.score = p.score.saturating_add(25);
+                }
+            }
             self.push_event(3, sx, sy, 25, team, lbl);
         }
         if tick % 60 == 0 {
-            for s in &self.shrines {
-                if s.owner == -1 { self.score_west = self.score_west.saturating_add(2); }
-                else if s.owner == 1 { self.score_east = self.score_east.saturating_add(2); }
+            let owned: Vec<(f32, f32, u8)> = self
+                .shrines
+                .iter()
+                .filter_map(|s| {
+                    if s.owner == -1 { Some((s.x, s.y, 0u8)) }
+                    else if s.owner == 1 { Some((s.x, s.y, 1u8)) }
+                    else { None }
+                })
+                .collect();
+            for (sx, sy, team) in owned {
+                if team == 0 { self.score_west = self.score_west.saturating_add(2); }
+                else { self.score_east = self.score_east.saturating_add(2); }
+                for p in self.players.values_mut() {
+                    if p.team == team && (p.x - sx).hypot(p.y - sy) <= 18.0 {
+                        p.score = p.score.saturating_add(2);
+                    }
+                }
             }
         }
 
@@ -2280,6 +2415,7 @@ impl GameState {
                     else { self.score_east = self.score_east.saturating_add(100); }
                     if let Some(p) = self.players.get_mut(&cid) {
                         p.carrying_relic = false;
+                        p.score = p.score.saturating_add(100);
                         p.grant_xp(90);
                     }
                     self.relic_carrier = None;
@@ -2296,9 +2432,61 @@ impl GameState {
             .find(|p| (p.x - self.relic_x).hypot(p.y - self.relic_y) <= 3.6 && p.z < 1.55)
             .map(|p| (p.id, p.team, p.name.clone(), p.x, p.y))
         {
-            if let Some(p) = self.players.get_mut(&pid) { p.carrying_relic = true; }
+            if let Some(p) = self.players.get_mut(&pid) {
+                p.carrying_relic = true;
+                p.score = p.score.saturating_add(15);
+            }
             self.relic_carrier = Some(pid);
             self.push_event(4, px, py, 0, team, format!("{} TOOK RELIC!", name));
+        }
+
+        // Check 5-minute match timeout or 500-point early victory
+        if self.score_west >= MATCH_SCORE_LIMIT
+            || self.score_east >= MATCH_SCORE_LIMIT
+            || self.match_time_left_s == 0
+        {
+            self.match_phase = if self.score_west > self.score_east {
+                MATCH_PHASE_WEST_VICTORY
+            } else if self.score_east > self.score_west {
+                MATCH_PHASE_EAST_VICTORY
+            } else {
+                MATCH_PHASE_DRAW
+            };
+            let mut best_name = "NONE".to_string();
+            let mut best_metric = 0u32;
+            let mut best_kills = 0u16;
+            let mut best_is_human = false;
+            let mut best_id = u32::MAX;
+            for p in self.players.values() {
+                let metric = (p.kills as u32).saturating_mul(25).saturating_add(p.score);
+                let is_human = !p.is_bot;
+                let better = metric > best_metric
+                    || (metric == best_metric && p.kills > best_kills)
+                    || (metric == best_metric && p.kills == best_kills && is_human && !best_is_human)
+                    || (metric == best_metric && p.kills == best_kills && is_human == best_is_human && p.id < best_id);
+                if better {
+                    best_metric = metric;
+                    best_kills = p.kills;
+                    best_is_human = is_human;
+                    best_id = p.id;
+                    best_name = p.name.clone();
+                }
+            }
+            self.mvp_name = best_name;
+            self.mvp_score = best_metric;
+            self.celebration_started = Some(Instant::now());
+            self.match_time_left_s = CELEBRATION_SECS;
+            self.projectiles.clear();
+            let banner = match self.match_phase {
+                MATCH_PHASE_WEST_VICTORY => "WEST VICTORY!",
+                MATCH_PHASE_EAST_VICTORY => "EAST VICTORY!",
+                _ => "MATCH DRAW!",
+            };
+            self.push_event(5, gw * 0.5, gh * 0.5, 0, 2, banner.to_string());
+            log::info!(
+                "Match ended: {} (West {} - {} East) | MVP: {} ({} pts)",
+                banner, self.score_west, self.score_east, self.mvp_name, self.mvp_score
+            );
         }
     }
 
@@ -2354,6 +2542,7 @@ impl GameState {
                     ability_e_cd_frac: (p.ability_e_cd.saturating_sub(tick) as f32 / 120.0).clamp(0.0, 1.0),
                     ult_r_cd_frac: (p.ult_r_cd.saturating_sub(tick) as f32 / 360.0).clamp(0.0, 1.0),
                     ack_input_seq: p.ack_input_seq,
+                    score: p.score,
                 }
             })
             .collect();
@@ -2422,7 +2611,7 @@ impl GameState {
             acoustic_ms: self.acoustic_ms,
             world_sparse_pct: self.world_sparse_pct,
         };
-        let match_secs = self.start_instant.elapsed().as_secs() as u32;
+        let match_secs = self.match_start_instant.elapsed().as_secs() as u32;
         let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
         let speech_bubbles: Vec<SpeechBubbleSnap> =
             self.speech_bubbles.iter().map(|(_, b)| b.clone()).collect();
@@ -2447,6 +2636,10 @@ impl GameState {
                 bot_brains: self.bot_brains.clone(),
                 kill_feed: kill_feed.clone(),
                 speech_bubbles: speech_bubbles.clone(),
+                match_phase: self.match_phase,
+                match_time_left_s: self.match_time_left_s,
+                mvp_name: self.mvp_name.clone(),
+                mvp_score: self.mvp_score,
             };
             let raw = encode_server_datagram(&msg);
             total_bytes += raw.len() as u64;
@@ -2902,12 +3095,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 gs.push_event(5, mx, my, 0, 2, wname.to_string());
                             }
                             ClientReliable::ResetWorld => {
-                                let (w, h, d) = (gs.grid_w, gs.grid_h, gs.grid_d);
-                                gs.volume = VolumeField::new_shattered_reach_3d(w, h, d);
-                                gs.eco.reset();
-                                gs.rafts.clear();
-                                gs.shrines = GameState::build_shrines(w, h);
-                                for peer in gs.peers.values_mut() { peer.needs_full_sync = true; }
+                                gs.reset_match();
                             }
                             ClientReliable::RequestFullSync => {
                                 if let Some(peer) = gs.peers.get_mut(&pid) { peer.needs_full_sync = true; }

@@ -31,6 +31,11 @@ pub const WEATHER_BLIZZARD: u8 = 1;
 pub const WEATHER_SQUALL: u8 = 2;
 pub const WEATHER_EMBER: u8 = 3;
 
+pub const MATCH_PHASE_ACTIVE: u8 = 0;
+pub const MATCH_PHASE_WEST_VICTORY: u8 = 1;
+pub const MATCH_PHASE_EAST_VICTORY: u8 = 2;
+pub const MATCH_PHASE_DRAW: u8 = 3;
+
 #[inline]
 pub fn chunks_for_dim(dim: usize) -> usize {
     dim.div_ceil(CHUNK_SIZE)
@@ -100,6 +105,8 @@ pub struct PlayerSnap {
     pub ability_e_cd_frac: f32,
     pub ult_r_cd_frac: f32,
     pub ack_input_seq: u32,
+    #[serde(default)]
+    pub score: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -244,6 +251,14 @@ pub enum ServerDatagram {
         kill_feed: Vec<KillFeedEntry>,
         #[serde(default)]
         speech_bubbles: Vec<SpeechBubbleSnap>,
+        #[serde(default)]
+        match_phase: u8,
+        #[serde(default)]
+        match_time_left_s: u16,
+        #[serde(default)]
+        mvp_name: String,
+        #[serde(default)]
+        mvp_score: u32,
     },
     /// 10 Hz single dirty 16×16×1 `A+` volumetric chunk at vertical layer `layer` (`0..grid_d`).
     APlusChunk {

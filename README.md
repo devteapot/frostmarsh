@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Live 512x512x4 (1M Voxels) Sparse Neural World with Live Acoustic Speech & Brain Inspector](models/unified_iter3_512/unified_live_1080p_hud.png)
+![Frostmarsh Live 512x512x4 (1M Voxels) in 8.59ms with Dual-Scale BotPolicyNetV2-RL, Spatial Audio & Acoustic Speech](models/unified_iter4_512/unified_live_1080p_hud.png)
 
 ---
 
@@ -55,7 +55,11 @@
 - **Live 1,048,576-Voxel (`512×512×4`) Sparse Neural World + Live Acoustics (Iteration 3):**
   - `SparseWorldRunner` (`ml/sparse_world_runner.py`) with 128-tile bucketing & shrinking-halo (`halo=6`, FP32 `max_abs_diff = 0.0`) runs live **`512×512×4` (`1M` voxels)** on Spark GB10 in **`11.20 ms`** (`SPARSE 8%`, **`4.74×`** faster than `53.12 ms` dense!) with `mass_err = 0`, `energy_err = 0`, and **`100–122 KB/s`** QUIC wire traffic.
   - `LiveAcousticEngine` (`ml/live_acoustics.py`, `acoustic_comm_live.pt`, `1.18 ms` @ `256²×4` / `1.49 ms` @ `512²×4`) runs live via `op=6` (`OP_ACOUSTIC_STEP`), streaming 3D-projected **SNR-tagged speech bubbles** (`+28 dB` clear replies vs. `-10 dB` waterfall/wall-muffled) and executing live human **`Enter`-key acoustic chat commands** (`SHOUT 1.0` / `WHISPER 0.25`) via `g_i` steering overrides.
-- **Live 30 Hz Server Loop (GB10, `512×512×4` 1M Voxels, 12 RL bots, Unix Socket IPC + `op=5/6`):** `11.20 ms` Sparse World + `11.39 ms` Eco + `4.71 ms` RL Bots+Saliency + `2.34 ms` Live Acoustics (`mass_err = 0`, `energy_err = 0`).
+- **Iteration 4 — Conservation-Distilled `WorldModel` v3 & Dual-Scale `BotPolicyNetV2-RL`:**
+  - `WorldModel` v3 (`ml/train_world_v3.py`, `world_model_v3.pt`, [WORLD_V3_METRICS.json](models/WORLD_V3_METRICS.json)): Cut held-out projection firewall active rate by **`-76.6%`** (`22.27%` → **`5.21%`**) while beating v1 raw MAE by **`-23.1%`** and keeping `0.9906` `Z_world` cosine compatibility with `SparseWorldRunner` (`FP32 diff = 0.0`).
+  - Dual-Scale `BotPolicyNetV2-RL` (`ml/bot_policy_v2.py`, `ml/train_bot_rl_v2.py`, `bot_policy_v2_rl.pt`, [BOT_RL_V2_TOURNAMENT.json](models/BOT_RL_V2_TOURNAMENT.json), `215K` params, `0.71 ms` / 12 bots): Fuses fine `14`-cell + coarse `60`-cell `Z_world` ego-crops. In 24-match held-out `256×256×4` tournaments, it beats **Scripted Teacher `87.5%` (`21W–3L`, `73.7` vs. `47.0` combos/match)**, **RL v1 `95.8%` (`23W–1L`, `3×` less wildfire burn)**, **BC `100.0%` (`24W–0L`)**, and **Blind `100.0%` (`24W–0L`)**.
+  - **Procedural 3D Spatial Audio (`cpal` `src/audio.rs`) + 5-Min Match Loop & `Tab` Scoreboard:** Pure-Rust lock-free stereo DSP soundscape (panned waterfall/wildfire/weather ambience + **SNR-filtered neural-voice synth chirps**, `U`-key mute), `5:00` / `500`-pt match loop with MVP Victory banner, and **zero compiler warnings** across the entire Rust workspace.
+- **Live 30 Hz Server Loop (GB10, `512×512×4` 1M Voxels, `WorldModel` v3 + `BotPolicyNetV2-RL`, Unix Socket IPC + `op=5/6`):** **`8.59 ms` Sparse World (`SPARSE 3%`, `6.1×` faster than dense)** + `11.50 ms` Eco + `2.18 ms` Dual-Scale RL Bots+Saliency + `2.56 ms` Live Acoustics (`mass_err = 0`, `energy_err = 0`, `91 KB/s` wire).
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
@@ -125,7 +129,8 @@ FROSTMARSH_SERVER=127.0.0.1:4433 ./play_frostmarsh.sh
 | `Space` | Dash |
 | `E` / `R` | Class signature ability & Ultimate |
 | `F1` / `F2` / `F3` | Switch class (**Frost Warden**, **Pyro Alchemist**, **Marsh Ranger**) |
-| **`Enter` / `Tab`** | **Open live in-world Acoustic Chat (`Tab` toggles SHOUT 1.0 ↔ WHISPER 0.25)** |
+| **`Enter` / `Tab`** | **Open live Acoustic Chat (`Tab` toggles SHOUT/WHISPER while typing; hold `Tab` outside chat for 6v6 Scoreboard)** |
+| **`U`** | **Mute / unmute procedural 3D spatial audio & SNR-filtered voice synths** |
 | **`N`** | **Live hot-toggle Shared-Latent Neural-Z Bots ↔ Scripted Bots** |
 | **`B`** | **Cycle Live Neural-Brain Inspector (`4×4` `Z_world` heatmap + intents)** |
 | **`V`** / `F6` | **Cycle dynamic weather (`Clear Frost`, `Blizzard`, `Squall`, `Ember Storm`)** |

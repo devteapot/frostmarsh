@@ -14,6 +14,7 @@
 //! - Default (interactive): Native `winit 0.30` Metal / Vulkan playable client (`--server 100.116.218.113:4433`)
 //! - `--headless`: Automated 1080p/4K capture + GPU FPS + 10 Hz `256×256` dirty-chunk benchmark
 
+mod audio;
 mod camera;
 mod hud;
 mod mesh_gen;
@@ -24,6 +25,7 @@ mod renderer;
 mod surfel_gen;
 mod world_bridge;
 
+use crate::audio::{SfxKind, SpatialAudioEngine};
 use crate::camera::MobaCamera;
 use crate::hud::{build_hud, HudConfig};
 use crate::mesh_gen::StaticMeshBank;
@@ -36,7 +38,7 @@ use frostmarsh_proto::*;
 use glam::Vec3;
 use image::{ImageBuffer, Rgba};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -306,6 +308,9 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 chat_open: false,
                 chat_input: "",
                 chat_shout: true,
+                show_scoreboard: false,
+                audio_muted: true,
+                audio_available: false,
             },
         );
         let (p50, p99, mean) = renderer.benchmark_gpu(
@@ -362,6 +367,9 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             chat_open: false,
             chat_input: "",
             chat_shout: true,
+            show_scoreboard: false,
+            audio_muted: true,
+            audio_available: false,
         },
     );
     let (rgba_main, _, _) = renderer.render_to_rgba(
@@ -432,6 +440,9 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     chat_open: false,
                     chat_input: "",
                     chat_shout: true,
+                    show_scoreboard: false,
+                    audio_muted: true,
+                    audio_available: false,
                 },
             ))
         } else {
@@ -508,6 +519,12 @@ struct InteractiveApp {
     chat_open: bool,
     chat_input: String,
     chat_shout: bool,
+    audio: Option<SpatialAudioEngine>,
+    audio_muted: bool,
+    seen_proj_ids: HashSet<u32>,
+    seen_event_ids: VecDeque<u32>,
+    seen_bubble_ticks: HashMap<u32, u32>,
+    last_audio_sim_tick: u64,
     keys: HashSet<KeyCode>,
     mouse_pos: (f32, f32),
     mouse_left: bool,
@@ -534,6 +551,7 @@ impl InteractiveApp {
         let meshes = StaticMeshBank::build(1);
         let surfels = SurfelProtoBank::build();
         let style_clean = args.style == "clean";
+        let audio = SpatialAudioEngine::try_new();
         Self {
             args,
             rt,
@@ -563,6 +581,12 @@ impl InteractiveApp {
             chat_open: false,
             chat_input: String::new(),
             chat_shout: true,
+            audio,
+            audio_muted: false,
+            seen_proj_ids: HashSet::new(),
+            seen_event_ids: VecDeque::with_capacity(64),
+            seen_bubble_ticks: HashMap::new(),
+            last_audio_sim_tick: 0,
             keys: HashSet::new(),
             mouse_pos: (720.0, 450.0),
             mouse_left: false,
@@ -653,6 +677,101 @@ impl InteractiveApp {
             .unwrap_or_default();
         let sun_dir = Approach4Renderer::sun_dir(atmo);
         let mats = self.camera.compute_matrices(out_w as f32, out_h as f32, sun_dir);
+
+        // Update Real-Time 3D Spatial Audio Engine (ambient waterfalls/wildfire/wind + spatial one-shots + SNR voice chirps)
+        if let Some(ref audio) = self.audio {
+            let fwd_xz = Vec3::new(mats.fwd.x, 0.0, mats.fwd.z).normalize_or(Vec3::NEG_Z);
+            let right_xz = Vec3::new(-fwd_xz.z, 0.0, fwd_xz.x);
+            let listener_pos = self.camera.target;
+
+            let spatial_pan_gain = |src: Vec3, ref_dist: f32| -> (f32, f32) {
+                let d = src - listener_pos;
+                let dist = d.length();
+                let pan = Vec3::new(d.x, 0.0, d.z)
+                    .normalize_or(Vec3::ZERO)
+                    .dot(right_xz)
+                    .clamp(-1.0, 1.0);
+                let gain = (1.0 / (1.0 + (dist / ref_dist).powi(2))).clamp(0.0, 1.0);
+                (pan, gain)
+            };
+
+            let (nearest_wf, nearby_fire) = self.world.sample_ambient_audio_sources(listener_pos);
+            let (wf_gain, wf_pan) = if let Some((wp, _)) = nearest_wf {
+                let (p, g) = spatial_pan_gain(wp, 38.0);
+                (g, p)
+            } else {
+                (0.0, 0.0)
+            };
+            let (fire_gain, fire_pan) = if let Some((fp, inten)) = nearby_fire {
+                let (p, g) = spatial_pan_gain(fp, 34.0);
+                ((g * (inten / 16.0).clamp(0.20, 1.0)).clamp(0.0, 1.0), p)
+            } else {
+                (0.0, 0.0)
+            };
+            let wind_mag = atmo.wind_x.hypot(atmo.wind_y);
+            audio.update_ambient(wf_gain, wf_pan, fire_gain, fire_pan, atmo.weather_kind, wind_mag);
+
+            if let Some(ref ent) = entities {
+                if ent.sim_tick != self.last_audio_sim_tick {
+                    if ent.sim_tick < self.last_audio_sim_tick {
+                        self.seen_proj_ids.clear();
+                        self.seen_event_ids.clear();
+                        self.seen_bubble_ticks.clear();
+                    }
+                    self.last_audio_sim_tick = ent.sim_tick;
+
+                    // New elemental projectile casts
+                    let mut active_projs = HashSet::with_capacity(ent.projectiles.len());
+                    for pr in &ent.projectiles {
+                        active_projs.insert(pr.id);
+                        if !self.seen_proj_ids.contains(&pr.id) {
+                            let (wx, wz) = self.world.grid_to_world_xz(pr.x, pr.y);
+                            let wy = self.world.sample_3d_y(pr.x, pr.y, pr.z);
+                            let (pan, gain) = spatial_pan_gain(Vec3::new(wx, wy, wz), 32.0);
+                            let kind = match pr.element % 3 {
+                                0 => SfxKind::FireCast,
+                                1 => SfxKind::FrostCast,
+                                _ => SfxKind::OilCast,
+                            };
+                            audio.trigger_sfx(kind, (pr.id & 0xFF) as u8, gain * 0.72, pan);
+                        }
+                    }
+                    self.seen_proj_ids = active_projs;
+
+                    // New combat / combo / kill / shrine / relic events
+                    for ev in &ent.events {
+                        if !self.seen_event_ids.contains(&ev.id) {
+                            self.seen_event_ids.push_back(ev.id);
+                            while self.seen_event_ids.len() > 64 {
+                                self.seen_event_ids.pop_front();
+                            }
+                            let (wx, wz) = self.world.grid_to_world_xz(ev.x, ev.y);
+                            let wy = self.world.sample_ground_y(ev.x, ev.y);
+                            let (pan, gain) = spatial_pan_gain(Vec3::new(wx, wy, wz), 46.0);
+                            match ev.kind {
+                                1 => audio.trigger_sfx(SfxKind::KillChord, 0, gain.max(0.32) * 0.85, pan),
+                                2 => audio.trigger_sfx(SfxKind::SteamCombo, (ev.id & 0xFF) as u8, gain.max(0.22) * 0.88, pan),
+                                3 | 4 => audio.trigger_sfx(SfxKind::ShrineOrRelic, 0, gain.max(0.45) * 0.80, pan),
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    // New 3D Acoustic Speech Bubbles -> SNR-Filtered Neural-Voice Synth Chirps!
+                    for sb in &ent.speech_bubbles {
+                        if self.seen_bubble_ticks.get(&sb.speaker_id).copied() != Some(sb.tick) {
+                            self.seen_bubble_ticks.insert(sb.speaker_id, sb.tick);
+                            let (wx, wz) = self.world.grid_to_world_xz(sb.x, sb.y);
+                            let wy = self.world.sample_3d_y(sb.x, sb.y, sb.z);
+                            let (pan, dist_g) = spatial_pan_gain(Vec3::new(wx, wy, wz), 52.0);
+                            let gain = dist_g.max(0.36) * 0.90;
+                            let sym = sb.symbol_id.wrapping_add((sb.speaker_id & 0x0F) as u8);
+                            audio.trigger_voice_chirp(sym, sb.snr_db, gain, pan);
+                        }
+                    }
+                }
+            }
+        }
 
         // Send 30 Hz inputs to server (camera-basis WASD + exact mouse-ray aiming!)
         if self.last_input_send.elapsed() >= Duration::from_millis(33) {
@@ -751,6 +870,9 @@ impl InteractiveApp {
                 chat_open: self.chat_open,
                 chat_input: &self.chat_input,
                 chat_shout: self.chat_shout,
+                show_scoreboard: !self.chat_open && self.keys.contains(&KeyCode::Tab),
+                audio_muted: self.audio_muted,
+                audio_available: self.audio.is_some(),
             },
         );
 
@@ -959,6 +1081,13 @@ impl ApplicationHandler for InteractiveApp {
                                 KeyCode::KeyT => self.style_clean = !self.style_clean,
                                 KeyCode::KeyL => self.layer_slice_mode = (self.layer_slice_mode + 1) % 3,
                                 KeyCode::KeyH => self.show_hud = !self.show_hud,
+                                KeyCode::KeyU => {
+                                    if let Some(ref audio) = self.audio {
+                                        self.audio_muted = audio.toggle_mute();
+                                    } else {
+                                        self.audio_muted = !self.audio_muted;
+                                    }
+                                }
                                 KeyCode::F4 => self.show_telemetry = !self.show_telemetry,
                                 KeyCode::F1 => {
                                     if let Some(ref q) = self.quic {

@@ -77,6 +77,10 @@ pub struct LiveEntityState {
     pub bot_brains: Vec<BotBrainSnap>,
     pub kill_feed: Vec<KillFeedEntry>,
     pub speech_bubbles: Vec<SpeechBubbleSnap>,
+    pub match_phase: u8,
+    pub match_time_left_s: u16,
+    pub mvp_name: String,
+    pub mvp_score: u32,
 }
 
 pub struct LiveWorldState {
@@ -224,7 +228,11 @@ impl QuicClientHandle {
                               telemetry: TelemetrySnap,
                               bot_brains: Vec<BotBrainSnap>,
                               kill_feed: Vec<KillFeedEntry>,
-                              speech_bubbles: Vec<SpeechBubbleSnap>| {
+                              speech_bubbles: Vec<SpeechBubbleSnap>,
+                              match_phase: u8,
+                              match_time_left_s: u16,
+                              mvp_name: String,
+                              mvp_score: u32| {
             st.resize_if_needed(
                 telemetry.grid_w as usize,
                 telemetry.grid_h as usize,
@@ -256,6 +264,10 @@ impl QuicClientHandle {
                 bot_brains,
                 kill_feed,
                 speech_bubbles,
+                match_phase,
+                match_time_left_s,
+                mvp_name,
+                mvp_score,
             });
         };
 
@@ -282,6 +294,10 @@ impl QuicClientHandle {
                             bot_brains,
                             kill_feed,
                             speech_bubbles,
+                            match_phase,
+                            match_time_left_s,
+                            mvp_name,
+                            mvp_score,
                         }) = decode_server_datagram(&bytes[1..])
                         {
                             let mut st = st_rel.lock().unwrap();
@@ -303,6 +319,10 @@ impl QuicClientHandle {
                                 bot_brains,
                                 kill_feed,
                                 speech_bubbles,
+                                match_phase,
+                                match_time_left_s,
+                                mvp_name,
+                                mvp_score,
                             );
                         }
                     } else if let Some(ServerReliable::Welcome {
@@ -390,6 +410,10 @@ impl QuicClientHandle {
                         bot_brains,
                         kill_feed,
                         speech_bubbles,
+                        match_phase,
+                        match_time_left_s,
+                        mvp_name,
+                        mvp_score,
                     } => {
                         let mut st = st_dg.lock().unwrap();
                         apply_snapshot(
@@ -410,6 +434,10 @@ impl QuicClientHandle {
                             bot_brains,
                             kill_feed,
                             speech_bubbles,
+                            match_phase,
+                            match_time_left_s,
+                            mvp_name,
+                            mvp_score,
                         );
                     }
                 }

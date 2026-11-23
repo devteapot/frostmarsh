@@ -36,6 +36,10 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from bot_policy import ACTION_OUT_DIM, BOT_FEAT_DIM, INSPECT_OUT_DIM, BotPolicyNet  # noqa: E402
+try:
+    from bot_policy_v2 import BotPolicyNetV2  # type: ignore  # noqa: E402
+except Exception:
+    BotPolicyNetV2 = None  # type: ignore[assignment]
 from model import EcosystemModel, WorldModel  # noqa: E402
 
 try:
@@ -307,13 +311,21 @@ class InferenceEngine:
         self.eco_model.load_state_dict(_load_state_dict(eco_pt))
         self.eco_model.to(self.device)
 
-        self.bot_policy: BotPolicyNet | None = None
+        self.bot_policy: Any = None
         if bot_pt.exists():
-            bp = BotPolicyNet().eval()
-            bp.load_state_dict(_load_state_dict(bot_pt))
-            bp.to(self.device)
-            self.bot_policy = bp
-            print(f"[gpu_infer_daemon] Loaded Shared-Latent BotPolicyNet from {bot_pt}", flush=True)
+            sd = _load_state_dict(bot_pt)
+            if BotPolicyNetV2 is not None and any(k.startswith("fine_adapter.") for k in sd):
+                bp = BotPolicyNetV2().eval()
+                bp.load_state_dict(sd)
+                bp.to(self.device)
+                self.bot_policy = bp
+                print(f"[gpu_infer_daemon] Loaded Dual-Scale BotPolicyNetV2 from {bot_pt}", flush=True)
+            else:
+                bp = BotPolicyNet().eval()
+                bp.load_state_dict(sd)
+                bp.to(self.device)
+                self.bot_policy = bp
+                print(f"[gpu_infer_daemon] Loaded Shared-Latent BotPolicyNet from {bot_pt}", flush=True)
 
         self.use_sparse_world: bool = bool(use_sparse_world and SparseWorldRunner is not None)
         self._sparse_runners: dict[tuple[int, int, int], _SparseWorldAdapter] = {}

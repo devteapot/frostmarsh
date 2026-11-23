@@ -221,6 +221,7 @@ pub struct ChunkCache {
     pub surfels: Vec<ChunkSurfelItem>,
     pub volumetrics: Vec<ChunkVolItem>,
     pub fire_hotspots: Vec<(Vec3, f32)>,
+    pub waterfall_points: Vec<Vec3>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -507,7 +508,13 @@ impl LiveApproach4World {
             surfels: Vec::with_capacity(64),
             volumetrics: Vec::with_capacity(64),
             fire_hotspots: Vec::with_capacity(2),
+            waterfall_points: Vec::with_capacity(4),
         };
+
+        let mut wf_sum = Vec3::ZERO;
+        let mut wf_cnt = 0.0f32;
+        let mut l2_fire_sum = Vec3::ZERO;
+        let mut l2_fire_cnt = 0.0f32;
 
         let is_solid_l2 = |gx: isize, gy: isize| -> bool {
             if gx < 0 || gy < 0 || gx >= gw as isize || gy >= gh as isize {
@@ -630,29 +637,37 @@ impl LiveApproach4World {
                 }
 
                 // Billowing 3D waterfall splash mist at the base of the cascade!
-                if waterfall_edge && j0 < 0.65 {
-                    cache.volumetrics.push(ChunkVolItem {
-                        world_pos: Vec3::new(wx, 1.15 + j1 * 0.9, wz),
-                        radius: 1.55 + j1 * 0.65,
-                        height_stretch: 1.25,
-                        color: [0.82, 0.94, 1.0],
-                        alpha: 0.56,
-                        kind: 2.0,
-                        phase: j0 * 16.0,
-                    });
+                if waterfall_edge {
+                    wf_sum += Vec3::new(wx, 2.2, wz);
+                    wf_cnt += 1.0;
+                    if j0 < 0.65 {
+                        cache.volumetrics.push(ChunkVolItem {
+                            world_pos: Vec3::new(wx, 1.15 + j1 * 0.9, wz),
+                            radius: 1.55 + j1 * 0.65,
+                            height_stretch: 1.25,
+                            color: [0.82, 0.94, 1.0],
+                            alpha: 0.56,
+                            kind: 2.0,
+                            phase: j0 * 16.0,
+                        });
+                    }
                 }
 
                 // Burning Layer 2 Timber Skybridge / Oil Cascade -> Soft Volumetric Fire!
-                if c.burning && j0 < 0.55 {
-                    cache.volumetrics.push(ChunkVolItem {
-                        world_pos: Vec3::new(wx, top_y + 0.85, wz),
-                        radius: 0.85 + j1 * 0.45,
-                        height_stretch: 1.85,
-                        color: [1.35, 0.50, 0.10],
-                        alpha: 0.76,
-                        kind: 0.0,
-                        phase: j0 * 15.0,
-                    });
+                if c.burning {
+                    l2_fire_sum += Vec3::new(wx, top_y + 0.85, wz);
+                    l2_fire_cnt += 1.0;
+                    if j0 < 0.55 {
+                        cache.volumetrics.push(ChunkVolItem {
+                            world_pos: Vec3::new(wx, top_y + 0.85, wz),
+                            radius: 0.85 + j1 * 0.45,
+                            height_stretch: 1.85,
+                            color: [1.35, 0.50, 0.10],
+                            alpha: 0.76,
+                            kind: 0.0,
+                            phase: j0 * 15.0,
+                        });
+                    }
                 }
 
                 // Highland Snow-Pine Surfels perched up on Layer 2 plateaus!
@@ -677,6 +692,12 @@ impl LiveApproach4World {
                     });
                 }
             }
+        }
+        if wf_cnt > 0.0 {
+            cache.waterfall_points.push(wf_sum / wf_cnt);
+        }
+        if l2_fire_cnt > 0.0 {
+            cache.fire_hotspots.push((l2_fire_sum / l2_fire_cnt, l2_fire_cnt));
         }
         self.chunks_l2[ci] = cache;
     }
@@ -843,6 +864,7 @@ impl LiveApproach4World {
             surfels: Vec::with_capacity(128),
             volumetrics: Vec::with_capacity(64),
             fire_hotspots: Vec::with_capacity(4),
+            waterfall_points: Vec::new(),
         };
 
         // 1. Smoothed terrain grid
@@ -1146,6 +1168,42 @@ impl LiveApproach4World {
         let xi = (gx.floor() as i32).clamp(0, (self.grid_w - 1) as i32) as usize;
         let yi = (gy.floor() as i32).clamp(0, (self.grid_h - 1) as i32) as usize;
         self.height_grid[yi * self.grid_w + xi].max(0.08)
+    }
+
+    /// Samples the nearest 3D waterfall centroid and nearby weighted wildfire centroid for spatial audio.
+    /// Returns `(nearest_waterfall: Option<(world_pos, dist)>, nearby_fire: Option<(world_pos, intensity)>)`.
+    pub fn sample_ambient_audio_sources(
+        &self,
+        listener_pos: Vec3,
+    ) -> (Option<(Vec3, f32)>, Option<(Vec3, f32)>) {
+        let mut best_wf: Option<(Vec3, f32)> = None;
+        for ch in &self.chunks_l2 {
+            for &wp in &ch.waterfall_points {
+                let d = wp.distance(listener_pos);
+                if best_wf.map_or(true, |(_, bd)| d < bd) {
+                    best_wf = Some((wp, d));
+                }
+            }
+        }
+
+        let mut fire_pos_sum = Vec3::ZERO;
+        let mut fire_weight_sum = 0.0f32;
+        for ch in self.chunks.iter().chain(self.chunks_l2.iter()) {
+            for &(fp, inten) in &ch.fire_hotspots {
+                let d = fp.distance(listener_pos);
+                if d < 72.0 {
+                    let w = inten / (1.0 + (d / 18.0).powi(2));
+                    fire_pos_sum += fp * w;
+                    fire_weight_sum += w;
+                }
+            }
+        }
+        let nearby_fire = if fire_weight_sum > 0.05 {
+            Some((fire_pos_sum / fire_weight_sum, fire_weight_sum))
+        } else {
+            None
+        };
+        (best_wf, nearby_fire)
     }
 
     /// Map authoritative 3D layer altitude `gz` (`1.0=ground`, `2.0=Highland/Skybridge`) into world Y!

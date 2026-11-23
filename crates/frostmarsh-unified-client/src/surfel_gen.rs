@@ -32,6 +32,7 @@ pub struct SplatRef {
 pub const SURFEL_PROTO_COUNT: usize = 7;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
 pub enum SurfelProtoKind {
     PineCanopy = 0,
     SnowPine = 1,

@@ -1565,6 +1565,193 @@ pub fn assemble_live_frame(
             });
             push_light(Vec3::new(wx, py, wz), 9.0, lcol);
         }
+
+        // Live 3D Volumetric Physical Actuator Beams, Cryo Fields, Matter Streams & Shockwaves!
+        for (p_idx, pulse) in ent.actuator_pulses.iter().enumerate() {
+            let (wx0, wz0) = world.grid_to_world_xz(pulse.x0, pulse.y0);
+            let wy0 = world.sample_3d_y(pulse.x0, pulse.y0, pulse.z0) + 1.35;
+            let (wx1, wz1) = world.grid_to_world_xz(pulse.x1, pulse.y1);
+            let wy1 = world.sample_3d_y(pulse.x1, pulse.y1, pulse.z1) + 1.10;
+            let p0 = Vec3::new(wx0, wy0, wz0);
+            let p1 = Vec3::new(wx1, wy1, wz1);
+            let beam_vec = p1 - p0;
+            let beam_len = beam_vec.length();
+            let focus_r = pulse.focus_radius.clamp(1.5, 8.5);
+            let seed = pulse.x0 * 0.73 + pulse.y0 * 1.19 + pulse.x1 * 0.41 + pulse.y1 * 0.89 + p_idx as f32 * 2.1;
+
+            // Orthogonal horizontal axis for cones, droplets & rings
+            let dir_xz = Vec3::new(beam_vec.x, 0.0, beam_vec.z).normalize_or(Vec3::X);
+            let perp_xz = Vec3::new(-dir_xz.z, 0.0, dir_xz.x);
+
+            // 1. Focused Heat Beam (thermal_flux > 0.2): orange-gold plasma beam + glowing core impact sphere
+            if pulse.thermal_flux > 0.2 {
+                let inten = pulse.thermal_flux.clamp(0.2, 1.0);
+                let steps = ((beam_len / 1.45).ceil() as usize).clamp(4, 16);
+                for s in 1..=steps {
+                    let t = s as f32 / steps as f32;
+                    let wpos = p0.lerp(p1, t);
+                    let rel = wpos - origin;
+                    let rad = (0.34 + 0.24 * inten) * (0.72 + 0.46 * t);
+                    vol_splats.push(VolSplat {
+                        pos_rad: [rel.x, rel.y, rel.z, rad],
+                        color_alpha: [1.45, 0.72 + 0.22 * (1.0 - t), 0.14, (0.66 + 0.22 * inten).min(0.90)],
+                        params: [1.15, 0.0, seed + s as f32 * 1.7, 0.35],
+                    });
+                }
+                let rel_end = p1 - origin;
+                // Outer scorching flare scaled by focus_radius
+                vol_splats.push(VolSplat {
+                    pos_rad: [rel_end.x, rel_end.y + 0.25, rel_end.z, focus_r * (0.44 + 0.18 * inten)],
+                    color_alpha: [1.40, 0.54, 0.10, (0.64 + 0.18 * inten).min(0.86)],
+                    params: [1.30, 0.0, seed + 21.0, 0.2],
+                });
+                // Glowing incandescent impact core sphere
+                vol_splats.push(VolSplat {
+                    pos_rad: [rel_end.x, rel_end.y + 0.20, rel_end.z, focus_r * (0.24 + 0.10 * inten)],
+                    color_alpha: [1.35, 0.96, 0.44, 0.88],
+                    params: [1.0, 3.0, seed + 31.0, 0.0],
+                });
+                push_light(
+                    p1 + Vec3::new(0.0, 0.8, 0.0),
+                    (focus_r * 2.8).clamp(8.0, 18.0),
+                    [1.15 * inten, 0.56 * inten, 0.16 * inten],
+                );
+            }
+
+            // 2. Cryo Field (thermal_flux < -0.2): crisp ice-cyan crystalline cone & cloud splats
+            if pulse.thermal_flux < -0.2 {
+                let inten = (-pulse.thermal_flux).clamp(0.2, 1.0);
+                let steps = ((beam_len / 1.85).ceil() as usize).clamp(4, 12);
+                for s in 1..=steps {
+                    let t = s as f32 / steps as f32;
+                    let ang = seed + s as f32 * 2.39996;
+                    let cone_spread = focus_r * 0.42 * t;
+                    let jitter = perp_xz * (ang.cos() * cone_spread) + Vec3::new(0.0, ang.sin() * cone_spread * 0.28, 0.0);
+                    let rel = (p0.lerp(p1, t) + jitter) - origin;
+                    let is_crystal = s % 2 == 0;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [rel.x, rel.y, rel.z, (0.34 + focus_r * 0.18 * t) * (0.75 + 0.30 * inten)],
+                        color_alpha: if is_crystal {
+                            [0.40, 0.92, 1.20, (0.60 + 0.24 * inten).min(0.86)]
+                        } else {
+                            [0.68, 0.96, 1.08, (0.48 + 0.20 * inten).min(0.72)]
+                        },
+                        params: [if is_crystal { 1.15 } else { 0.90 }, if is_crystal { 3.0 } else { 2.0 }, seed + s as f32 * 1.9, 0.2],
+                    });
+                }
+                // Crystalline impact cloud ring scaled by focus_radius
+                for k in 0..6 {
+                    let ang = (k as f32 / 6.0) * std::f32::consts::TAU + seed * 0.4;
+                    let rr = focus_r * 0.44;
+                    let wpos = p1 + Vec3::new(ang.cos() * rr, 0.25 + (k % 2) as f32 * 0.35, ang.sin() * rr);
+                    let rel = wpos - origin;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [rel.x, rel.y, rel.z, focus_r * (0.24 + 0.10 * inten)],
+                        color_alpha: [0.46, 0.94, 1.18, (0.54 + 0.22 * inten).min(0.80)],
+                        params: [1.05, if k % 2 == 0 { 3.0 } else { 2.0 }, seed + k as f32 * 2.3, 0.15],
+                    });
+                }
+                push_light(
+                    p1 + Vec3::new(0.0, 0.8, 0.0),
+                    (focus_r * 2.6).clamp(8.0, 16.0),
+                    [0.34 * inten, 0.82 * inten, 1.15 * inten],
+                );
+            }
+
+            // 3A. Matter Stream — Oil (sp_oil > 0.2): dark-violet glossy droplets
+            if pulse.sp_oil > 0.2 {
+                let inten = pulse.sp_oil.clamp(0.2, 1.0);
+                let steps = ((beam_len / 1.75).ceil() as usize).clamp(4, 10);
+                for s in 1..=steps {
+                    let t = s as f32 / steps as f32;
+                    let arc_y = (t * std::f32::consts::PI).sin() * (1.1 + beam_len * 0.07);
+                    let wobble = (seed + s as f32 * 3.1).sin() * (0.25 + focus_r * 0.10 * t);
+                    let wpos = p0.lerp(p1, t) + Vec3::new(0.0, arc_y, 0.0) + perp_xz * wobble;
+                    let rel = wpos - origin;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [rel.x, rel.y, rel.z, 0.34 + 0.26 * inten],
+                        color_alpha: [0.34, 0.12, 0.54, (0.70 + 0.18 * inten).min(0.88)],
+                        params: [1.0, 3.0, seed + s as f32 * 2.7, 0.0],
+                    });
+                }
+                for k in 0..4 {
+                    let ang = (k as f32 / 4.0) * std::f32::consts::TAU + seed;
+                    let rr = focus_r * 0.40;
+                    let rel = (p1 + Vec3::new(ang.cos() * rr, 0.15, ang.sin() * rr)) - origin;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [rel.x, rel.y, rel.z, 0.42 + focus_r * 0.12],
+                        color_alpha: [0.28, 0.10, 0.46, (0.68 + 0.18 * inten).min(0.86)],
+                        params: [0.85, 3.0, seed + k as f32 * 4.1, 0.0],
+                    });
+                }
+            }
+
+            // 3B. Matter Stream — Water (sp_water > 0.2): azure mist stream + spray cloud
+            if pulse.sp_water > 0.2 {
+                let inten = pulse.sp_water.clamp(0.2, 1.0);
+                let steps = ((beam_len / 1.9).ceil() as usize).clamp(4, 10);
+                for s in 1..=steps {
+                    let t = s as f32 / steps as f32;
+                    let wobble = (seed + s as f32 * 2.1).cos() * (0.30 + focus_r * 0.14 * t);
+                    let rel = (p0.lerp(p1, t) + perp_xz * wobble) - origin;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [rel.x, rel.y, rel.z, 0.42 + focus_r * 0.15 * t],
+                        color_alpha: [0.26, 0.76, 1.08, (0.50 + 0.22 * inten).min(0.76)],
+                        params: [1.0, 2.0, seed + s as f32 * 1.6, 0.3],
+                    });
+                }
+                let rel_end = p1 - origin;
+                vol_splats.push(VolSplat {
+                    pos_rad: [rel_end.x, rel_end.y + 0.4, rel_end.z, focus_r * (0.42 + 0.15 * inten)],
+                    color_alpha: [0.34, 0.82, 1.12, (0.52 + 0.20 * inten).min(0.74)],
+                    params: [1.10, 2.0, seed + 13.0, 0.3],
+                });
+            }
+
+            // 3C. Matter Stream — Smoke (sp_smoke > 0.2): billowing gray-indigo smokescreen puffs
+            if pulse.sp_smoke > 0.2 {
+                let inten = pulse.sp_smoke.clamp(0.2, 1.0);
+                for k in 0..7 {
+                    let ang = (k as f32 / 7.0) * std::f32::consts::TAU + seed * 0.7;
+                    let rr = if k == 0 { 0.0 } else { focus_r * (0.28 + 0.28 * ((k % 3) as f32 * 0.5)) };
+                    let wpos = if k >= 5 {
+                        p0.lerp(p1, 0.55 + (k - 5) as f32 * 0.20)
+                    } else {
+                        p1 + Vec3::new(ang.cos() * rr, 0.45 + (k % 3) as f32 * 0.45, ang.sin() * rr)
+                    };
+                    let rel = wpos - origin;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [rel.x, rel.y, rel.z, focus_r * (0.30 + 0.16 * inten)],
+                        color_alpha: [0.30, 0.31, 0.44, (0.42 + 0.20 * inten).min(0.66)],
+                        params: [1.10, 1.0, seed + k as f32 * 3.3, 0.45],
+                    });
+                }
+            }
+
+            // 4. Kinetic Impulse (impulse > 0.2): translucent expanding shockwave ring splats around (x1, y1, z1)
+            if pulse.impulse > 0.2 {
+                let inten = pulse.impulse.clamp(0.2, 1.0);
+                let wave_phase = (sim_time * 3.6 + seed * 0.25).fract();
+                let ring_r = (focus_r * 0.45 + wave_phase * (focus_r * 0.85 + 2.4)).max(1.2);
+                let ring_col = if pulse.team == 0 {
+                    [0.64, 0.92, 1.18]
+                } else {
+                    [1.18, 0.80, 0.52]
+                };
+                let ring_alpha = ((1.0 - wave_phase * 0.65) * (0.48 + 0.30 * inten)).clamp(0.18, 0.78);
+                let ring_n = 12usize;
+                for k in 0..ring_n {
+                    let ang = (k as f32 / ring_n as f32) * std::f32::consts::TAU + wave_phase * 0.6;
+                    let wpos = p1 + Vec3::new(ang.cos() * ring_r, 0.25, ang.sin() * ring_r);
+                    let rel = wpos - origin;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [rel.x, rel.y, rel.z, 0.42 + 0.34 * inten],
+                        color_alpha: [ring_col[0], ring_col[1], ring_col[2], ring_alpha],
+                        params: [0.68, 3.0, seed + k as f32 * 0.8, 0.0],
+                    });
+                }
+            }
+        }
     }
 
     // Back-to-front depth sort ONLY the compact soft volumetric splats (~300–1200) for clean alpha compositing!

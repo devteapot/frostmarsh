@@ -1,0 +1,403 @@
+{
+  "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "checkpoint": "/content/world_model_3d_v4.pt",
+  "model_class": "WorldModel3D",
+  "arch": {
+    "in_ch": 18,
+    "out_ch": 17,
+    "width": 48,
+    "num_res": 5,
+    "z_flux_ch": 5,
+    "z_flux_names": [
+      "flux_z_water",
+      "flux_z_oil",
+      "flux_z_steam",
+      "flux_z_smoke",
+      "heat_z"
+    ],
+    "vertical_mixing": "Conv3d(48, 48, kernel_size=(3,1,1), padding=(1,0,0)) + zero-init vert_gamma"
+  },
+  "n_params_v3": 112817,
+  "n_params_v4": 123766,
+  "param_overhead_abs": 10949,
+  "param_overhead_pct": 9.71,
+  "init_v3_parity_max_abs_diff": 0.0,
+  "train_steps": 1800,
+  "train_time_s": 69.25,
+  "learned_vert_gamma_abs_mean": 0.00872,
+  "horizontal_eval_256x256x4": {
+    "world_model_v3_2d": {
+      "proj_active_pct": 5.217,
+      "proj_active_cell_scaled_2e3_pct": 18.625,
+      "donor_clamp_cell_pct": 7.92,
+      "heat_clamp_cell_pct": 1.906,
+      "rxn_clamp_cell_pct": 6.102,
+      "raw_mse_vs_teacher": 0.00256,
+      "raw_mae_vs_teacher": 0.004545,
+      "proj_mse_vs_teacher": 0.002502,
+      "proj_mae_vs_teacher": 0.003665,
+      "flux_mae_vs_teacher": 0.000891,
+      "heat_mae_vs_teacher": 0.031139,
+      "rxn_mae_vs_teacher": 0.001123,
+      "z_world_cosine_sim_to_v3": 1.0,
+      "z_world_mse_to_v3": 0.0,
+      "g1_3d_max_rel_mass_drift_50t": 1.150884118927664e-07,
+      "g1_3d_max_rel_energy_drift_50t": 2.1620952270491076e-07
+    },
+    "world_model_3d_v4": {
+      "proj_active_pct": 5.245,
+      "proj_active_cell_scaled_2e3_pct": 18.713,
+      "donor_clamp_cell_pct": 7.918,
+      "heat_clamp_cell_pct": 1.935,
+      "rxn_clamp_cell_pct": 6.129,
+      "raw_mse_vs_teacher": 0.002553,
+      "raw_mae_vs_teacher": 0.004543,
+      "proj_mse_vs_teacher": 0.002494,
+      "proj_mae_vs_teacher": 0.003651,
+      "flux_mae_vs_teacher": 0.000885,
+      "heat_mae_vs_teacher": 0.03117,
+      "rxn_mae_vs_teacher": 0.001117,
+      "z_world_cosine_sim_to_v3": 0.999991,
+      "z_world_mse_to_v3": 1.6e-05,
+      "g1_3d_max_rel_mass_drift_50t": 1.2065314693000302e-07,
+      "g1_3d_max_rel_energy_drift_50t": 1.0979928051887002e-07
+    }
+  },
+  "vertical_3d_eval_256x256x4": {
+    "world_model_v3_2d": {
+      "gravity_water": {
+        "mae": 0.00595,
+        "rmse": 0.017461,
+        "r2": -0.13135,
+        "active_mae": 0.018949,
+        "active_r2": -0.5093
+      },
+      "gravity_oil": {
+        "mae": 0.000587,
+        "rmse": 0.005823,
+        "r2": -0.01028,
+        "active_mae": 0.034242,
+        "active_r2": -1.35807
+      },
+      "gravity_all": {
+        "mae": 0.003269,
+        "rmse": 0.013016,
+        "r2": -0.06731,
+        "active_mae": 0.019792,
+        "active_r2": -0.53964
+      },
+      "buoyancy_steam": {
+        "mae": 0.003167,
+        "rmse": 0.018829,
+        "r2": -0.0291,
+        "active_mae": 0.041463,
+        "active_r2": -0.5509
+      },
+      "buoyancy_smoke": {
+        "mae": 0.001196,
+        "rmse": 0.007453,
+        "r2": -0.02644,
+        "active_mae": 0.027049,
+        "active_r2": -1.13208
+      },
+      "buoyancy_all": {
+        "mae": 0.002181,
+        "rmse": 0.014319,
+        "r2": -0.02376,
+        "active_mae": 0.036358,
+        "active_r2": -0.57678
+      },
+      "vertical_heat": {
+        "mae": 0.001385,
+        "rmse": 0.00397,
+        "r2": -0.00144,
+        "active_mae": 0.057613,
+        "active_r2": -0.0252
+      },
+      "all_mass_flux": {
+        "mae": 0.002725,
+        "rmse": 0.013683,
+        "r2": -0.00158,
+        "active_mae": 0.024317,
+        "active_r2": -0.01115
+      },
+      "mean_r2_grav_buoy_heat": -0.03084
+    },
+    "v3_2d_latent_probe": {
+      "gravity_water": {
+        "mae": 0.00718,
+        "rmse": 0.015034,
+        "r2": 0.16135,
+        "active_mae": 0.013859,
+        "active_r2": 0.15207
+      },
+      "gravity_oil": {
+        "mae": 0.004515,
+        "rmse": 0.00819,
+        "r2": -0.99829,
+        "active_mae": 0.028784,
+        "active_r2": -0.89445
+      },
+      "gravity_all": {
+        "mae": 0.005847,
+        "rmse": 0.012106,
+        "r2": 0.07672,
+        "active_mae": 0.014682,
+        "active_r2": 0.09766
+      },
+      "buoyancy_steam": {
+        "mae": 0.014016,
+        "rmse": 0.023415,
+        "r2": -0.59139,
+        "active_mae": 0.03784,
+        "active_r2": -0.34323
+      },
+      "buoyancy_smoke": {
+        "mae": 0.00998,
+        "rmse": 0.015504,
+        "r2": -3.44175,
+        "active_mae": 0.026719,
+        "active_r2": -1.13409
+      },
+      "buoyancy_all": {
+        "mae": 0.011998,
+        "rmse": 0.019857,
+        "r2": -0.96874,
+        "active_mae": 0.033901,
+        "active_r2": -0.39436
+      },
+      "vertical_heat": {
+        "mae": 0.023481,
+        "rmse": 0.045238,
+        "r2": -129.02937,
+        "active_mae": 0.138844,
+        "active_r2": -10.02439
+      },
+      "all_mass_flux": {
+        "mae": 0.008923,
+        "rmse": 0.016445,
+        "r2": -0.44669,
+        "active_mae": 0.019932,
+        "active_r2": 0.24197
+      },
+      "mean_r2_grav_buoy_heat": -43.30713
+    },
+    "world_model_3d_v4": {
+      "gravity_water": {
+        "mae": 0.003872,
+        "rmse": 0.007571,
+        "r2": 0.78732,
+        "active_mae": 0.004728,
+        "active_r2": 0.92165
+      },
+      "gravity_oil": {
+        "mae": 0.001011,
+        "rmse": 0.003343,
+        "r2": 0.66697,
+        "active_mae": 0.010783,
+        "active_r2": 0.72168
+      },
+      "gravity_all": {
+        "mae": 0.002442,
+        "rmse": 0.005852,
+        "r2": 0.78423,
+        "active_mae": 0.005062,
+        "active_r2": 0.90985
+      },
+      "buoyancy_steam": {
+        "mae": 0.002835,
+        "rmse": 0.009101,
+        "r2": 0.75957,
+        "active_mae": 0.015971,
+        "active_r2": 0.74708
+      },
+      "buoyancy_smoke": {
+        "mae": 0.001295,
+        "rmse": 0.003772,
+        "r2": 0.73713,
+        "active_mae": 0.008389,
+        "active_r2": 0.71152
+      },
+      "buoyancy_all": {
+        "mae": 0.002065,
+        "rmse": 0.006966,
+        "r2": 0.75771,
+        "active_mae": 0.013286,
+        "active_r2": 0.74878
+      },
+      "vertical_heat": {
+        "mae": 0.000594,
+        "rmse": 0.001274,
+        "r2": 0.89688,
+        "active_mae": 0.017133,
+        "active_r2": 0.82694
+      },
+      "all_mass_flux": {
+        "mae": 0.002254,
+        "rmse": 0.006433,
+        "r2": 0.77859,
+        "active_mae": 0.007308,
+        "active_r2": 0.8849
+      },
+      "mean_r2_grav_buoy_heat": 0.81294
+    }
+  },
+  "latency_fp16": {
+    "256x256x4_fp16": {
+      "world_model_v3_2d": {
+        "p50_ms": 1.706,
+        "p95_ms": 1.714,
+        "mean_ms": 1.707
+      },
+      "world_model_3d_v4": {
+        "p50_ms": 2.241,
+        "p95_ms": 2.249,
+        "mean_ms": 2.241
+      },
+      "overhead_p50_ms": 0.535,
+      "overhead_p50_pct": 31.36
+    },
+    "512x512x4_fp16": {
+      "world_model_v3_2d": {
+        "p50_ms": 11.167,
+        "p95_ms": 11.18,
+        "mean_ms": 11.167
+      },
+      "world_model_3d_v4": {
+        "p50_ms": 13.91,
+        "p95_ms": 13.922,
+        "mean_ms": 13.911
+      },
+      "overhead_p50_ms": 2.743,
+      "overhead_p50_pct": 24.56
+    }
+  },
+  "history": [
+    {
+      "step": 200,
+      "elapsed_s": 6.2,
+      "train_phys": 0.32662,
+      "train_proj": 0.16794,
+      "train_vert": 0.0,
+      "val_horiz_proj_active_pct": 5.548,
+      "val_horiz_raw_mae": 0.004852,
+      "val_vert_grav_r2": 0.20484,
+      "val_vert_buoy_r2": 0.40327,
+      "val_vert_heat_r2": -0.44348,
+      "val_vert_mean_r2": 0.05488,
+      "vert_gamma_abs_mean": 0.00752
+    },
+    {
+      "step": 400,
+      "elapsed_s": 13.8,
+      "train_phys": 0.26329,
+      "train_proj": 0.16094,
+      "train_vert": 0.0,
+      "val_horiz_proj_active_pct": 5.555,
+      "val_horiz_raw_mae": 0.004858,
+      "val_vert_grav_r2": 0.51362,
+      "val_vert_buoy_r2": 0.58812,
+      "val_vert_heat_r2": -1.54138,
+      "val_vert_mean_r2": -0.14655,
+      "vert_gamma_abs_mean": 0.00753
+    },
+    {
+      "step": 600,
+      "elapsed_s": 21.5,
+      "train_phys": 1.80246,
+      "train_proj": 1.81445,
+      "train_vert": 9.24567,
+      "val_horiz_proj_active_pct": 5.555,
+      "val_horiz_raw_mae": 0.004862,
+      "val_vert_grav_r2": 0.62577,
+      "val_vert_buoy_r2": 0.60442,
+      "val_vert_heat_r2": -1.2497,
+      "val_vert_mean_r2": -0.0065,
+      "vert_gamma_abs_mean": 0.0068
+    },
+    {
+      "step": 800,
+      "elapsed_s": 29.1,
+      "train_phys": 0.23726,
+      "train_proj": 0.14397,
+      "train_vert": 0.0,
+      "val_horiz_proj_active_pct": 5.557,
+      "val_horiz_raw_mae": 0.004865,
+      "val_vert_grav_r2": 0.69044,
+      "val_vert_buoy_r2": 0.67292,
+      "val_vert_heat_r2": 0.11004,
+      "val_vert_mean_r2": 0.49113,
+      "vert_gamma_abs_mean": 0.00728
+    },
+    {
+      "step": 1000,
+      "elapsed_s": 36.7,
+      "train_phys": 0.20191,
+      "train_proj": 0.1283,
+      "train_vert": 0.0,
+      "val_horiz_proj_active_pct": 5.567,
+      "val_horiz_raw_mae": 0.004872,
+      "val_vert_grav_r2": 0.81785,
+      "val_vert_buoy_r2": 0.69489,
+      "val_vert_heat_r2": 0.49485,
+      "val_vert_mean_r2": 0.6692,
+      "vert_gamma_abs_mean": 0.00777
+    },
+    {
+      "step": 1200,
+      "elapsed_s": 44.4,
+      "train_phys": 0.86319,
+      "train_proj": 0.79773,
+      "train_vert": 1.17507,
+      "val_horiz_proj_active_pct": 5.578,
+      "val_horiz_raw_mae": 0.004878,
+      "val_vert_grav_r2": 0.84571,
+      "val_vert_buoy_r2": 0.70815,
+      "val_vert_heat_r2": 0.69792,
+      "val_vert_mean_r2": 0.75059,
+      "vert_gamma_abs_mean": 0.00829
+    },
+    {
+      "step": 1400,
+      "elapsed_s": 52.0,
+      "train_phys": 0.23392,
+      "train_proj": 0.15255,
+      "train_vert": 0.0,
+      "val_horiz_proj_active_pct": 5.59,
+      "val_horiz_raw_mae": 0.004883,
+      "val_vert_grav_r2": 0.86223,
+      "val_vert_buoy_r2": 0.73841,
+      "val_vert_heat_r2": 0.8565,
+      "val_vert_mean_r2": 0.81905,
+      "vert_gamma_abs_mean": 0.00852
+    },
+    {
+      "step": 1600,
+      "elapsed_s": 59.6,
+      "train_phys": 0.25185,
+      "train_proj": 0.13033,
+      "train_vert": 0.0,
+      "val_horiz_proj_active_pct": 5.6,
+      "val_horiz_raw_mae": 0.004888,
+      "val_vert_grav_r2": 0.87423,
+      "val_vert_buoy_r2": 0.78018,
+      "val_vert_heat_r2": 0.87937,
+      "val_vert_mean_r2": 0.84459,
+      "vert_gamma_abs_mean": 0.00872
+    },
+    {
+      "step": 1800,
+      "elapsed_s": 67.3,
+      "train_phys": 0.63655,
+      "train_proj": 0.50397,
+      "train_vert": 0.59345,
+      "val_horiz_proj_active_pct": 5.603,
+      "val_horiz_raw_mae": 0.004891,
+      "val_vert_grav_r2": 0.87517,
+      "val_vert_buoy_r2": 0.78675,
+      "val_vert_heat_r2": 0.86976,
+      "val_vert_mean_r2": 0.84389,
+      "vert_gamma_abs_mean": 0.00887
+    }
+  ]
+}

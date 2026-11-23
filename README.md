@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Live 512x512x4 Physics-Native Continuous Actuators & Emergent Neural Bots](models/unified_iter5_512/unified_live_1080p_hud.png)
+![Frostmarsh Live 512x512x4 with ActuatorPolicyNet v2 (91.7% vs Legacy), Sparse Eco & Live Acoustic Chat](models/unified_iter6_512/unified_live_1080p_hud.png)
 
 ---
 
@@ -63,7 +63,13 @@
   - `ActuatorPolicyNet` (`ml/actuator_policy.py`, `ml/train_actuator_rl.py`, `actuator_policy_rl.pt`, [ACTUATOR_EMERGENCE_METRICS.json](models/ACTUATOR_EMERGENCE_METRICS.json), `214.6K` params): Replaces fixed named spells and `if was_oiled` rules with **`10` continuous conservation-bounded physical actuator channels** (`±thermal_flux`, `water/oil/smoke` matter emission, continuous `focus_radius`, kinetic `impulse`).
   - Trained purely from random weights via sparse-goal PPO across **`64` parallel arenas (`768` bots, `3.69M` bot-steps at `10,799` steps/s on A100)** with zero imitation teacher: autonomously discovered **Oil→Ignition detonations (`15.5`/match)**, **Flash-Boil Steam Bursts (`17.5`/match)**, **Cryo-Bridge Crossings (`13.1`/match)**, **Smokescreen Cover (`7.9`/match)**, and bimodal `focus_radius` specialization (wide `3.5–7.0` cryo fields vs. tight `1.8–3.5` thermal beams). Beats Random Actuators **`100.0%` (`24W–0L`)** and Thermal-Only (no matter) **`62.5%` (`15W–9L`, `+88.6%` pressure-wave damage)**.
   - **Live Physics-Native Engine (`P`-key hot-toggle `PHYSICS-NATIVE` ↔ `CLASSIC`):** `VolumeField::apply_physical_actuator` + `sample_entity_physics` (`8/8` exact `mass_err=0, energy_err=0` tests) drive thermal stress, combustion `ΔT` / flash-boil `Δsteam` blasts + knockback, ice/oil/water friction, and `L2` skybridge collapse directly from voxels (`op=7` live at `2.28 ms` / 12 bots alongside `8.69 ms` sparse `512×512×4` world!).
-- **Live 30 Hz Server Loop (GB10, `512×512×4` 1M Voxels, `WorldModel` v3 + `ActuatorPolicyNet` `op=7`):** **`8.69 ms` Sparse World (`SPARSE 5%`, `6.0×` faster than dense)** + `11.51 ms` Eco + `2.28 ms` Actuator Bots+Saliency + `2.50 ms` Live Acoustics (`mass_err = 0`, `energy_err = 0`, `109 KB/s` wire, `71.2 FPS` @ 1080p / `70.1 FPS` @ 4K Metal).
+- **Iteration 6 — Pure Continuous Actuators Beat Legacy Named Spells `91.67%` + True 3D Cross-Layer `WorldModel3D` v4 + Sparse `EcosystemModel` & 3D Beam VFX:**
+  - `ActuatorPolicyNet` v2 (`ml/train_actuator_rl_v2.py`, `actuator_policy_v2_rl.pt`, [ACTUATOR_V2_TOURNAMENT.json](models/ACTUATOR_V2_TOURNAMENT.json), trained on Colab `RTX PRO 6000 Blackwell` via `768`-bot League Self-Play, **zero hardcoded spells, zero imitation teacher**):
+    - **vs. Legacy Named-Spell Scripted:** **`91.67%` WR (`22W–2L`, `371.0` vs. `240.5` score, `84.0` Oil→Ignition & `107.9` Flash-Boil Steam bursts/match, `2.45×` pressure-wave damage!)**
+    - **vs. Actuator v1 (Iter 5A):** **`100.0%` (`24W–0L`)** · **vs. Thermal-Only:** **`95.83%` (`23W–1L`)** · **vs. Random:** **`100.0%` (`24W–0L`)**.
+  - **True 3D Cross-Layer `WorldModel3D` v4** (`ml/world_model_3d.py`, `ml/train_world_3d_v4.py`, `world_model_3d_v4.pt`, [WORLD_3D_V4_METRICS.json](models/WORLD_3D_V4_METRICS.json), `123.8K` params): Adds `1×1×3` cross-layer mixing + vertical interface transport head (`flux_z_water/oil/steam/smoke`, `heat_z`), jumping **composite 3D vertical R² from `-0.031` (2D v3) → `+0.813`** (`0.922` active waterfall gravity R², `0.758` buoyancy R², `0.897` vertical heat R²) while keeping `proj_active_pct = 5.25%` (`< 6%`) and `0.999991` `Z_world` cosine parity.
+  - **`SparseEcoRunner` (`ml/sparse_eco_runner.py`, FP32 `max_abs_diff = 2.09e-7`) + Live 3D Volumetric Actuator Beam VFX (`ActuatorPulseSnap`):** Cut live `512×512` `ECO` latency from `11.51 ms` → **`7.50 ms`** (`-35%`) and renders continuous heat beams, cryo cones, matter streams, and kinetic shockwave rings through `volumetric_splat.wgsl` + dynamic point lights.
+- **Live 30 Hz Server Loop (GB10, `512×512×4` 1M Voxels, Sparse World + Sparse Eco + `ActuatorPolicyNet` v2 `op=7`):** `11.43 ms` Sparse World (`SPARSE 6%`) + `7.50 ms` Sparse Eco + **`1.79 ms` Actuator v2 Bots+Saliency** + `2.24 ms` Live Acoustics (`mass_err = 0`, `energy_err = 0`, `119 KB/s` wire, **`74.8 FPS` @ 1080p / `71.3 FPS` @ 4K Metal**).
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 

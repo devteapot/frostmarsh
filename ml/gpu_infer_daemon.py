@@ -49,6 +49,11 @@ except Exception:
     SparseWorldRunner = None  # type: ignore[assignment]
 
 try:
+    from sparse_eco_runner import SparseEcoRunner  # type: ignore  # noqa: E402
+except Exception:
+    SparseEcoRunner = None  # type: ignore[assignment]
+
+try:
     from live_acoustics import LiveAcousticEngine  # type: ignore  # noqa: E402
 except Exception:
     LiveAcousticEngine = None  # type: ignore[assignment]
@@ -293,6 +298,55 @@ class _SparseWorldAdapter:
         return self.host_out_bytes, z_world, self.static_in, float(active_frac), infer_us
 
 
+class _SparseEcoAdapter:
+    """Wraps SparseEcoRunner with pinned host I/O buffers matching _CUDAGraphRunner."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        h: int,
+        w: int,
+        batch: int,
+        device: torch.device,
+        use_fp16: bool,
+    ):
+        assert SparseEcoRunner is not None
+        self.device = device
+        self.use_fp16 = use_fp16
+        self.in_shape = (batch, 8, h, w)
+        self.out_shape = (batch, 4, h, w)
+        self.static_in = torch.zeros(self.in_shape, dtype=torch.float32, device=device)
+        self.host_in = torch.empty(self.in_shape, dtype=torch.float32, pin_memory=(device.type == "cuda"))
+        self.host_out = torch.empty(self.out_shape, dtype=torch.float32, pin_memory=(device.type == "cuda"))
+        self.host_in_np = self.host_in.numpy()
+        self.host_out_np = self.host_out.numpy()
+        self.host_in_u8 = self.host_in_np.view(np.uint8).ravel()
+        self.host_out_bytes = memoryview(self.host_out_np).cast("B")
+        self.runner = _call_with_accepted_kwargs(
+            SparseEcoRunner,
+            model,
+            device=device,
+            use_fp16=use_fp16,
+            fp16=use_fp16,
+            h=h,
+            w=w,
+            height=h,
+            width=w,
+            batch=batch,
+        )
+
+    def infer_from_host_in(self) -> tuple[memoryview, torch.Tensor, torch.Tensor, float, int]:
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            self.static_in.copy_(self.host_in, non_blocking=(self.device.type == "cuda"))
+            out_t, z_eco, active_frac = self.runner.step(self.static_in)
+            self.host_out.copy_(out_t.float(), non_blocking=False)
+            if self.use_fp16 and self.device.type == "cuda" and z_eco.dtype != torch.float16:
+                z_eco = z_eco.half()
+        infer_us = int((time.perf_counter() - t0) * 1_000_000)
+        return self.host_out_bytes, z_eco, self.static_in, float(active_frac), infer_us
+
+
 class InferenceEngine:
     def __init__(
         self,
@@ -302,16 +356,23 @@ class InferenceEngine:
         use_fp16: bool = True,
         warmup_shapes: tuple[tuple[int, int], ...] = ((128, 128),),
         use_sparse_world: bool = True,
+        use_sparse_eco: bool | None = None,
         acoustic_pt: Path | None = None,
         actuator_pt: Path | None = None,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.use_fp16 = use_fp16 and (self.device.type == "cuda")
         self.lock = threading.Lock()
+        if use_sparse_eco is None:
+            use_sparse_eco = use_sparse_world
 
         if self.device.type == "cuda":
             # Disable cudnn.benchmark when sparse dynamic tile batches are enabled to avoid 1s autotune stalls
-            torch.backends.cudnn.benchmark = not bool(use_sparse_world and SparseWorldRunner is not None)
+            any_sparse = bool(
+                (use_sparse_world and SparseWorldRunner is not None)
+                or (use_sparse_eco and SparseEcoRunner is not None)
+            )
+            torch.backends.cudnn.benchmark = not any_sparse
             torch.set_float32_matmul_precision("high")
 
         self.world_model = WorldModel(in_ch=18, out_ch=17, width=48, num_res=5).eval()
@@ -358,6 +419,8 @@ class InferenceEngine:
 
         self.use_sparse_world: bool = bool(use_sparse_world and SparseWorldRunner is not None)
         self._sparse_runners: dict[tuple[int, int, int], _SparseWorldAdapter] = {}
+        self.use_sparse_eco: bool = bool(use_sparse_eco and SparseEcoRunner is not None)
+        self._sparse_eco_runners: dict[tuple[int, int, int], _SparseEcoAdapter] = {}
 
         self.acoustic_engine: Any = None
         ac_path = acoustic_pt if acoustic_pt is not None else (_SCRIPT_DIR / "acoustic_comm_live.pt")
@@ -395,6 +458,7 @@ class InferenceEngine:
         self.last_z_eco: torch.Tensor = torch.zeros((1, 32, 256, 256), dtype=torch.float16, device=self.device)
         self.last_world_state: torch.Tensor | None = None
         self.last_sparse_active_frac: float = 1.0
+        self.last_sparse_eco_active_frac: float = 1.0
         self._acoustic_step_counter: int = 0
         self._last_auto_callout_ts: float = 0.0
 
@@ -451,6 +515,36 @@ class InferenceEngine:
                 return None
         return adapter
 
+    def _get_sparse_eco_runner(self, h: int, w: int, batch: int) -> _SparseEcoAdapter | None:
+        if not self.use_sparse_eco or SparseEcoRunner is None:
+            return None
+        key = (batch, h, w)
+        adapter = self._sparse_eco_runners.get(key)
+        if adapter is None:
+            try:
+                adapter = _SparseEcoAdapter(
+                    model=self.eco_model,
+                    h=h,
+                    w=w,
+                    batch=batch,
+                    device=self.device,
+                    use_fp16=self.use_fp16,
+                )
+                self._sparse_eco_runners[key] = adapter
+                print(
+                    f"[gpu_infer_daemon] Activated SparseEcoRunner for {batch}x8x{h}x{w}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[gpu_infer_daemon] SparseEcoRunner unavailable for {batch}x8x{h}x{w} ({exc}); using dense CUDA Graph",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.use_sparse_eco = False
+                return None
+        return adapter
+
     def infer_bytes(self, op: int, h: int, w: int, recv_fn, batch: int = 1) -> tuple[int, memoryview, int]:
         _, out_ch = EXPECTED_SPECS[op]
         with self.lock:
@@ -481,6 +575,30 @@ class InferenceEngine:
                         self.last_sparse_active_frac = 1.0
                         return out_ch, memoryview(bytes(out_view)), infer_us
 
+            if op == OP_ECO_STEP and self.use_sparse_eco:
+                e_adapter = self._get_sparse_eco_runner(h, w, batch)
+                if e_adapter is not None:
+                    if not recv_fn(memoryview(e_adapter.host_in_u8)):
+                        raise ConnectionError("EOF reading request payload")
+                    try:
+                        out_view, z_latent, _x_dev, active_frac, infer_us = e_adapter.infer_from_host_in()
+                        self.last_z_eco = z_latent
+                        self.last_sparse_eco_active_frac = active_frac
+                        return out_ch, memoryview(bytes(out_view)), infer_us
+                    except Exception as exc:
+                        print(
+                            f"[gpu_infer_daemon] SparseEcoRunner step failed ({exc}); falling back to dense",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        self.use_sparse_eco = False
+                        runner = self._get_runner(op, h, w, batch)
+                        runner.host_in.copy_(e_adapter.host_in)
+                        out_view, z_latent, _x_dev, infer_us = runner.infer_from_host_in()
+                        self.last_z_eco = z_latent
+                        self.last_sparse_eco_active_frac = 1.0
+                        return out_ch, memoryview(bytes(out_view)), infer_us
+
             runner = self._get_runner(op, h, w, batch)
             if not recv_fn(memoryview(runner.host_in_u8)):
                 raise ConnectionError("EOF reading request payload")
@@ -491,6 +609,7 @@ class InferenceEngine:
                 self.last_sparse_active_frac = 1.0
             elif op == OP_ECO_STEP:
                 self.last_z_eco = z_latent
+                self.last_sparse_eco_active_frac = 1.0
             out_copy = bytes(out_view)
         return out_ch, memoryview(out_copy), infer_us
 
@@ -1186,9 +1305,16 @@ def main() -> None:
         default=(SparseWorldRunner is not None),
         help="Use SparseWorldRunner active-tile acceleration for op=1 when available (default: True if importable)",
     )
+    parser.add_argument(
+        "--sparse-eco",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use SparseEcoRunner active-tile acceleration for op=2 (default: enabled automatically with --sparse-world)",
+    )
     parser.add_argument("--fp32", action="store_true")
     args = parser.parse_args()
 
+    use_sparse_eco = args.sparse_world if args.sparse_eco is None else args.sparse_eco
     host, port = parse_bind(args.bind)
     engine = InferenceEngine(
         args.world_model,
@@ -1196,6 +1322,7 @@ def main() -> None:
         args.bot_policy,
         use_fp16=not args.fp32,
         use_sparse_world=args.sparse_world,
+        use_sparse_eco=use_sparse_eco,
         acoustic_pt=args.acoustic_ckpt,
         actuator_pt=args.actuator_policy,
     )
@@ -1214,7 +1341,8 @@ def main() -> None:
         f"[gpu_infer_daemon] Ready on {host}:{daemon.actual_port}{unix_info} | device={dev_name} | "
         f"fp16={engine.use_fp16} | neural_bots={engine.bot_policy is not None} | "
         f"actuator_policy={engine.actuator_policy is not None} | "
-        f"sparse_world={engine.use_sparse_world} | acoustics={'neural' if engine.acoustic_engine is not None else 'physical-fallback'}",
+        f"sparse_world={engine.use_sparse_world} | sparse_eco={engine.use_sparse_eco} | "
+        f"acoustics={'neural' if engine.acoustic_engine is not None else 'physical-fallback'}",
         flush=True,
     )
     daemon.serve_forever()

@@ -207,6 +207,24 @@ pub struct SpeechBubbleSnap {
     pub tick: u32,
 }
 
+/// Short-lived 3D volumetric physical actuator pulse (heat beam, cryo field, matter stream, or kinetic shockwave).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ActuatorPulseSnap {
+    pub x0: f32,
+    pub y0: f32,
+    pub z0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    pub z1: f32,
+    pub thermal_flux: f32, // +heat, -cryo
+    pub sp_oil: f32,
+    pub sp_water: f32,
+    pub sp_smoke: f32,
+    pub focus_radius: f32,
+    pub impulse: f32,
+    pub team: u8,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TelemetrySnap {
     pub mode: String,
@@ -264,6 +282,8 @@ pub enum ServerDatagram {
         kill_feed: Vec<KillFeedEntry>,
         #[serde(default)]
         speech_bubbles: Vec<SpeechBubbleSnap>,
+        #[serde(default)]
+        actuator_pulses: Vec<ActuatorPulseSnap>,
         #[serde(default)]
         match_phase: u8,
         #[serde(default)]

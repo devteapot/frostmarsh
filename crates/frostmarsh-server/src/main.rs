@@ -813,6 +813,7 @@ struct GameState {
     pending_chat: Option<PendingChat>,
     bot_overrides: HashMap<u32, BotCommandOverride>,
     recent_actuators: VecDeque<(u32, u8, f32, f32, f32, u64)>,
+    actuator_pulses: Vec<(u64, f32, ActuatorPulseSnap)>,
     peers: HashMap<u32, ClientPeer>,
     hazard_layers: Vec<Vec<u8>>,
     weather_kind: u8,
@@ -908,6 +909,7 @@ impl GameState {
             pending_chat: None,
             bot_overrides: HashMap::new(),
             recent_actuators: VecDeque::with_capacity(32),
+            actuator_pulses: Vec::with_capacity(32),
             peers: HashMap::new(),
             weather_kind: WEATHER_CLEAR,
             day_time: 0.25,
@@ -1724,6 +1726,34 @@ impl GameState {
             self.recent_actuators.pop_front();
         }
 
+        // Record short-lived 3D volumetric actuator pulse VFX (TTL ~8 ticks = 0.25s)
+        if tf_s.abs() > 0.15 || so_s > 0.15 || sw_s > 0.15 || ss_s > 0.15 || imp_s > 0.15 {
+            let energy = tf_s.abs() * 1.2 + so_s + sw_s + ss_s + imp_s * 1.4;
+            self.actuator_pulses.push((
+                tick + 8,
+                energy,
+                ActuatorPulseSnap {
+                    x0: px,
+                    y0: py,
+                    z0: pz,
+                    x1: tx,
+                    y1: ty,
+                    z1: layer as f32,
+                    thermal_flux: tf_s,
+                    sp_oil: so_s,
+                    sp_water: sw_s,
+                    sp_smoke: ss_s,
+                    focus_radius: r,
+                    impulse: imp_s,
+                    team,
+                },
+            ));
+            if self.actuator_pulses.len() > 48 {
+                self.actuator_pulses.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                self.actuator_pulses.truncate(32);
+            }
+        }
+
         if tf_s.abs() > 0.45 || imp_s > 0.35 {
             self.eco.inject_fear_pulse(tx, ty, (r * 3.0).clamp(10.0, 24.0), 0.75 * scale);
         }
@@ -1866,6 +1896,7 @@ impl GameState {
         self.speech_bubbles.clear();
         self.bot_overrides.clear();
         self.recent_actuators.clear();
+        self.actuator_pulses.clear();
         self.pending_chat = None;
         self.weather_kind = WEATHER_CLEAR;
 
@@ -2471,6 +2502,7 @@ impl GameState {
         self.speech_bubbles.retain(|(exp, _)| tick <= *exp);
         self.bot_overrides.retain(|_, ov| tick <= ov.expires_tick);
         self.recent_actuators.retain(|&(_, _, _, _, _, exp)| tick <= exp);
+        self.actuator_pulses.retain(|(exp, _, _)| tick <= *exp);
 
         // Hold victory celebration state for 10 seconds, then cleanly reset for the next match
         if self.match_phase != MATCH_PHASE_ACTIVE {
@@ -3111,6 +3143,15 @@ impl GameState {
         let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
         let speech_bubbles: Vec<SpeechBubbleSnap> =
             self.speech_bubbles.iter().map(|(_, b)| b.clone()).collect();
+        let mut active_pulses: Vec<(f32, ActuatorPulseSnap)> = self
+            .actuator_pulses
+            .iter()
+            .filter(|(exp, _, _)| tick <= *exp)
+            .map(|(_, energy, snap)| (*energy, snap.clone()))
+            .collect();
+        active_pulses.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let actuator_pulses: Vec<ActuatorPulseSnap> =
+            active_pulses.into_iter().take(16).map(|(_, s)| s).collect();
 
         let mut dead = Vec::new();
         let mut total_bytes = 0u64;
@@ -3132,6 +3173,7 @@ impl GameState {
                 bot_brains: self.bot_brains.clone(),
                 kill_feed: kill_feed.clone(),
                 speech_bubbles: speech_bubbles.clone(),
+                actuator_pulses: actuator_pulses.clone(),
                 match_phase: self.match_phase,
                 match_time_left_s: self.match_time_left_s,
                 mvp_name: self.mvp_name.clone(),

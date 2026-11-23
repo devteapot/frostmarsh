@@ -1,0 +1,630 @@
+{
+  "iteration": "8A",
+  "title": "True Isotropic 3D Z=16 (1m x 1m x 1m) Neural World Field & Learned NeuralMaterialHead(Z_world)",
+  "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "arch": {
+    "model_class": "NeuralWorldField3D",
+    "encoder_class": "NeuralField3DEncoder",
+    "material_head_class": "NeuralMaterialHead",
+    "physics_head_class": "PhysicsDelta3DHead",
+    "in_ch": 18,
+    "latent_ch": 32,
+    "material_head_hidden_ch": 20,
+    "encoder_halo": 2,
+    "material_head_halo": 1,
+    "total_halo": 3,
+    "density_mat_channels": [
+      "solid_density",
+      "fluid_density",
+      "gas_optical_density",
+      "roughness_wetness"
+    ],
+    "albedo_thermal_channels": [
+      "albedo_r",
+      "albedo_g",
+      "albedo_b",
+      "blackbody_temp_glow"
+    ]
+  },
+  "training": {
+    "train_steps": 1400,
+    "batch_size": 4,
+    "train_resolution": [
+      16,
+      128,
+      128
+    ],
+    "unique_train_worlds_seen": 132,
+    "train_time_s": 41.34,
+    "n_params_encoder": 46496,
+    "n_params_material_head": 12428,
+    "n_params_physics_head": 1419,
+    "n_params_total": 60343,
+    "n_params_1x1x1_baseline": 11912,
+    "final_train_stats": {
+      "loss_total": 0.034371938556432724,
+      "loss_density": 0.009300485253334045,
+      "loss_albedo": 0.008446251042187214,
+      "loss_grad": 0.010522488504648209,
+      "loss_phys": 0.0012790040345862508,
+      "step": 1400.0,
+      "lr": 0.00012
+    },
+    "history": [
+      {
+        "loss_total": 2.676297187805176,
+        "loss_density": 1.0081026554107666,
+        "loss_albedo": 1.082419991493225,
+        "loss_grad": 0.2653277814388275,
+        "loss_phys": 0.023784449324011803,
+        "step": 1.0,
+        "lr": 0.0029999963744325574
+      },
+      {
+        "loss_total": 0.18870636820793152,
+        "loss_density": 0.05765233188867569,
+        "loss_albedo": 0.05257789045572281,
+        "loss_grad": 0.04218931123614311,
+        "loss_phys": 0.006318105850368738,
+        "step": 100.0,
+        "lr": 0.0029638961935418246
+      },
+      {
+        "loss_total": 0.09149055182933807,
+        "loss_density": 0.02444256842136383,
+        "loss_albedo": 0.0218272116035223,
+        "loss_grad": 0.02646768093109131,
+        "loss_phys": 0.003759996499866247,
+        "step": 200.0,
+        "lr": 0.002857395169779482
+      },
+      {
+        "loss_total": 0.08465029299259186,
+        "loss_density": 0.021172523498535156,
+        "loss_albedo": 0.021192967891693115,
+        "loss_grad": 0.022241603583097458,
+        "loss_phys": 0.0037549203261733055,
+        "step": 300.0,
+        "lr": 0.0026858373347539623
+      },
+      {
+        "loss_total": 0.07907378673553467,
+        "loss_density": 0.016280002892017365,
+        "loss_albedo": 0.017335081472992897,
+        "loss_grad": 0.017364121973514557,
+        "loss_phys": 0.004973042756319046,
+        "step": 400.0,
+        "lr": 0.002457825314676574
+      },
+      {
+        "loss_total": 0.062051691114902496,
+        "loss_density": 0.014354960061609745,
+        "loss_albedo": 0.015453201718628407,
+        "loss_grad": 0.016697969287633896,
+        "loss_phys": 0.0029210923239588737,
+        "step": 500.0,
+        "lr": 0.002184792584329283
+      },
+      {
+        "loss_total": 0.056662850081920624,
+        "loss_density": 0.014000549912452698,
+        "loss_albedo": 0.013925977982580662,
+        "loss_grad": 0.014979688450694084,
+        "loss_phys": 0.0025863386690616608,
+        "step": 600.0,
+        "lr": 0.001880430144897088
+      },
+      {
+        "loss_total": 0.049939293414354324,
+        "loss_density": 0.013291877694427967,
+        "loss_albedo": 0.01225553173571825,
+        "loss_grad": 0.012689666822552681,
+        "loss_phys": 0.0021799528039991856,
+        "step": 700.0,
+        "lr": 0.0015599999999999978
+      },
+      {
+        "loss_total": 0.04632789269089699,
+        "loss_density": 0.013075408525764942,
+        "loss_albedo": 0.011030507273972034,
+        "loss_grad": 0.01204705610871315,
+        "loss_phys": 0.0019389608642086387,
+        "step": 800.0,
+        "lr": 0.0012395698551029045
+      },
+      {
+        "loss_total": 0.04168270528316498,
+        "loss_density": 0.010798963718116283,
+        "loss_albedo": 0.009543185122311115,
+        "loss_grad": 0.011718573048710823,
+        "loss_phys": 0.0018896153196692467,
+        "step": 900.0,
+        "lr": 0.0009352074156707154
+      },
+      {
+        "loss_total": 0.03749015927314758,
+        "loss_density": 0.009816806763410568,
+        "loss_albedo": 0.008564706891775131,
+        "loss_grad": 0.01128845289349556,
+        "loss_phys": 0.0016049955738708377,
+        "step": 1000.0,
+        "lr": 0.0006621746853234229
+      },
+      {
+        "loss_total": 0.03625451773405075,
+        "loss_density": 0.009759081527590752,
+        "loss_albedo": 0.008768253959715366,
+        "loss_grad": 0.011013083159923553,
+        "loss_phys": 0.0013961028307676315,
+        "step": 1100.0,
+        "lr": 0.00043416266524603755
+      },
+      {
+        "loss_total": 0.03721018135547638,
+        "loss_density": 0.009826121851801872,
+        "loss_albedo": 0.00941398460417986,
+        "loss_grad": 0.010695192962884903,
+        "loss_phys": 0.0014441171661019325,
+        "step": 1200.0,
+        "lr": 0.0002626048302205176
+      },
+      {
+        "loss_total": 0.03387840837240219,
+        "loss_density": 0.009402306750416756,
+        "loss_albedo": 0.008075977675616741,
+        "loss_grad": 0.010468270629644394,
+        "loss_phys": 0.0012627927353605628,
+        "step": 1300.0,
+        "lr": 0.00015610380645817432
+      },
+      {
+        "loss_total": 0.034371938556432724,
+        "loss_density": 0.009300485253334045,
+        "loss_albedo": 0.008446251042187214,
+        "loss_grad": 0.010522488504648209,
+        "loss_phys": 0.0012790040345862508,
+        "step": 1400.0,
+        "lr": 0.00012
+      }
+    ]
+  },
+  "heldout_eval_256x256x16_fp16": {
+    "eval_dtype": "fp16",
+    "eval_seeds": [
+      1000,
+      1001,
+      1002,
+      1003
+    ],
+    "eval_resolution": [
+      16,
+      256,
+      256
+    ],
+    "voxels_per_world": 1048576,
+    "total_eval_voxels": 4194304,
+    "neural_field_3d": {
+      "density_mat": {
+        "overall": {
+          "mae": 0.003318,
+          "rmse": 0.008307,
+          "r2": 0.999549
+        },
+        "solid_density": {
+          "mae": 0.005384,
+          "rmse": 0.009402,
+          "r2": 0.999622
+        },
+        "fluid_density": {
+          "mae": 0.001872,
+          "rmse": 0.008729,
+          "r2": 0.991467
+        },
+        "gas_optical_density": {
+          "mae": 0.001747,
+          "rmse": 0.003901,
+          "r2": 0.973152
+        },
+        "roughness_wetness": {
+          "mae": 0.00427,
+          "rmse": 0.00981,
+          "r2": 0.995881
+        },
+        "roughness_wetness_active_surface": {
+          "mae": 0.005099,
+          "rmse": 0.012042,
+          "r2": 0.992709
+        }
+      },
+      "albedo_thermal": {
+        "overall": {
+          "mae": 0.002216,
+          "rmse": 0.005888,
+          "r2": 0.99776
+        },
+        "albedo_rgb": {
+          "mae": 0.002832,
+          "rmse": 0.006626,
+          "r2": 0.995264
+        },
+        "albedo_rgb_active_surface": {
+          "mae": 0.003687,
+          "rmse": 0.008076,
+          "r2": 0.988104
+        },
+        "blackbody_temp_glow": {
+          "mae": 0.000368,
+          "rmse": 0.002643,
+          "r2": 0.971898
+        },
+        "blackbody_temp_glow_active": {
+          "mae": 0.033494,
+          "rmse": 0.052645,
+          "r2": 0.96826
+        },
+        "albedo_r": {
+          "mae": 0.002742,
+          "rmse": 0.006482,
+          "r2": 0.995368
+        },
+        "albedo_g": {
+          "mae": 0.002904,
+          "rmse": 0.006439,
+          "r2": 0.995133
+        },
+        "albedo_b": {
+          "mae": 0.00285,
+          "rmse": 0.006946,
+          "r2": 0.993966
+        }
+      }
+    },
+    "solid_density_3d_normal_cos_sim": 0.998741,
+    "aux_3d_physics_evolution": {
+      "delta_mass": {
+        "mae": 0.000248,
+        "rmse": 0.001496,
+        "r2": 0.903427
+      },
+      "delta_temp": {
+        "mae": 0.000671,
+        "rmse": 0.00254,
+        "r2": 0.967445
+      },
+      "delta_mass_active": {
+        "mae": 0.003006,
+        "rmse": 0.006788,
+        "r2": 0.989284
+      },
+      "delta_temp_active": {
+        "mae": 0.0011,
+        "rmse": 0.00601,
+        "r2": 0.966255
+      }
+    },
+    "ablation_1x1x1_no_3d_context": {
+      "density_mat": {
+        "overall": {
+          "mae": 0.00902,
+          "rmse": 0.030004,
+          "r2": 0.994111
+        },
+        "solid_density": {
+          "mae": 0.015081,
+          "rmse": 0.034774,
+          "r2": 0.994833
+        },
+        "fluid_density": {
+          "mae": 0.004551,
+          "rmse": 0.017585,
+          "r2": 0.965365
+        },
+        "gas_optical_density": {
+          "mae": 0.006626,
+          "rmse": 0.011588,
+          "r2": 0.763144
+        },
+        "roughness_wetness": {
+          "mae": 0.009823,
+          "rmse": 0.044139,
+          "r2": 0.916606
+        },
+        "roughness_wetness_active_surface": {
+          "mae": 0.014379,
+          "rmse": 0.055494,
+          "r2": 0.845141
+        }
+      },
+      "albedo_thermal": {
+        "overall": {
+          "mae": 0.006241,
+          "rmse": 0.016134,
+          "r2": 0.983185
+        },
+        "albedo_rgb": {
+          "mae": 0.00789,
+          "rmse": 0.018285,
+          "r2": 0.963932
+        },
+        "albedo_rgb_active_surface": {
+          "mae": 0.011534,
+          "rmse": 0.0229,
+          "r2": 0.904358
+        },
+        "blackbody_temp_glow": {
+          "mae": 0.001294,
+          "rmse": 0.006172,
+          "r2": 0.846758
+        },
+        "blackbody_temp_glow_active": {
+          "mae": 0.029434,
+          "rmse": 0.040435,
+          "r2": 0.981276
+        },
+        "albedo_r": {
+          "mae": 0.007053,
+          "rmse": 0.017109,
+          "r2": 0.967727
+        },
+        "albedo_g": {
+          "mae": 0.008202,
+          "rmse": 0.018083,
+          "r2": 0.961617
+        },
+        "albedo_b": {
+          "mae": 0.008415,
+          "rmse": 0.01958,
+          "r2": 0.952049
+        }
+      }
+    },
+    "sparse_brick_exact_parity": {
+      "16x16x8": {
+        "fp32_max_abs_diff_density_mat": 0.0,
+        "fp32_max_abs_diff_albedo_thermal": 0.0,
+        "fp32_max_abs_diff_z_world_3d": 0.0,
+        "exact_parity_pass": true
+      },
+      "8x8x8": {
+        "fp32_max_abs_diff_density_mat": 0.0,
+        "fp32_max_abs_diff_albedo_thermal": 0.0,
+        "fp32_max_abs_diff_z_world_3d": 0.0,
+        "exact_parity_pass": true
+      }
+    }
+  },
+  "latency_benchmark_fp16": {
+    "dtype": "fp16",
+    "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "resolutions": {
+      "256x256x16": {
+        "voxels": 1048576,
+        "dense": {
+          "median_ms": 3.8274,
+          "p95_ms": 3.8379,
+          "fps_equiv": 261.27,
+          "mvox_per_sec": 273.96
+        },
+        "sparse_16x16x8": {
+          "5pct": {
+            "active_frac": 0.05,
+            "active_bricks": 26,
+            "total_bricks": 512,
+            "median_ms": 0.6235,
+            "p95_ms": 0.6371,
+            "speedup_vs_dense": 6.14,
+            "effective_mvox_per_sec": 1681.7
+          },
+          "10pct": {
+            "active_frac": 0.1,
+            "active_bricks": 51,
+            "total_bricks": 512,
+            "median_ms": 0.8843,
+            "p95_ms": 0.8888,
+            "speedup_vs_dense": 4.33,
+            "effective_mvox_per_sec": 1185.81
+          },
+          "15pct": {
+            "active_frac": 0.15,
+            "active_bricks": 77,
+            "total_bricks": 512,
+            "median_ms": 1.1459,
+            "p95_ms": 1.151,
+            "speedup_vs_dense": 3.34,
+            "effective_mvox_per_sec": 915.06
+          },
+          "20pct": {
+            "active_frac": 0.2,
+            "active_bricks": 102,
+            "total_bricks": 512,
+            "median_ms": 1.4102,
+            "p95_ms": 1.4141,
+            "speedup_vs_dense": 2.71,
+            "effective_mvox_per_sec": 743.54
+          },
+          "30pct": {
+            "active_frac": 0.3,
+            "active_bricks": 154,
+            "total_bricks": 512,
+            "median_ms": 1.9819,
+            "p95_ms": 1.9865,
+            "speedup_vs_dense": 1.93,
+            "effective_mvox_per_sec": 529.08
+          }
+        },
+        "sparse_8x8x8": {
+          "5pct": {
+            "active_frac": 0.05,
+            "active_bricks": 102,
+            "total_bricks": 2048,
+            "median_ms": 0.7051,
+            "p95_ms": 0.7105,
+            "speedup_vs_dense": 5.43
+          },
+          "10pct": {
+            "active_frac": 0.1,
+            "active_bricks": 205,
+            "total_bricks": 2048,
+            "median_ms": 1.0513,
+            "p95_ms": 1.0554,
+            "speedup_vs_dense": 3.64
+          }
+        }
+      },
+      "512x512x16": {
+        "voxels": 4194304,
+        "dense": {
+          "median_ms": 22.5022,
+          "p95_ms": 22.5283,
+          "fps_equiv": 44.44,
+          "mvox_per_sec": 186.4
+        },
+        "sparse_16x16x8": {
+          "5pct": {
+            "active_frac": 0.05,
+            "active_bricks": 102,
+            "total_bricks": 2048,
+            "median_ms": 1.7178,
+            "p95_ms": 1.725,
+            "speedup_vs_dense": 13.1,
+            "effective_mvox_per_sec": 2441.66
+          },
+          "10pct": {
+            "active_frac": 0.1,
+            "active_bricks": 205,
+            "total_bricks": 2048,
+            "median_ms": 2.9382,
+            "p95_ms": 2.9446,
+            "speedup_vs_dense": 7.66,
+            "effective_mvox_per_sec": 1427.52
+          },
+          "15pct": {
+            "active_frac": 0.15,
+            "active_bricks": 307,
+            "total_bricks": 2048,
+            "median_ms": 4.7078,
+            "p95_ms": 4.7145,
+            "speedup_vs_dense": 4.78,
+            "effective_mvox_per_sec": 890.93
+          },
+          "20pct": {
+            "active_frac": 0.2,
+            "active_bricks": 410,
+            "total_bricks": 2048,
+            "median_ms": 7.0296,
+            "p95_ms": 7.0386,
+            "speedup_vs_dense": 3.2,
+            "effective_mvox_per_sec": 596.66
+          },
+          "30pct": {
+            "active_frac": 0.3,
+            "active_bricks": 614,
+            "total_bricks": 2048,
+            "median_ms": 11.2905,
+            "p95_ms": 11.2979,
+            "speedup_vs_dense": 1.99,
+            "effective_mvox_per_sec": 371.49
+          }
+        },
+        "sparse_8x8x8": {
+          "5pct": {
+            "active_frac": 0.05,
+            "active_bricks": 410,
+            "total_bricks": 8192,
+            "median_ms": 2.1609,
+            "p95_ms": 2.167,
+            "speedup_vs_dense": 10.41
+          },
+          "10pct": {
+            "active_frac": 0.1,
+            "active_bricks": 819,
+            "total_bricks": 8192,
+            "median_ms": 4.198,
+            "p95_ms": 4.2048,
+            "speedup_vs_dense": 5.36
+          }
+        }
+      }
+    }
+  },
+  "capsule_collision_benchmark": {
+    "total_trajectories": 256,
+    "steps_per_trajectory": 220,
+    "total_simulated_steps": 56320,
+    "capsule_radius_m": 0.35,
+    "capsule_height_m": 1.4,
+    "solid_iso_threshold": 0.5,
+    "strict_penetration_threshold": 0.55,
+    "tunnel_ceiling_penetrations": 0,
+    "spike_snags": 0,
+    "wall_contact_substeps": 2553,
+    "mean_tangent_slide_velocity_ratio": 0.5958,
+    "mean_tangent_normal_orthogonality_err": 0.0,
+    "overall_mean_goal_progress_pct": 99.3,
+    "per_cohort": {
+      "bridge_crossing": {
+        "trajectories": 64,
+        "penetrations": 0,
+        "spike_snags": 0,
+        "max_spine_solid_density": 0.2884,
+        "mean_max_step_dz_m": 0.0791,
+        "mean_goal_progress_pct": 99.78,
+        "mean_z_range_m": [
+          8.16,
+          8.86
+        ]
+      },
+      "under_bridge_piers": {
+        "trajectories": 64,
+        "penetrations": 0,
+        "spike_snags": 0,
+        "max_spine_solid_density": 0.326,
+        "mean_max_step_dz_m": 0.1606,
+        "mean_goal_progress_pct": 98.51,
+        "mean_z_range_m": [
+          1.58,
+          6.53
+        ]
+      },
+      "vaulted_cave_tunnel": {
+        "trajectories": 64,
+        "penetrations": 0,
+        "spike_snags": 0,
+        "max_spine_solid_density": 0.3048,
+        "mean_max_step_dz_m": 0.2088,
+        "mean_goal_progress_pct": 99.89,
+        "mean_z_range_m": [
+          0.57,
+          1.7
+        ]
+      },
+      "steep_alpine_cliffs": {
+        "trajectories": 64,
+        "penetrations": 0,
+        "spike_snags": 0,
+        "max_spine_solid_density": 0.3113,
+        "mean_max_step_dz_m": 0.1379,
+        "mean_goal_progress_pct": 99.02,
+        "mean_z_range_m": [
+          2.53,
+          10.15
+        ]
+      }
+    }
+  },
+  "demo_volume_export": {
+    "path": "/content/out/checkpoints/z16_demo_volume.bin",
+    "magic": "FM3D",
+    "width": 256,
+    "height": 256,
+    "depth": 16,
+    "bytes": 8388624,
+    "roundtrip_verified": true
+  },
+  "artifacts": {
+    "checkpoint": "/content/out/checkpoints/neural_field_3d_z16.pt",
+    "demo_volume_bin": "/content/out/checkpoints/z16_demo_volume.bin",
+    "metrics_json": "/content/out/NEURAL_FIELD_3D_METRICS.json",
+    "visualization_png": "/content/out/neural_field_3d_viz.png"
+  }
+}

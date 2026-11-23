@@ -32,7 +32,7 @@ use crate::mesh_gen::StaticMeshBank;
 use crate::net::QuicClientHandle;
 use crate::renderer::{Approach4Renderer, Atmosphere, RenderStyle};
 use crate::surfel_gen::SurfelProtoBank;
-use crate::world_bridge::{assemble_live_frame, AimReticle, LiveApproach4World, SP_ICE};
+use crate::world_bridge::{assemble_live_frame, AimReticle, LiveApproach4World, SP_ICE, SP_ROCK, SP_WOOD};
 use clap::Parser;
 use frostmarsh_proto::*;
 use glam::Vec3;
@@ -518,8 +518,89 @@ fn hero_class_base_speed(class_id: u8) -> f32 {
     }
 }
 
-/// Exact client-side mirror of `frostmarsh-server`'s locomotion + wall sliding + terrain drag/glide
-/// so predicted hero motion matches authoritative server updates with zero rubber-banding!
+/// Discrete per-cell solid density matching `frostmarsh-server` & `world_bridge.rs` 3×3 spaced pine trunks 1:1.
+#[inline]
+fn client_cell_solid_density(
+    world: &LiveApproach4World,
+    xi: i32,
+    yi: i32,
+    on_l2: bool,
+    allow_water: bool,
+) -> f32 {
+    let x = xi.clamp(0, (world.grid_w.saturating_sub(1)) as i32) as usize;
+    let y = yi.clamp(0, (world.grid_h.saturating_sub(1)) as i32) as usize;
+    let idx = y * world.grid_w + x;
+    if on_l2 {
+        let c2 = world.decoded_l2[idx];
+        if c2.s1 == SP_ROCK || (c2.wall && c2.s1 != SP_WOOD) {
+            return 1.0;
+        }
+        if c2.wall && c2.s1 == SP_WOOD && !c2.walkable {
+            return if x % 3 == 0 && y % 3 == 0 { 1.0 } else { 0.0 };
+        }
+        if c2.walkable && !c2.wall {
+            return 0.0;
+        }
+        let c1 = world.decoded[idx];
+        return if c1.s1 == SP_ROCK || (c1.wall && c1.s1 != SP_WOOD) { 1.0 } else { 0.0 };
+    }
+    let c1 = world.decoded[idx];
+    if c1.s1 == SP_ROCK || (c1.wall && c1.s1 != SP_WOOD) {
+        return 1.0;
+    }
+    if c1.wall && c1.s1 == SP_WOOD && !c1.walkable {
+        return if x % 3 == 0 && y % 3 == 0 { 1.0 } else { 0.0 };
+    }
+    if !allow_water && c1.water_slow && !c1.walkable && !c1.wall {
+        return 0.85;
+    }
+    0.0
+}
+
+/// Continuous bilinear solid-density field at `(x, y, on_l2)` (exact 1:1 parity with `frostmarsh-server`).
+#[inline]
+fn sample_solid_density(
+    world: &LiveApproach4World,
+    x: f32,
+    y: f32,
+    on_l2: bool,
+    allow_water: bool,
+) -> f32 {
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = fx.floor() as i32;
+    let y0 = fy.floor() as i32;
+    let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+    let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+    let d00 = client_cell_solid_density(world, x0, y0, on_l2, allow_water);
+    let d10 = client_cell_solid_density(world, x0 + 1, y0, on_l2, allow_water);
+    let d01 = client_cell_solid_density(world, x0, y0 + 1, on_l2, allow_water);
+    let d11 = client_cell_solid_density(world, x0 + 1, y0 + 1, on_l2, allow_water);
+    let d0 = d00 + (d10 - d00) * tx;
+    let d1 = d01 + (d11 - d01) * tx;
+    d0 + (d1 - d0) * ty
+}
+
+/// Hero capsule solid density (`R = 0.65`, center + 4 perimeter probes at `0.55`).
+#[inline]
+fn sample_capsule_density(
+    world: &LiveApproach4World,
+    x: f32,
+    y: f32,
+    on_l2: bool,
+    allow_water: bool,
+) -> f32 {
+    const PROBE_R: f32 = 0.55;
+    let c0 = sample_solid_density(world, x, y, on_l2, allow_water);
+    let pe = sample_solid_density(world, x + PROBE_R, y, on_l2, allow_water);
+    let pw = sample_solid_density(world, x - PROBE_R, y, on_l2, allow_water);
+    let ps = sample_solid_density(world, x, y + PROBE_R, on_l2, allow_water);
+    let pn = sample_solid_density(world, x, y - PROBE_R, on_l2, allow_water);
+    0.40 * c0 + 0.15 * (pe + pw + ps + pn)
+}
+
+/// Exact client-side mirror of `frostmarsh-server`'s continuous bilinear capsule wall-sliding locomotion
+/// so predicted hero motion matches authoritative server updates with zero snagging and zero rubber-banding!
 #[allow(clippy::too_many_arguments)]
 fn predict_hero_step(
     world: &LiveApproach4World,
@@ -538,12 +619,11 @@ fn predict_hero_step(
     let gw = world.grid_w as f32;
     let gh = world.grid_h as f32;
     let mlen = move_x.hypot(move_y);
-    if mlen < 0.01 && !dashing {
-        return (x, y);
-    }
     let (dx, dy) = if mlen >= 0.01 { (move_x / mlen, move_y / mlen) } else { (0.0, 0.0) };
     let mut speed = if dashing {
         42.0
+    } else if mlen < 0.01 {
+        0.0
     } else {
         let mut s = hero_class_base_speed(class_id);
         if carrying_relic { s *= 0.78; }
@@ -551,17 +631,18 @@ fn predict_hero_step(
         s
     };
 
+    let on_l2 = z >= 1.55;
     let sample_cell = |tx: f32, ty: f32| {
         let xi = (tx.floor() as i32).clamp(0, (world.grid_w.saturating_sub(1)) as i32) as usize;
         let yi = (ty.floor() as i32).clamp(0, (world.grid_h.saturating_sub(1)) as i32) as usize;
         let idx = yi * world.grid_w + xi;
-        if z >= 1.55 { world.decoded_l2[idx] } else { world.decoded[idx] }
+        if on_l2 { world.decoded_l2[idx] } else { world.decoded[idx] }
     };
 
     let c_here = sample_cell(x, y);
     let on_raft = z < 1.35
         && bodies.iter().any(|b| (x - b.x).powi(2) + (y - b.y).powi(2) <= (b.radius + 1.0).powi(2));
-    if !dashing {
+    if !dashing && speed > 0.0 {
         if !on_raft && c_here.water_slow && c_here.s1 != SP_ICE {
             speed *= 0.60;
         } else if c_here.s1 == SP_ICE {
@@ -569,34 +650,52 @@ fn predict_hero_step(
         }
     }
 
-    let nx = (x + dx * speed * dt).clamp(3.5, (gw - 3.5).max(3.5));
-    let ny = (y + dy * speed * dt).clamp(3.5, (gh - 3.5).max(3.5));
-
-    let can_step = |tx: f32, ty: f32| -> bool {
-        let xi = (tx.floor() as i32).clamp(0, (world.grid_w.saturating_sub(1)) as i32) as usize;
-        let yi = (ty.floor() as i32).clamp(0, (world.grid_h.saturating_sub(1)) as i32) as usize;
-        let idx = yi * world.grid_w + xi;
-        if z >= 1.55 {
-            let c2 = world.decoded_l2[idx];
-            if c2.walkable && !c2.wall {
-                return true;
-            }
-            return !world.decoded[idx].wall;
-        }
-        let c1 = world.decoded[idx];
-        let raft = bodies.iter().any(|b| (tx - b.x).powi(2) + (ty - b.y).powi(2) <= (b.radius + 1.0).powi(2));
-        (c1.walkable || raft || dashing) && !c1.wall
+    let mut vx_s = dx * speed;
+    let mut vy_s = dy * speed;
+    let capsule_at = |tx: f32, ty: f32| -> f32 {
+        let allow_water = dashing
+            || on_raft
+            || (z < 1.35
+                && bodies.iter().any(|b| {
+                    (tx - b.x).powi(2) + (ty - b.y).powi(2) <= (b.radius + 1.0).powi(2)
+                }));
+        sample_capsule_density(world, tx, ty, on_l2, allow_water)
     };
 
-    if can_step(nx, ny) {
-        (nx, ny)
-    } else if can_step(nx, y) {
-        (nx, y)
-    } else if can_step(x, ny) {
-        (x, ny)
-    } else {
-        (x, y)
+    let mut fx = (x + vx_s * dt).clamp(3.5, (gw - 3.5).max(3.5));
+    let mut fy = (y + vy_s * dt).clamp(3.5, (gh - 3.5).max(3.5));
+    for _ in 0..2 {
+        let dens = capsule_at(fx, fy);
+        if dens <= 0.35 {
+            break;
+        }
+        let eps = 0.35f32;
+        let gx = (capsule_at(fx + eps, fy) - capsule_at(fx - eps, fy)) / (2.0 * eps);
+        let gy = (capsule_at(fx, fy + eps) - capsule_at(fx, fy - eps)) / (2.0 * eps);
+        let gmag = gx.hypot(gy);
+        if gmag > 1e-4 {
+            let nx = gx / gmag;
+            let ny = gy / gmag;
+            let vn = vx_s * nx + vy_s * ny;
+            if vn > 0.0 {
+                vx_s -= vn * nx;
+                vy_s -= vn * ny;
+            }
+            let push = ((dens - 0.35) * 0.65).min(0.45);
+            fx = (x + vx_s * dt - nx * push).clamp(3.5, (gw - 3.5).max(3.5));
+            fy = (y + vy_s * dt - ny * push).clamp(3.5, (gh - 3.5).max(3.5));
+        } else {
+            fx = x;
+            fy = y;
+            break;
+        }
     }
+    let d_final = capsule_at(fx, fy);
+    if d_final > 0.62 && capsule_at(x, y) < d_final {
+        fx = x;
+        fy = y;
+    }
+    (fx, fy)
 }
 
 struct InteractiveApp {
@@ -619,6 +718,8 @@ struct InteractiveApp {
     brain_selected_idx: Option<usize>,
     selected_element: u8,
     focus_radius: f32,
+    next_dome_mode: u8,
+    last_cursor_grid: Option<(f32, f32)>,
     chat_open: bool,
     chat_input: String,
     chat_shout: bool,
@@ -696,6 +797,8 @@ impl InteractiveApp {
             brain_selected_idx: None,
             selected_element: 0,
             focus_radius: 4.0,
+            next_dome_mode: 1,
+            last_cursor_grid: None,
             chat_open: false,
             chat_input: String::new(),
             chat_shout: true,
@@ -1123,6 +1226,7 @@ impl InteractiveApp {
         ) {
             let (hgx, hgy) = self.world.world_xz_to_grid(hit_wx, hit_wz);
             cursor_grid = Some((hgx, hgy));
+            self.last_cursor_grid = cursor_grid;
             let dx = hgx - hero_gx;
             let dy = hgy - hero_gy;
             if dx.hypot(dy) > 0.05 {
@@ -1594,6 +1698,44 @@ impl ApplicationHandler for InteractiveApp {
                                 KeyCode::KeyK => {
                                     if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::CycleTimeScale);
+                                    }
+                                }
+                                KeyCode::KeyJ => {
+                                    if let Some(ref q) = self.quic {
+                                        let shift_held = self.keys.contains(&KeyCode::ShiftLeft)
+                                            || self.keys.contains(&KeyCode::ShiftRight);
+                                        if shift_held {
+                                            q.send_reliable_detached(ClientReliable::PlaceTimeDome {
+                                                gx: 0.0,
+                                                gy: 0.0,
+                                                mode: 0,
+                                            });
+                                            self.next_dome_mode = 1;
+                                        } else {
+                                            let (gx, gy) = self.last_cursor_grid.unwrap_or_else(|| {
+                                                self.pred_hero_pos
+                                                    .map(|(hx, hy, _)| (hx, hy))
+                                                    .unwrap_or((
+                                                        self.world.grid_w as f32 * 0.5,
+                                                        self.world.grid_h as f32 * 0.5,
+                                                    ))
+                                            });
+                                            let mode = self.next_dome_mode;
+                                            q.send_reliable_detached(ClientReliable::PlaceTimeDome {
+                                                gx: gx.clamp(8.0, (self.world.grid_w.saturating_sub(8)) as f32),
+                                                gy: gy.clamp(8.0, (self.world.grid_h.saturating_sub(8)) as f32),
+                                                mode,
+                                            });
+                                            self.next_dome_mode = if mode == 1 { 2 } else { 1 };
+                                            if let Some(ref audio) = self.audio {
+                                                let sfx = if mode == 1 {
+                                                    SfxKind::FrostCast
+                                                } else {
+                                                    SfxKind::FireCast
+                                                };
+                                                audio.trigger_sfx(sfx, mode, 0.55, 0.0);
+                                            }
+                                        }
                                     }
                                 }
                                 KeyCode::Space => self.pending_dash = true,

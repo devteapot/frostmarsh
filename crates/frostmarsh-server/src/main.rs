@@ -17,7 +17,7 @@ use bytes::Bytes;
 use clap::Parser;
 use field_core::{
     EntityVoxelPhysics, Field, INPUT_CHANNELS, OUTPUT_CHANNELS, RawStepOutput, SP_ICE, SP_OIL,
-    SP_PLANT, SP_ROCK, SP_STEAM, SP_WATER, VolumeField,
+    SP_PLANT, SP_ROCK, SP_STEAM, SP_WATER, SP_WOOD, VolumeField,
 };
 use frostmarsh_proto::*;
 #[cfg(feature = "onnx")]
@@ -291,6 +291,12 @@ impl JsonVal {
     fn as_arr(&self) -> Option<&[JsonVal]> {
         match self {
             JsonVal::Arr(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            JsonVal::Bool(b) => Some(*b),
             _ => None,
         }
     }
@@ -739,6 +745,17 @@ struct ShrineEntity {
     owner: i8,
 }
 
+#[derive(Clone, Debug)]
+struct TimeDomeEntity {
+    id: u32,
+    x: f32,
+    y: f32,
+    radius: f32,
+    dt_scale: f32, // 0.15 = Stasis Dome, 3.0 = Haste Zone
+    expires_tick: u64,
+    owner_team: u8,
+}
+
 struct ClientPeer {
     conn: Connection,
     needs_full_sync: bool,
@@ -814,6 +831,8 @@ struct GameState {
     bot_overrides: HashMap<u32, BotCommandOverride>,
     recent_actuators: VecDeque<(u32, u8, f32, f32, f32, u64)>,
     actuator_pulses: Vec<(u64, f32, ActuatorPulseSnap)>,
+    time_domes: Vec<TimeDomeEntity>,
+    system2_slm_active: bool,
     peers: HashMap<u32, ClientPeer>,
     hazard_layers: Vec<Vec<u8>>,
     weather_kind: u8,
@@ -913,6 +932,8 @@ impl GameState {
             bot_overrides: HashMap::new(),
             recent_actuators: VecDeque::with_capacity(32),
             actuator_pulses: Vec::with_capacity(32),
+            time_domes: Vec::with_capacity(4),
+            system2_slm_active: false,
             peers: HashMap::new(),
             weather_kind: WEATHER_CLEAR,
             day_time: 0.25,
@@ -1078,6 +1099,9 @@ impl GameState {
             if sp.is_finite() && sp > 0.0 {
                 self.world_sparse_pct = sp.clamp(0.0, 100.0);
             }
+        }
+        if let Some(slm) = root.get("system2_slm_active").and_then(|v| v.as_bool()) {
+            self.system2_slm_active = slm;
         }
 
         let tick_now = self.sim_tick;
@@ -1328,6 +1352,162 @@ impl GameState {
         let idx = f.idx(xi, yi);
         let hz = self.hazard_layers[2][idx];
         (hz & (1 << 0)) != 0 && (hz & (1 << 1)) == 0 && f.cell_volume(idx) >= 220
+    }
+
+    /// Discrete per-cell solid density matching client `world_bridge.rs` 3×3 spaced tree trunks 1:1.
+    #[inline]
+    fn cell_solid_density(&self, xi: i32, yi: i32, layer: usize, allow_water: bool) -> f32 {
+        let x = xi.clamp(0, (self.grid_w - 1) as i32) as usize;
+        let y = yi.clamp(0, (self.grid_h - 1) as i32) as usize;
+        let surf_l = self.surf_layer();
+        if layer >= 2 && self.grid_d >= 3 {
+            let f2 = &self.volume.layers[2];
+            let idx = y * self.grid_w + x;
+            if f2.mass[SP_ROCK][idx] >= 500 {
+                return 1.0;
+            }
+            if f2.mass[SP_WOOD][idx] >= 650 {
+                return if x % 3 == 0 && y % 3 == 0 { 1.0 } else { 0.0 };
+            }
+            let hz2 = self.hazard_layers[2][idx];
+            if (hz2 & (1 << 0)) != 0 && (hz2 & (1 << 1)) == 0 && f2.cell_volume(idx) >= 220 {
+                return 0.0;
+            }
+            // Open air over surface: block only solid surface rock cliffs
+            let f1 = &self.volume.layers[surf_l];
+            return if f1.mass[SP_ROCK][idx] >= 500 { 1.0 } else { 0.0 };
+        }
+        let f = &self.volume.layers[surf_l];
+        let idx = y * self.grid_w + x;
+        if f.mass[SP_ROCK][idx] >= 500 {
+            return 1.0;
+        }
+        if f.mass[SP_WOOD][idx] >= 650 {
+            return if x % 3 == 0 && y % 3 == 0 { 1.0 } else { 0.0 };
+        }
+        if !allow_water {
+            let hz = self.hazard_layers[surf_l][idx];
+            let walkable = (hz & (1 << 0)) != 0;
+            let wall = (hz & (1 << 1)) != 0;
+            let water_slow = (hz & (1 << 4)) != 0;
+            if water_slow && !walkable && !wall {
+                return 0.85;
+            }
+        }
+        0.0
+    }
+
+    /// Continuous bilinear solid-density field at `(x, y, layer)`.
+    #[inline]
+    fn sample_solid_density(&self, x: f32, y: f32, layer: usize, allow_water: bool) -> f32 {
+        let fx = x - 0.5;
+        let fy = y - 0.5;
+        let x0 = fx.floor() as i32;
+        let y0 = fy.floor() as i32;
+        let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+        let d00 = self.cell_solid_density(x0, y0, layer, allow_water);
+        let d10 = self.cell_solid_density(x0 + 1, y0, layer, allow_water);
+        let d01 = self.cell_solid_density(x0, y0 + 1, layer, allow_water);
+        let d11 = self.cell_solid_density(x0 + 1, y0 + 1, layer, allow_water);
+        let d0 = d00 + (d10 - d00) * tx;
+        let d1 = d01 + (d11 - d01) * tx;
+        d0 + (d1 - d0) * ty
+    }
+
+    /// Hero capsule solid density (`R = 0.65`, center + 4 perimeter probes at `0.55`).
+    #[inline]
+    fn sample_capsule_density(&self, x: f32, y: f32, layer: usize, allow_water: bool) -> f32 {
+        const PROBE_R: f32 = 0.55;
+        let c0 = self.sample_solid_density(x, y, layer, allow_water);
+        let pe = self.sample_solid_density(x + PROBE_R, y, layer, allow_water);
+        let pw = self.sample_solid_density(x - PROBE_R, y, layer, allow_water);
+        let ps = self.sample_solid_density(x, y + PROBE_R, layer, allow_water);
+        let pn = self.sample_solid_density(x, y - PROBE_R, layer, allow_water);
+        0.40 * c0 + 0.15 * (pe + pw + ps + pn)
+    }
+
+    /// Sample active Time-Dilation Dome `dt_scale` at `(x, y)` (`1.0` ambient, `0.15` Stasis, `3.0` Haste).
+    #[inline]
+    fn sample_time_dome_scale(&self, x: f32, y: f32) -> f32 {
+        for dome in self.time_domes.iter().rev() {
+            let d2 = (x - dome.x).powi(2) + (y - dome.y).powi(2);
+            if d2 <= dome.radius * dome.radius {
+                return dome.dt_scale;
+            }
+        }
+        1.0
+    }
+
+    /// Build continuous `[H, W]` `local_dt` field for `WorldModelDT` (`op=9`) and fallback flux scaling.
+    fn build_local_dt_map(&self) -> Vec<f32> {
+        let len = self.grid_w * self.grid_h;
+        let mut dt_map = vec![1.0f32; len];
+        for dome in &self.time_domes {
+            let r = dome.radius;
+            let r_inner = (r - 1.5).max(1.0);
+            let x0 = ((dome.x - r).floor() as i32).clamp(0, (self.grid_w - 1) as i32) as usize;
+            let x1 = ((dome.x + r).ceil() as i32).clamp(0, (self.grid_w - 1) as i32) as usize;
+            let y0 = ((dome.y - r).floor() as i32).clamp(0, (self.grid_h - 1) as i32) as usize;
+            let y1 = ((dome.y + r).ceil() as i32).clamp(0, (self.grid_h - 1) as i32) as usize;
+            for y in y0..=y1 {
+                let dy = (y as f32 + 0.5) - dome.y;
+                let row = y * self.grid_w;
+                for x in x0..=x1 {
+                    let dx = (x as f32 + 0.5) - dome.x;
+                    let dist = dx.hypot(dy);
+                    if dist <= r_inner {
+                        dt_map[row + x] = dome.dt_scale;
+                    } else if dist < r {
+                        let t = ((dist - r_inner) / (r - r_inner)).clamp(0.0, 1.0);
+                        let blend = 0.5 - 0.5 * (t * std::f32::consts::PI).cos();
+                        dt_map[row + x] = dome.dt_scale + (1.0 - dome.dt_scale) * blend;
+                    }
+                }
+            }
+        }
+        dt_map
+    }
+
+    fn place_time_dome(&mut self, pid: u32, gx: f32, gy: f32, mode: u8) {
+        let owner_team = self.players.get(&pid).map(|p| p.team).unwrap_or(0);
+        if mode == 0 {
+            self.time_domes.clear();
+            let (mx, my) = (self.grid_w as f32 * 0.5, self.grid_h as f32 * 0.5);
+            self.push_event(5, mx, my, 0, owner_team, "TIME DOMES CLEARED!".into());
+            return;
+        }
+        let cx = if gx.is_finite() {
+            gx.clamp(8.0, (self.grid_w.saturating_sub(8)) as f32)
+        } else {
+            self.grid_w as f32 * 0.5
+        };
+        let cy = if gy.is_finite() {
+            gy.clamp(8.0, (self.grid_h.saturating_sub(8)) as f32)
+        } else {
+            self.grid_h as f32 * 0.5
+        };
+        let dt_scale = if mode == 2 { 3.0f32 } else { 0.15f32 };
+        if self.time_domes.len() >= 4 {
+            self.time_domes.remove(0);
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.time_domes.push(TimeDomeEntity {
+            id,
+            x: cx,
+            y: cy,
+            radius: 16.0,
+            dt_scale,
+            expires_tick: self.sim_tick + 540, // 18s at 30 Hz
+            owner_team,
+        });
+        let lbl = if mode == 2 {
+            "HASTE ZONE 3.0X!"
+        } else {
+            "STASIS DOME 0.15X!"
+        };
+        self.push_event(2, cx, cy, 0, owner_team, lbl.into());
     }
 
     fn apply_damage(&mut self, attacker: Option<u32>, victim_id: u32, mut dmg: i16, tag: &str, elem: u8) {
@@ -1903,6 +2083,7 @@ impl GameState {
         self.bot_overrides.clear();
         self.recent_actuators.clear();
         self.actuator_pulses.clear();
+        self.time_domes.clear();
         self.pending_chat = None;
         self.weather_kind = WEATHER_CLEAR;
 
@@ -2513,6 +2694,7 @@ impl GameState {
         self.bot_overrides.retain(|_, ov| tick <= ov.expires_tick);
         self.recent_actuators.retain(|&(_, _, _, _, _, exp)| tick <= exp);
         self.actuator_pulses.retain(|(exp, _, _)| tick <= *exp);
+        self.time_domes.retain(|d| tick <= d.expires_tick);
 
         // Hold victory celebration state for 10 seconds, then cleanly reset for the next match
         if self.match_phase != MATCH_PHASE_ACTIVE {
@@ -2612,43 +2794,60 @@ impl GameState {
                 if ((hz_here & (1 << 3)) != 0 || tick < chilled_until) && tick >= dash_until { mult *= 0.68; }
             }
             let (cvx, cvy) = on_raft.unwrap_or((0.0, 0.0));
-            let nx = (px + (vx * mult + cvx + kb_vx) * dt).clamp(3.5, gw - 3.5);
-            let ny = (py + (vy * mult + cvy + kb_vy) * dt).clamp(3.5, gh - 3.5);
+            let mut vx_s = vx * mult + cvx + kb_vx;
+            let mut vy_s = vy * mult + cvy + kb_vy;
             kb_vx *= 0.82;
             kb_vy *= 0.82;
             if kb_vx.abs() < 0.05 { kb_vx = 0.0; }
             if kb_vy.abs() < 0.05 { kb_vy = 0.0; }
 
-            // Can step on current layer OR onto Layer 2 highland plateau/skybridge via ramps!
-            let can_step_xy = |tx: f32, ty: f32| -> bool {
-                if pz >= 1.55 {
-                    if physics_native {
-                        let p2 = self.volume.sample_entity_physics(tx, ty, 2.min(self.grid_d - 1));
-                        let hz2 = self.sample_hazard(tx, ty, 2.min(self.grid_d - 1));
-                        if p2.support_solid && (hz2 & (1 << 1)) == 0 {
-                            return true;
-                        }
-                    } else if self.layer2_has_walkable_deck(tx, ty) {
-                        return true;
-                    }
-                    // Allow stepping off cliff / skybridge into open air above walkable/water surface!
-                    let hz1 = self.sample_hazard(tx, ty, surf_l);
-                    return (hz1 & (1 << 1)) == 0;
-                }
-                let hz = self.sample_hazard(tx, ty, surf_l);
-                let raft = self.rafts.iter().any(|b| (tx - b.x).powi(2) + (ty - b.y).powi(2) <= (b.radius + 1.0).powi(2));
-                ((hz & (1 << 0)) != 0 || raft || tick < dash_until) && (hz & (1 << 1)) == 0
+            // Continuous bilinear solid-density gradient capsule collider (R = 0.65, probes at 0.55)
+            // Exact 1:1 parity with client `predict_hero_step`: weaves between 3×3 pine trunks and glides smoothly along walls!
+            let coll_layer = if pz >= 1.55 { 2.min(self.grid_d - 1) } else { surf_l };
+            let dashing_now = tick < dash_until;
+            let capsule_at = |tx: f32, ty: f32| -> f32 {
+                let allow_water = dashing_now
+                    || on_raft.is_some()
+                    || (pz < 1.35
+                        && self.rafts.iter().any(|b| {
+                            (tx - b.x).powi(2) + (ty - b.y).powi(2) <= (b.radius + 1.0).powi(2)
+                        }));
+                self.sample_capsule_density(tx, ty, coll_layer, allow_water)
             };
 
-            let (fx, fy) = if can_step_xy(nx, ny) {
-                (nx, ny)
-            } else if can_step_xy(nx, py) {
-                (nx, py)
-            } else if can_step_xy(px, ny) {
-                (px, ny)
-            } else {
-                (px, py)
-            };
+            let mut fx = (px + vx_s * dt).clamp(3.5, gw - 3.5);
+            let mut fy = (py + vy_s * dt).clamp(3.5, gh - 3.5);
+            for _ in 0..2 {
+                let dens = capsule_at(fx, fy);
+                if dens <= 0.35 {
+                    break;
+                }
+                let eps = 0.35f32;
+                let gx = (capsule_at(fx + eps, fy) - capsule_at(fx - eps, fy)) / (2.0 * eps);
+                let gy = (capsule_at(fx, fy + eps) - capsule_at(fx, fy - eps)) / (2.0 * eps);
+                let gmag = gx.hypot(gy);
+                if gmag > 1e-4 {
+                    let nx = gx / gmag;
+                    let ny = gy / gmag;
+                    let vn = vx_s * nx + vy_s * ny;
+                    if vn > 0.0 {
+                        vx_s -= vn * nx;
+                        vy_s -= vn * ny;
+                    }
+                    let push = ((dens - 0.35) * 0.65).min(0.45);
+                    fx = (px + vx_s * dt - nx * push).clamp(3.5, gw - 3.5);
+                    fy = (py + vy_s * dt - ny * push).clamp(3.5, gh - 3.5);
+                } else {
+                    fx = px;
+                    fy = py;
+                    break;
+                }
+            }
+            let d_final = capsule_at(fx, fy);
+            if d_final > 0.62 && capsule_at(px, py) < d_final {
+                fx = px;
+                fy = py;
+            }
 
             // 3D Vertical Altitude Update:
             // - In physics_native: structural support comes directly from `sample_entity_physics(..., 2).support_solid`!
@@ -2722,8 +2921,10 @@ impl GameState {
                         new_last_blast_ft = field_tick;
                     }
                 }
-                // 2. Scorch / Hypothermia damage from temp_c extremes (>120°C or <-25°C)
-                if tick % 6 == 0 {
+                // 2. Scorch / Hypothermia damage from temp_c extremes (>120°C or <-25°C), dilated inside TimeDomes!
+                let dome_dt_p = self.sample_time_dome_scale(fx, fy);
+                let scorch_cadence: u64 = if dome_dt_p < 0.5 { 36 } else if dome_dt_p > 1.5 { 2 } else { 6 };
+                if tick % scorch_cadence == 0 {
                     if phys.temp_c > 120.0 {
                         let dmg = (((phys.temp_c - 120.0) / 45.0).ceil() as i16).clamp(2, 16);
                         phys_dmg_events.push((owner, pid, dmg, "SCORCH", 0));
@@ -2734,6 +2935,8 @@ impl GameState {
                 }
             }
 
+            let dome_dt_classic = self.sample_time_dome_scale(fx, fy);
+            let burn_cadence_classic: u64 = if dome_dt_classic < 0.5 { 48 } else if dome_dt_classic > 1.5 { 3 } else { 8 };
             let p = self.players.get_mut(&pid).unwrap();
             p.x = fx;
             p.y = fy;
@@ -2750,7 +2953,7 @@ impl GameState {
                     let heal = if near_friendly_shrine { 4 } else { 2 };
                     p.hp = (p.hp + heal).min(p.max_hp);
                 }
-            } else if tick % 8 == 0 && (hz_here & (1 << 2)) != 0 && tick >= dash_until {
+            } else if tick % burn_cadence_classic == 0 && (hz_here & (1 << 2)) != 0 && tick >= dash_until {
                 let burn_dmg = if tick < p.oiled_until { 8 } else { 4 };
                 phys_dmg_events.push((None, pid, burn_dmg, "BURN", 0));
             } else if tick % 25 == 0 && p.hp < p.max_hp && (hz_here & (1 << 2)) == 0 {
@@ -2765,14 +2968,16 @@ impl GameState {
             self.push_event(2, cx, cy, 0, t, lbl);
         }
 
-        // Advance 3D projectiles + High-Ground Damage Bonus + Elemental Combos!
+        // Advance 3D projectiles + Time-Dilation Dome Bullet-Time/Haste + High-Ground Damage Bonus!
         let old_proj = std::mem::take(&mut self.projectiles);
         let mut next_proj = Vec::with_capacity(old_proj.len());
         let mut proj_hits: Vec<(u32, u32, u8, f32, f32, f32, bool)> = Vec::new();
         for mut pr in old_proj {
-            let nx = pr.x + pr.vx * dt;
-            let ny = pr.y + pr.vy * dt;
-            let nz = (pr.z + pr.vz * dt).clamp(surf_z, (self.grid_d - 1) as f32);
+            let dome_dt = self.sample_time_dome_scale(pr.x, pr.y);
+            let pr_dt = dt * dome_dt;
+            let nx = pr.x + pr.vx * pr_dt;
+            let ny = pr.y + pr.vy * pr_dt;
+            let nz = (pr.z + pr.vz * pr_dt).clamp(surf_z, (self.grid_d - 1) as f32);
             let pl = (nz.round() as usize).clamp(0, self.grid_d - 1);
 
             let mut hit = nx < 3.0
@@ -2832,7 +3037,16 @@ impl GameState {
                 pr.x = nx;
                 pr.y = ny;
                 pr.z = nz;
-                pr.ttl -= 1;
+                if dome_dt < 0.5 {
+                    // Bullet-time stasis: slow TTL expiry so slowed bolts linger visibly inside dome!
+                    if (tick + pr.id as u64) % 6 == 0 {
+                        pr.ttl = pr.ttl.saturating_sub(1);
+                    }
+                } else if dome_dt > 1.5 {
+                    pr.ttl = pr.ttl.saturating_sub(2);
+                } else {
+                    pr.ttl -= 1;
+                }
                 next_proj.push(pr);
             }
         }
@@ -3086,16 +3300,32 @@ impl GameState {
         let projectiles: Vec<ProjectileSnap> = self
             .projectiles
             .iter()
-            .map(|pr| ProjectileSnap {
-                id: pr.id,
-                element: pr.element,
-                x: pr.x,
-                y: pr.y,
-                z: pr.z,
-                vx: pr.vx,
-                vy: pr.vy,
-                vz: pr.vz,
-                radius: pr.radius,
+            .map(|pr| {
+                let dscale = self.sample_time_dome_scale(pr.x, pr.y);
+                ProjectileSnap {
+                    id: pr.id,
+                    element: pr.element,
+                    x: pr.x,
+                    y: pr.y,
+                    z: pr.z,
+                    vx: pr.vx * dscale,
+                    vy: pr.vy * dscale,
+                    vz: pr.vz * dscale,
+                    radius: pr.radius,
+                }
+            })
+            .collect();
+        let time_domes: Vec<TimeDomeSnap> = self
+            .time_domes
+            .iter()
+            .map(|d| TimeDomeSnap {
+                id: d.id,
+                x: d.x,
+                y: d.y,
+                radius: d.radius,
+                dt_scale: d.dt_scale,
+                ttl_s: (d.expires_tick.saturating_sub(tick) as f32) / 30.0,
+                owner_team: d.owner_team,
             })
             .collect();
         let bodies: Vec<CellBodySnap> = self
@@ -3151,6 +3381,8 @@ impl GameState {
             time_scale: self.time_scale,
             world_day: self.world_day,
             neural_3d_vertical: self.neural_3d_vertical,
+            active_time_domes: time_domes.len().min(255) as u8,
+            system2_slm_active: self.system2_slm_active,
         };
         let match_secs = self.match_start_instant.elapsed().as_secs() as u32;
         let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
@@ -3191,6 +3423,7 @@ impl GameState {
                 match_time_left_s: self.match_time_left_s,
                 mvp_name: self.mvp_name.clone(),
                 mvp_score: self.mvp_score,
+                time_domes: time_domes.clone(),
             };
             let raw = encode_server_datagram(&msg);
             total_bytes += raw.len() as u64;
@@ -3430,10 +3663,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = (&model_path, &eco_path);
 
         let period = Duration::from_millis(100);
+        let mut world_dt_backoff: u32 = 0;
         let mut world_3d_backoff: u32 = 0;
         loop {
             let t_loop = Instant::now();
-            let (mode, eco_on, gw, gh, gd, weather_kind, day_time_now, batched_in, eco_in, fallback_raws) = {
+            let (mode, eco_on, gw, gh, gd, weather_kind, day_time_now, batched_in, eco_in, fallback_raws, local_dt_map, has_active_domes) = {
                 let gs = field_state.lock().unwrap();
                 let sl = gs.surf_layer();
                 let m = gs.sim_mode.clone();
@@ -3441,20 +3675,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let bin = if m == "neural" { Some(gs.volume.encode_batched_input_tensor()) } else { None };
                 let ein = if e { Some(gs.eco.build_input(&gs.volume.layers[sl])) } else { None };
                 let raws = if m != "neural" { Some(gs.volume.refsim_raw_outputs_all()) } else { None };
-                (m, e, gs.grid_w, gs.grid_h, gs.grid_d, gs.weather_kind, gs.day_time, bin, ein, raws)
+                let has_d = !gs.time_domes.is_empty();
+                let dt_map = gs.build_local_dt_map();
+                (m, e, gs.grid_w, gs.grid_h, gs.grid_d, gs.weather_kind, gs.day_time, bin, ein, raws, dt_map, has_d)
             };
 
             let t0 = Instant::now();
-            let (raw_layers, z_flux_opt, reported_ms, active_backend, used_neural_3d_z) = if mode == "neural" {
+            let (mut raw_layers, mut z_flux_opt, reported_ms, active_backend, used_neural_3d_z, used_world_dt) = if mode == "neural" {
                 if let Some(ref mut rpc) = cuda_rpc {
                     let per = OUTPUT_CHANNELS * gw * gh;
                     let horiz_len = gd * per;
                     let z_len = gd.saturating_sub(1) * 5 * gw * gh;
                     let expected_3d_len = horiz_len + z_len;
 
-                    let mut op8_result: Option<(Vec<RawStepOutput>, Vec<f32>, f32)> = None;
-                    if world_3d_backoff == 0 && gd >= 2 {
-                        match rpc.call_batched(8, gd as u8, INPUT_CHANNELS as u16, gh as u16, gw as u16, batched_in.as_ref().unwrap()) {
+                    // 1. Try op=9 (`OP_WORLD_DT_STEP` — WorldModelDT continuous local_dt Time-Dilation Domes!)
+                    let mut op9_result: Option<(Vec<RawStepOutput>, Vec<f32>, f32)> = None;
+                    if world_dt_backoff == 0 && gd >= 2 {
+                        let bin = batched_in.as_ref().unwrap();
+                        let mut dt_payload = Vec::with_capacity(bin.len() + local_dt_map.len());
+                        dt_payload.extend_from_slice(bin);
+                        dt_payload.extend_from_slice(&local_dt_map);
+                        match rpc.call_batched(9, gd as u8, INPUT_CHANNELS as u16, gh as u16, gw as u16, &dt_payload) {
                             Ok((flat, gpu_ms)) if flat.len() == expected_3d_len => {
                                 let mut layers_out = Vec::with_capacity(gd);
                                 for z in 0..gd {
@@ -3466,45 +3707,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     });
                                 }
                                 let z_flux = flat[horiz_len..expected_3d_len].to_vec();
-                                op8_result = Some((layers_out, z_flux, gpu_ms));
+                                op9_result = Some((layers_out, z_flux, gpu_ms));
                             }
                             Ok((flat, _)) => {
                                 log::warn!(
-                                    "CUDA op=8 returned unexpected payload len {} (expected {}), falling back to op=1",
+                                    "CUDA op=9 returned unexpected payload len {} (expected {}), falling back to op=8",
                                     flat.len(),
                                     expected_3d_len
                                 );
-                                world_3d_backoff = 50;
+                                world_dt_backoff = 50;
                             }
                             Err(_) => {
-                                // Daemon does not have world_model_3d_v4.pt loaded; retry periodically
-                                world_3d_backoff = 50;
+                                // Daemon does not have world_model_dt.pt loaded; retry periodically
+                                world_dt_backoff = 50;
                             }
                         }
-                    } else if world_3d_backoff > 0 {
-                        world_3d_backoff -= 1;
+                    } else if world_dt_backoff > 0 {
+                        world_dt_backoff -= 1;
                     }
 
-                    if let Some((layers_out, z_flux, gpu_ms)) = op8_result {
-                        (layers_out, Some(z_flux), gpu_ms, "cuda-fp16-3d-v4".to_string(), true)
+                    if let Some((layers_out, z_flux, gpu_ms)) = op9_result {
+                        (layers_out, Some(z_flux), gpu_ms, "cuda-fp16-dt".to_string(), true, true)
                     } else {
-                        match rpc.call_batched(1, gd as u8, INPUT_CHANNELS as u16, gh as u16, gw as u16, batched_in.as_ref().unwrap()) {
-                            Ok((flat, gpu_ms)) => {
-                                let mut layers_out = Vec::with_capacity(gd);
-                                for z in 0..gd {
-                                    let s = z * per;
-                                    layers_out.push(RawStepOutput {
-                                        width: gw,
-                                        height: gh,
-                                        data: flat[s..s + per].to_vec(),
-                                    });
+                        // 2. Fallback to op=8 (`WorldModel3D` v4)
+                        let mut op8_result: Option<(Vec<RawStepOutput>, Vec<f32>, f32)> = None;
+                        if world_3d_backoff == 0 && gd >= 2 {
+                            match rpc.call_batched(8, gd as u8, INPUT_CHANNELS as u16, gh as u16, gw as u16, batched_in.as_ref().unwrap()) {
+                                Ok((flat, gpu_ms)) if flat.len() == expected_3d_len => {
+                                    let mut layers_out = Vec::with_capacity(gd);
+                                    for z in 0..gd {
+                                        let s = z * per;
+                                        layers_out.push(RawStepOutput {
+                                            width: gw,
+                                            height: gh,
+                                            data: flat[s..s + per].to_vec(),
+                                        });
+                                    }
+                                    let z_flux = flat[horiz_len..expected_3d_len].to_vec();
+                                    op8_result = Some((layers_out, z_flux, gpu_ms));
                                 }
-                                (layers_out, None, gpu_ms, "cuda-fp16-3d".to_string(), false)
+                                Ok((flat, _)) => {
+                                    log::warn!(
+                                        "CUDA op=8 returned unexpected payload len {} (expected {}), falling back to op=1",
+                                        flat.len(),
+                                        expected_3d_len
+                                    );
+                                    world_3d_backoff = 50;
+                                }
+                                Err(_) => {
+                                    world_3d_backoff = 50;
+                                }
                             }
-                            Err(e) => {
-                                log::warn!("CUDA 3D RPC failed ({}), fallback RefSim", e);
-                                let gs = field_state.lock().unwrap();
-                                (gs.volume.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-fallback".into(), false)
+                        } else if world_3d_backoff > 0 {
+                            world_3d_backoff -= 1;
+                        }
+
+                        if let Some((layers_out, z_flux, gpu_ms)) = op8_result {
+                            (layers_out, Some(z_flux), gpu_ms, "cuda-fp16-3d-v4".to_string(), true, false)
+                        } else {
+                            match rpc.call_batched(1, gd as u8, INPUT_CHANNELS as u16, gh as u16, gw as u16, batched_in.as_ref().unwrap()) {
+                                Ok((flat, gpu_ms)) => {
+                                    let mut layers_out = Vec::with_capacity(gd);
+                                    for z in 0..gd {
+                                        let s = z * per;
+                                        layers_out.push(RawStepOutput {
+                                            width: gw,
+                                            height: gh,
+                                            data: flat[s..s + per].to_vec(),
+                                        });
+                                    }
+                                    (layers_out, None, gpu_ms, "cuda-fp16-3d".to_string(), false, false)
+                                }
+                                Err(e) => {
+                                    log::warn!("CUDA 3D RPC failed ({}), fallback RefSim", e);
+                                    let gs = field_state.lock().unwrap();
+                                    (gs.volume.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-fallback".into(), false, false)
+                                }
                             }
                         }
                     }
@@ -3513,22 +3791,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(ref mut ob) = onnx {
                         let vclone = { field_state.lock().unwrap().volume.clone() };
                         match ob.step_volume(&vclone) {
-                            Ok(v) => (v, None, t0.elapsed().as_secs_f32() * 1000.0, "onnx-cpu-3d".into(), false),
-                            Err(_) => (vclone.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-fallback".into(), false),
+                            Ok(v) => (v, None, t0.elapsed().as_secs_f32() * 1000.0, "onnx-cpu-3d".into(), false, false),
+                            Err(_) => (vclone.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-fallback".into(), false, false),
                         }
                     } else {
                         let gs = field_state.lock().unwrap();
-                        (gs.volume.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into(), false)
+                        (gs.volume.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into(), false, false)
                     }
                     #[cfg(not(feature = "onnx"))]
                     {
                         let gs = field_state.lock().unwrap();
-                        (gs.volume.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into(), false)
+                        (gs.volume.refsim_raw_outputs_all(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into(), false, false)
                     }
                 }
             } else {
-                (fallback_raws.unwrap(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into(), false)
+                (fallback_raws.unwrap(), None, t0.elapsed().as_secs_f32() * 1000.0, "refsim-3d".into(), false, false)
             };
+
+            // Graceful spatial time-dilation flux scaling when domes are active and op=9 WorldModelDT is unavailable
+            if has_active_domes && !used_world_dt && local_dt_map.len() == gw * gh {
+                let len = gw * gh;
+                for raw in &mut raw_layers {
+                    if raw.data.len() == OUTPUT_CHANNELS * len {
+                        for y in 0..gh {
+                            let row = y * gw;
+                            let row_s = (y + 1).min(gh - 1) * gw;
+                            for x in 0..gw {
+                                let idx = row + x;
+                                let dt_c = local_dt_map[idx];
+                                let dt_e = dt_c.min(local_dt_map[row + (x + 1).min(gw - 1)]);
+                                let dt_s = dt_c.min(local_dt_map[row_s + x]);
+                                if (dt_c - 1.0).abs() > 1e-3 || (dt_e - 1.0).abs() > 1e-3 || (dt_s - 1.0).abs() > 1e-3 {
+                                    for c in 0..4 { raw.data[c * len + idx] *= dt_e; }
+                                    for c in 4..8 { raw.data[c * len + idx] *= dt_s; }
+                                    raw.data[8 * len + idx] *= dt_e;
+                                    raw.data[9 * len + idx] *= dt_s;
+                                    for c in 10..OUTPUT_CHANNELS { raw.data[c * len + idx] *= dt_c; }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(ref mut zf) = z_flux_opt {
+                    let n_if = gd.saturating_sub(1);
+                    let stride = 5 * len;
+                    if zf.len() >= n_if * stride {
+                        for z in 0..n_if {
+                            let base = z * stride;
+                            for idx in 0..len {
+                                let dt_c = local_dt_map[idx];
+                                if (dt_c - 1.0).abs() > 1e-3 {
+                                    for c in 0..5 {
+                                        zf[base + c * len + idx] *= dt_c;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             let (eco_out, eco_ms) = if eco_on {
                 if let Some(einp) = eco_in {
@@ -3782,6 +4103,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     focus_radius,
                                     impulse,
                                 );
+                            }
+                            ClientReliable::PlaceTimeDome { gx, gy, mode } => {
+                                gs.place_time_dome(pid, gx, gy, mode);
                             }
                         }
                     }

@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "frostmarsh-3d-sandbox"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = "30.0.2"
+winit = "0.30"
+glam = "0.33"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }

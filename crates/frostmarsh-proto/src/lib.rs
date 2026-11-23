@@ -64,6 +64,8 @@ pub enum ClientReliable {
         focus_radius: f32,
         impulse: f32,
     },
+    /// Place or clear a spatial `WorldModelDT` time-dilation dome (`mode`: 0=clear, 1=0.15x Stasis, 2=3.0x Haste).
+    PlaceTimeDome { gx: f32, gy: f32, mode: u8 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,6 +228,18 @@ pub struct ActuatorPulseSnap {
     pub team: u8,
 }
 
+/// Active spatial `WorldModelDT` time-dilation dome (`0.15x` Stasis Dome or `3.0x` Haste Zone).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TimeDomeSnap {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub dt_scale: f32,
+    pub ttl_s: f32,
+    pub owner_team: u8,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TelemetrySnap {
     pub mode: String,
@@ -265,6 +279,10 @@ pub struct TelemetrySnap {
     pub world_day: u32,
     #[serde(default)]
     pub neural_3d_vertical: bool,
+    #[serde(default)]
+    pub active_time_domes: u8,
+    #[serde(default)]
+    pub system2_slm_active: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -299,6 +317,8 @@ pub enum ServerDatagram {
         mvp_name: String,
         #[serde(default)]
         mvp_score: u32,
+        #[serde(default)]
+        time_domes: Vec<TimeDomeSnap>,
     },
     /// 10 Hz single dirty 16×16×1 `A+` volumetric chunk at vertical layer `layer` (`0..grid_d`).
     APlusChunk {

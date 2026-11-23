@@ -40,6 +40,12 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from world_model_3d import WorldModel3D  # noqa: E402
 
+try:
+    from world_model_dt import WorldModelDT, encode_dt_features  # noqa: E402
+except Exception:
+    WorldModelDT = None  # type: ignore[assignment]
+    encode_dt_features = None  # type: ignore[assignment]
+
 
 def dense_world_3d_forward_with_latent(
     wm: WorldModel3D, state: torch.Tensor
@@ -304,6 +310,354 @@ class SparseWorld3DRunner:
         self._last_z_flux = z_flux.contiguous()
         self._last_z = z_world.contiguous()
         self._last_x = x_cur.clone()
+        return self._last_horiz, self._last_z_flux, self._last_z, 1.0
+
+
+def dense_world_dt_forward_with_latent(
+    wm: WorldModelDT,
+    state: torch.Tensor,
+    local_dt: torch.Tensor | float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Exact dense `WorldModelDT` forward on `[L, 18, H, W]` with spatially varying `local_dt` returning:
+      - `out_horiz` : `[L, 17, H, W]`
+      - `out_z_flux`: `[L - 1, 5, H, W]` (active vertical interfaces z <-> z+1)
+      - `z_world`   : `[L, 48, H, W]`
+    """
+    horiz, z_flux_full, z_world = wm(
+        state,
+        local_dt=local_dt,
+        return_z_flux=True,
+        return_struct=False,
+        return_latent=True,
+    )
+    L = state.shape[0]
+    if L > 1:
+        z_flux = z_flux_full[:-1].contiguous()
+    else:
+        z_flux = z_flux_full[:0].contiguous()
+    return horiz, z_flux, z_world
+
+
+def shrinking_halo_dt_forward_with_latent(
+    wm: WorldModelDT,
+    patches_x: torch.Tensor,
+    patches_dt: torch.Tensor,
+    halo: int = 6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Exact mathematically equivalent shrinking-halo `WorldModelDT` pass on active 3D column patches:
+      Inputs:
+        - `patches_x` : `[K, L, 18, T + 2*halo, T + 2*halo]`
+        - `patches_dt`: `[K, L,  1, T + 2*halo, T + 2*halo]`
+      Outputs:
+        - `horiz`     : `[K, L,     17, T, T]`
+        - `z_if`      : `[K, L - 1,  5, T, T]`
+        - `z_5d`      : `[K, L,     48, T, T]`
+    """
+    assert encode_dt_features is not None
+    K, L, C_in, Hp, Wp = patches_x.shape
+    T_h = Hp - 2 * halo
+    T_w = Wp - 2 * halo
+    assert T_h > 0 and T_w > 0, f"Patch size {(Hp, Wp)} too small for halo={halo}"
+
+    x_2d = patches_x.reshape(K * L, C_in, Hp, Wp)
+    dt_2d_full = patches_dt.clamp(min=0.0).reshape(K * L, 1, Hp, Wp)
+
+    # 1. Stem valid conv shrinks spatial dims by 2: Hp -> Hp - 2
+    h = F.conv2d(x_2d, wm.stem.conv.weight, wm.stem.conv.bias, padding=0)
+    dt_cur = dt_2d_full[:, :, 1:-1, 1:-1]
+    dt_emb_cur = wm.dt_mlp(encode_dt_features(dt_cur))
+    film_cur = wm.dt_film(dt_emb_cur).view(K * L, wm.num_res, 2, wm.width, Hp - 2, Wp - 2)
+
+    # 2. FiLM-modulated shrinking-halo residual blocks
+    for idx, blk in enumerate(wm.blocks):
+        gamma_f = film_cur[:, idx, 0]
+        beta_f = film_cur[:, idx, 1]
+        h_mod = h * (1.0 + 0.5 * torch.tanh(gamma_f)) + beta_f
+        conv_out = F.conv2d(F.gelu(h_mod), blk.conv.conv.weight, blk.conv.conv.bias, padding=0)
+        h = h[:, :, 1:-1, 1:-1] + blk.gamma * conv_out
+        if idx + 1 < wm.num_res:
+            film_cur = film_cur[:, :, :, :, 1:-1, 1:-1]
+
+    # 3. Crop center [T_h, T_w] of x, dt, dt_emb + exact 1-pixel east/south face dt
+    x_int = patches_x[:, :, :, halo:-halo, halo:-halo]
+    dt_int5 = patches_dt[:, :, :, halo:-halo, halo:-halo].clamp(min=0.0)
+    dt_int2 = dt_int5.reshape(K * L, 1, T_h, T_w)
+    dt_e_nb = patches_dt[:, :, :, halo:-halo, halo + 1 : Wp - halo + 1].clamp(min=0.0).reshape(K * L, 1, T_h, T_w)
+    dt_s_nb = patches_dt[:, :, :, halo + 1 : Hp - halo + 1, halo:-halo].clamp(min=0.0).reshape(K * L, 1, T_h, T_w)
+    dt_e = torch.minimum(dt_int2, dt_e_nb)
+    dt_s = torch.minimum(dt_int2, dt_s_nb)
+    dt_emb_int = dt_emb_cur[:, :, wm.num_res : -wm.num_res, wm.num_res : -wm.num_res]
+
+    # 4. 1x1x3 vertical cross-layer mixing on active columns -> shared Z_world latent
+    h_3d = h.view(K, L, wm.width, T_h, T_w).transpose(1, 2)
+    v_mix = wm.vert_conv(F.gelu(h_3d))
+    h_3d_mixed = h_3d + wm.vert_gamma * v_mix
+    z_5d = F.gelu(h_3d_mixed).transpose(1, 2)  # [K, L, width, T_h, T_w]
+    z_2d = z_5d.reshape(K * L, wm.width, T_h, T_w)
+
+    # 5. Horizontal 17-channel head with continuous Δt rate modulation + face-symmetric scaling
+    raw_h = wm.head(z_2d) * wm.out_scale
+    rate_mult = 1.0 + 0.85 * torch.tanh(wm.dt_head_mod(dt_emb_int))
+    horiz_rate = torch.cat(
+        [raw_h[:, :10] * rate_mult[:, :10], F.softplus(raw_h[:, 10:]) * rate_mult[:, 10:]],
+        dim=1,
+    )
+    horiz_2d = torch.cat(
+        [
+            horiz_rate[:, 0:4] * dt_e,
+            horiz_rate[:, 4:8] * dt_s,
+            horiz_rate[:, 8:9] * dt_e,
+            horiz_rate[:, 9:10] * dt_s,
+            horiz_rate[:, 10:17] * dt_int2,
+        ],
+        dim=1,
+    )
+    horiz = horiz_2d.view(K, L, wm.out_ch, T_h, T_w)
+
+    # 6. Staggered vertical interface head on L-1 active interfaces scaled by min(dt[z], dt[z+1])
+    if L > 1:
+        x_lo = x_int[:, :-1].reshape(K * (L - 1), C_in, T_h, T_w)
+        x_hi = x_int[:, 1:].reshape(K * (L - 1), C_in, T_h, T_w)
+        v_lo = v_mix[:, :, :-1].transpose(1, 2).reshape(K * (L - 1), wm.width, T_h, T_w)
+        dt_z = torch.minimum(dt_int5[:, :-1], dt_int5[:, 1:])
+        dt_z_emb = wm.dt_mlp(encode_dt_features(dt_z.reshape(K * (L - 1), 1, T_h, T_w)))
+        vh = F.gelu(
+            wm.vert_lo_in(x_lo)
+            + wm.vert_hi_in(x_hi)
+            + wm.vert_lat_in(v_lo)
+            + wm.dt_z_mod(dt_z_emb)
+        )
+        z_if = (wm.vert_head(vh) * wm.z_out_scale).view(K, L - 1, wm.z_flux_ch, T_h, T_w) * dt_z
+    else:
+        z_if = horiz.new_zeros((K, 0, wm.z_flux_ch, T_h, T_w))
+
+    return horiz, z_if, z_5d
+
+
+class SparseWorldDTRunner:
+    """
+    Production sparse active-column `WorldModelDT` runner with continuous per-voxel `local_dt`
+    conditioning (spatial Time-Dilation Domes: 0.15x Stasis / 3.0x Haste) and persistent caches.
+    """
+
+    def __init__(
+        self,
+        world_model_dt: WorldModelDT,
+        device: torch.device | str,
+        use_fp16: bool = True,
+        tile_size: int = 16,
+        halo: int = 6,
+        sparse_threshold: float = 0.42,
+        diff_eps: float = 1e-4,
+    ) -> None:
+        self.device = torch.device(device)
+        self.use_fp16 = bool(use_fp16) and (self.device.type == "cuda")
+        self.compute_dtype = torch.float16 if self.use_fp16 else torch.float32
+        self.tile_size = int(tile_size)
+        self.halo = int(halo)
+        self.patch_size = self.tile_size + 2 * self.halo
+        self.sparse_threshold = float(sparse_threshold)
+        self.diff_eps = float(diff_eps)
+
+        self._required_halo = 1 + len(world_model_dt.blocks)
+        if self.halo < self._required_halo:
+            raise ValueError(
+                f"halo={self.halo} is smaller than WorldModelDT receptive-field radius {self._required_halo}"
+            )
+        self._extra_halo = self.halo - self._required_halo
+
+        self.world_model_dt = world_model_dt
+        self._wm = copy.deepcopy(world_model_dt).to(device=self.device, dtype=self.compute_dtype).eval()
+        for p in self._wm.parameters():
+            p.requires_grad_(False)
+
+        self._last_horiz: torch.Tensor | None = None
+        self._last_z_flux: torch.Tensor | None = None
+        self._last_z: torch.Tensor | None = None
+        self._last_x: torch.Tensor | None = None
+        self._last_dt: torch.Tensor | None = None
+
+    def reset(self) -> None:
+        self._last_horiz = None
+        self._last_z_flux = None
+        self._last_z = None
+        self._last_x = None
+        self._last_dt = None
+
+    def _normalize_dt(self, local_dt: torch.Tensor | float | None, L: int, H: int, W: int) -> torch.Tensor:
+        """Normalize `local_dt` into `[L, 1, H, W]` on `self.device` in `self.compute_dtype`."""
+        if local_dt is None:
+            return torch.ones((L, 1, H, W), dtype=self.compute_dtype, device=self.device)
+        if isinstance(local_dt, (int, float)):
+            return torch.full((L, 1, H, W), max(0.0, float(local_dt)), dtype=self.compute_dtype, device=self.device)
+        t = local_dt.to(device=self.device, dtype=self.compute_dtype, non_blocking=(self.device.type == "cuda")).clamp(min=0.0)
+        if t.ndim == 0:
+            return t.view(1, 1, 1, 1).expand(L, 1, H, W).contiguous()
+        if t.ndim == 2:
+            return t.view(1, 1, H, W).expand(L, 1, H, W).contiguous()
+        if t.ndim == 3:
+            return t.view(t.shape[0], 1, H, W).expand(L, 1, H, W).contiguous()
+        if t.ndim == 4:
+            return t.expand(L, 1, H, W).contiguous()
+        raise ValueError(f"Unsupported local_dt shape {tuple(t.shape)}")
+
+    def _compute_column_mask(
+        self,
+        x_cur: torch.Tensor,
+        dt_cur: torch.Tensor,
+        prev_x: torch.Tensor | None,
+        dirty_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        L, _, H, W = x_cur.shape
+        T = self.tile_size
+        th, tw = H // T, W // T
+
+        if dirty_mask is not None:
+            dm = dirty_mask.to(device=self.device)
+            if dm.shape == (th, tw):
+                col_mask = dm.bool()
+            elif dm.shape == (L, th, tw):
+                col_mask = dm.bool().any(dim=0)
+            elif dm.shape == (H, W):
+                pooled = F.max_pool2d(dm.to(dtype=self.compute_dtype).unsqueeze(0).unsqueeze(0), kernel_size=T, stride=T)
+                col_mask = pooled.squeeze(0).squeeze(0) > 0.5
+            elif dm.shape == (L, H, W):
+                col_px = dm.bool().any(dim=0).to(dtype=self.compute_dtype)
+                pooled = F.max_pool2d(col_px.unsqueeze(0).unsqueeze(0), kernel_size=T, stride=T)
+                col_mask = pooled.squeeze(0).squeeze(0) > 0.5
+            else:
+                raise ValueError(f"dirty_mask shape {tuple(dirty_mask.shape)} incompatible with {(L, H, W)}")
+        else:
+            ref = prev_x.to(device=self.device, dtype=self.compute_dtype) if prev_x is not None else self._last_x
+            assert ref is not None
+            d_sp = (x_cur[:, :10] - ref[:, :10]).abs().amax(dim=1) > max(self.diff_eps, 0.015)
+            d_tmp = (x_cur[:, 10] - ref[:, 10]).abs() > max(self.diff_eps * 4.0, 0.04)
+            has_force = (x_cur[:, 16].abs() > 0.01) | (x_cur[:, 17].abs() > 0.01)
+            diff_col_px = (d_sp | d_tmp | has_force).any(dim=0).to(dtype=self.compute_dtype)
+            pooled = F.max_pool2d(diff_col_px.unsqueeze(0).unsqueeze(0), kernel_size=T, stride=T)
+            col_mask = pooled.squeeze(0).squeeze(0) > 0.5
+
+        # Mark any column whose local_dt changed (plus 1-tile halo neighbor ring for RF=6 parity!)
+        if self._last_dt is not None and self._last_dt.shape == dt_cur.shape:
+            dt_diff = (dt_cur[:, 0] - self._last_dt[:, 0]).abs().amax(dim=0) > 1e-3  # [H, W]
+            if bool(dt_diff.any().item()):
+                dt_tile = F.max_pool2d(
+                    dt_diff.to(dtype=self.compute_dtype).unsqueeze(0).unsqueeze(0),
+                    kernel_size=T,
+                    stride=T,
+                )
+                dt_tile_dil = F.max_pool2d(dt_tile, kernel_size=3, stride=1, padding=1)
+                col_mask = col_mask | (dt_tile_dil.squeeze(0).squeeze(0) > 0.5)
+
+        return col_mask
+
+    @torch.inference_mode()
+    def step(
+        self,
+        x: torch.Tensor,
+        local_dt: torch.Tensor | float | None = None,
+        prev_x: torch.Tensor | None = None,
+        dirty_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        """
+        Advance `WorldModelDT` on `x` (`[L, 18, H, W]`) with optional `[H, W]` `local_dt` map.
+        Returns `(out_horiz [L,17,H,W], out_z_flux [L-1,5,H,W], z_world [L,48,H,W], active_frac)`.
+        """
+        if x.ndim != 4:
+            raise ValueError(f"Expected 4D tensor [L, 18, H, W], got shape {tuple(x.shape)}")
+
+        x_cur = x.to(device=self.device, dtype=self.compute_dtype, non_blocking=(self.device.type == "cuda"))
+        L, C, H, W = x_cur.shape
+        dt_cur = self._normalize_dt(local_dt, L, H, W)
+        T = self.tile_size
+
+        need_dense = (
+            self._last_horiz is None
+            or self._last_z_flux is None
+            or self._last_z is None
+            or self._last_x is None
+            or self._last_dt is None
+            or self._last_x.shape != x_cur.shape
+            or (H % T != 0)
+            or (W % T != 0)
+        )
+
+        if not need_dense:
+            assert self._last_horiz is not None
+            assert self._last_z_flux is not None
+            assert self._last_z is not None
+            assert self._last_x is not None
+            assert self._last_dt is not None
+
+            th, tw = H // T, W // T
+            total_cols = th * tw
+            col_active = self._compute_column_mask(x_cur, dt_cur, prev_x, dirty_mask)
+            coords = torch.nonzero(col_active, as_tuple=False)
+            k = int(coords.shape[0])
+            active_frac = float(k) / float(total_cols)
+
+            if k == 0:
+                self._last_x.copy_(x_cur)
+                self._last_dt.copy_(dt_cur)
+                return self._last_horiz, self._last_z_flux, self._last_z, 0.0
+
+            if active_frac < self.sparse_threshold:
+                ty, tx = coords[:, 0], coords[:, 1]
+
+                padded_x = F.pad(x_cur, (self.halo, self.halo, self.halo, self.halo), mode="replicate")
+                unfolded_x = padded_x.unfold(2, self.patch_size, T).unfold(3, self.patch_size, T)
+                patches_x = unfolded_x.permute(2, 3, 0, 1, 4, 5)[ty, tx].contiguous()
+
+                padded_dt = F.pad(dt_cur, (self.halo, self.halo, self.halo, self.halo), mode="replicate")
+                unfolded_dt = padded_dt.unfold(2, self.patch_size, T).unfold(3, self.patch_size, T)
+                patches_dt = unfolded_dt.permute(2, 3, 0, 1, 4, 5)[ty, tx].contiguous()
+
+                if self._extra_halo > 0:
+                    e = self._extra_halo
+                    patches_x = patches_x[:, :, :, e:-e, e:-e].contiguous()
+                    patches_dt = patches_dt[:, :, :, e:-e, e:-e].contiguous()
+
+                # 128-column bucketing so cuDNN never re-autotunes on K +- 1 jitter
+                k_pad = ((k + 127) // 128) * 128
+                if k_pad > k:
+                    pad_x = patches_x.new_zeros((k_pad - k, L, C, patches_x.shape[3], patches_x.shape[4]))
+                    pad_dt = patches_dt.new_ones((k_pad - k, L, 1, patches_dt.shape[3], patches_dt.shape[4]))
+                    patches_x_run = torch.cat([patches_x, pad_x], dim=0)
+                    patches_dt_run = torch.cat([patches_dt, pad_dt], dim=0)
+                else:
+                    patches_x_run = patches_x
+                    patches_dt_run = patches_dt
+
+                y_horiz, y_z_flux, y_z = shrinking_halo_dt_forward_with_latent(
+                    self._wm, patches_x_run, patches_dt_run, halo=self._required_halo
+                )
+                if k_pad > k:
+                    y_horiz = y_horiz[:k]
+                    y_z_flux = y_z_flux[:k]
+                    y_z = y_z[:k]
+
+                out_ch = self._last_horiz.shape[1]
+                z_ch = self._last_z.shape[1]
+                self._last_horiz.view(L, out_ch, th, T, tw, T).permute(2, 4, 0, 1, 3, 5)[ty, tx] = y_horiz
+                if L > 1:
+                    zf_ch = self._last_z_flux.shape[1]
+                    self._last_z_flux.view(L - 1, zf_ch, th, T, tw, T).permute(2, 4, 0, 1, 3, 5)[
+                        ty, tx
+                    ] = y_z_flux
+                self._last_z.view(L, z_ch, th, T, tw, T).permute(2, 4, 0, 1, 3, 5)[ty, tx] = y_z
+                self._last_x.copy_(x_cur)
+                self._last_dt.copy_(dt_cur)
+                return self._last_horiz, self._last_z_flux, self._last_z, active_frac
+
+        # Dense fallback / initial cache population
+        horiz, z_flux, z_world = dense_world_dt_forward_with_latent(self._wm, x_cur, local_dt=dt_cur)
+        self._last_horiz = horiz.contiguous()
+        self._last_z_flux = z_flux.contiguous()
+        self._last_z = z_world.contiguous()
+        self._last_x = x_cur.clone()
+        self._last_dt = dt_cur.clone()
         return self._last_horiz, self._last_z_flux, self._last_z, 1.0
 
 

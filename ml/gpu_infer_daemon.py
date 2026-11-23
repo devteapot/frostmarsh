@@ -11,6 +11,7 @@ Serves low-latency GPU inference on TCP_NODELAY and optional Unix domain socket:
   - op=6: AcousticStep    (UTF-8 JSON -> UTF-8 JSON) 3D physical acoustics, emergent bot speech bubbles & human chat overrides!
   - op=7: ActuatorPolicy  ([N, 168]      f32 -> [N, 26]       f32) continuous physical actuators (10 floats) + 16 (4x4) Z_world saliency!
   - op=8: WorldModel3D    ([L, 18, H, W] f32 -> [L, 17, H, W] + [L-1, 5, H, W] f32) true 3D sparse/dense horizontal + vertical interface fluxes + Z_world cache!
+  - op=9: WorldModelDT    ([L, 18, H, W] + [H, W] local_dt f32 -> [L, 17, H, W] + [L-1, 5, H, W] f32) spatial time-dilation domes!
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import inspect
 import json
 import math
 import os
+import queue
 import signal
 import socket
 import struct
@@ -74,6 +76,7 @@ OP_BOT_POLICY_INSPECT = 5
 OP_ACOUSTIC_STEP = 6
 OP_ACTUATOR_POLICY = 7
 OP_WORLD_3D_STEP = 8
+OP_WORLD_DT_STEP = 9
 
 Z_FLUX_CH = 5
 ACTUATOR_OUT_DIM = 10
@@ -411,6 +414,265 @@ class _SparseWorld3DAdapter:
         return self.host_out_bytes, z_world, self.static_in, float(active_frac), infer_us
 
 
+class _SparseWorldDTAdapter:
+    """Wraps SparseWorldDTRunner with pinned host I/O buffers for op=9 (`OP_WORLD_DT_STEP`)."""
+
+    def __init__(
+        self,
+        runner_cls: Any,
+        model_dt: torch.nn.Module,
+        h: int,
+        w: int,
+        batch: int,
+        device: torch.device,
+        use_fp16: bool,
+        use_sparse: bool = True,
+    ):
+        self.device = device
+        self.use_fp16 = use_fp16
+        self.x_shape = (batch, 18, h, w)
+        self.dt_shape = (h, w)
+        self.x_elems = batch * 18 * h * w
+        self.dt_elems = h * w
+        self.horiz_shape = (batch, 17, h, w)
+        self.z_flux_layers = max(0, batch - 1)
+        self.z_flux_shape = (self.z_flux_layers, Z_FLUX_CH, h, w)
+        self.horiz_elems = batch * 17 * h * w
+        self.z_flux_elems = self.z_flux_layers * Z_FLUX_CH * h * w
+
+        self.static_in_x = torch.zeros(self.x_shape, dtype=torch.float32, device=device)
+        self.static_in_dt = torch.ones(self.dt_shape, dtype=torch.float32, device=device)
+        self.host_in = torch.empty(
+            (self.x_elems + self.dt_elems,),
+            dtype=torch.float32,
+            pin_memory=(device.type == "cuda"),
+        )
+        self.host_in_x = self.host_in[: self.x_elems].view(*self.x_shape)
+        self.host_in_dt = self.host_in[self.x_elems :].view(*self.dt_shape)
+        self.host_out = torch.empty(
+            (self.horiz_elems + self.z_flux_elems,),
+            dtype=torch.float32,
+            pin_memory=(device.type == "cuda"),
+        )
+        self.host_out_horiz = self.host_out[: self.horiz_elems].view(*self.horiz_shape)
+        self.host_out_zflux = (
+            self.host_out[self.horiz_elems :].view(*self.z_flux_shape)
+            if self.z_flux_elems > 0
+            else None
+        )
+        self.host_in_np = self.host_in.numpy()
+        self.host_out_np = self.host_out.numpy()
+        self.host_in_u8 = self.host_in_np.view(np.uint8).ravel()
+        self.host_out_bytes = memoryview(self.host_out_np).cast("B")
+        self.runner = runner_cls(
+            model_dt,
+            device=device,
+            use_fp16=use_fp16,
+            sparse_threshold=(0.42 if use_sparse else 0.0),
+        )
+
+    def infer_from_host_in(self) -> tuple[memoryview, torch.Tensor, torch.Tensor, float, int]:
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            self.static_in_x.copy_(self.host_in_x, non_blocking=(self.device.type == "cuda"))
+            self.static_in_dt.copy_(self.host_in_dt, non_blocking=(self.device.type == "cuda"))
+            horiz_t, z_flux_t, z_world, active_frac = self.runner.step(
+                self.static_in_x, local_dt=self.static_in_dt
+            )
+            self.host_out_horiz.copy_(horiz_t.float(), non_blocking=False)
+            if self.host_out_zflux is not None:
+                self.host_out_zflux.copy_(z_flux_t.float(), non_blocking=False)
+            if self.use_fp16 and self.device.type == "cuda" and z_world.dtype != torch.float16:
+                z_world = z_world.half()
+        infer_us = int((time.perf_counter() - t0) * 1_000_000)
+        return self.host_out_bytes, z_world, self.static_in_x, float(active_frac), infer_us
+
+
+class _AsyncSystem2Bridge:
+    """
+    Strictly non-blocking System-2 `Qwen2.5-1.5B-Instruct` dialogue adapter for `op=6`.
+    - Lazily loads `System2DialogueEngine` + `ZWorldToLanguageBridge` in a background thread.
+    - `submit_async(...)`: <10 us non-blocking enqueue onto an observation worker queue.
+    - `poll_replies()`: <30 us non-blocking poll of completed LLM replies + actuator plans.
+    """
+
+    def __init__(self, device: torch.device, use_fp16: bool = True):
+        self.device = device
+        self.use_fp16 = use_fp16
+        self.is_ready: bool = False
+        self.load_error: str | None = None
+        self._bridge: Any = None
+        self._engine: Any = None
+        self._bot_profile_cls: Any = None
+        self._req_cls: Any = None
+        self._obs_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=4)
+        self._req_meta: dict[str, dict[str, Any]] = {}
+        self._meta_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._seed_counter = 0
+
+        threading.Thread(target=self._init_and_observe_loop, name="System2SLMInitObs", daemon=True).start()
+
+    def _init_and_observe_loop(self) -> None:
+        try:
+            from system2_slm import (  # noqa: E402
+                BotProfile,
+                DialogueRequest,
+                System2DialogueEngine,
+                ZWorldToLanguageBridge,
+            )
+
+            self._bot_profile_cls = BotProfile
+            self._req_cls = DialogueRequest
+            self._bridge = ZWorldToLanguageBridge(device=self.device, use_fp16=self.use_fp16)
+            dev_str = "cuda" if self.device.type == "cuda" else "cpu"
+            try:
+                self._engine = System2DialogueEngine(
+                    device=dev_str, local_files_only=True, start_worker=True
+                )
+            except Exception:
+                self._engine = System2DialogueEngine(
+                    device=dev_str, local_files_only=False, start_worker=True
+                )
+            self.is_ready = True
+            print(
+                f"[gpu_infer_daemon] System-2 SLM ready ({self._engine.model_id}, "
+                f"{self._engine.dtype}, load={self._engine.load_time_s:.2f}s)",
+                flush=True,
+            )
+        except Exception as exc:
+            self.load_error = str(exc)
+            print(
+                f"[gpu_infer_daemon] System-2 SLM init failed ({exc}); running without SLM",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        # Background observation worker: bridges Z_world + w_state + AcousticField3D -> System2DialogueEngine
+        while not self._stop.is_set():
+            try:
+                item = self._obs_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._seed_counter += 1
+                b = item["bot"]
+                cls_id = int(b.get("class_id", b.get("cls", 0)))
+                bot_cls = {0: "Vanguard", 1: "Pyromancer", 2: "Cryo-Scout"}.get(cls_id, "Vanguard")
+                hp_frac = float(b.get("hp_frac", b.get("hp", 1.0)))
+                hp_val = hp_frac * 100.0 if hp_frac <= 1.5 else hp_frac
+                bx = float(b.get("x", 128.0))
+                by = float(b.get("y", 128.0))
+                bz = int(round(float(b.get("z", 1.0))))
+                bot_id_int = int(b.get("id", 0))
+                bot_name = str(b.get("name", f"BOT-{bot_id_int}"))
+                bot_team = int(b.get("team", 0))
+                profile = self._bot_profile_cls(
+                    bot_id=str(bot_id_int),
+                    name=bot_name,
+                    bot_class=bot_cls,
+                    team=bot_team,
+                    x=bx,
+                    y=by,
+                    layer=bz,
+                    hp=hp_val,
+                )
+                obs = self._bridge.observe(
+                    w_state=item["w_state"],
+                    z_world=item["z_world"],
+                    bot=profile,
+                    speaker_name=item["speaker_name"],
+                    speaker_pos=item["speaker_pos"],
+                    speaker_volume=item["speaker_volume"],
+                    raw_utterance=item["raw_utterance"],
+                    seed=self._seed_counter,
+                    force_recompute_acoustics=False,
+                )
+                req = self._req_cls(
+                    bot=profile,
+                    observation=obs,
+                    conversation_id=f"live_team_{bot_team}",
+                    max_new_tokens=64,
+                )
+                with self._meta_lock:
+                    self._req_meta[req.request_id] = {
+                        "bot_id": bot_id_int,
+                        "bot_name": bot_name,
+                        "team": bot_team,
+                        "x": bx,
+                        "y": by,
+                        "z": float(b.get("z", 1.0)),
+                        "snr_db": float(obs.incoming_snr_db),
+                        "grid_w": float(item.get("grid_w", 256.0)),
+                        "grid_h": float(item.get("grid_h", 256.0)),
+                    }
+                    # Prevent unbounded metadata growth
+                    if len(self._req_meta) > 32:
+                        oldest = next(iter(self._req_meta))
+                        self._req_meta.pop(oldest, None)
+                self._engine.submit_dialogue(req)
+            except Exception as exc:
+                print(f"[gpu_infer_daemon] System-2 SLM observe/submit error: {exc}", file=sys.stderr, flush=True)
+            finally:
+                self._obs_queue.task_done()
+
+    def submit_async(
+        self,
+        w_state: torch.Tensor,
+        z_world: torch.Tensor,
+        bot: dict[str, Any],
+        speaker_name: str,
+        speaker_pos: tuple[float, float, int],
+        speaker_volume: float,
+        raw_utterance: str,
+        grid_w: float = 256.0,
+        grid_h: float = 256.0,
+    ) -> bool:
+        """Strictly non-blocking (<10 us) submission into background System-2 observation queue."""
+        if not self.is_ready or self._engine is None:
+            return False
+        payload = {
+            "w_state": w_state.detach(),
+            "z_world": z_world.detach(),
+            "bot": dict(bot),
+            "speaker_name": speaker_name,
+            "speaker_pos": speaker_pos,
+            "speaker_volume": float(speaker_volume),
+            "raw_utterance": raw_utterance,
+            "grid_w": grid_w,
+            "grid_h": grid_h,
+        }
+        try:
+            self._obs_queue.put_nowait(payload)
+            return True
+        except queue.Full:
+            try:
+                self._obs_queue.get_nowait()
+                self._obs_queue.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self._obs_queue.put_nowait(payload)
+                return True
+            except queue.Full:
+                return False
+
+    def poll_replies(self) -> list[tuple[Any, dict[str, Any]]]:
+        """Strictly non-blocking (<30 us) poll of completed System-2 SLM replies + bot metadata."""
+        if not self.is_ready or self._engine is None:
+            return []
+        resps = self._engine.poll_replies()
+        if not resps:
+            return []
+        out: list[tuple[Any, dict[str, Any]]] = []
+        with self._meta_lock:
+            for r in resps:
+                meta = self._req_meta.pop(r.request_id, {})
+                out.append((r, meta))
+        return out
+
+
 class InferenceEngine:
     def __init__(
         self,
@@ -424,6 +686,8 @@ class InferenceEngine:
         acoustic_pt: Path | None = None,
         actuator_pt: Path | None = None,
         world_3d_pt: Path | None = None,
+        world_dt_pt: Path | None = None,
+        enable_system2_slm: bool = False,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.use_fp16 = use_fp16 and (self.device.type == "cuda")
@@ -512,6 +776,37 @@ class InferenceEngine:
                 )
                 self.world_model_3d = None
                 self._sparse_3d_runner_cls = None
+
+        # Optional WorldModelDT (`op=9` continuous per-voxel local_dt Time-Dilation Domes)
+        self.world_model_dt: Any = None
+        self._sparse_dt_runner_cls: Any = None
+        self._sparse_dt_runners: dict[tuple[int, int, int], _SparseWorldDTAdapter] = {}
+        if world_dt_pt is not None and world_dt_pt.exists():
+            try:
+                from world_model_dt import WorldModelDT  # noqa: E402
+                from sparse_world_3d_runner import SparseWorldDTRunner  # noqa: E402
+
+                wmdt = WorldModelDT(in_ch=18, out_ch=17, width=48, num_res=5, z_flux_ch=Z_FLUX_CH).eval()
+                wmdt.load_state_dict(_load_state_dict(world_dt_pt))
+                wmdt.to(self.device)
+                self.world_model_dt = wmdt
+                self._sparse_dt_runner_cls = SparseWorldDTRunner
+                if self.device.type == "cuda" and use_sparse_world:
+                    torch.backends.cudnn.benchmark = False
+                print(f"[gpu_infer_daemon] Loaded WorldModelDT from {world_dt_pt}", flush=True)
+            except Exception as exc:
+                print(
+                    f"[gpu_infer_daemon] WorldModelDT load failed ({exc}); op=9 disabled",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.world_model_dt = None
+                self._sparse_dt_runner_cls = None
+
+        # Optional non-blocking System-2 Qwen2.5-1.5B Dialogue Engine (`--system2-slm`)
+        self.system2_bridge: _AsyncSystem2Bridge | None = None
+        if enable_system2_slm:
+            self.system2_bridge = _AsyncSystem2Bridge(device=self.device, use_fp16=self.use_fp16)
 
         self.acoustic_engine: Any = None
         ac_path = acoustic_pt if acoustic_pt is not None else (_SCRIPT_DIR / "acoustic_comm_live.pt")
@@ -605,6 +900,42 @@ class InferenceEngine:
             adapter = self._get_sparse_3d_runner(h, w, batch)
             if not recv_fn(memoryview(adapter.host_in_u8)):
                 raise ConnectionError("EOF reading op=8 request payload")
+            out_view, z_latent, x_dev, active_frac, infer_us = adapter.infer_from_host_in()
+            self.last_z_world = z_latent
+            self.last_world_state = x_dev
+            self.last_sparse_active_frac = active_frac
+            out_copy = bytes(out_view)
+        return memoryview(out_copy), infer_us
+
+    def _get_sparse_dt_runner(self, h: int, w: int, batch: int) -> _SparseWorldDTAdapter:
+        assert self.world_model_dt is not None and self._sparse_dt_runner_cls is not None
+        key = (batch, h, w)
+        adapter = self._sparse_dt_runners.get(key)
+        if adapter is None:
+            adapter = _SparseWorldDTAdapter(
+                runner_cls=self._sparse_dt_runner_cls,
+                model_dt=self.world_model_dt,
+                h=h,
+                w=w,
+                batch=batch,
+                device=self.device,
+                use_fp16=self.use_fp16,
+                use_sparse=self.use_sparse_world,
+            )
+            self._sparse_dt_runners[key] = adapter
+            print(
+                f"[gpu_infer_daemon] Activated SparseWorldDTRunner for {batch}x18x{h}x{w} + local_dt (sparse={self.use_sparse_world})",
+                flush=True,
+            )
+        return adapter
+
+    def infer_world_dt_bytes(self, h: int, w: int, recv_fn, batch: int = 4) -> tuple[memoryview, int]:
+        if self.world_model_dt is None or self._sparse_dt_runner_cls is None:
+            raise RuntimeError("world_model_dt.pt not loaded")
+        with self.lock:
+            adapter = self._get_sparse_dt_runner(h, w, batch)
+            if not recv_fn(memoryview(adapter.host_in_u8)):
+                raise ConnectionError("EOF reading op=9 request payload")
             out_view, z_latent, x_dev, active_frac, infer_us = adapter.infer_from_host_in()
             self.last_z_world = z_latent
             self.last_world_state = x_dev
@@ -994,11 +1325,11 @@ class InferenceEngine:
                                 "id": bid,
                                 "name": str(b.get("name", f"BOT-{bid}")),
                                 "team": int(b.get("team", 0)),
-                                "cls": int(b.get("cls", 0)),
+                                "cls": int(b.get("class_id", b.get("cls", 0))),
                                 "x": bx,
                                 "y": by,
                                 "layer": int(round(bz)),
-                                "hp": float(b.get("hp", 1.0)),
+                                "hp": float(b.get("hp_frac", b.get("hp", 1.0))),
                             }
                         )
                     lis = req.get("listener") or [128.0, 128.0, 1.0]
@@ -1098,8 +1429,123 @@ class InferenceEngine:
             infer_us = int((time.perf_counter() - t0) * 1_000_000)
             result.setdefault("bubbles", [])
             result.setdefault("overrides", [])
+
+            # Non-blocking System-2 Qwen2.5-1.5B Dialogue Hook (<10 us submit / <30 us poll)
+            slm_active = bool(self.system2_bridge is not None and self.system2_bridge.is_ready)
+            if slm_active and self.system2_bridge is not None:
+                chat_req = req.get("chat")
+                raw_bots_slm = req.get("bots") or []
+                gw_slm = float(req.get("grid_w", 256.0))
+                gh_slm = float(req.get("grid_h", 256.0))
+                if (
+                    isinstance(chat_req, dict)
+                    and str(chat_req.get("text", "")).strip()
+                    and self.last_world_state is not None
+                    and self.last_z_world is not None
+                    and raw_bots_slm
+                ):
+                    cx = float(chat_req.get("x", gw_slm * 0.5))
+                    cy = float(chat_req.get("y", gh_slm * 0.5))
+                    cz = int(round(float(chat_req.get("layer", 1.0))))
+                    c_team = int(chat_req.get("team", 0))
+                    c_vol = float(chat_req.get("volume", 1.0))
+                    c_text = str(chat_req.get("text", "")).strip()
+                    allies = [b for b in raw_bots_slm if int(b.get("team", 0)) == c_team] or raw_bots_slm
+                    chosen = min(
+                        allies,
+                        key=lambda b: math.hypot(
+                            float(b.get("x", gw_slm * 0.5)) - cx,
+                            float(b.get("y", gh_slm * 0.5)) - cy,
+                        ),
+                    )
+                    self.system2_bridge.submit_async(
+                        w_state=self.last_world_state,
+                        z_world=self.last_z_world,
+                        bot=chosen,
+                        speaker_name="Commander",
+                        speaker_pos=(cx, cy, cz),
+                        speaker_volume=c_vol,
+                        raw_utterance=c_text,
+                        grid_w=gw_slm,
+                        grid_h=gh_slm,
+                    )
+
+                for resp, meta in self.system2_bridge.poll_replies():
+                    plan = resp.plan
+                    reply_txt = str(plan.get("reply", "")).strip()
+                    if not reply_txt:
+                        continue
+                    bid = int(meta.get("bot_id", 0))
+                    bx = float(meta.get("x", gw_slm * 0.5))
+                    by = float(meta.get("y", gh_slm * 0.5))
+                    bz = float(meta.get("z", 1.0))
+                    mgw = float(meta.get("grid_w", gw_slm))
+                    mgh = float(meta.get("grid_h", gh_slm))
+                    sector = str(plan.get("target_sector", ""))
+                    sector_targets = {
+                        "NW Highland": (mgw * 0.28, mgh * 0.25),
+                        "NE Skybridge": (mgw * 0.55, mgh * 0.30),
+                        "SW Oil Basin": (mgw * 0.28, mgh * 0.72),
+                        "SE Shrine Valley": (mgw * 0.72, mgh * 0.72),
+                        "L0 Cavern": (mgw * 0.50, mgh * 0.50),
+                        "Central River": (mgw * 0.50, mgh * 0.50),
+                    }
+                    tx, ty = sector_targets.get(sector, (bx, by))
+                    dx, dy = tx - bx, ty - by
+                    mag = math.hypot(dx, dy)
+                    mx, my = (dx / mag, dy / mag) if mag > 1.5 else (0.0, 0.0)
+
+                    ab = plan.get("actuator_bias") or {}
+                    tf = float(ab.get("thermal_flux", 0.0))
+                    matter = str(ab.get("matter", "none")).lower()
+                    if matter == "oil":
+                        elem_ov = 2
+                    elif tf < -0.25 or matter == "water":
+                        elem_ov = 1
+                    elif tf > 0.25:
+                        elem_ov = 0
+                    else:
+                        elem_ov = -1
+
+                    if matter == "smoke":
+                        ab_ov = 0
+                    elif matter == "water" and tf < -0.2:
+                        ab_ov = 3
+                    elif abs(tf) > 0.7:
+                        ab_ov = 4
+                    else:
+                        ab_ov = 2
+
+                    result["bubbles"].insert(
+                        0,
+                        {
+                            "speaker_id": bid,
+                            "speaker_name": str(meta.get("bot_name", resp.bot_name)),
+                            "team": int(meta.get("team", 0)),
+                            "x": bx,
+                            "y": by,
+                            "z": bz,
+                            "snr_db": float(meta.get("snr_db", 12.0)),
+                            "symbol_id": 16,
+                            "text": reply_txt[:72],
+                        },
+                    )
+                    if bid > 0:
+                        result["overrides"].append(
+                            {
+                                "bot_id": bid,
+                                "move_x": round(mx, 3),
+                                "move_y": round(my, 3),
+                                "elem": elem_ov,
+                                "ability": ab_ov,
+                                "snr_db": float(meta.get("snr_db", 12.0)),
+                                "ttl_ticks": 90,
+                            }
+                        )
+
             result["acoustic_ms"] = round(float(result.get("acoustic_ms", infer_us / 1000.0)), 3)
             result["sparse_pct"] = round(self.last_sparse_active_frac * 100.0, 2)
+            result["system2_slm_active"] = slm_active
         out_bytes = json.dumps(result, separators=(",", ":")).encode("utf-8")
         return out_bytes, infer_us
 
@@ -1296,6 +1742,38 @@ class GPUInferDaemon:
                     break
                 op, pad_batch, channels, height, width, payload_bytes, _seq = HEADER_STRUCT.unpack(hdr_buf)
 
+                if op == OP_WORLD_DT_STEP:
+                    batch = max(1, int(pad_batch))
+                    expected_bytes = (batch * 18 + 1) * height * width * 4
+                    if (
+                        self.engine.world_model_dt is None
+                        or channels != 18
+                        or height == 0
+                        or width == 0
+                        or payload_bytes != expected_bytes
+                    ):
+                        if 0 < payload_bytes <= 64 * 1024 * 1024:
+                            _recv_exact(conn, memoryview(bytearray(payload_bytes)))
+                        self._send_error(conn, STATUS_BAD_REQUEST, height, width)
+                        continue
+                    try:
+                        out_bytes, infer_us = self.engine.infer_world_dt_bytes(
+                            height, width, lambda mv: _recv_exact(conn, mv), batch=batch
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[gpu_infer_daemon] WorldModelDT op=9 error ({height}x{width}): {exc}",
+                            file=sys.stderr,
+                        )
+                        self._send_error(conn, STATUS_INTERNAL_ERROR, height, width)
+                        continue
+                    resp_hdr = HEADER_STRUCT.pack(
+                        STATUS_OK, batch, 17, height, width, len(out_bytes), infer_us
+                    )
+                    conn.sendall(resp_hdr)
+                    conn.sendall(out_bytes)
+                    continue
+
                 if op == OP_WORLD_3D_STEP:
                     batch = max(1, int(pad_batch))
                     expected_bytes = batch * 18 * height * width * 4
@@ -1460,6 +1938,18 @@ def main() -> None:
         default=_SCRIPT_DIR / "world_model_3d_v4.pt",
         help="Optional WorldModel3D v4 checkpoint path for op=8 true 3D vertical physics",
     )
+    parser.add_argument(
+        "--world-model-dt",
+        type=Path,
+        default=_SCRIPT_DIR / "world_model_dt.pt",
+        help="Optional WorldModelDT checkpoint path for op=9 spatial time-dilation domes",
+    )
+    parser.add_argument(
+        "--system2-slm",
+        action="store_true",
+        default=False,
+        help="Enable non-blocking background System-2 Qwen2.5-1.5B dialogue engine in op=6 (default: False)",
+    )
     parser.add_argument("--eco-model", type=Path, default=_SCRIPT_DIR / "ecosystem_model.pt")
     parser.add_argument("--bot-policy", type=Path, default=_SCRIPT_DIR / "bot_policy.pt")
     parser.add_argument("--actuator-policy", type=Path, default=_SCRIPT_DIR / "actuator_policy_rl.pt")
@@ -1491,6 +1981,8 @@ def main() -> None:
         acoustic_pt=args.acoustic_ckpt,
         actuator_pt=args.actuator_policy,
         world_3d_pt=args.world_model_3d,
+        world_dt_pt=args.world_model_dt,
+        enable_system2_slm=args.system2_slm,
     )
     daemon = GPUInferDaemon(host, port, engine, unix_sock=args.unix_sock)
     daemon.start_listening()
@@ -1506,6 +1998,8 @@ def main() -> None:
     print(
         f"[gpu_infer_daemon] Ready on {host}:{daemon.actual_port}{unix_info} | device={dev_name} | "
         f"fp16={engine.use_fp16} | world_3d={engine.world_model_3d is not None} | "
+        f"world_dt={engine.world_model_dt is not None} | "
+        f"system2_slm={args.system2_slm} | "
         f"neural_bots={engine.bot_policy is not None} | "
         f"actuator_policy={engine.actuator_policy is not None} | "
         f"sparse_world={engine.use_sparse_world} | sparse_eco={engine.use_sparse_eco} | "

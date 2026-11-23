@@ -234,6 +234,33 @@ pub fn build_hud(
             }
         }
 
+        // Active Spatial Time-Dilation Dome world-space badges
+        for d in &ent.time_domes {
+            let (wx, wz) = world.grid_to_world_xz(d.x, d.y);
+            let gy = world.sample_ground_y(d.x, d.y);
+            let rel = Vec3::new(wx, gy + d.radius * 0.62 + 1.8, wz) - mats.origin;
+            if let Some((sx, sy)) = project_world(rel, mats, sw, sh) {
+                let is_stasis = d.dt_scale < 0.8;
+                let lbl = if is_stasis {
+                    format!("STASIS 0.15X {:.0}S", d.ttl_s.max(0.0))
+                } else {
+                    format!("HASTE 3.0X {:.0}S", d.ttl_s.max(0.0))
+                };
+                let col = if is_stasis {
+                    [0.36, 0.94, 1.0, 1.0]
+                } else {
+                    [1.0, 0.82, 0.28, 1.0]
+                };
+                let sc = 1.35 * ui;
+                let tw = HudBatch::text_width(&lbl, sc);
+                let pw = tw + 12.0 * ui;
+                let ph = 18.0 * ui;
+                b.rect(sx - pw * 0.5, sy - ph * 0.5, pw, ph, [0.05, 0.05, 0.14, 0.82]);
+                b.rect_outline(sx - pw * 0.5, sy - ph * 0.5, pw, ph, 1.2 * ui, col);
+                b.text_shadow(sx - tw * 0.5, sy - 4.5 * ui, sc, col, &lbl);
+            }
+        }
+
         // Floating damage & elemental combo callouts
         for ev in ent.events.iter().rev().take(12) {
             if ev.kind == 0 || ev.kind == 2 {
@@ -294,7 +321,7 @@ pub fn build_hud(
                 let mut cy = (sy - card_h - 10.0 * ui).clamp(safe_min_y, (safe_max_y - card_h).max(safe_min_y));
 
                 // Avoid top-left telemetry & top-right minimap / brain inspector
-                if cfg.show_telemetry && cx < 428.0 * ui && cy < 184.0 * ui {
+                if cfg.show_telemetry && cx < 428.0 * ui && cy < 204.0 * ui {
                     cx = 430.0 * ui;
                 }
                 let right_guard_h = if cfg.show_brain_inspector { 442.0 * ui } else { 226.0 * ui };
@@ -477,6 +504,19 @@ pub fn build_hud(
             let col = if s.owner < 0 { west_col } else if s.owner > 0 { east_col } else { gold_col };
             b.rect(sx - 4.0 * ui, sy - 4.0 * ui, 8.0 * ui, 8.0 * ui, col);
             b.rect_outline(sx - 4.0 * ui, sy - 4.0 * ui, 8.0 * ui, 8.0 * ui, 1.2 * ui, text_hi);
+        }
+        // Active Time-Dilation Domes on minimap
+        for d in &ent.time_domes {
+            let dx = mm_x + (d.x / gw) * mm_sz;
+            let dy = mm_y + (d.y / gh) * mm_sz;
+            let dr = ((d.radius / gw) * mm_sz).clamp(4.0 * ui, 28.0 * ui);
+            let dcol = if d.dt_scale < 0.8 {
+                [0.32, 0.94, 1.0, 0.92]
+            } else {
+                [1.0, 0.82, 0.26, 0.92]
+            };
+            b.rect(dx - dr, dy - dr, dr * 2.0, dr * 2.0, [dcol[0], dcol[1], dcol[2], 0.20]);
+            b.rect_outline(dx - dr, dy - dr, dr * 2.0, dr * 2.0, 1.4 * ui, dcol);
         }
         // Relic star
         let rx = mm_x + (ent.relic_x / gw) * mm_sz;
@@ -747,7 +787,7 @@ pub fn build_hud(
         let tx = 14.0 * ui;
         let ty = 14.0 * ui;
         let tw = 408.0 * ui;
-        let th = 154.0 * ui;
+        let th = 174.0 * ui;
         b.rect(tx, ty, tw, th, panel_bg);
         b.rect_outline(tx, ty, tw, th, 1.5 * ui, panel_border);
 
@@ -800,6 +840,16 @@ pub fn build_hud(
             } else {
                 ("CLASSIC SPELLS [P]".to_string(), text_dim)
             };
+            let dome_cnt = (t.active_time_domes as usize).max(ent.time_domes.len());
+            let slm_tag = if t.system2_slm_active { "SLM:ON" } else { "SLM:OFF" };
+            let l8 = format!("[J] DOME:{}/4 (SHIFT+J CLR)  {}", dome_cnt, slm_tag);
+            let l8_col = if t.system2_slm_active {
+                [0.34, 0.98, 0.76, 1.0]
+            } else if dome_cnt > 0 {
+                [0.38, 0.94, 1.0, 1.0]
+            } else {
+                [0.72, 0.80, 0.94, 1.0]
+            };
             b.text_shadow(tx + 10.0 * ui, ty + 10.0 * ui, sc, gold_col, &l1);
             b.text_shadow(tx + 10.0 * ui, ty + 30.0 * ui, sc, text_hi, &l2);
             b.text_shadow(
@@ -829,6 +879,7 @@ pub fn build_hud(
                 &l6,
             );
             b.text_shadow(tx + 10.0 * ui, ty + 130.0 * ui, sc, l7_col, &l7);
+            b.text_shadow(tx + 10.0 * ui, ty + 150.0 * ui, sc, l8_col, &l8);
         }
 
         // Compact Shrine / Combo / Weather Feed right below telemetry (kills live in dedicated right-edge Kill Feed)
@@ -931,9 +982,9 @@ pub fn build_hud(
 
         // Controls hint bar at bottom
         let hint_bar = if phys_native {
-            format!("1-3 MATTER  [/] R={:.1}  P MODE  K TIME  ENTER CHAT", cfg.focus_radius)
+            format!("1-3 MAT  [/] R={:.1}  J DOME  K TIME  P MODE  ENTER CHAT", cfg.focus_radius)
         } else {
-            "1-3 ELEM  P MODE  K TIME  F1-F3 CLS  ENTER CHAT".to_string()
+            "1-3 ELEM  J DOME  K TIME  P MODE  F1-F3 CLS  ENTER CHAT".to_string()
         };
         b.text(
             bar_x,

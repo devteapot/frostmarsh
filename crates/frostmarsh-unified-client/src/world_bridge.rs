@@ -1906,6 +1906,78 @@ pub fn assemble_live_frame(
                 }
             }
         }
+
+        // Live 3D Volumetric Spatial Time-Dilation Domes (`WorldModelDT`: 0.15x Ice-Cyan Stasis / 3.0x Amber-Gold Haste!)
+        for dome in &ent.time_domes {
+            let (wx, wz) = world.grid_to_world_xz(dome.x, dome.y);
+            let gy = world.sample_ground_y(dome.x, dome.y);
+            let rel_base = Vec3::new(wx, gy + 0.14, wz) - origin;
+            let is_stasis = dome.dt_scale < 0.8;
+            let fade = (dome.ttl_s / 2.0).clamp(0.18, 1.0);
+            let pulse = 0.92 + 0.08 * (sim_time * if is_stasis { 1.4 } else { 5.8 } + dome.id as f32).sin();
+            let spin = sim_time * if is_stasis { 0.22 } else { 2.10 } + dome.id as f32 * 0.9;
+            let (ring_col, wisp_col, light_col) = if is_stasis {
+                ([0.24, 0.92, 1.20], [0.42, 0.96, 1.28], [0.22, 0.80, 1.12])
+            } else {
+                ([1.22, 0.78, 0.18], [1.36, 0.88, 0.28], [1.12, 0.70, 0.18])
+            };
+
+            let r = dome.radius.clamp(6.0, 28.0);
+            // 1. Ground perimeter ring + 2 elevated glowing dome latitude rings
+            let ring_tiers = [
+                (0.0f32, 1.00f32, 0.88f32 * fade),
+                (r * 0.24, 0.86, 0.68 * fade),
+                (r * 0.46, 0.58, 0.56 * fade),
+            ];
+            for (ti, &(dy, r_mul, glow_a)) in ring_tiers.iter().enumerate() {
+                let s = r * r_mul * 0.88;
+                let dir = if ti % 2 == 0 { 1.0 } else { -1.0 };
+                mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                    pos_yaw: [rel_base.x, rel_base.y + dy, rel_base.z, spin * dir],
+                    scale_pitch: [s, 1.25, s, 0.0],
+                    tint_glow: [ring_col[0] * pulse, ring_col[1] * pulse, ring_col[2] * pulse, glow_a],
+                    flags: [-1.0, 0.0, 0.0, 0.0],
+                });
+            }
+
+            // 2. Suspended translucent volumetric shimmer wisps forming the 3D hemisphere canopy
+            let hemi_h = r * 0.62;
+            let bands: [(usize, f32, f32); 2] = [(12, 0.28, 1.35), (6, 0.64, 1.55)];
+            for (bi, &(cnt, el_frac, rad_w)) in bands.iter().enumerate() {
+                let el = el_frac * std::f32::consts::FRAC_PI_2;
+                let ring_r = r * el.cos();
+                let band_y = gy + 0.65 + hemi_h * el.sin();
+                for k in 0..cnt {
+                    let az = (k as f32 / cnt as f32) * std::f32::consts::TAU
+                        + spin * (0.45 + bi as f32 * 0.35);
+                    let bob = 0.24 * (sim_time * if is_stasis { 1.2 } else { 4.8 } + k as f32 * 1.7 + dome.id as f32).sin();
+                    let wpos = Vec3::new(wx + az.cos() * ring_r, band_y + bob, wz + az.sin() * ring_r);
+                    let rel = wpos - origin;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [rel.x, rel.y, rel.z, rad_w],
+                        color_alpha: [
+                            wisp_col[0],
+                            wisp_col[1],
+                            wisp_col[2],
+                            (if is_stasis { 0.30 } else { 0.36 }) * fade,
+                        ],
+                        params: [1.15, 3.0, dome.id as f32 * 2.3 + k as f32 * 1.1, 0.0],
+                    });
+                }
+            }
+            // Zenith crown shimmer wisp
+            let crown_rel = Vec3::new(wx, gy + 0.9 + hemi_h, wz) - origin;
+            vol_splats.push(VolSplat {
+                pos_rad: [crown_rel.x, crown_rel.y, crown_rel.z, 2.35],
+                color_alpha: [wisp_col[0], wisp_col[1], wisp_col[2], 0.44 * fade],
+                params: [0.85, 3.0, dome.id as f32 * 4.1, 0.0],
+            });
+            push_light(
+                Vec3::new(wx, gy + 4.8, wz),
+                (r * 1.6).clamp(14.0, 28.0),
+                [light_col[0] * fade * pulse, light_col[1] * fade * pulse, light_col[2] * fade * pulse],
+            );
+        }
     }
 
     // Live 3D Ground Aim Reticle under the player's cursor (shows exact aim point & focus radius!)

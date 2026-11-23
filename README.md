@@ -75,6 +75,12 @@
   - **`WorldModelDT` Continuous `Δt` Time-Dilation & Emergent Destructible Structures** (`ml/world_model_dt.py`, `world_model_dt.pt`, [WORLD_DT_STRUCTURES_METRICS.json](models/WORLD_DT_STRUCTURES_METRICS.json), `132.3K` params, Colab `L4`): Beats naive linear `Δt·v4` at `4.0×` (`Horiz R² = 0.7634` vs `0.3825`, `Rxn R² = +0.6663` vs `-0.4964`); **`2.79×`** adaptive multi-rate temporal-sparsity speedup at `512×512×4`; **`0.15×` Stasis Domes freeze wildfires `88.7%` and plunging waterfalls `86.6%`** (`3.0×` zones accelerate burn `2.34×`, drift `5.1e-10`); and `struct_head` (`R² = 0.800`) drives **L2 timber skybridge burn/collapse (`t=7`)**, **cryo ice rampart construction (`t=9`, `99.4%` integrity)**, and **thermal dam breach river redirection (`12.7k` mass surge)**.
   - **System-2 `Z_world → Qwen2.5-1.5B-Instruct` Physics-Grounded Dialogue** (`ml/system2_slm.py`, [SYSTEM2_SLM_METRICS.json](models/SYSTEM2_SLM_METRICS.json), [SYSTEM2_SLM_REPORT.md](models/SYSTEM2_SLM_REPORT.md)): Runs on Spark GB10 (`bf16`, `3.44 GB` peak VRAM) at **`56.86 ms` p50 TTFT**, `44.45 tok/s`, **`0.78 µs`** non-blocking submit (zero 30 Hz stall), **`100%` valid structured `g_i` actuator plans (`38/38`)**, and **`100%` low-SNR acoustic awareness** (waterfall `-6.3 dB`, L0 cavern `-14.8 dB`, basalt wall `-1.4 dB`).
   - **Unified Client Playability & Visual Overhaul:** Fixed exact 360° cursor facing (`(-aim_x).atan2(aim_y)` + 0 ms 3D `AimReticle`), added server-matched `ack_input_seq` replay prediction + 60 Hz edge-triggered inputs + 0 ms predicted actuator beams, smoothed terrain heightfields (`3×3` zero-spike pass), re-proportioned towering Nordic pines (`3–4×` hero height) & monumental `y=8.35` L2 Sky-Arches, and doubled Metal FPS to **`119.4–130.5 FPS` @ 1080p / `96.7–119.0 FPS` @ 4K**.
+- **Iteration 8 — True Isotropic 3D `Z=16` Neural Material Field (`NeuralField3DEncoder` + Client-Swappable `NeuralMaterialHead`), `384 FPS` Surface-Nets vs. Raymarch Head-to-Head, & Live `WorldModelDT` + `Qwen2.5-1.5B`:**
+  - **True 3D `Z=16` (`1m×1m×1m`) Neural Field & `NeuralMaterialHead(Z_world)`** (`ml/neural_field_3d.py`, `ml/train_neural_field_3d.py`, `neural_field_3d_z16.pt`, [NEURAL_FIELD_3D_METRICS.json](models/NEURAL_FIELD_3D_METRICS.json), Colab `RTX PRO 6000 Blackwell`): Cleanly splits server **`NeuralField3DEncoder` (`46.5K` params, `Z_world_3d`)** from a swappable **`12.4K`-param (`50 KB`) `NeuralMaterialHead`** outputting two direct-to-GPU `RGBA8` 3D textures (`density_mat` + `albedo_thermal`). Held-out unseen `256×256×16` R²: **`0.9995` `density_mat`**, **`0.9978` `albedo_thermal`**, **`0.9987` 3D surface normal cosine**, exact `0.0` sparse-vs-dense FP32 parity, **`0.624 ms`** (`256×256×16` @ 5% active) / **`1.718 ms` (`13.1×` speedup)** for **`4.19M` voxels (`512×512×16`)**, and **`0` penetrations / `0` snags** across `56,320` continuous `∇solid_density` 3D capsule steps!
+  - **Head-to-Head Direct-3D-Texture Metal GPU Benchmark (`crates/frostmarsh-3d-sandbox`, [RENDER_3D_HEADTOHEAD_METRICS.json](models/RENDER_3D_HEADTOHEAD_METRICS.json), [NEURAL_E2E_Z16_METAL_METRICS.json](models/NEURAL_E2E_Z16_METAL_METRICS.json)):** Tested **both** direct 3D-texture shaders on vaulted caves, 3-span arched bridges, waterfalls, and Track 8A's live neural volume (`z16_demo_volume.bin`, zero hardcoded terrain rules):
+    - **Smooth Surface-Nets + 3D-Tex Shading + Raymarched Vol Overlay (Winner, `2.8–3.2×` faster, `1.33/255` MAE parity):** **`339–384 FPS` @ 1080p** (`2.60–2.95 ms`), **`100–115 FPS` @ 4K** (`8.70–9.99 ms`), **`365–652 FPS` in vaulted caves**, and **`0.031–0.033 ms` (`33 µs`)** per dirty `16×16×16` brick!
+    - **Sparse `8×8×8` Brick DDA Raymarch:** `105–139 FPS` @ 1080p (`7.19–9.51 ms`), `31.5–39.6 FPS` @ 4K.
+  - **Live on Spark GB10 (`512×512×4 = 1,048,576` voxels, 6 Concurrent Neural Models):** Wired `WorldModelDT` (`op=9`, **`J`-key** `0.15×` Stasis / `3.0×` Haste Time-Dilation Domes), non-blocking **`Qwen/Qwen2.5-1.5B-Instruct` (`SLM:ON`)** live `Enter`-key acoustic chat, and **1:1 continuous bilinear solid-density gradient capsule wall-sliding collisions** (smoothly weaving between towering pine trunks with `0` warnings and `mass_err = 0`, `energy_err = 0`).
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
@@ -89,9 +95,13 @@
 
 ## Visual Showcase
 
-| `WorldModelDT` Continuous Δt Time-Dilation & Destructible Structures | Emergent Continuous Physical Actuators (`ActuatorPolicyNet`, Colab `A100`) |
+| True 3D `Z=16` Direct-3D-Texture Head-to-Head (`339 FPS` Surface-Nets vs `105 FPS` Raymarch) | End-to-End Neural `Z_world` → `NeuralMaterialHead` → `384 FPS` Metal |
 |---|---|
-| ![WorldModelDT Time Dilation & Structures](models/world_dt_structures_viz.png) | ![Emergent Physical Actuators](models/actuator_emergence_viz.png) |
+| ![True 3D Z=16 Head-to-Head](models/render_3d_headtohead_viz.png) | ![Neural Z_world to 384 FPS Metal](models/neural_e2e_z16_metal.png) |
+
+| `WorldModelDT` Continuous Δt Time-Dilation & Destructible Structures | True 3D `Z=16` Neural Material Field & `13.1×` Sparse Brick Scaling |
+|---|---|
+| ![WorldModelDT Time Dilation & Structures](models/world_dt_structures_viz.png) | ![Neural 3D Field Z=16](models/neural_field_3d_viz.png) |
 
 | Tier 1 (`512²` Painterly) | Tier 4 (Multi-Style Client Diffusion) |
 |---|---|
@@ -145,6 +155,7 @@ FROSTMARSH_SERVER=127.0.0.1:4433 ./play_frostmarsh.sh
 | `F1` / `F2` / `F3` | Switch class (**Frost Warden**, **Pyro Alchemist**, **Marsh Ranger**) |
 | **`P`** | **Live hot-toggle `PHYSICS-NATIVE` continuous actuators ↔ `CLASSIC` named spells** |
 | **`K`** | **Cycle Diurnal World Time-Warp (`1× → 4× → 16× → 0.25×` solar freeze/thaw cycle)** |
+| **`J` / `Shift+J`** | **Place `0.15×` Stasis Dome / `3.0×` Haste Zone at cursor (`Shift+J` clears domes)** |
 | **`LMB` / `RMB` / `[` `]`** | **In Physics-Native mode: `+ΔE` Heat / `-ΔE` Cryo / Adjust Focus Radius (`2.0..8.0`)** |
 | **`Enter` / `Tab`** | **Open live Acoustic Chat (`Tab` toggles SHOUT/WHISPER while typing; hold `Tab` outside chat for 6v6 Scoreboard)** |
 | **`U`** | **Mute / unmute procedural 3D spatial audio & SNR-filtered voice synths** |

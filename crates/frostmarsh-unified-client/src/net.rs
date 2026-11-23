@@ -82,6 +82,7 @@ pub struct LiveEntityState {
     pub match_time_left_s: u16,
     pub mvp_name: String,
     pub mvp_score: u32,
+    pub time_domes: Vec<TimeDomeSnap>,
 }
 
 pub struct LiveWorldState {
@@ -251,7 +252,8 @@ impl QuicClientHandle {
                               match_phase: u8,
                               match_time_left_s: u16,
                               mvp_name: String,
-                              mvp_score: u32| {
+                              mvp_score: u32,
+                              time_domes: Vec<TimeDomeSnap>| {
             st.resize_if_needed(
                 telemetry.grid_w as usize,
                 telemetry.grid_h as usize,
@@ -288,6 +290,7 @@ impl QuicClientHandle {
                 match_time_left_s,
                 mvp_name,
                 mvp_score,
+                time_domes,
             });
         };
 
@@ -319,6 +322,7 @@ impl QuicClientHandle {
                             match_time_left_s,
                             mvp_name,
                             mvp_score,
+                            time_domes,
                         }) = decode_server_datagram(&bytes[1..])
                         {
                             let mut st = st_rel.lock().unwrap();
@@ -345,6 +349,7 @@ impl QuicClientHandle {
                                 match_time_left_s,
                                 mvp_name,
                                 mvp_score,
+                                time_domes,
                             );
                         }
                     } else if let Some(ServerReliable::Welcome {
@@ -437,6 +442,7 @@ impl QuicClientHandle {
                         match_time_left_s,
                         mvp_name,
                         mvp_score,
+                        time_domes,
                     } => {
                         let mut st = st_dg.lock().unwrap();
                         apply_snapshot(
@@ -462,6 +468,7 @@ impl QuicClientHandle {
                             match_time_left_s,
                             mvp_name,
                             mvp_score,
+                            time_domes,
                         );
                     }
                 }

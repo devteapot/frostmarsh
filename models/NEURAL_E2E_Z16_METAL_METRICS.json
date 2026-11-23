@@ -1,0 +1,89 @@
+{
+  "adapter": "Apple M4 Pro",
+  "backend": "Metal",
+  "volume_dims": [
+    256,
+    256,
+    16
+  ],
+  "axis_convention": "World right-handed Y-up: X=width(256), Y=depth/altitude(16), Z=height(256); GPU TextureDimension::D3 Extent3d(256, 16, 256)",
+  "brick_occupancy_8x8x8": {
+    "grid_dims": [
+      32,
+      2,
+      32
+    ],
+    "non_empty_bricks": 1953,
+    "total_bricks": 2048,
+    "occupancy_pct": 95.361328125
+  },
+  "surface_nets_build": {
+    "full_build_ms": 8.392583,
+    "dirty_brick_16x16x16_p50_ms": 0.033,
+    "dirty_brick_16x16x16_max_ms": 0.043833,
+    "vertex_count": 92140,
+    "triangle_count": 163382,
+    "brick_count": 256
+  },
+  "renderer_a_raymarch": {
+    "res_1080p": {
+      "p50_ms": 7.187125,
+      "p99_ms": 8.323042,
+      "mean_ms": 7.1886888666666655,
+      "fps_p50": 139.13769414056387
+    },
+    "res_4k": {
+      "p50_ms": 25.232958,
+      "p99_ms": 26.003583,
+      "mean_ms": 25.1614777,
+      "fps_p50": 39.63070837751167
+    },
+    "cave_1080p": {
+      "p50_ms": 3.0373330000000003,
+      "p99_ms": 3.28675,
+      "mean_ms": 3.0600971666666665,
+      "fps_p50": 329.2362082129289
+    }
+  },
+  "renderer_b_surface_nets": {
+    "res_1080p": {
+      "p50_ms": 2.601416,
+      "p99_ms": 3.0855,
+      "mean_ms": 2.6396000333333327,
+      "fps_p50": 384.40603117686675
+    },
+    "res_4k": {
+      "p50_ms": 8.696833,
+      "p99_ms": 9.103333,
+      "mean_ms": 8.694118033333334,
+      "fps_p50": 114.9843856953445
+    },
+    "cave_1080p": {
+      "p50_ms": 1.533042,
+      "p99_ms": 1.650625,
+      "mean_ms": 1.5341167,
+      "fps_p50": 652.2978496349089
+    }
+  },
+  "speedup_b_over_a_1080p": 2.7627741968220385,
+  "speedup_b_over_a_4k": 2.9013961749064285,
+  "visual_parity_mae_rgb_255": {
+    "bridge_view_mae": 1.3266486625514404,
+    "cave_view_mae": 1.8408307613168724
+  },
+  "capsule_collision_3d": {
+    "bridge_walk_ok": true,
+    "bridge_min_y": 9.027083,
+    "bridge_max_y": 9.046053,
+    "bridge_max_penetration_m": 5.269376e-7,
+    "under_bridge_walk_ok": true,
+    "under_bridge_min_clearance_m": 4.1499963,
+    "under_bridge_max_penetration_m": 0.000088214874,
+    "cave_traverse_ok": true,
+    "cave_min_ceiling_clearance_m": 4.9378595,
+    "cave_max_penetration_m": 0.00006849116,
+    "wall_slide_45deg_ok": false,
+    "wall_slide_max_penetration_m": 0.00009904424,
+    "wall_slide_min_tangent_speed": 0.0
+  }
+}

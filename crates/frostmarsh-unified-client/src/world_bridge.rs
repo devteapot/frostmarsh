@@ -13,6 +13,7 @@ use crate::mesh_gen::{MeshInstance, MeshKind, MeshVertex, MESH_KIND_COUNT};
 use crate::net::LiveEntityState;
 use crate::parametric::hash2i;
 use crate::surfel_gen::{SplatPlacement, SplatRef, SurfelProtoBank, SurfelProtoKind};
+use crate::z16_world::Z16World;
 use bytemuck::{Pod, Zeroable};
 use frostmarsh_proto::{
     chunks_for_dim, CHUNK_SIZE, CLASS_ALCHEMIST, CLASS_WARDEN, STATUS_SHIELDED,
@@ -1373,8 +1374,10 @@ pub struct AimReticle {
     pub color: [f32; 3],
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn assemble_live_frame(
     world: &LiveApproach4World,
+    z16: Option<&Z16World>,
     entities: Option<&LiveEntityState>,
     surfels_bank: &SurfelProtoBank,
     mats: &CameraMatrices,
@@ -1388,12 +1391,34 @@ pub fn assemble_live_frame(
     let cull_rad = (cam_dist * 1.95 + 42.0).max(96.0);
     let cull_r2 = cull_rad * cull_rad;
 
-    let mut terrain_verts = Vec::with_capacity(48_000);
-    let mut terrain_idxs = Vec::with_capacity(96_000);
+    let mut terrain_verts = Vec::with_capacity(if z16.is_some() { 0 } else { 48_000 });
+    let mut terrain_idxs = Vec::with_capacity(if z16.is_some() { 0 } else { 96_000 });
     let mut mesh_batches: [Vec<MeshInstance>; MESH_KIND_COUNT] = std::array::from_fn(|_| Vec::new());
     let mut surfel_placements = Vec::with_capacity(3_072);
     let mut surfel_refs = Vec::with_capacity(80_000);
     let mut vol_splats = Vec::with_capacity(2_048);
+
+    let grid_to_xz = |gx: f32, gy: f32| -> (f32, f32) {
+        if let Some(z16w) = z16 {
+            z16w.grid_to_world_xz(gx, gy)
+        } else {
+            world.grid_to_world_xz(gx, gy)
+        }
+    };
+    let sample_g_y = |gx: f32, gy: f32| -> f32 {
+        if let Some(z16w) = z16 {
+            z16w.sample_surface_y(gx, gy)
+        } else {
+            world.sample_ground_y(gx, gy)
+        }
+    };
+    let sample_e_y = |gx: f32, gy: f32, gz: f32| -> f32 {
+        if z16.is_some() {
+            gz
+        } else {
+            world.sample_3d_y(gx, gy, gz)
+        }
+    };
 
     let mut add_surfel = |kind: SurfelProtoKind,
                           world_pos: Vec3,
@@ -1480,17 +1505,40 @@ pub fn assemble_live_frame(
         all_fires.extend_from_slice(&ch.fire_hotspots);
     };
 
-    if layer_slice_mode != 2 {
-        for ch in &world.chunks {
-            emit_chunk(ch);
+    if let Some(z16w) = z16 {
+        // True 3D Z=16 mode: Surface-Nets renders terrain directly; emit Hard-Z sculpted pines & fire hotspots!
+        visible_chunks = z16w.non_empty_bricks();
+        for pines in &z16w.brick_pines {
+            for p in pines {
+                let dx = p.world_pos.x - cam_target.x;
+                let dz = p.world_pos.z - cam_target.z;
+                if dx * dx + dz * dz > cull_r2 {
+                    continue;
+                }
+                let kind = if p.snowy {
+                    SurfelProtoKind::SnowPine
+                } else {
+                    SurfelProtoKind::PineCanopy
+                };
+                add_surfel(kind, p.world_pos, p.yaw, p.scale, p.tint, p.wind_phase, 0.0);
+            }
         }
-    }
-    if layer_slice_mode != 1 {
-        for ch in &world.chunks_l2 {
-            emit_chunk(ch);
+        for flist in &z16w.brick_fires {
+            all_fires.extend_from_slice(flist);
         }
-        for ch in &world.chunks_l3 {
-            emit_chunk(ch);
+    } else {
+        if layer_slice_mode != 2 {
+            for ch in &world.chunks {
+                emit_chunk(ch);
+            }
+        }
+        if layer_slice_mode != 1 {
+            for ch in &world.chunks_l2 {
+                emit_chunk(ch);
+            }
+            for ch in &world.chunks_l3 {
+                emit_chunk(ch);
+            }
         }
     }
 
@@ -1519,8 +1567,8 @@ pub fn assemble_live_frame(
     if let Some(ent) = entities {
         // 3 Capturable Elemental Shrines
         for s in &ent.shrines {
-            let (wx, wz) = world.grid_to_world_xz(s.x, s.y);
-            let gy = world.sample_ground_y(s.x, s.y);
+            let (wx, wz) = grid_to_xz(s.x, s.y);
+            let gy = sample_g_y(s.x, s.y);
             let rel = Vec3::new(wx, gy - 0.05, wz) - origin;
             let scol = if s.progress < -0.15 {
                 let t = (-s.progress).clamp(0.0, 1.0);
@@ -1531,16 +1579,26 @@ pub fn assemble_live_frame(
             } else {
                 [0.98, 0.86, 0.44]
             };
+            let shrine_scale = if let Some(z16w) = z16 {
+                (z16w.width as f32 / 192.0).clamp(0.68, 1.0) * 1.65
+            } else {
+                1.85
+            };
+            let ring_scale = if let Some(z16w) = z16 {
+                (z16w.width as f32 / 256.0 * 7.2).clamp(3.8, 7.5)
+            } else {
+                8.5
+            };
             mesh_batches[MeshKind::ShrineObelisk as usize].push(MeshInstance {
                 pos_yaw: [rel.x, rel.y, rel.z, sim_time * 0.35 + s.id as f32],
-                scale_pitch: [1.85, 1.85, 1.85, 0.0],
+                scale_pitch: [shrine_scale, shrine_scale, shrine_scale, 0.0],
                 tint_glow: [scol[0], scol[1], scol[2], 0.35],
                 flags: [-1.0, 0.0, 0.0, 0.0],
             });
             // Capture radius ring on ground
             mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
                 pos_yaw: [rel.x, rel.y + 0.15, rel.z, 0.0],
-                scale_pitch: [8.5, 1.0, 8.5, 0.0],
+                scale_pitch: [ring_scale, 1.0, ring_scale, 0.0],
                 tint_glow: [scol[0], scol[1], scol[2], 0.55],
                 flags: [-1.0, 0.0, 0.0, 0.0],
             });
@@ -1555,9 +1613,10 @@ pub fn assemble_live_frame(
 
         // Carved `CellBody` Ice Rafts
         for raft in &ent.bodies {
-            let (wx, wz) = world.grid_to_world_xz(raft.x, raft.y);
+            let (wx, wz) = grid_to_xz(raft.x, raft.y);
             let bob = 0.06 * (sim_time * 3.1 + raft.id as f32).sin();
-            let rel = Vec3::new(wx, 0.04 + bob, wz) - origin;
+            let base_y = if z16.is_some() { raft.z.max(1.8) } else { 0.04 };
+            let rel = Vec3::new(wx, base_y + bob, wz) - origin;
             let rad_s = raft.radius.clamp(1.6, 5.5);
             mesh_batches[MeshKind::IceRaft as usize].push(MeshInstance {
                 pos_yaw: [rel.x, rel.y, rel.z, (raft.id as f32) * 0.9 + sim_time * 0.18],
@@ -1574,8 +1633,8 @@ pub fn assemble_live_frame(
 
         // Golden Relic + Pedestal
         let any_carrier = ent.players.iter().any(|p| p.carrying_relic);
-        let (rx, rz) = world.grid_to_world_xz(ent.relic_x, ent.relic_y);
-        let ry = world.sample_ground_y(ent.relic_x, ent.relic_y);
+        let (rx, rz) = grid_to_xz(ent.relic_x, ent.relic_y);
+        let ry = sample_g_y(ent.relic_x, ent.relic_y);
         if !any_carrier {
             let rel_ped = Vec3::new(rx, ry - 0.05, rz) - origin;
             mesh_batches[MeshKind::RelicPedestal as usize].push(MeshInstance {
@@ -1599,10 +1658,10 @@ pub fn assemble_live_frame(
             });
         }
 
-        // 3-Class Heroes & Bots (using true 3D altitude `p.z` so L2 Skybridge/Plateau heroes tower overhead!)
+        // 3-Class Heroes & Bots (using true 3D altitude `p.z` so L2 Skybridge/Plateau or Z=16 Bridge/Cave heroes align 1:1!)
         for p in &ent.players {
-            let (wx, wz) = world.grid_to_world_xz(p.x, p.y);
-            let gy = world.sample_3d_y(p.x, p.y, p.z);
+            let (wx, wz) = grid_to_xz(p.x, p.y);
+            let gy = sample_e_y(p.x, p.y, p.z);
             let speed = p.vx.hypot(p.vy);
             let stride = if speed > 1.0 {
                 (sim_time * 11.0 + p.id as f32 * 1.7).sin().abs() * 0.22
@@ -1697,8 +1756,8 @@ pub fn assemble_live_frame(
 
         // Elemental Projectiles + Soft Volumetric Trails (in true 3D `(x, y, z)`!)
         for pr in &ent.projectiles {
-            let (wx, wz) = world.grid_to_world_xz(pr.x, pr.y);
-            let gy = world.sample_3d_y(pr.x, pr.y, pr.z);
+            let (wx, wz) = grid_to_xz(pr.x, pr.y);
+            let gy = sample_e_y(pr.x, pr.y, pr.z);
             let py = gy + 1.55;
             let rel = Vec3::new(wx, py, wz) - origin;
             let (col, lcol, vkind) = match pr.element {
@@ -1722,10 +1781,10 @@ pub fn assemble_live_frame(
 
         // Live 3D Volumetric Physical Actuator Beams, Cryo Fields, Matter Streams & Shockwaves!
         for (p_idx, pulse) in ent.actuator_pulses.iter().enumerate() {
-            let (wx0, wz0) = world.grid_to_world_xz(pulse.x0, pulse.y0);
-            let wy0 = world.sample_3d_y(pulse.x0, pulse.y0, pulse.z0) + 1.35;
-            let (wx1, wz1) = world.grid_to_world_xz(pulse.x1, pulse.y1);
-            let wy1 = world.sample_3d_y(pulse.x1, pulse.y1, pulse.z1) + 1.10;
+            let (wx0, wz0) = grid_to_xz(pulse.x0, pulse.y0);
+            let wy0 = sample_e_y(pulse.x0, pulse.y0, pulse.z0) + 1.35;
+            let (wx1, wz1) = grid_to_xz(pulse.x1, pulse.y1);
+            let wy1 = sample_e_y(pulse.x1, pulse.y1, pulse.z1) + 1.10;
             let p0 = Vec3::new(wx0, wy0, wz0);
             let p1 = Vec3::new(wx1, wy1, wz1);
             let beam_vec = p1 - p0;
@@ -1909,8 +1968,8 @@ pub fn assemble_live_frame(
 
         // Live 3D Volumetric Spatial Time-Dilation Domes (`WorldModelDT`: 0.15x Ice-Cyan Stasis / 3.0x Amber-Gold Haste!)
         for dome in &ent.time_domes {
-            let (wx, wz) = world.grid_to_world_xz(dome.x, dome.y);
-            let gy = world.sample_ground_y(dome.x, dome.y);
+            let (wx, wz) = grid_to_xz(dome.x, dome.y);
+            let gy = sample_g_y(dome.x, dome.y);
             let rel_base = Vec3::new(wx, gy + 0.14, wz) - origin;
             let is_stasis = dome.dt_scale < 0.8;
             let fade = (dome.ttl_s / 2.0).clamp(0.18, 1.0);
@@ -1982,8 +2041,8 @@ pub fn assemble_live_frame(
 
     // Live 3D Ground Aim Reticle under the player's cursor (shows exact aim point & focus radius!)
     if let Some(ret) = aim_reticle {
-        let (rx, rz) = world.grid_to_world_xz(ret.gx, ret.gy);
-        let ry = world.sample_3d_y(ret.gx, ret.gy, ret.gz) + 0.08;
+        let (rx, rz) = grid_to_xz(ret.gx, ret.gy);
+        let ry = sample_e_y(ret.gx, ret.gy, ret.gz) + 0.08;
         let rel = Vec3::new(rx, ry, rz) - origin;
         let outer_s = (ret.radius * 0.72).clamp(1.2, 6.0);
         // Outer focus-radius ring

@@ -124,16 +124,16 @@ impl CudaRpcClient {
             #[cfg(unix)]
             if self.addr.starts_with('/') {
                 let s = UnixStream::connect(&self.addr)?;
-                s.set_read_timeout(Some(Duration::from_millis(3000)))?;
-                s.set_write_timeout(Some(Duration::from_millis(3000)))?;
+                s.set_read_timeout(Some(Duration::from_millis(8000)))?;
+                s.set_write_timeout(Some(Duration::from_millis(8000)))?;
                 log::info!("Connected to PyTorch CUDA FP16 3D daemon via Unix socket {}", self.addr);
                 self.stream = Some(RpcStream::Unix(s));
                 return Ok(self.stream.as_mut().unwrap());
             }
             let s = TcpStream::connect_timeout(&self.addr.parse()?, Duration::from_millis(800))?;
             s.set_nodelay(true)?;
-            s.set_read_timeout(Some(Duration::from_millis(3000)))?;
-            s.set_write_timeout(Some(Duration::from_millis(3000)))?;
+            s.set_read_timeout(Some(Duration::from_millis(8000)))?;
+            s.set_write_timeout(Some(Duration::from_millis(8000)))?;
             log::info!("Connected to PyTorch CUDA FP16 3D daemon at {}", self.addr);
             self.stream = Some(RpcStream::Tcp(s));
         }
@@ -852,6 +852,7 @@ struct GameState {
     bytes_sent_window: u64,
     bytes_window_start: Instant,
     wire_kbps: f32,
+    rt_handle: tokio::runtime::Handle,
 }
 
 impl GameState {
@@ -974,6 +975,7 @@ impl GameState {
             bytes_sent_window: 0,
             bytes_window_start: Instant::now(),
             wire_kbps: 0.0,
+            rt_handle: tokio::runtime::Handle::current(),
         };
         gs.refresh_hazard_grids();
         for i in 0..bot_count {
@@ -1223,13 +1225,14 @@ impl GameState {
             (gw * 0.50, gh * 0.50)
         };
         let src_spl = 56.0 + 38.0 * chat.volume.clamp(0.1, 1.0);
+        let z_scale = if self.is_z16() { 1.2 } else { 6.0 };
         let tick_now = self.sim_tick;
         let mut replies = 0usize;
         for &(bid, ref bname, bteam, _, bx, by, bz, _, _) in bots {
             if bteam != chat.team {
                 continue;
             }
-            let dist = (bx - chat.x).hypot(by - chat.y).hypot((bz - chat.layer) * 6.0);
+            let dist = (bx - chat.x).hypot(by - chat.y).hypot((bz - chat.layer) * z_scale);
             let snr = src_spl - 20.0 * (dist * 0.45 + 1.0).max(1.0).log10() - 42.0;
             if snr >= 0.0 {
                 let dx = tx - bx;
@@ -1247,7 +1250,7 @@ impl GameState {
                     },
                 );
                 if replies < 2 {
-                    let ldist = (bx - listener.0).hypot(by - listener.1).hypot((bz - listener.2) * 6.0);
+                    let ldist = (bx - listener.0).hypot(by - listener.1).hypot((bz - listener.2) * z_scale);
                     let lsnr = 88.0 - 20.0 * (ldist * 0.45 + 1.0).max(1.0).log10() - 42.0;
                     self.push_speech_bubble(SpeechBubbleSnap {
                         speaker_id: bid,
@@ -1685,7 +1688,7 @@ impl GameState {
                 p.mana -= 8.0;
                 p.bolt_cd = tick + bolt_cd_ticks;
                 let pwr = 1.0 + (p.level as f32 - 1.0) * 0.12;
-                let vz = if p.z >= 1.6 { -0.65 } else { 0.0 }; // High-ground bolts arc gently downward!
+                let vz = if self.grid_d < 16 && p.z >= 1.6 { -0.65 } else { 0.0 }; // High-ground bolts arc gently downward on L=4!
                 spawn_projs.push((
                     p.team,
                     inp.bolt_element % 3,
@@ -1988,9 +1991,10 @@ impl GameState {
         // Radial momentum impulse on nearby entities & floating ice rafts
         if imp_s > 0.1 {
             let eff_r = r + 4.5;
+            let shock_z_tol = if self.is_z16() { 2.2 } else { 1.1 };
             let mut shock_hits: Vec<(u32, i16)> = Vec::new();
             for t in self.players.values_mut() {
-                if t.id == pid || tick < t.dash_until || (t.z - pz).abs() > 1.1 {
+                if t.id == pid || tick < t.dash_until || (t.z - pz).abs() > shock_z_tol {
                     continue;
                 }
                 let rx = t.x - tx;
@@ -2243,11 +2247,12 @@ impl GameState {
             if let Some(&(_, enemy)) = others.iter().find(|(_, o)| o.team != p.team) {
                 nearest_enemy_ids[bi] = enemy.id;
             }
+            let z_band_scale = 3.0 / gd_m1;
             for (ti, &(d, o)) in others.iter().take(8).enumerate() {
                 let tb = base + SELF_DIM + ti * TOKEN_DIM;
                 feats[tb] = ((o.x - p.x) / 80.0).clamp(-1.0, 1.0);
                 feats[tb + 1] = ((o.y - p.y) / 80.0).clamp(-1.0, 1.0);
-                feats[tb + 2] = ((o.z - p.z) / 2.0).clamp(-1.0, 1.0);
+                feats[tb + 2] = (((o.z - p.z) * z_band_scale) / 2.0).clamp(-1.0, 1.0);
                 feats[tb + 3] = if o.team != p.team { 1.0 } else { 0.0 };
                 feats[tb + 4] = (o.hp as f32 / o.max_hp.max(1) as f32).clamp(0.0, 1.0);
                 feats[tb + 5] = if o.carrying_relic { 1.0 } else { 0.0 };
@@ -3556,10 +3561,10 @@ impl GameState {
         Bytes::from(encode_server_datagram(&pkt))
     }
 
-    fn send_packet_datagram_or_uni(conn: &Connection, raw: Bytes) {
+    fn send_packet_datagram_or_uni(rt_handle: &tokio::runtime::Handle, conn: &Connection, raw: Bytes) {
         if let Err(quinn::SendDatagramError::TooLarge) = conn.send_datagram(raw.clone()) {
             let conn_c = conn.clone();
-            tokio::spawn(async move {
+            rt_handle.spawn(async move {
                 if let Ok(mut send) = conn_c.open_uni().await {
                     let mut framed = Vec::with_capacity(1 + raw.len());
                     framed.push(0xFE);
@@ -3571,6 +3576,34 @@ impl GameState {
         }
     }
 
+    /// Sends a batch of packets (e.g. `VolumetricBrick3D` full sync or 10 Hz dirty bricks) on a single
+    /// Tokio task via `rt_handle`, trying unreliable QUIC datagram first and falling back cleanly to
+    /// `0xFE`-framed uni-streams without ever panicking from the 10 Hz `std::thread` or exceeding
+    /// QUIC's concurrent uni-stream window!
+    fn send_packets_batched(rt_handle: &tokio::runtime::Handle, conn: Connection, pkts: Vec<Bytes>) {
+        if pkts.is_empty() {
+            return;
+        }
+        rt_handle.spawn(async move {
+            for raw in pkts {
+                match conn.send_datagram(raw.clone()) {
+                    Ok(()) => {}
+                    Err(quinn::SendDatagramError::TooLarge) => {
+                        if let Ok(mut send) = conn.open_uni().await {
+                            let mut framed = Vec::with_capacity(1 + raw.len());
+                            framed.push(0xFE);
+                            framed.extend_from_slice(&raw);
+                            let _ = send.write_all(&framed).await;
+                            let _ = send.finish();
+                        }
+                    }
+                    Err(quinn::SendDatagramError::ConnectionLost(_)) => break,
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+
     fn broadcast_chunks_10hz(&mut self, dirty: &[(u8, u16, u16)]) {
         if self.peers.is_empty() {
             return;
@@ -3579,53 +3612,66 @@ impl GameState {
         let surf_l = self.surf_layer() as u8;
         let total_2d = self.chunks_x * self.chunks_y;
         let aoi_r = self.aoi_radius as i32;
+        let rt_handle = self.rt_handle.clone();
 
-        // Pre-encode dirty 3D chunks once (skipping completely empty air chunks on upper layers except when clearing)
+        // Pre-encode dirty 3D chunks once (on Z=16 only surface APlusChunks + full 16-layer VolumetricBrick3D!)
         let mut dirty_map: HashMap<(u8, u16, u16), Bytes> = HashMap::with_capacity(dirty.len());
         let mut dirty_bricks: HashMap<(u16, u16), Bytes> = HashMap::new();
         for &(layer, cx, cy) in dirty {
-            dirty_map.insert((layer, cx, cy), self.encode_chunk_pkt(layer, cx, cy));
+            if !is_z16 || layer == surf_l {
+                dirty_map.insert((layer, cx, cy), self.encode_chunk_pkt(layer, cx, cy));
+            }
             if is_z16 && !dirty_bricks.contains_key(&(cx, cy)) {
                 dirty_bricks.insert((cx, cy), self.encode_brick3d_pkt(cx, cy));
             }
         }
 
         let any_full = self.peers.values().any(|p| p.needs_full_sync);
-        let full_pkts: Vec<Bytes> = if any_full {
-            let mut v = Vec::with_capacity(total_2d * 2);
-            // Always send full surface layer (L1) + sparse non-empty chunks on L2 & L3!
-            for layer in 0..(self.grid_d as u8) {
-                if layer == 0 && self.grid_d >= 2 {
-                    // L0 is deep riverbed beneath L1; only upper layers need client visuals!
-                    continue;
-                }
-                for cy in 0..(self.chunks_y as u16) {
-                    for cx in 0..(self.chunks_x as u16) {
-                        if layer != surf_l && !self.volume.is_chunk_non_empty(layer as usize, cx, cy) {
-                            continue;
-                        }
-                        if let Some(b) = dirty_map.get(&(layer, cx, cy)) {
-                            v.push(b.clone());
-                        } else {
-                            v.push(self.encode_chunk_pkt(layer, cx, cy));
-                        }
-                    }
-                }
-            }
+        let (full_pkts, full_bricks): (Vec<Bytes>, Vec<Bytes>) = if any_full {
             if is_z16 {
+                // On --layers 16: stream full surface APlusChunks (minimap/2D fallback) + ALL VolumetricBrick3D bricks!
+                let mut surf_v = Vec::with_capacity(total_2d);
+                let mut brick_v = Vec::with_capacity(total_2d);
                 for by in 0..(self.chunks_y as u16) {
                     for bx in 0..(self.chunks_x as u16) {
-                        if let Some(b) = dirty_bricks.get(&(bx, by)) {
-                            v.push(b.clone());
+                        if let Some(b) = dirty_map.get(&(surf_l, bx, by)) {
+                            surf_v.push(b.clone());
                         } else {
-                            v.push(self.encode_brick3d_pkt(bx, by));
+                            surf_v.push(self.encode_chunk_pkt(surf_l, bx, by));
+                        }
+                        if let Some(b) = dirty_bricks.get(&(bx, by)) {
+                            brick_v.push(b.clone());
+                        } else {
+                            brick_v.push(self.encode_brick3d_pkt(bx, by));
                         }
                     }
                 }
+                (surf_v, brick_v)
+            } else {
+                let mut v = Vec::with_capacity(total_2d * 2);
+                // Always send full surface layer (L1) + sparse non-empty chunks on L2 & L3!
+                for layer in 0..(self.grid_d as u8) {
+                    if layer == 0 && self.grid_d >= 2 {
+                        // L0 is deep riverbed beneath L1; only upper layers need client visuals!
+                        continue;
+                    }
+                    for cy in 0..(self.chunks_y as u16) {
+                        for cx in 0..(self.chunks_x as u16) {
+                            if layer != surf_l && !self.volume.is_chunk_non_empty(layer as usize, cx, cy) {
+                                continue;
+                            }
+                            if let Some(b) = dirty_map.get(&(layer, cx, cy)) {
+                                v.push(b.clone());
+                            } else {
+                                v.push(self.encode_chunk_pkt(layer, cx, cy));
+                            }
+                        }
+                    }
+                }
+                (v, Vec::new())
             }
-            v
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         let player_chunks: HashMap<u32, (i32, i32)> = self
@@ -3636,6 +3682,7 @@ impl GameState {
 
         let cx_dim = self.chunks_x;
         let mut macro_cache: HashMap<(u16, u16), Bytes> = HashMap::new();
+        let mut macro_brick_cache: HashMap<(u16, u16), Bytes> = HashMap::new();
         if aoi_r > 0 {
             let cursors: Vec<usize> = self
                 .peers
@@ -3651,6 +3698,13 @@ impl GameState {
                     if !dirty_map.contains_key(&(surf_l, cx, cy)) && !macro_cache.contains_key(&(cx, cy)) {
                         macro_cache.insert((cx, cy), self.encode_chunk_pkt(surf_l, cx, cy));
                     }
+                    if is_z16
+                        && step < 2
+                        && !dirty_bricks.contains_key(&(cx, cy))
+                        && !macro_brick_cache.contains_key(&(cx, cy))
+                    {
+                        macro_brick_cache.insert((cx, cy), self.encode_brick3d_pkt(cx, cy));
+                    }
                 }
             }
         }
@@ -3661,10 +3715,33 @@ impl GameState {
             let mut sent_cnt = 0u16;
             if peer.needs_full_sync {
                 peer.needs_full_sync = false;
-                for b in &full_pkts {
-                    peer_b += b.len() as u64;
-                    sent_cnt += 1;
-                    Self::send_packet_datagram_or_uni(&peer.conn, b.clone());
+                if is_z16 {
+                    let mut batch_pkts = Vec::with_capacity(full_bricks.len() + full_pkts.len());
+                    // Prioritize full 3D VolumetricBrick3D world first so client renders all 16 layers immediately!
+                    for b in &full_bricks {
+                        peer_b += b.len() as u64;
+                        sent_cnt = sent_cnt.saturating_add(1);
+                        batch_pkts.push(b.clone());
+                    }
+                    for b in &full_pkts {
+                        peer_b += b.len() as u64;
+                        sent_cnt = sent_cnt.saturating_add(1);
+                        batch_pkts.push(b.clone());
+                    }
+                    log::info!(
+                        "Full Z=16 sync queued for player {}: {} VolumetricBrick3D bricks + {} surf chunks ({:.1} KB)",
+                        pid,
+                        full_bricks.len(),
+                        full_pkts.len(),
+                        peer_b as f32 / 1024.0
+                    );
+                    Self::send_packets_batched(&rt_handle, peer.conn.clone(), batch_pkts);
+                } else {
+                    for b in &full_pkts {
+                        peer_b += b.len() as u64;
+                        sent_cnt = sent_cnt.saturating_add(1);
+                        Self::send_packet_datagram_or_uni(&rt_handle, &peer.conn, b.clone());
+                    }
                 }
             } else {
                 let (pcx, pcy) = player_chunks
@@ -3679,18 +3756,19 @@ impl GameState {
                         || ((cx as i32 - pcx).abs() <= aoi_r && (cy as i32 - pcy).abs() <= aoi_r);
                     if in_aoi {
                         peer_b += b.len() as u64;
-                        sent_cnt += 1;
+                        sent_cnt = sent_cnt.saturating_add(1);
                         let _ = peer.conn.send_datagram(b.clone());
                     }
                 }
+                let mut z16_bricks_out: Vec<Bytes> = Vec::new();
                 if is_z16 {
                     for (&(bx, by), b) in &dirty_bricks {
                         let in_aoi = aoi_r == 0
                             || ((bx as i32 - pcx).abs() <= aoi_r && (by as i32 - pcy).abs() <= aoi_r);
                         if in_aoi {
                             peer_b += b.len() as u64;
-                            sent_cnt += 1;
-                            Self::send_packet_datagram_or_uni(&peer.conn, b.clone());
+                            sent_cnt = sent_cnt.saturating_add(1);
+                            z16_bricks_out.push(b.clone());
                         }
                     }
                 }
@@ -3701,11 +3779,21 @@ impl GameState {
                         let cy = (ci / cx_dim) as u16;
                         if let Some(b) = macro_cache.get(&(cx, cy)) {
                             peer_b += b.len() as u64;
-                            sent_cnt += 1;
+                            sent_cnt = sent_cnt.saturating_add(1);
                             let _ = peer.conn.send_datagram(b.clone());
+                        }
+                        if is_z16 && step < 2 {
+                            if let Some(b) = macro_brick_cache.get(&(cx, cy)) {
+                                peer_b += b.len() as u64;
+                                sent_cnt = sent_cnt.saturating_add(1);
+                                z16_bricks_out.push(b.clone());
+                            }
                         }
                     }
                     peer.macro_cursor = (peer.macro_cursor + 12) % total_2d;
+                }
+                if !z16_bricks_out.is_empty() {
+                    Self::send_packets_batched(&rt_handle, peer.conn.clone(), z16_bricks_out);
                 }
             }
             bytes_one_peer = peer_b;
@@ -3850,8 +3938,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 world_dt_backoff = 50;
                             }
-                            Err(_) => {
+                            Err(e) => {
                                 // Daemon does not have world_model_dt.pt loaded; retry periodically
+                                log::debug!("CUDA op=9 unavailable for {}x{}x{} ({}); falling back to op=8", gw, gh, gd, e);
                                 world_dt_backoff = 50;
                             }
                         }
@@ -3887,7 +3976,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                     world_3d_backoff = 50;
                                 }
-                                Err(_) => {
+                                Err(e) => {
+                                    log::debug!("CUDA op=8 unavailable for {}x{}x{} ({}); falling back to op=1", gw, gh, gd, e);
                                     world_3d_backoff = 50;
                                 }
                             }

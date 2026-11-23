@@ -72,44 +72,46 @@ def shrinking_halo_3d_forward_with_latent(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Exact mathematically equivalent shrinking-halo `WorldModel3D` pass on active 3D column patches:
-      Input:  `patches` `[K, L, 18, T + 2*halo, T + 2*halo]` (typically `[K, 4, 18, 28, 28]`)
+      Input:  `patches` `[K, L, 18, T_h + 2*halo, T_w + 2*halo]` (works for ANY `L >= 1`, e.g. `L=4` or `L=16`)
       Output:
-        - `horiz` : `[K, L, 17, T, T]`
-        - `z_flux`: `[K, L - 1, 5, T, T]`
-        - `z_5d`  : `[K, L, 48, T, T]`
+        - `horiz` : `[K, L, 17, T_h, T_w]`
+        - `z_flux`: `[K, L - 1, 5, T_h, T_w]`
+        - `z_5d`  : `[K, L, 48, T_h, T_w]`
     """
-    K, L, C_in, P, _ = patches.shape
-    T = P - 2 * halo
-    x_center = patches[:, :, :, halo:-halo, halo:-halo]  # [K, L, C_in, T, T]
+    K, L, C_in, Hp, Wp = patches.shape
+    T_h = Hp - 2 * halo
+    T_w = Wp - 2 * halo
+    assert T_h > 0 and T_w > 0, f"Patch size {(Hp, Wp)} too small for halo={halo}"
+    x_center = patches[:, :, :, halo:-halo, halo:-halo]  # [K, L, C_in, T_h, T_w]
 
     # 1. Exact shrinking-halo 2D spatial residual trunk (28 -> 26 -> 24 -> 22 -> 20 -> 18 -> 16)
-    x_2d = patches.reshape(K * L, C_in, P, P)
+    x_2d = patches.reshape(K * L, C_in, Hp, Wp)
     h = F.conv2d(x_2d, wm.stem.conv.weight, wm.stem.conv.bias, padding=0)
     for blk in wm.blocks:
         conv_out = F.conv2d(F.gelu(h), blk.conv.conv.weight, blk.conv.conv.bias, padding=0)
         h = h[:, :, 1:-1, 1:-1] + blk.gamma * conv_out
 
     # 2. Exact 1x1x3 vertical cross-layer mixing layer (purely vertical, zero extra spatial halo!)
-    h_3d = h.view(K, L, wm.width, T, T).transpose(1, 2)  # [K, width, L, T, T]
+    h_3d = h.view(K, L, wm.width, T_h, T_w).transpose(1, 2)  # [K, width, L, T_h, T_w]
     v_mix = wm.vert_conv(F.gelu(h_3d))
     h_3d_mixed = h_3d + wm.vert_gamma * v_mix
-    z_5d = F.gelu(h_3d_mixed).transpose(1, 2)  # [K, L, width, T, T]
-    z_2d = z_5d.reshape(K * L, wm.width, T, T)
+    z_5d = F.gelu(h_3d_mixed).transpose(1, 2)  # [K, L, width, T_h, T_w]
+    z_2d = z_5d.reshape(K * L, wm.width, T_h, T_w)
 
     # 3. Exact horizontal 17-channel head
     raw_h = wm.head(z_2d) * wm.out_scale
     horiz_2d = torch.cat([raw_h[:, :10], F.softplus(raw_h[:, 10:])], dim=1)
-    horiz = horiz_2d.view(K, L, wm.out_ch, T, T)
+    horiz = horiz_2d.view(K, L, wm.out_ch, T_h, T_w)
 
     # 4. Exact staggered vertical interface head on L-1 active interfaces (purely 1x1 spatially!)
     if L > 1:
-        x_lo = x_center[:, :-1].reshape(K * (L - 1), C_in, T, T)
-        x_hi = x_center[:, 1:].reshape(K * (L - 1), C_in, T, T)
-        v_lo = v_mix[:, :, :-1].transpose(1, 2).reshape(K * (L - 1), wm.width, T, T)
+        x_lo = x_center[:, :-1].reshape(K * (L - 1), C_in, T_h, T_w)
+        x_hi = x_center[:, 1:].reshape(K * (L - 1), C_in, T_h, T_w)
+        v_lo = v_mix[:, :, :-1].transpose(1, 2).reshape(K * (L - 1), wm.width, T_h, T_w)
         vh = F.gelu(wm.vert_lo_in(x_lo) + wm.vert_hi_in(x_hi) + wm.vert_lat_in(v_lo))
-        z_if = (wm.vert_head(vh) * wm.z_out_scale).view(K, L - 1, wm.z_flux_ch, T, T)
+        z_if = (wm.vert_head(vh) * wm.z_out_scale).view(K, L - 1, wm.z_flux_ch, T_h, T_w)
     else:
-        z_if = horiz.new_zeros((K, 0, wm.z_flux_ch, T, T))
+        z_if = horiz.new_zeros((K, 0, wm.z_flux_ch, T_h, T_w))
 
     return horiz, z_if, z_5d
 
@@ -273,8 +275,9 @@ class SparseWorld3DRunner:
                     e = self._extra_halo
                     patches = patches[:, :, :, e:-e, e:-e].contiguous()
 
-                # 128-column bucketing so cuDNN never re-autotunes on K +- 1 jitter!
-                k_pad = ((k + 127) // 128) * 128
+                # 128-column bucketing (capped at total_cols for small grids like 64x64 / 128x128)
+                # so cuDNN never re-autotunes on K +- 1 jitter and small grids never over-pad!
+                k_pad = min(((k + 127) // 128) * 128, total_cols)
                 if k_pad > k:
                     pad_extra = patches.new_zeros(
                         (k_pad - k, L, C, patches.shape[3], patches.shape[4])
@@ -368,17 +371,22 @@ def shrinking_halo_dt_forward_with_latent(
     h = F.conv2d(x_2d, wm.stem.conv.weight, wm.stem.conv.bias, padding=0)
     dt_cur = dt_2d_full[:, :, 1:-1, 1:-1]
     dt_emb_cur = wm.dt_mlp(encode_dt_features(dt_cur))
-    film_cur = wm.dt_film(dt_emb_cur).view(K * L, wm.num_res, 2, wm.width, Hp - 2, Wp - 2)
 
-    # 2. FiLM-modulated shrinking-halo residual blocks
+    # 2. FiLM-modulated shrinking-halo residual blocks (compute 1x1 FiLM per block on the shrinking crop:
+    #    bit-for-bit identical to upfront dt_film, >5x lower peak VRAM for L=16!)
+    film_w = wm.dt_film.weight
+    film_b = wm.dt_film.bias
+    film_stride = 2 * wm.width
     for idx, blk in enumerate(wm.blocks):
-        gamma_f = film_cur[:, idx, 0]
-        beta_f = film_cur[:, idx, 1]
+        w_blk = film_w[idx * film_stride : (idx + 1) * film_stride]
+        b_blk = film_b[idx * film_stride : (idx + 1) * film_stride] if film_b is not None else None
+        film_blk = F.conv2d(dt_emb_cur, w_blk, b_blk)
+        gamma_f = film_blk[:, : wm.width]
+        beta_f = film_blk[:, wm.width :]
         h_mod = h * (1.0 + 0.5 * torch.tanh(gamma_f)) + beta_f
         conv_out = F.conv2d(F.gelu(h_mod), blk.conv.conv.weight, blk.conv.conv.bias, padding=0)
         h = h[:, :, 1:-1, 1:-1] + blk.gamma * conv_out
-        if idx + 1 < wm.num_res:
-            film_cur = film_cur[:, :, :, :, 1:-1, 1:-1]
+        dt_emb_cur = dt_emb_cur[:, :, 1:-1, 1:-1]
 
     # 3. Crop center [T_h, T_w] of x, dt, dt_emb + exact 1-pixel east/south face dt
     x_int = patches_x[:, :, :, halo:-halo, halo:-halo]
@@ -388,7 +396,7 @@ def shrinking_halo_dt_forward_with_latent(
     dt_s_nb = patches_dt[:, :, :, halo + 1 : Hp - halo + 1, halo:-halo].clamp(min=0.0).reshape(K * L, 1, T_h, T_w)
     dt_e = torch.minimum(dt_int2, dt_e_nb)
     dt_s = torch.minimum(dt_int2, dt_s_nb)
-    dt_emb_int = dt_emb_cur[:, :, wm.num_res : -wm.num_res, wm.num_res : -wm.num_res]
+    dt_emb_int = dt_emb_cur
 
     # 4. 1x1x3 vertical cross-layer mixing on active columns -> shared Z_world latent
     h_3d = h.view(K, L, wm.width, T_h, T_w).transpose(1, 2)
@@ -619,8 +627,9 @@ class SparseWorldDTRunner:
                     patches_x = patches_x[:, :, :, e:-e, e:-e].contiguous()
                     patches_dt = patches_dt[:, :, :, e:-e, e:-e].contiguous()
 
-                # 128-column bucketing so cuDNN never re-autotunes on K +- 1 jitter
-                k_pad = ((k + 127) // 128) * 128
+                # 128-column bucketing (capped at total_cols for small grids like 64x64 / 128x128)
+                # so cuDNN never re-autotunes on K +- 1 jitter and small grids never over-pad!
+                k_pad = min(((k + 127) // 128) * 128, total_cols)
                 if k_pad > k:
                     pad_x = patches_x.new_zeros((k_pad - k, L, C, patches_x.shape[3], patches_x.shape[4]))
                     pad_dt = patches_dt.new_ones((k_pad - k, L, 1, patches_dt.shape[3], patches_dt.shape[4]))
@@ -686,6 +695,8 @@ def verify_sparse_world_3d_parity(h: int = 128, w: int = 128, layers: int = 4) -
             col_mask[ty, tx] = True
             next_x[:, 0, ty * T : (ty + 1) * T, tx * T : (tx + 1) * T] += 0.25
             next_x[1, 10, ty * T : (ty + 1) * T, tx * T : (tx + 1) * T] += 0.40
+            if layers >= 4:
+                next_x[layers - 2, 10, ty * T : (ty + 1) * T, tx * T : (tx + 1) * T] += 0.30
 
     runner = SparseWorld3DRunner(
         wm, device=device, use_fp16=False, tile_size=T, halo=6, sparse_threshold=0.42
@@ -726,5 +737,79 @@ def verify_sparse_world_3d_parity(h: int = 128, w: int = 128, layers: int = 4) -
     }
 
 
+def verify_sparse_world_dt_parity(h: int = 128, w: int = 128, layers: int = 16) -> dict[str, float]:
+    """
+    Verify on CPU FP32 that sparse interior active columns match dense `WorldModelDT`
+    (`max_abs_diff < 1e-5`) across `out_horiz`, `out_z_flux`, and `z_world` with a Stasis Dome!
+    """
+    assert WorldModelDT is not None
+    torch.manual_seed(43)
+    device = torch.device("cpu")
+    wm = WorldModelDT(in_ch=18, out_ch=17, width=48, num_res=5, z_flux_ch=5).to(device).eval()
+    with torch.no_grad():
+        wm.vert_gamma.fill_(0.35)
+        wm.dt_film.weight.normal_(0.0, 0.05)
+        wm.dt_head_mod.weight.normal_(0.0, 0.05)
+        wm.dt_z_mod.weight.normal_(0.0, 0.05)
+
+    prev_x = torch.rand((layers, 18, h, w), dtype=torch.float32, device=device) * 0.5
+    prev_x[:, 16:18] = 0.0
+    next_x = prev_x.clone()
+
+    T = 16
+    th, tw = h // T, w // T
+    col_mask = torch.zeros((th, tw), dtype=torch.bool, device=device)
+    for ty in range(2, min(th - 2, 5)):
+        for tx in range(2, min(tw - 2, 6)):
+            col_mask[ty, tx] = True
+            next_x[:, 0, ty * T : (ty + 1) * T, tx * T : (tx + 1) * T] += 0.25
+            next_x[min(layers - 1, 12), 10, ty * T : (ty + 1) * T, tx * T : (tx + 1) * T] += 0.45
+
+    dt_map = torch.ones((h, w), dtype=torch.float32, device=device)
+    dt_map[h // 4 : (3 * h) // 4, w // 4 : (3 * w) // 4] = 0.15  # Stasis Dome!
+
+    runner = SparseWorldDTRunner(
+        wm, device=device, use_fp16=False, tile_size=T, halo=6, sparse_threshold=0.42
+    )
+    with torch.inference_mode():
+        _, _, _, frac0 = runner.step(prev_x, local_dt=dt_map)
+        sp_h, sp_zf, sp_z, frac1 = runner.step(next_x, local_dt=dt_map)
+        dn_h, dn_zf, dn_z = dense_world_dt_forward_with_latent(wm, next_x, local_dt=dt_map)
+
+    assert frac0 == 1.0, f"Expected initial dense pass (1.0), got {frac0}"
+    assert 0.0 < frac1 < 0.42, f"Expected sparse pass (< 0.42), got {frac1}"
+    assert tuple(sp_h.shape) == (layers, 17, h, w), f"Bad horiz shape {tuple(sp_h.shape)}"
+    assert tuple(sp_zf.shape) == (layers - 1, 5, h, w), f"Bad z_flux shape {tuple(sp_zf.shape)}"
+    assert tuple(sp_z.shape) == (layers, 48, h, w), f"Bad z_world shape {tuple(sp_z.shape)}"
+
+    active_px = col_mask.repeat_interleave(T, dim=0).repeat_interleave(T, dim=1)
+    interior = torch.zeros_like(active_px)
+    interior[6 : h - 6, 6 : w - 6] = True
+    eval_px = active_px & interior
+
+    diff_h = float((sp_h - dn_h).abs()[:, :, eval_px].max().item())
+    diff_zf = float((sp_zf - dn_zf).abs()[:, :, eval_px].max().item())
+    diff_z = float((sp_z - dn_z).abs()[:, :, eval_px].max().item())
+
+    print(
+        f"[SparseWorldDTRunner CPU FP32 Parity] grid={h}x{w}x{layers} active_frac={frac1:.3f} | "
+        f"max_abs_diff(horiz={diff_h:.2e}, z_flux={diff_zf:.2e}, z_world={diff_z:.2e})"
+    )
+    assert diff_h < 1e-5, f"DT horiz parity failed: {diff_h}"
+    assert diff_zf < 1e-5, f"DT z_flux parity failed: {diff_zf}"
+    assert diff_z < 1e-5, f"DT z_world parity failed: {diff_z}"
+
+    return {
+        "active_frac": frac1,
+        "max_abs_diff_horiz": diff_h,
+        "max_abs_diff_z_flux": diff_zf,
+        "max_abs_diff_z_world": diff_z,
+    }
+
+
 if __name__ == "__main__":
-    verify_sparse_world_3d_parity()
+    verify_sparse_world_3d_parity(128, 128, layers=4)
+    verify_sparse_world_3d_parity(128, 128, layers=16)
+    if WorldModelDT is not None:
+        verify_sparse_world_dt_parity(128, 128, layers=4)
+        verify_sparse_world_dt_parity(128, 128, layers=16)

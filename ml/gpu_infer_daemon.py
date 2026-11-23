@@ -99,6 +99,70 @@ def _load_state_dict(path: Path) -> dict:
     return ckpt
 
 
+def _remap_z_to_4_strata(z: float, num_layers: int) -> float:
+    """Remap continuous vertical altitude z in [0..L-1] into canonical 4-strata band_z in [0..3]."""
+    if num_layers <= 4:
+        return max(0.0, min(float(max(1, num_layers) - 1), float(z)))
+    return max(0.0, min(3.0, (float(z) / float(num_layers - 1)) * 3.0))
+
+
+def _pool_z_to_4_strata(
+    tensor_L: torch.Tensor,
+    is_world_state: bool | None = None,
+) -> torch.Tensor:
+    """
+    Pool an isotropic high-depth 3D tensor `[L, C, H, W]` (e.g. `L=16` meters) into the
+    4 canonical semantic strata expected by `BotPolicyNetV2`, `ActuatorPolicyNet` v2,
+    `LiveAcousticEngine`, and `System2DialogueEngine`:
+      - band 0 = z[0..L/4]       (cave / subterranean)
+      - band 1 = z[L/4..L/2]     (canyon / river / surface)
+      - band 2 = z[L/2..3L/4]    (arched bridge / highland)
+      - band 3 = z[3L/4..L]      (mountain peaks / sky)
+
+    Uses `mean` for `Z_world` latent & temperature/flows/elevation, `max` (`amax`) for
+    physical species masses / log-density / rock-wall flags, and clamped `sum` for
+    forcing energy/mass impulses. No-op when `L <= 4`.
+    """
+    if tensor_L.ndim != 4 or tensor_L.shape[0] <= 4:
+        return tensor_L
+    L, C, H, W = tensor_L.shape
+    world_mode = (C == 18) if is_world_state is None else bool(is_world_state)
+
+    if L % 4 == 0:
+        b = tensor_L.reshape(4, L // 4, C, H, W)
+        if not world_mode:
+            return b.mean(dim=1).contiguous()
+        out = b.mean(dim=1)  # temp (10), flow_e/s (12, 13), elev (14)
+        out[:, :10] = b[:, :, :10].amax(dim=1)  # physical species masses [0..9]
+        if C > 11:
+            out[:, 11] = b[:, :, 11].amax(dim=1)  # log total density
+        if C > 15:
+            out[:, 15] = b[:, :, 15].amax(dim=1)  # solid rock wall flag
+        if C > 16:
+            out[:, 16] = b[:, :, 16].sum(dim=1).clamp(-10.0, 10.0)  # stratum forcing energy
+        if C > 17:
+            out[:, 17] = b[:, :, 17].sum(dim=1).clamp(-4.0, 4.0)  # stratum forcing mass
+        return out.contiguous()
+
+    chunks = torch.tensor_split(tensor_L, 4, dim=0)
+    if not world_mode:
+        return torch.stack([c.mean(dim=0) for c in chunks], dim=0).contiguous()
+    bands = []
+    for c in chunks:
+        band = c.mean(dim=0)
+        band[:10] = c[:, :10].amax(dim=0)
+        if C > 11:
+            band[11] = c[:, 11].amax(dim=0)
+        if C > 15:
+            band[15] = c[:, 15].amax(dim=0)
+        if C > 16:
+            band[16] = c[:, 16].sum(dim=0).clamp(-10.0, 10.0)
+        if C > 17:
+            band[17] = c[:, 17].sum(dim=0).clamp(-4.0, 4.0)
+        bands.append(band)
+    return torch.stack(bands, dim=0).contiguous()
+
+
 def _recv_exact(sock: socket.socket, buf: memoryview) -> bool:
     n = len(buf)
     got = 0
@@ -602,7 +666,7 @@ class _AsyncSystem2Bridge:
                         "team": bot_team,
                         "x": bx,
                         "y": by,
-                        "z": float(b.get("z", 1.0)),
+                        "z": float(b.get("orig_z", b.get("z", 1.0))),
                         "snr_db": float(obs.incoming_snr_db),
                         "grid_w": float(item.get("grid_w", 256.0)),
                         "grid_h": float(item.get("grid_h", 256.0)),
@@ -840,9 +904,14 @@ class InferenceEngine:
         self._runners: dict[tuple[int, int, int, int], _CUDAGraphRunner] = {}
 
         # Zero-copy shared VRAM latent & state cache (updated automatically on every world & eco step!)
-        self.last_z_world: torch.Tensor = torch.zeros((4, 48, 256, 256), dtype=torch.float16, device=self.device)
-        self.last_z_eco: torch.Tensor = torch.zeros((1, 32, 256, 256), dtype=torch.float16, device=self.device)
+        cache_dtype = torch.float16 if self.use_fp16 else torch.float32
+        self.last_z_world: torch.Tensor = torch.zeros((4, 48, 256, 256), dtype=cache_dtype, device=self.device)
+        self.last_z_eco: torch.Tensor = torch.zeros((1, 32, 256, 256), dtype=cache_dtype, device=self.device)
         self.last_world_state: torch.Tensor | None = None
+        self._pooled_z_world: torch.Tensor | None = None
+        self._pooled_z_world_src: torch.Tensor | None = None
+        self._pooled_world_state: torch.Tensor | None = None
+        self._pooled_world_state_src: torch.Tensor | None = None
         self.last_sparse_active_frac: float = 1.0
         self.last_sparse_eco_active_frac: float = 1.0
         self._acoustic_step_counter: int = 0
@@ -851,6 +920,36 @@ class InferenceEngine:
         for (h, w) in warmup_shapes:
             for op in (OP_WORLD_STEP, OP_ECO_STEP):
                 self._get_runner(op, h, w, 1)
+
+    def _invalidate_strata_pool_cache(self) -> None:
+        self._pooled_z_world = None
+        self._pooled_z_world_src = None
+        self._pooled_world_state = None
+        self._pooled_world_state_src = None
+
+    def _get_z_world_4strata(self) -> torch.Tensor:
+        """Return canonical 4-strata Z_world [<=4, 48, H, W], pooling L>4 (e.g. L=16) on demand."""
+        z = self.last_z_world
+        if z.shape[0] <= 4:
+            return z
+        if self._pooled_z_world is not None and self._pooled_z_world_src is z:
+            return self._pooled_z_world
+        pooled = _pool_z_to_4_strata(z, is_world_state=False)
+        self._pooled_z_world = pooled
+        self._pooled_z_world_src = z
+        return pooled
+
+    def _get_world_state_4strata(self) -> torch.Tensor | None:
+        """Return canonical 4-strata w_state [<=4, 18, H, W], pooling L>4 (e.g. L=16) on demand."""
+        w = self.last_world_state
+        if w is None or w.shape[0] <= 4:
+            return w
+        if self._pooled_world_state is not None and self._pooled_world_state_src is w:
+            return self._pooled_world_state
+        pooled = _pool_z_to_4_strata(w, is_world_state=True)
+        self._pooled_world_state = pooled
+        self._pooled_world_state_src = w
+        return pooled
 
     def _get_runner(self, op: int, h: int, w: int, batch: int = 1) -> _CUDAGraphRunner:
         key = (op, batch, h, w)
@@ -903,6 +1002,7 @@ class InferenceEngine:
             out_view, z_latent, x_dev, active_frac, infer_us = adapter.infer_from_host_in()
             self.last_z_world = z_latent
             self.last_world_state = x_dev
+            self._invalidate_strata_pool_cache()
             self.last_sparse_active_frac = active_frac
             out_copy = bytes(out_view)
         return memoryview(out_copy), infer_us
@@ -939,6 +1039,7 @@ class InferenceEngine:
             out_view, z_latent, x_dev, active_frac, infer_us = adapter.infer_from_host_in()
             self.last_z_world = z_latent
             self.last_world_state = x_dev
+            self._invalidate_strata_pool_cache()
             self.last_sparse_active_frac = active_frac
             out_copy = bytes(out_view)
         return memoryview(out_copy), infer_us
@@ -1015,6 +1116,7 @@ class InferenceEngine:
                         out_view, z_latent, x_dev, active_frac, infer_us = s_adapter.infer_from_host_in()
                         self.last_z_world = z_latent
                         self.last_world_state = x_dev
+                        self._invalidate_strata_pool_cache()
                         self.last_sparse_active_frac = active_frac
                         return out_ch, memoryview(bytes(out_view)), infer_us
                     except Exception as exc:
@@ -1030,6 +1132,7 @@ class InferenceEngine:
                         out_view, z_latent, x_dev, infer_us = runner.infer_from_host_in()
                         self.last_z_world = z_latent
                         self.last_world_state = x_dev
+                        self._invalidate_strata_pool_cache()
                         self.last_sparse_active_frac = 1.0
                         return out_ch, memoryview(bytes(out_view)), infer_us
 
@@ -1064,6 +1167,7 @@ class InferenceEngine:
             if op == OP_WORLD_STEP:
                 self.last_z_world = z_latent
                 self.last_world_state = x_dev
+                self._invalidate_strata_pool_cache()
                 self.last_sparse_active_frac = 1.0
             elif op == OP_ECO_STEP:
                 self.last_z_eco = z_latent
@@ -1085,7 +1189,9 @@ class InferenceEngine:
         """Lightweight 3D physical acoustic propagation (inverse-square + basalt wall occlusion + slab loss + fire/water noise)."""
         vol = max(0.05, min(1.0, float(volume)))
         src_spl = 56.0 + 38.0 * vol  # 56 dB whisper .. 94 dB shout
-        dist = math.sqrt((sx - lx) ** 2 + (sy - ly) ** 2 + ((sz - lz) * 6.0) ** 2)
+        layers_z = int(ws_cpu.shape[0]) if (ws_cpu is not None and ws_cpu.ndim == 4) else 4
+        z_scale = 6.0 * (3.0 / float(max(3, layers_z - 1)))
+        dist = math.sqrt((sx - lx) ** 2 + (sy - ly) ** 2 + ((sz - lz) * z_scale) ** 2)
         spread_loss = 20.0 * math.log10(max(1.0, dist * 0.45 + 1.0))
 
         wall_loss = 0.0
@@ -1277,7 +1383,8 @@ class InferenceEngine:
                 (6, "WATCH SKYBRIDGE ARCH!"),
             ]
             sym_id, msg = callouts[self._acoustic_step_counter % len(callouts)]
-            if bz >= 1.55:
+            layers_fb = int(ws_cpu.shape[0]) if (ws_cpu is not None and ws_cpu.ndim == 4) else int(req.get("grid_d", 4))
+            if _remap_z_to_4_strata(bz, layers_fb) >= 1.55:
                 sym_id, msg = 1, "HIGH GROUND OVERWATCH!"
             elif snr_l < 0.0:
                 msg = "...STATIC ON RIDGE..."
@@ -1311,6 +1418,10 @@ class InferenceEngine:
                 and self.last_z_world is not None
             ):
                 try:
+                    w_state_4 = self._get_world_state_4strata()
+                    z_world_4 = self._get_z_world_4strata()
+                    assert w_state_4 is not None
+                    num_layers = int(self.last_world_state.shape[0])
                     raw_bots = req.get("bots") or []
                     bot_states = []
                     bot_pos_map: dict[int, tuple[float, float, float]] = {}
@@ -1320,6 +1431,7 @@ class InferenceEngine:
                         by = float(b.get("y", 128.0))
                         bz = float(b.get("z", 1.0))
                         bot_pos_map[bid] = (bx, by, bz)
+                        band_z = _remap_z_to_4_strata(bz, num_layers)
                         bot_states.append(
                             {
                                 "id": bid,
@@ -1328,26 +1440,36 @@ class InferenceEngine:
                                 "cls": int(b.get("class_id", b.get("cls", 0))),
                                 "x": bx,
                                 "y": by,
-                                "layer": int(round(bz)),
+                                "layer": band_z if num_layers > 4 else int(round(bz)),
                                 "hp": float(b.get("hp_frac", b.get("hp", 1.0))),
                             }
                         )
                     lis = req.get("listener") or [128.0, 128.0, 1.0]
-                    listener_pos = (
+                    listener_pos_orig = (
                         float(lis[0]) if len(lis) > 0 else 128.0,
                         float(lis[1]) if len(lis) > 1 else 128.0,
                         float(lis[2]) if len(lis) > 2 else 1.0,
                     )
+                    listener_pos_4 = (
+                        listener_pos_orig[0],
+                        listener_pos_orig[1],
+                        _remap_z_to_4_strata(listener_pos_orig[2], num_layers),
+                    )
                     chat = req.get("chat")
+                    chat_4: dict[str, Any] | None = None
+                    if isinstance(chat, dict) and chat.get("text"):
+                        chat_4 = dict(chat)
+                        if num_layers > 4 and "layer" in chat_4:
+                            chat_4["layer"] = _remap_z_to_4_strata(float(chat_4["layer"]), num_layers)
                     raw_res = self.acoustic_engine.step_live(
-                        w_state=self.last_world_state,
-                        z_world=self.last_z_world,
+                        w_state=w_state_4,
+                        z_world=z_world_4,
                         bot_states=bot_states,
-                        listener_pos=listener_pos,
-                        human_chat=chat if isinstance(chat, dict) and chat.get("text") else None,
+                        listener_pos=listener_pos_4,
+                        human_chat=chat_4,
                     )
                     now_ts = time.perf_counter()
-                    has_chat = isinstance(chat, dict) and bool(chat.get("text"))
+                    has_chat = chat_4 is not None
                     bubbles: list[dict[str, Any]] = []
                     overrides: list[dict[str, Any]] = []
 
@@ -1376,7 +1498,7 @@ class InferenceEngine:
                     if has_chat:
                         for rep in (raw_res.get("human_replies") or [])[:3]:
                             bid = int(rep.get("bot_id", 0))
-                            bx, by, bz = bot_pos_map.get(bid, listener_pos)
+                            bx, by, bz = bot_pos_map.get(bid, listener_pos_orig)
                             bubbles.append(
                                 {
                                     "speaker_id": bid,
@@ -1395,7 +1517,13 @@ class InferenceEngine:
                         self._last_auto_callout_ts = now_ts
                         for sb in (raw_res.get("speech_bubbles") or [])[: (1 if has_chat else 2)]:
                             bid = int(sb.get("bot_id", 0))
-                            pos = sb.get("pos") or list(bot_pos_map.get(bid, listener_pos))
+                            orig_pos = bot_pos_map.get(bid, listener_pos_orig)
+                            pos = sb.get("pos") or list(orig_pos)
+                            bz_out = (
+                                float(orig_pos[2])
+                                if num_layers > 4
+                                else (float(pos[2]) if len(pos) > 2 else float(orig_pos[2]))
+                            )
                             txt = str(sb.get("text", ""))
                             # Strip redundant "[Name @ L1 ...] " prefix for clean floating 3D bubbles
                             if ' "' in txt and txt.endswith('"'):
@@ -1409,7 +1537,7 @@ class InferenceEngine:
                                     "team": int(sb.get("team", 0)),
                                     "x": float(pos[0]),
                                     "y": float(pos[1]),
-                                    "z": float(pos[2]) if len(pos) > 2 else 1.0,
+                                    "z": bz_out,
                                     "snr_db": float(sb.get("snr_db", 0.0)),
                                     "symbol_id": int(sb.get("symbol_id", 0)),
                                     "text": txt[:72],
@@ -1444,9 +1572,14 @@ class InferenceEngine:
                     and self.last_z_world is not None
                     and raw_bots_slm
                 ):
+                    slm_layers = int(self.last_world_state.shape[0])
+                    w_slm_4 = self._get_world_state_4strata()
+                    z_slm_4 = self._get_z_world_4strata()
+                    assert w_slm_4 is not None
                     cx = float(chat_req.get("x", gw_slm * 0.5))
                     cy = float(chat_req.get("y", gh_slm * 0.5))
-                    cz = int(round(float(chat_req.get("layer", 1.0))))
+                    cz_raw = float(chat_req.get("layer", 1.0))
+                    cz_4 = int(round(_remap_z_to_4_strata(cz_raw, slm_layers)))
                     c_team = int(chat_req.get("team", 0))
                     c_vol = float(chat_req.get("volume", 1.0))
                     c_text = str(chat_req.get("text", "")).strip()
@@ -1458,12 +1591,16 @@ class InferenceEngine:
                             float(b.get("y", gh_slm * 0.5)) - cy,
                         ),
                     )
+                    chosen_slm = dict(chosen)
+                    orig_bot_z = float(chosen.get("z", 1.0))
+                    chosen_slm["orig_z"] = orig_bot_z
+                    chosen_slm["z"] = _remap_z_to_4_strata(orig_bot_z, slm_layers)
                     self.system2_bridge.submit_async(
-                        w_state=self.last_world_state,
-                        z_world=self.last_z_world,
-                        bot=chosen,
+                        w_state=w_slm_4,
+                        z_world=z_slm_4,
+                        bot=chosen_slm,
                         speaker_name="Commander",
-                        speaker_pos=(cx, cy, cz),
+                        speaker_pos=(cx, cy, cz_4),
                         speaker_volume=c_vol,
                         raw_utterance=c_text,
                         grid_w=gw_slm,
@@ -1556,15 +1693,20 @@ class InferenceEngine:
         with self.lock:
             t0 = time.perf_counter()
             with torch.inference_mode():
+                num_layers = int(self.last_z_world.shape[0])
+                if num_layers > 4 and np.any(arr[:, 2] > 1.0):
+                    # Remap raw z in [0..L-1] into canonical normalized strata [0..1] (= band_z / 3.0)
+                    arr[:, 2] = np.clip(arr[:, 2] / float(num_layers - 1), 0.0, 1.0)
+                z_world_4 = self._get_z_world_4strata()
                 bf = torch.from_numpy(arr).to(self.device, non_blocking=False)
                 if self.use_fp16:
                     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                         res = self.bot_policy(
-                            self.last_z_world, self.last_z_eco, bf, return_saliency=return_saliency
+                            z_world_4, self.last_z_eco, bf, return_saliency=return_saliency
                         )
                 else:
                     res = self.bot_policy(
-                        self.last_z_world, self.last_z_eco, bf, return_saliency=return_saliency
+                        z_world_4, self.last_z_eco, bf, return_saliency=return_saliency
                     )
                 if return_saliency:
                     actions, saliency = res
@@ -1582,16 +1724,21 @@ class InferenceEngine:
         with self.lock:
             t0 = time.perf_counter()
             with torch.inference_mode():
+                num_layers = int(self.last_z_world.shape[0])
+                if num_layers > 4 and np.any(arr[:, 2] > 1.0):
+                    # Remap raw z in [0..L-1] into canonical normalized strata [0..1] (= band_z / 3.0)
+                    arr[:, 2] = np.clip(arr[:, 2] / float(num_layers - 1), 0.0, 1.0)
+                z_world_4 = self._get_z_world_4strata()
                 bf = torch.from_numpy(arr).to(self.device, non_blocking=False)
                 if self.actuator_policy is not None:
                     if self.use_fp16:
                         with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                             res = self.actuator_policy(
-                                self.last_z_world, self.last_z_eco, bf, return_saliency=True
+                                z_world_4, self.last_z_eco, bf, return_saliency=True
                             )
                     else:
                         res = self.actuator_policy(
-                            self.last_z_world, self.last_z_eco, bf, return_saliency=True
+                            z_world_4, self.last_z_eco, bf, return_saliency=True
                         )
                     if isinstance(res, tuple):
                         act, saliency = res
@@ -1603,11 +1750,11 @@ class InferenceEngine:
                     if self.use_fp16:
                         with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                             actions, saliency = self.bot_policy(
-                                self.last_z_world, self.last_z_eco, bf, return_saliency=True
+                                z_world_4, self.last_z_eco, bf, return_saliency=True
                             )
                     else:
                         actions, saliency = self.bot_policy(
-                            self.last_z_world, self.last_z_eco, bf, return_saliency=True
+                            z_world_4, self.last_z_eco, bf, return_saliency=True
                         )
                     a = actions.float()
                     sal = saliency.float()
@@ -1752,7 +1899,7 @@ class GPUInferDaemon:
                         or width == 0
                         or payload_bytes != expected_bytes
                     ):
-                        if 0 < payload_bytes <= 64 * 1024 * 1024:
+                        if 0 < payload_bytes <= 512 * 1024 * 1024:
                             _recv_exact(conn, memoryview(bytearray(payload_bytes)))
                         self._send_error(conn, STATUS_BAD_REQUEST, height, width)
                         continue
@@ -1784,7 +1931,7 @@ class GPUInferDaemon:
                         or width == 0
                         or payload_bytes != expected_bytes
                     ):
-                        if 0 < payload_bytes <= 64 * 1024 * 1024:
+                        if 0 < payload_bytes <= 512 * 1024 * 1024:
                             _recv_exact(conn, memoryview(bytearray(payload_bytes)))
                         self._send_error(conn, STATUS_BAD_REQUEST, height, width)
                         continue
@@ -1883,14 +2030,14 @@ class GPUInferDaemon:
                 batch = max(1, int(pad_batch))
                 spec = EXPECTED_SPECS.get(op)
                 if spec is None or channels != spec[0] or height == 0 or width == 0:
-                    if 0 < payload_bytes <= 64 * 1024 * 1024:
+                    if 0 < payload_bytes <= 512 * 1024 * 1024:
                         _recv_exact(conn, memoryview(bytearray(payload_bytes)))
                     self._send_error(conn, STATUS_BAD_REQUEST, height, width)
                     continue
 
                 expected_bytes = batch * channels * height * width * 4
                 if payload_bytes != expected_bytes:
-                    if 0 < payload_bytes <= 64 * 1024 * 1024:
+                    if 0 < payload_bytes <= 512 * 1024 * 1024:
                         _recv_exact(conn, memoryview(bytearray(payload_bytes)))
                     self._send_error(conn, STATUS_BAD_REQUEST, height, width)
                     continue

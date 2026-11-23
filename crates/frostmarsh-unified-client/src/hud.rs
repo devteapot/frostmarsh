@@ -11,6 +11,7 @@
 use crate::camera::CameraMatrices;
 use crate::net::LiveEntityState;
 use crate::world_bridge::LiveApproach4World;
+use crate::z16_world::Z16World;
 use bytemuck::{Pod, Zeroable};
 use frostmarsh_proto::*;
 use glam::{Vec3, Vec4};
@@ -33,6 +34,8 @@ pub struct HudConfig<'a> {
     pub selected_element: u8,
     pub focus_radius: f32,
     pub style_label: &'static str,
+    pub z16_active: bool,
+    pub z16_style_label: &'static str,
     pub fps: f32,
     pub rtt_ms: f32,
     pub chat_open: bool,
@@ -166,6 +169,7 @@ pub fn build_hud(
     sw: f32,
     sh: f32,
     world: &LiveApproach4World,
+    z16: Option<&Z16World>,
     entities: Option<&LiveEntityState>,
     mats: &CameraMatrices,
     cfg: &HudConfig<'_>,
@@ -174,6 +178,27 @@ pub fn build_hud(
     if !cfg.show_hud {
         return b;
     }
+    let grid_to_xz = |gx: f32, gy: f32| -> (f32, f32) {
+        if let Some(z16w) = z16 {
+            z16w.grid_to_world_xz(gx, gy)
+        } else {
+            world.grid_to_world_xz(gx, gy)
+        }
+    };
+    let sample_g_y = |gx: f32, gy: f32| -> f32 {
+        if let Some(z16w) = z16 {
+            z16w.sample_surface_y(gx, gy)
+        } else {
+            world.sample_ground_y(gx, gy)
+        }
+    };
+    let sample_e_y = |gx: f32, gy: f32, gz: f32| -> f32 {
+        if z16.is_some() {
+            gz
+        } else {
+            world.sample_3d_y(gx, gy, gz)
+        }
+    };
     let ui = (sh / 1080.0).clamp(0.75, 2.0);
     let panel_bg = [0.08, 0.07, 0.16, 0.82];
     let panel_border = [0.36, 0.34, 0.58, 0.85];
@@ -188,8 +213,8 @@ pub fn build_hud(
     // ------------------------------------------------------------------
     if let Some(ent) = entities {
         for p in &ent.players {
-            let (wx, wz) = world.grid_to_world_xz(p.x, p.y);
-            let gy = world.sample_3d_y(p.x, p.y, p.z);
+            let (wx, wz) = grid_to_xz(p.x, p.y);
+            let gy = sample_e_y(p.x, p.y, p.z);
             let rel = Vec3::new(wx, gy + 3.65, wz) - mats.origin;
             if let Some((sx, sy)) = project_world(rel, mats, sw, sh) {
                 let bw = 54.0 * ui;
@@ -217,8 +242,8 @@ pub fn build_hud(
 
         // Shrine world labels
         for s in &ent.shrines {
-            let (wx, wz) = world.grid_to_world_xz(s.x, s.y);
-            let gy = world.sample_ground_y(s.x, s.y);
+            let (wx, wz) = grid_to_xz(s.x, s.y);
+            let gy = sample_g_y(s.x, s.y);
             let rel = Vec3::new(wx, gy + 5.8, wz) - mats.origin;
             if let Some((sx, sy)) = project_world(rel, mats, sw, sh) {
                 let bw = 72.0 * ui;
@@ -236,8 +261,8 @@ pub fn build_hud(
 
         // Active Spatial Time-Dilation Dome world-space badges
         for d in &ent.time_domes {
-            let (wx, wz) = world.grid_to_world_xz(d.x, d.y);
-            let gy = world.sample_ground_y(d.x, d.y);
+            let (wx, wz) = grid_to_xz(d.x, d.y);
+            let gy = sample_g_y(d.x, d.y);
             let rel = Vec3::new(wx, gy + d.radius * 0.62 + 1.8, wz) - mats.origin;
             if let Some((sx, sy)) = project_world(rel, mats, sw, sh) {
                 let is_stasis = d.dt_scale < 0.8;
@@ -264,8 +289,8 @@ pub fn build_hud(
         // Floating damage & elemental combo callouts
         for ev in ent.events.iter().rev().take(12) {
             if ev.kind == 0 || ev.kind == 2 {
-                let (wx, wz) = world.grid_to_world_xz(ev.x, ev.y);
-                let gy = world.sample_ground_y(ev.x, ev.y);
+                let (wx, wz) = grid_to_xz(ev.x, ev.y);
+                let gy = sample_g_y(ev.x, ev.y);
                 let rel = Vec3::new(wx, gy + 4.9, wz) - mats.origin;
                 if let Some((sx, sy)) = project_world(rel, mats, sw, sh) {
                     let sc = if ev.kind == 2 { 2.0 * ui } else { 1.6 * ui };
@@ -291,8 +316,8 @@ pub fn build_hud(
             let msg_sc = 1.25 * ui;
 
             for sb in ent.speech_bubbles.iter().rev().take(5) {
-                let (wx, wz) = world.grid_to_world_xz(sb.x, sb.y);
-                let gy = world.sample_3d_y(sb.x, sb.y, sb.z);
+                let (wx, wz) = grid_to_xz(sb.x, sb.y);
+                let gy = sample_e_y(sb.x, sb.y, sb.z);
                 let rel = Vec3::new(wx, gy + 5.2, wz) - mats.origin;
                 let Some((sx, sy)) = project_world(rel, mats, sw, sh) else {
                     continue;
@@ -494,8 +519,13 @@ pub fn build_hud(
     b.rect_outline(mm_x - 4.0 * ui, mm_y - 4.0 * ui, mm_sz + 8.0 * ui, mm_sz + 24.0 * ui, 2.0 * ui, panel_border);
     b.textured_rect(mm_x, mm_y, mm_sz, mm_sz, [1.0, 1.0, 1.0, 0.96]);
 
-    let gw = world.grid_w.max(1) as f32;
-    let gh = world.grid_h.max(1) as f32;
+    let (gw_u, gh_u, gd_u) = if let Some(z16w) = z16 {
+        (z16w.width, z16w.height, z16w.depth)
+    } else {
+        (world.grid_w, world.grid_h, world.grid_d)
+    };
+    let gw = gw_u.max(1) as f32;
+    let gh = gh_u.max(1) as f32;
     if let Some(ent) = entities {
         // Shrines on minimap
         for s in &ent.shrines {
@@ -539,8 +569,12 @@ pub fn build_hud(
             b.rect(px - sz * 0.5, py - sz * 0.5, sz, sz, col);
         }
     }
-    let mm_lbl = format!("3D REACH {}X{}X{}", world.grid_w, world.grid_h, world.grid_d);
-    b.text_shadow(mm_x + 4.0 * ui, mm_y + mm_sz + 5.0 * ui, 1.25 * ui, text_dim, &mm_lbl);
+    let mm_lbl = if cfg.z16_active {
+        format!("3D-Z16 {}X{}X{}", gw_u, gh_u, gd_u)
+    } else {
+        format!("3D REACH {}X{}X{}", gw_u, gh_u, gd_u)
+    };
+    b.text_shadow(mm_x + 4.0 * ui, mm_y + mm_sz + 5.0 * ui, 1.25 * ui, if cfg.z16_active { [0.38, 0.94, 1.0, 1.0] } else { text_dim }, &mm_lbl);
 
     // ------------------------------------------------------------------
     // 3B. LIVE NEURAL-BRAIN INSPECTOR CARD (TOP-RIGHT BELOW MINIMAP)
@@ -842,8 +876,18 @@ pub fn build_hud(
             };
             let dome_cnt = (t.active_time_domes as usize).max(ent.time_domes.len());
             let slm_tag = if t.system2_slm_active { "SLM:ON" } else { "SLM:OFF" };
-            let l8 = format!("[J] DOME:{}/4 (SHIFT+J CLR)  {}", dome_cnt, slm_tag);
-            let l8_col = if t.system2_slm_active {
+            let l8 = if cfg.z16_active {
+                format!("[Y] STYLE:{}  3D-Z16  DOME:{}/4", cfg.z16_style_label, dome_cnt)
+            } else {
+                format!("[J] DOME:{}/4 (SHIFT+J CLR)  {}", dome_cnt, slm_tag)
+            };
+            let l8_col = if cfg.z16_active {
+                match cfg.z16_style_label {
+                    "VOLCANIC" => [1.00, 0.52, 0.22, 1.0],
+                    "ARCANE" => [0.58, 0.88, 1.00, 1.0],
+                    _ => [0.34, 0.98, 0.86, 1.0],
+                }
+            } else if t.system2_slm_active {
                 [0.34, 0.98, 0.76, 1.0]
             } else if dome_cnt > 0 {
                 [0.38, 0.94, 1.0, 1.0]
@@ -930,7 +974,13 @@ pub fn build_hud(
             CLASS_ALCHEMIST => "PYRO ALCHEMIST",
             _ => "MARSH RANGER",
         };
-        let alt_tag = if p.z >= 1.55 { "L2 HIGH" } else { "L1 GND" };
+        let alt_tag = if cfg.z16_active {
+            format!("Z:{:.1}M", p.z)
+        } else if p.z >= 1.55 {
+            "L2 HIGH".to_string()
+        } else {
+            "L1 GND".to_string()
+        };
         let header = format!(
             "LV.{} {} [{}] K:{} D:{}",
             p.level, cls_name, alt_tag, p.kills, p.deaths
@@ -981,7 +1031,13 @@ pub fn build_hud(
         let phys_native = entities.map(|e| e.telemetry.physics_native).unwrap_or(false);
 
         // Controls hint bar at bottom
-        let hint_bar = if phys_native {
+        let hint_bar = if cfg.z16_active {
+            if phys_native {
+                format!("1-3 MAT  [/] R={:.1}  Y STYLE  T PIXEL  J DOME  P MODE", cfg.focus_radius)
+            } else {
+                "1-3 ELEM  Y STYLE  T PIXEL  J DOME  P MODE  ENTER CHAT".to_string()
+            }
+        } else if phys_native {
             format!("1-3 MAT  [/] R={:.1}  J DOME  K TIME  P MODE  ENTER CHAT", cfg.focus_radius)
         } else {
             "1-3 ELEM  J DOME  K TIME  P MODE  F1-F3 CLS  ENTER CHAT".to_string()
@@ -1202,11 +1258,37 @@ pub fn build_hud(
 
         let tab_lbl = "[TAB] SCORE";
         let tab_w = HudBatch::text_width(tab_lbl, sc) + 14.0 * ui;
-        let tab_x = sfx_x - tab_w - 8.0 * ui;
-        if tab_x > hx + hud_w + 8.0 * ui {
-            b.rect(tab_x, py, tab_w, pill_h, [0.06, 0.05, 0.14, 0.72]);
-            b.rect_outline(tab_x, py, tab_w, pill_h, 1.0 * ui, panel_border);
-            b.text(tab_x + 7.0 * ui, py + 6.0 * ui, sc, text_dim, tab_lbl);
+        let mut cursor_x = sfx_x - tab_w - 8.0 * ui;
+        if cursor_x > hx + hud_w + 8.0 * ui {
+            b.rect(cursor_x, py, tab_w, pill_h, [0.06, 0.05, 0.14, 0.72]);
+            b.rect_outline(cursor_x, py, tab_w, pill_h, 1.0 * ui, panel_border);
+            b.text(cursor_x + 7.0 * ui, py + 6.0 * ui, sc, text_dim, tab_lbl);
+        }
+
+        if cfg.z16_active {
+            let style_col = match cfg.z16_style_label {
+                "VOLCANIC" => [1.00, 0.48, 0.18, 1.0],
+                "ARCANE" => [0.56, 0.88, 1.00, 1.0],
+                _ => [0.34, 0.96, 0.84, 1.0],
+            };
+            let st_lbl = format!("[Y] STYLE:{}", cfg.z16_style_label);
+            let st_w = HudBatch::text_width(&st_lbl, sc) + 14.0 * ui;
+            let st_x = cursor_x - st_w - 8.0 * ui;
+            if st_x > hx + hud_w + 8.0 * ui {
+                b.rect(st_x, py, st_w, pill_h, [0.06, 0.05, 0.14, 0.86]);
+                b.rect_outline(st_x, py, st_w, pill_h, 1.3 * ui, style_col);
+                b.text_shadow(st_x + 7.0 * ui, py + 6.0 * ui, sc, style_col, &st_lbl);
+                cursor_x = st_x;
+            }
+            let z_lbl = "3D-Z16";
+            let z_w = HudBatch::text_width(z_lbl, sc) + 14.0 * ui;
+            let z_x = cursor_x - z_w - 8.0 * ui;
+            if z_x > hx + hud_w + 8.0 * ui {
+                let z_col = [0.38, 0.94, 1.0, 1.0];
+                b.rect(z_x, py, z_w, pill_h, [0.06, 0.10, 0.18, 0.88]);
+                b.rect_outline(z_x, py, z_w, pill_h, 1.3 * ui, z_col);
+                b.text_shadow(z_x + 7.0 * ui, py + 6.0 * ui, sc, z_col, z_lbl);
+            }
         }
     }
 

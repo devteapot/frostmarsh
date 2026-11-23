@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Live 512x512x4 with WorldModel3D v4 Neural Vertical Physics, Diurnal World Time & Towering Pines](models/unified_iter7_512/unified_live_1080p_hud.png)
+![Frostmarsh Live True 3D 256x256x16 (1.05M Isotropic Voxels) — Arched Stone Bridge, Smooth Surface-Nets Pixel-2xSS at 149 FPS, WorldModelDT & Qwen2.5-1.5B](models/unified_iter10_z16/unified_live_1080p_hud.png)
 
 ---
 
@@ -85,23 +85,28 @@
   - **Client-Side WGSL Neural Decoder & Swappable Client Styles (`ml/export_client_material_wgsl.py`, `crates/frostmarsh-3d-sandbox`, [STYLIZED_3D_Z16_METRICS.json](models/STYLIZED_3D_Z16_METRICS.json)):** Server exports ONLY compressed `Z_world_3d` latent bricks (`z16_latent_bricks.bin`, zero baked RGB). Client GPU caches **`4 KB`** of active style weights in workgroup SRAM (`neural_material_decode.wgsl`) and decodes all **`1,048,576` voxels in `0.935 ms`** (`12.2 µs` / dirty `16³` brick, bit-exact `0` diff vs CPU, `R² = 0.994–0.997`). Layers Frostmarsh triplanar masonry/terrain detail, Hard-Z sculpted pine surfels (`22.4K`), and 2×SS ink outlines on top of true 3D `Z=16` caves & arched bridges at **`238 FPS` @ 1080p `PIXEL-2×SS`** (`331 FPS` Clean-3D, `101 FPS` @ 4K), with **`Y`-key** live `0.92 ms` client style swapping (`NORDIC` ↔ `VOLCANIC EMBER` ↔ `ARCANE THERMAL`) on the same `Z_world_3d`!
   - **True 3D `Z=16` Authoritative Engine (`field-core` + `frostmarsh-proto` + `frostmarsh-server`):** Added `VolumeField::init_shattered_reach_z16()` (`11/11` `field-core` conservation & 3D cave/bridge capsule tests passing, `mass_err = 0`, `energy_err = 0`), LZ4 `ServerDatagram::VolumetricBrick3D` streaming, and `--layers 16` server (`7.5 ms/tick` @ `128×128×16`) while keeping `--layers 4` 100% compatible.
   - **WebGPU/WASM Browser Client (`crates/frostmarsh-web-client` → `web/pkg/`):** Compiled true 3D `Z=16` Smooth Surface-Nets + Volumetric Overlay + 3D Hero Knights + `T`-key `Pixel-2×SS` ↔ `Clean-3D` + `C`-key `∇solid_density` capsule walk to `wasm32-unknown-unknown` (`993 KB` gzipped, `0` warnings under `-D warnings`, `python3 web/serve.py` → `http://127.0.0.1:8080`).
+- **Iteration 10 — The Grand Unification (Live True 3D `256×256×16 = 1,048,576` Isotropic Voxel Multiplayer Over QUIC):**
+  - **Live `VolumetricBrick3D` + Smooth Surface-Nets + `Y`-Key Client Styles inside `frostmarsh-unified-client`:** Auto-detects `--layers 16` servers, receives LZ4-compressed `16×16×16` 3D bricks (`868.5 KB` full sync for `256×256×16` = `1.05M` voxels, `170,708` Surface-Nets triangles built in `15.96 ms`), renders true 3D vaulted caves, 3-span arched stone/timber bridges with triplanar masonry, sculpted Hard-Z pine surfels, raymarched volumetric water/fire/smoke, exact `∇solid_density` 3D capsule prediction, `T`-key `PIXEL-2×SS` ↔ `CLEAN-3D`, and **`Y`-key live client style swap (`NORDIC` ↔ `VOLCANIC EMBER` ↔ `ARCANE THERMAL`)** while keeping `--layers 4` 100% compatible.
+  - **Live `L=16` 6-Model Neural Stack on Spark GB10 (`cuda-fp16-dt`, `mass_err = 0`, `energy_err = 0`):** Generalized `SparseWorld3DRunner` & `SparseWorldDTRunner` to arbitrary `L` (`3.45e-8` `L=16` sparse-vs-dense parity, `5×` lower peak VRAM) with 4-band vertical pooling for `BotPolicyNetV2`, `ActuatorPolicyNet` v2 (`op=7`), `LiveAcousticEngine` (`op=6`), and `Qwen2.5-1.5B-Instruct` (`SLM:ON`).
+  - **Live Apple M4 Pro Metal Performance (`256×256×16` True 3D Over QUIC):** **`149.4 FPS`** @ 1080p `PIXEL-2×SS` (`6.69 ms`) · **`165.4 FPS`** @ 1080p `CLEAN-3D` (`6.05 ms`) · **`155.1 FPS`** @ 4K `PIXEL-2×SS` (`6.45 ms`).
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
 | World Scale | Render Mode | Resolution | p50 Frame Time | FPS |
 |---|---|---|---:|---:|
+| **`256×256×16` (1.05M true 3D)** | **Surface-Nets + Pixel-2xSS + Vol Overlay + HUD** | **1920×1080** | **`6.69 ms`** | **149.4 FPS** |
+| **`256×256×16` (1.05M true 3D)** | **Surface-Nets + Clean 3D + Vol Overlay + HUD** | **1920×1080** | **`6.05 ms`** | **165.4 FPS** |
+| **`256×256×16` (1.05M true 3D)** | **Surface-Nets + Pixel-2xSS + Vol Overlay + HUD** | **3840×2160 (4K)** | **`6.45 ms`** | **155.1 FPS** |
 | **`512×512×4` (1.05M vox)** | **Pixel-2xSS + Vol3DGS + Brain/Speech HUD** | **1920×1080** | **`8.37 ms`** | **119.4 FPS** |
-| **`512×512×4` (1.05M vox)** | **Clean 3D + Vol3DGS + Brain/Speech HUD** | **1920×1080** | **`7.67 ms`** | **130.5 FPS** |
-| **`512×512×4` (1.05M vox)** | **Pixel-2xSS + Vol3DGS + Brain/Speech HUD** | **3840×2160 (4K)** | **`8.41 ms`** | **119.0 FPS** |
 | **`512×512×4` (1.05M vox)** | **Clean 3D + Vol3DGS + Brain/Speech HUD** | **3840×2160 (4K)** | **`10.34 ms`** | **96.7 FPS** |
 
 ---
 
 ## Visual Showcase
 
-| Client-Side WGSL `NeuralMaterialHead(Z_world)`: Stylized True 3D `Z=16` & Live `0.92 ms` Style Swap | True 3D `Z=16` Direct-3D-Texture Head-to-Head (`339 FPS` Surface-Nets vs `105 FPS` Raymarch) |
+| Live True 3D `256×256×16` Multiplayer 4-View Orbit + Live `Y`-Key Client Style Swap | Client-Side WGSL `NeuralMaterialHead(Z_world)`: Stylized True 3D `Z=16` (`0.94 ms` Decode) |
 |---|---|
-| ![Client-Side WGSL Neural Style Swap on True 3D Z=16](models/stylized_3d_z16_showcase.png) | ![True 3D Z=16 Head-to-Head](models/render_3d_headtohead_viz.png) |
+| ![Live 256x256x16 4-View Orbit & Styles](models/unified_iter10_z16/unified_orbit_4view.png) | ![Client-Side WGSL Neural Style Swap on True 3D Z=16](models/stylized_3d_z16_showcase.png) |
 
 | `WorldModelDT` Continuous Δt Time-Dilation & Destructible Structures | True 3D `Z=16` Neural Material Field & `13.1×` Sparse Brick Scaling |
 |---|---|
@@ -160,6 +165,7 @@ FROSTMARSH_SERVER=127.0.0.1:4433 ./play_frostmarsh.sh
 | **`P`** | **Live hot-toggle `PHYSICS-NATIVE` continuous actuators ↔ `CLASSIC` named spells** |
 | **`K`** | **Cycle Diurnal World Time-Warp (`1× → 4× → 16× → 0.25×` solar freeze/thaw cycle)** |
 | **`J` / `Shift+J`** | **Place `0.15×` Stasis Dome / `3.0×` Haste Zone at cursor (`Shift+J` clears domes)** |
+| **`Y`** | **Live hot-swap Client Visual Style (`NORDIC` ↔ `VOLCANIC EMBER` ↔ `ARCANE THERMAL`) on True 3D `Z=16`** |
 | **`LMB` / `RMB` / `[` `]`** | **In Physics-Native mode: `+ΔE` Heat / `-ΔE` Cryo / Adjust Focus Radius (`2.0..8.0`)** |
 | **`Enter` / `Tab`** | **Open live Acoustic Chat (`Tab` toggles SHOUT/WHISPER while typing; hold `Tab` outside chat for 6v6 Scoreboard)** |
 | **`U`** | **Mute / unmute procedural 3D spatial audio & SNR-filtered voice synths** |

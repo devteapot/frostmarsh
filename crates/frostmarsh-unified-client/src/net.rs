@@ -98,6 +98,15 @@ pub struct LiveWorldState {
     pub received_surf_chunks: Vec<bool>,
     /// Dirty `(layer, chunk_idx)` flags across all `depth` layers.
     pub dirty_chunks: Vec<Vec<bool>>,
+    /// Flat client-side true 3D `Z=16` staging arrays in GPU `(X=width, Y=depth, Z=height)` order:
+    /// index = `((iz * depth + iy) * width + ix) * 4`. Lazily allocated when `depth >= 16`.
+    pub z16_density_mat: Vec<u8>,
+    pub z16_albedo_thermal: Vec<u8>,
+    pub received_z16_bricks: Vec<bool>,
+    pub dirty_z16_mask: Vec<bool>,
+    pub dirty_z16_bricks: Vec<(usize, usize)>,
+    pub has_z16_bricks: bool,
+    pub bricks_3d_rx: u64,
     pub latest_field_tick: u64,
     pub entities: Option<LiveEntityState>,
     pub chunks_rx: u64,
@@ -107,11 +116,15 @@ pub struct LiveWorldState {
     pub rtt_ms: f32,
 }
 
+#[allow(dead_code)]
+pub type SharedNetState = LiveWorldState;
+
 impl LiveWorldState {
     pub fn new(width: usize, height: usize, depth: usize) -> Self {
         let d = depth.max(1);
         let cx = chunks_for_dim(width);
         let cy = chunks_for_dim(height);
+        let z16_bytes = if d >= 16 { width * height * d * 4 } else { 0 };
         Self {
             width,
             height,
@@ -122,6 +135,13 @@ impl LiveWorldState {
             aplus_layers: vec![vec![[0xff, 0, 26, 1]; width * height]; d],
             received_surf_chunks: vec![false; cx * cy],
             dirty_chunks: vec![vec![false; cx * cy]; d],
+            z16_density_mat: vec![0u8; z16_bytes],
+            z16_albedo_thermal: vec![0u8; z16_bytes],
+            received_z16_bricks: vec![false; cx * cy],
+            dirty_z16_mask: vec![false; cx * cy],
+            dirty_z16_bricks: Vec::new(),
+            has_z16_bricks: d >= 16,
+            bricks_3d_rx: 0,
             latest_field_tick: 0,
             entities: None,
             chunks_rx: 0,
@@ -149,6 +169,13 @@ impl LiveWorldState {
         self.aplus_layers = vec![vec![[0xff, 0, 26, 1]; w * h]; d];
         self.received_surf_chunks = vec![false; self.chunks_x * self.chunks_y];
         self.dirty_chunks = vec![vec![false; self.chunks_x * self.chunks_y]; d];
+        let z16_bytes = if d >= 16 { w * h * d * 4 } else { 0 };
+        self.z16_density_mat = vec![0u8; z16_bytes];
+        self.z16_albedo_thermal = vec![0u8; z16_bytes];
+        self.received_z16_bricks = vec![false; self.chunks_x * self.chunks_y];
+        self.dirty_z16_mask = vec![false; self.chunks_x * self.chunks_y];
+        self.dirty_z16_bricks.clear();
+        self.has_z16_bricks = d >= 16;
     }
 
     pub fn total_surf_chunks(&self) -> usize {
@@ -157,6 +184,122 @@ impl LiveWorldState {
 
     pub fn received_surf_count(&self) -> usize {
         self.received_surf_chunks.iter().filter(|&&b| b).count()
+    }
+
+    pub fn received_z16_count(&self) -> usize {
+        self.received_z16_bricks.iter().filter(|&&b| b).count()
+    }
+
+    pub fn take_dirty_z16_bricks(&mut self) -> Vec<(usize, usize)> {
+        let out = std::mem::take(&mut self.dirty_z16_bricks);
+        for &(bx, by) in &out {
+            let bi = by * self.chunks_x + bx;
+            if bi < self.dirty_z16_mask.len() {
+                self.dirty_z16_mask[bi] = false;
+            }
+        }
+        out
+    }
+
+    pub fn apply_aplus_chunk(
+        &mut self,
+        raw_len: u64,
+        field_tick: u64,
+        layer: u8,
+        cx: u8,
+        cy: u8,
+        lz4_cells: &[u8],
+    ) {
+        let Some(raw) = decompress_aplus_cells(lz4_cells) else {
+            return;
+        };
+        if raw.len() != CHUNK_SIZE * CHUNK_SIZE * 4 {
+            return;
+        }
+        let l_u = layer as usize;
+        let cx_u = cx as usize;
+        let cy_u = cy as usize;
+        if l_u >= self.depth || cx_u >= self.chunks_x || cy_u >= self.chunks_y {
+            return;
+        }
+        self.bytes_rx += raw_len;
+        self.chunks_rx += 1;
+        self.latest_field_tick = self.latest_field_tick.max(field_tick);
+
+        let x0 = cx_u * CHUNK_SIZE;
+        let y0 = cy_u * CHUNK_SIZE;
+        let w = self.width;
+        let h = self.height;
+        let grid = &mut self.aplus_layers[l_u];
+        for dy in 0..CHUNK_SIZE {
+            let gy = (y0 + dy).min(h - 1);
+            for dx in 0..CHUNK_SIZE {
+                let gx = (x0 + dx).min(w - 1);
+                let src = (dy * CHUNK_SIZE + dx) * 4;
+                grid[gy * w + gx] = [raw[src], raw[src + 1], raw[src + 2], raw[src + 3]];
+            }
+        }
+        let ci = cy_u * self.chunks_x + cx_u;
+        if l_u == self.surf_layer() {
+            self.received_surf_chunks[ci] = true;
+        }
+        self.dirty_chunks[l_u][ci] = true;
+    }
+
+    pub fn apply_brick3d(&mut self, raw_len: u64, brick: &Brick3DPayload) {
+        let d = brick.depth as usize;
+        let bx = brick.bx as usize;
+        let by = brick.by as usize;
+        if d == 0 || d != self.depth || bx >= self.chunks_x || by >= self.chunks_y {
+            return;
+        }
+        let expected_brick_bytes = CHUNK_SIZE * CHUNK_SIZE * d * 4;
+        let Some((dm_raw, at_raw)) = decode_brick3d_lz4(brick) else {
+            return;
+        };
+        if dm_raw.len() != expected_brick_bytes || at_raw.len() != expected_brick_bytes {
+            return;
+        }
+
+        let w = self.width;
+        let h = self.height;
+        let total_bytes = w * h * d * 4;
+        if self.z16_density_mat.len() != total_bytes {
+            self.z16_density_mat = vec![0u8; total_bytes];
+            self.z16_albedo_thermal = vec![0u8; total_bytes];
+        }
+
+        let x0 = bx * CHUNK_SIZE;
+        let y0 = by * CHUNK_SIZE;
+        let copy_w = CHUNK_SIZE.min(w.saturating_sub(x0));
+        let copy_h = CHUNK_SIZE.min(h.saturating_sub(y0));
+        let row_bytes = copy_w * 4;
+
+        // Transpose Z-major [z][dy][dx][4] -> GPU (X=width, Y=depth, Z=height): [iz=gy][iy=z][ix=gx][4]
+        for z in 0..d {
+            for dy in 0..copy_h {
+                let gy = y0 + dy;
+                let src = ((z * CHUNK_SIZE + dy) * CHUNK_SIZE) * 4;
+                let dst = ((gy * d + z) * w + x0) * 4;
+                self.z16_density_mat[dst..dst + row_bytes]
+                    .copy_from_slice(&dm_raw[src..src + row_bytes]);
+                self.z16_albedo_thermal[dst..dst + row_bytes]
+                    .copy_from_slice(&at_raw[src..src + row_bytes]);
+            }
+        }
+
+        self.bytes_rx += raw_len;
+        self.bricks_3d_rx += 1;
+        self.has_z16_bricks = true;
+
+        let bi = by * self.chunks_x + bx;
+        if bi < self.received_z16_bricks.len() {
+            self.received_z16_bricks[bi] = true;
+        }
+        if bi < self.dirty_z16_mask.len() && !self.dirty_z16_mask[bi] {
+            self.dirty_z16_mask[bi] = true;
+            self.dirty_z16_bricks.push((bx, by));
+        }
     }
 
     pub fn take_dirty_list(&mut self) -> Vec<(usize, usize)> {
@@ -294,63 +437,82 @@ impl QuicClientHandle {
             });
         };
 
-        // Reliable uni-stream listener (Welcome + WAN MTU-fallback EntitySnapshots)
+        // Reliable uni-stream listener (Welcome + WAN MTU-fallback EntitySnapshots, APlusChunks, & VolumetricBrick3D!)
         let st_rel = state.clone();
         let conn_rel = conn.clone();
         tokio::spawn(async move {
             while let Ok(mut recv) = conn_rel.accept_uni().await {
-                if let Ok(bytes) = recv.read_to_end(65536).await {
+                if let Ok(bytes) = recv.read_to_end(262_144).await {
                     if bytes.first() == Some(&0xFE) {
-                        if let Some(ServerDatagram::EntitySnapshot {
-                            sim_tick,
-                            match_time_secs,
-                            your_player_id,
-                            echo_client_time_ms,
-                            relic_x,
-                            relic_y,
-                            players,
-                            projectiles,
-                            bodies,
-                            shrines,
-                            events,
-                            telemetry,
-                            bot_brains,
-                            kill_feed,
-                            speech_bubbles,
-                            actuator_pulses,
-                            match_phase,
-                            match_time_left_s,
-                            mvp_name,
-                            mvp_score,
-                            time_domes,
-                        }) = decode_server_datagram(&bytes[1..])
-                        {
-                            let mut st = st_rel.lock().unwrap();
-                            apply_snapshot(
-                                &mut st,
-                                bytes.len() as u64,
-                                sim_tick,
-                                match_time_secs,
-                                your_player_id,
-                                echo_client_time_ms,
-                                relic_x,
-                                relic_y,
-                                players,
-                                projectiles,
-                                bodies,
-                                shrines,
-                                events,
-                                telemetry,
-                                bot_brains,
-                                kill_feed,
-                                speech_bubbles,
-                                actuator_pulses,
-                                match_phase,
-                                match_time_left_s,
-                                mvp_name,
-                                mvp_score,
-                                time_domes,
-                            );
+                        if let Some(pkt) = decode_server_datagram(&bytes[1..]) {
+                            let raw_len = bytes.len() as u64;
+                            match pkt {
+                                ServerDatagram::EntitySnapshot {
+                                    sim_tick,
+                                    match_time_secs,
+                                    your_player_id,
+                                    echo_client_time_ms,
+                                    relic_x,
+                                    relic_y,
+                                    players,
+                                    projectiles,
+                                    bodies,
+                                    shrines,
+                                    events,
+                                    telemetry,
+                                    bot_brains,
+                                    kill_feed,
+                                    speech_bubbles,
+                                    actuator_pulses,
+                                    match_phase,
+                                    match_time_left_s,
+                                    mvp_name,
+                                    mvp_score,
+                                    time_domes,
+                                } => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    apply_snapshot(
+                                        &mut st,
+                                        raw_len,
+                                        sim_tick,
+                                        match_time_secs,
+                                        your_player_id,
+                                        echo_client_time_ms,
+                                        relic_x,
+                                        relic_y,
+                                        players,
+                                        projectiles,
+                                        bodies,
+                                        shrines,
+                                        events,
+                                        telemetry,
+                                        bot_brains,
+                                        kill_feed,
+                                        speech_bubbles,
+                                        actuator_pulses,
+                                        match_phase,
+                                        match_time_left_s,
+                                        mvp_name,
+                                        mvp_score,
+                                        time_domes,
+                                    );
+                                }
+                                ServerDatagram::APlusChunk {
+                                    field_tick,
+                                    layer,
+                                    chunk_id: _,
+                                    cx,
+                                    cy,
+                                    lz4_cells,
+                                } => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    st.apply_aplus_chunk(raw_len, field_tick, layer, cx, cy, &lz4_cells);
+                                }
+                                ServerDatagram::VolumetricBrick3D(brick) => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    st.apply_brick3d(raw_len, &brick);
+                                }
+                            }
                         }
                     } else if let Some(ServerReliable::Welcome {
                         your_player_id,
@@ -367,7 +529,7 @@ impl QuicClientHandle {
             }
         });
 
-        // Unreliable datagram reader (3D layered APlusChunk + EntitySnapshot)
+        // Unreliable datagram reader (3D layered APlusChunk + VolumetricBrick3D + EntitySnapshot)
         let st_dg = state.clone();
         let conn_dg = conn.clone();
         tokio::spawn(async move {
@@ -385,41 +547,8 @@ impl QuicClientHandle {
                         cy,
                         lz4_cells,
                     } => {
-                        let Some(raw) = decompress_aplus_cells(&lz4_cells) else {
-                            continue;
-                        };
-                        if raw.len() != CHUNK_SIZE * CHUNK_SIZE * 4 {
-                            continue;
-                        }
                         let mut st = st_dg.lock().unwrap();
-                        let l_u = layer as usize;
-                        let cx_u = cx as usize;
-                        let cy_u = cy as usize;
-                        if l_u >= st.depth || cx_u >= st.chunks_x || cy_u >= st.chunks_y {
-                            continue;
-                        }
-                        st.bytes_rx += raw_len;
-                        st.chunks_rx += 1;
-                        st.latest_field_tick = st.latest_field_tick.max(field_tick);
-
-                        let x0 = cx_u * CHUNK_SIZE;
-                        let y0 = cy_u * CHUNK_SIZE;
-                        let w = st.width;
-                        let h = st.height;
-                        let grid = &mut st.aplus_layers[l_u];
-                        for dy in 0..CHUNK_SIZE {
-                            let gy = (y0 + dy).min(h - 1);
-                            for dx in 0..CHUNK_SIZE {
-                                let gx = (x0 + dx).min(w - 1);
-                                let src = (dy * CHUNK_SIZE + dx) * 4;
-                                grid[gy * w + gx] = [raw[src], raw[src + 1], raw[src + 2], raw[src + 3]];
-                            }
-                        }
-                        let ci = cy_u * st.chunks_x + cx_u;
-                        if l_u == st.surf_layer() {
-                            st.received_surf_chunks[ci] = true;
-                        }
-                        st.dirty_chunks[l_u][ci] = true;
+                        st.apply_aplus_chunk(raw_len, field_tick, layer, cx, cy, &lz4_cells);
                     }
                     ServerDatagram::EntitySnapshot {
                         sim_tick,
@@ -471,7 +600,10 @@ impl QuicClientHandle {
                             time_domes,
                         );
                     }
-                    ServerDatagram::VolumetricBrick3D(_) => {}
+                    ServerDatagram::VolumetricBrick3D(brick) => {
+                        let mut st = st_dg.lock().unwrap();
+                        st.apply_brick3d(raw_len, &brick);
+                    }
                 }
             }
         });
@@ -513,7 +645,12 @@ impl QuicClientHandle {
         loop {
             let (rc, tot, has_ent) = {
                 let st = self.state.lock().unwrap();
-                (st.received_surf_count(), st.total_surf_chunks(), st.entities.is_some())
+                let rc = if st.depth >= 16 {
+                    st.received_z16_count()
+                } else {
+                    st.received_surf_count()
+                };
+                (rc, st.total_surf_chunks(), st.entities.is_some())
             };
             let target = ((tot as f32) * min_frac).ceil() as usize;
             if rc >= target && has_ent {

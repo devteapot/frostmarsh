@@ -24,15 +24,17 @@ mod parametric;
 mod renderer;
 mod surfel_gen;
 mod world_bridge;
+mod z16_world;
 
 use crate::audio::{SfxKind, SpatialAudioEngine};
 use crate::camera::MobaCamera;
 use crate::hud::{build_hud, HudConfig};
 use crate::mesh_gen::StaticMeshBank;
 use crate::net::QuicClientHandle;
-use crate::renderer::{Approach4Renderer, Atmosphere, RenderStyle};
+use crate::renderer::{z16_style_label, Approach4Renderer, Atmosphere, RenderStyle};
 use crate::surfel_gen::SurfelProtoBank;
 use crate::world_bridge::{assemble_live_frame, AimReticle, LiveApproach4World, SP_ICE, SP_ROCK, SP_WOOD};
+use crate::z16_world::Z16World;
 use clap::Parser;
 use frostmarsh_proto::*;
 use glam::Vec3;
@@ -182,21 +184,37 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let (rc, tot, has_ent) = rt.block_on(quic.wait_for_sync(0.95, Duration::from_secs(10)));
     println!("[Unified] Synced {}/{} chunks (entities={})", rc, tot, has_ent);
 
-    let (gw, gh, gd) = {
+    let (gw, gh, gd, z16_active) = {
         let st = quic.state.lock().unwrap();
-        (st.width, st.height, st.depth)
+        (st.width, st.height, st.depth, st.depth >= 16 || st.has_z16_bricks)
     };
     let mut world = LiveApproach4World::new(gw, gh, gd);
+    let mut z16_world = if z16_active { Some(Z16World::new(gw, gh, gd)) } else { None };
 
-    // Full initial 3D volumetric build (L1 surface + L2 highland/skybridges/waterfalls + L3 plumes)
-    let dirty_init = {
+    // Full initial 3D volumetric build (either true 3D Z=16 Surface-Nets OR L4 layered A+)
+    let full_sync_build_ms = if let Some(ref mut z16w) = z16_world {
         let mut st = quic.state.lock().unwrap();
-        st.take_dirty_list()
+        let dirty_z16 = st.take_dirty_z16_bricks();
+        let (rebuilt, ms) = z16w.apply_dirty_bricks(&st.z16_density_mat, &st.z16_albedo_thermal, &dirty_z16);
+        println!(
+            "[Unified] Z=16 Initial Surface-Nets: {} bricks, {} tris in {:.2}ms (bytes_rx={})",
+            rebuilt,
+            z16w.total_triangles(),
+            ms,
+            st.bytes_rx
+        );
+        ms
+    } else {
+        let dirty_init = {
+            let mut st = quic.state.lock().unwrap();
+            st.take_dirty_list()
+        };
+        let aplus_copy = { quic.state.lock().unwrap().aplus_layers.clone() };
+        let (_, ms) = world.update_dirty_chunks(&aplus_copy, &dirty_init);
+        ms
     };
-    let aplus_copy = { quic.state.lock().unwrap().aplus_layers.clone() };
-    let (_, full_sync_build_ms) = world.update_dirty_chunks(&aplus_copy, &dirty_init);
 
-    // Observe 10 Hz incremental 3D dirty-chunk rebuilds
+    // Observe 10 Hz incremental 3D dirty-chunk / dirty-brick rebuilds
     let mut dirty_samples = Vec::new();
     let t_obs = Instant::now();
     let mut last_tick = 0u64;
@@ -215,18 +233,29 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
             test_chat_sent = true;
         }
-        let (ft, dirty, snap_layers) = {
+        if let Some(ref mut z16w) = z16_world {
             let mut st = quic.state.lock().unwrap();
-            let d = st.take_dirty_list();
-            let cells = if !d.is_empty() { Some(st.aplus_layers.clone()) } else { None };
-            (st.latest_field_tick, d, cells)
-        };
-        if let Some(layers) = snap_layers {
-            if ft > last_tick {
-                last_tick = ft;
-                let (cnt, ms) = world.update_dirty_chunks(&layers, &dirty);
+            let dirty_z16 = st.take_dirty_z16_bricks();
+            if !dirty_z16.is_empty() {
+                let (cnt, ms) = z16w.apply_dirty_bricks(&st.z16_density_mat, &st.z16_albedo_thermal, &dirty_z16);
                 if cnt > 0 {
                     dirty_samples.push(ms);
+                }
+            }
+        } else {
+            let (ft, dirty, snap_layers) = {
+                let mut st = quic.state.lock().unwrap();
+                let d = st.take_dirty_list();
+                let cells = if !d.is_empty() { Some(st.aplus_layers.clone()) } else { None };
+                (st.latest_field_tick, d, cells)
+            };
+            if let Some(layers) = snap_layers {
+                if ft > last_tick {
+                    last_tick = ft;
+                    let (cnt, ms) = world.update_dirty_chunks(&layers, &dirty);
+                    if cnt > 0 {
+                        dirty_samples.push(ms);
+                    }
                 }
             }
         }
@@ -250,25 +279,43 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or_default();
 
-    renderer.upload_minimap(world.grid_w as u32, world.grid_h as u32, &world.minimap_rgba);
+    renderer.set_z16_mode(z16_active, 0);
+    if let Some(ref mut z16w) = z16_world {
+        renderer.upload_z16_world(z16w);
+        renderer.upload_minimap(z16w.width as u32, z16w.height as u32, &z16w.minimap_rgba);
+    } else {
+        renderer.upload_minimap(world.grid_w as u32, world.grid_h as u32, &world.minimap_rgba);
+    }
 
-    // Heroic 3D Volumetric Vista showcasing Layer 2 Highland Plateaus, Plunging 3D Waterfalls,
-    // Overhanging Stone Sky-Arch (with fjord underneath!), Central Spire, and Layer 3 Plumes!
-    let focus_target = Vec3::new(0.0, 2.2, -(gh as f32) * 0.14);
-
-    let cam_main = MobaCamera {
-        target: focus_target,
-        yaw: 0.48,
-        pitch: 0.56,
-        dist: 102.0,
-        fov_y: 38.0_f32.to_radians(),
-        ortho: false,
+    // Heroic 3D Volumetric Vista:
+    // - Z=16 mode: frames the 3-Span Arched Stone & Timber Bridge, river canyon, North alpine waterfall,
+    //   SW cave massif, Hard-Z sculpted pines, and live multiplayer heroes!
+    // - L4 mode: frames Layer 2 Highland Plateaus, Plunging 3D Waterfalls, Stone Sky-Arch & Central Spire!
+    let cam_main = if z16_active {
+        MobaCamera {
+            target: Vec3::new(0.0, 5.6, -4.0),
+            yaw: 0.46,
+            pitch: 0.42,
+            dist: (gw as f32 * 0.46).clamp(48.0, 96.0),
+            fov_y: 38.0_f32.to_radians(),
+            ortho: false,
+        }
+    } else {
+        MobaCamera {
+            target: Vec3::new(0.0, 2.2, -(gh as f32) * 0.14),
+            yaw: 0.48,
+            pitch: 0.56,
+            dist: 102.0,
+            fov_y: 38.0_f32.to_radians(),
+            ortho: false,
+        }
     };
     let sun_dir = Approach4Renderer::sun_dir(atmo);
     let mats_main = cam_main.compute_matrices(1920.0, 1080.0, sun_dir);
     let sim_time = 2.4f32;
     let frame_main = assemble_live_frame(
         &world,
+        z16_world.as_ref(),
         entities.as_ref(),
         &surfels,
         &mats_main,
@@ -295,6 +342,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             *bw as f32,
             *bh as f32,
             &world,
+            z16_world.as_ref(),
             entities.as_ref(),
             &m,
             &HudConfig {
@@ -305,6 +353,8 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 selected_element: 0,
                 focus_radius: 4.0,
                 style_label: st.label,
+                z16_active,
+                z16_style_label: z16_style_label(0),
                 fps: fps_1080,
                 rtt_ms: 1.2,
                 chat_open: false,
@@ -349,12 +399,13 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Capture 1: Crisp 1920×1080 Live Battle + Full HUD + Live 256×256 Minimap
+    // Capture 1: Crisp 1920×1080 Live Battle + Full HUD + Live Tactical Minimap
     let style_main = style_from_name(&args.style, 1080);
     let hud_main = build_hud(
         1920.0,
         1080.0,
         &world,
+        z16_world.as_ref(),
         entities.as_ref(),
         &mats_main,
         &HudConfig {
@@ -365,6 +416,8 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             selected_element: 0,
             focus_radius: 4.0,
             style_label: style_main.label,
+            z16_active,
+            z16_style_label: z16_style_label(0),
             fps: fps_1080,
             rtt_ms: 1.2,
             chat_open: false,
@@ -389,46 +442,97 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&args.out_dir)?;
     save_rgba_png(&args.out_dir.join("unified_live_1080p_hud.png"), 1920, 1080, &rgba_main)?;
 
-    // Capture 2: 2×2 Multi-Angle Orbit Showcase (960×540 per panel -> 1920×1080)
-    let views = [
-        // Top-left: Wide 3D Shattered Reach overview (ALL 4 LAYERS with HUD)
-        (
-            MobaCamera { target: Vec3::new(0.0, 2.0, -(gh as f32) * 0.14), yaw: 0.44, pitch: 0.62, dist: 124.0, fov_y: 40.0_f32.to_radians(), ortho: false },
-            RenderStyle::pixel_art(1),
-            true,
-            0u8,
-        ),
-        // Top-right: Low dramatic angle looking UNDER the Layer 2 Stone Sky-Arch + Plunging 3D Waterfalls!
-        (
-            MobaCamera { target: Vec3::new(-4.0, 2.5, -(gh as f32) * 0.23), yaw: 0.35, pitch: 0.36, dist: 56.0, fov_y: 36.0_f32.to_radians(), ortho: false },
-            RenderStyle::pixel_art(1),
-            false,
-            0u8,
-        ),
-        // Bottom-left: Layer 2 + Layer 3 Slice ONLY (`L` slice mode = 2: floating Skybridges, Highland Lakes, Plumes!)
-        (
-            MobaCamera { target: Vec3::new(0.0, 4.0, -(gh as f32) * 0.12), yaw: 0.62, pitch: 0.56, dist: 112.0, fov_y: 38.0_f32.to_radians(), ortho: false },
-            RenderStyle::pixel_art(1),
-            false,
-            2u8,
-        ),
-        // Bottom-right: Southern Timber Skybridge + SE Obsidian High-Overlook (Clean 3D Resolve)
-        (
-            MobaCamera { target: Vec3::new(14.0, 2.5, (gh as f32) * 0.18), yaw: -0.95, pitch: 0.46, dist: 68.0, fov_y: 38.0_f32.to_radians(), ortho: false },
-            RenderStyle::clean_3d(),
-            false,
-            0u8,
-        ),
-    ];
+    // Capture 2: 2×2 Multi-Angle & Live Style-Swap Orbit Showcase (960×540 per panel -> 1920×1080)
+    let views: [(MobaCamera, RenderStyle, bool, u8, u32); 4] = if z16_active {
+        let base_d = (gw as f32 * 0.44).clamp(46.0, 92.0);
+        [
+            // Top-left: NORDIC PIXEL-2XSS Bridge & Waterfall Vista + HUD
+            (
+                MobaCamera { target: Vec3::new(0.0, 5.6, -4.0), yaw: 0.46, pitch: 0.42, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
+                RenderStyle::pixel_art(1),
+                true,
+                0u8,
+                0u32,
+            ),
+            // Top-right: Low dramatic angle looking UNDER the 3-Span Stone Archway & River!
+            (
+                MobaCamera { target: Vec3::new(-4.0, 4.6, 0.0), yaw: 0.34, pitch: 0.24, dist: base_d * 0.56, fov_y: 36.0_f32.to_radians(), ortho: false },
+                RenderStyle::pixel_art(1),
+                false,
+                0u8,
+                0u32,
+            ),
+            // Bottom-left: Live Y-Key Client Style 1 — VOLCANIC EMBER (PIXEL-2XSS)!
+            (
+                MobaCamera { target: Vec3::new(0.0, 5.6, -4.0), yaw: -0.52, pitch: 0.40, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
+                RenderStyle::pixel_art(1),
+                false,
+                0u8,
+                1u32,
+            ),
+            // Bottom-right: Live Y-Key Client Style 2 — ARCANE THERMAL (CLEAN-3D)!
+            (
+                MobaCamera { target: Vec3::new(0.0, 5.6, -4.0), yaw: 0.58, pitch: 0.44, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
+                RenderStyle::clean_3d(),
+                false,
+                0u8,
+                2u32,
+            ),
+        ]
+    } else {
+        [
+            (
+                MobaCamera { target: Vec3::new(0.0, 2.0, -(gh as f32) * 0.14), yaw: 0.44, pitch: 0.62, dist: 124.0, fov_y: 40.0_f32.to_radians(), ortho: false },
+                RenderStyle::pixel_art(1),
+                true,
+                0u8,
+                0u32,
+            ),
+            (
+                MobaCamera { target: Vec3::new(-4.0, 2.5, -(gh as f32) * 0.23), yaw: 0.35, pitch: 0.36, dist: 56.0, fov_y: 36.0_f32.to_radians(), ortho: false },
+                RenderStyle::pixel_art(1),
+                false,
+                0u8,
+                0u32,
+            ),
+            (
+                MobaCamera { target: Vec3::new(0.0, 4.0, -(gh as f32) * 0.12), yaw: 0.62, pitch: 0.56, dist: 112.0, fov_y: 38.0_f32.to_radians(), ortho: false },
+                RenderStyle::pixel_art(1),
+                false,
+                2u8,
+                0u32,
+            ),
+            (
+                MobaCamera { target: Vec3::new(14.0, 2.5, (gh as f32) * 0.18), yaw: -0.95, pitch: 0.46, dist: 68.0, fov_y: 38.0_f32.to_radians(), ortho: false },
+                RenderStyle::clean_3d(),
+                false,
+                0u8,
+                0u32,
+            ),
+        ]
+    };
     let mut panels = Vec::with_capacity(4);
-    for (cam, st, with_hud, slice_mode) in &views {
+    for (cam, st, with_hud, slice_mode, z16_st) in &views {
+        renderer.set_z16_mode(z16_active, *z16_st);
         let m = cam.compute_matrices(960.0, 540.0, sun_dir);
-        let fr = assemble_live_frame(&world, entities.as_ref(), &surfels, &m, cam.target, cam.dist, sim_time, *slice_mode, None);
+        let fr = assemble_live_frame(
+            &world,
+            z16_world.as_ref(),
+            entities.as_ref(),
+            &surfels,
+            &m,
+            cam.target,
+            cam.dist,
+            sim_time,
+            *slice_mode,
+            None,
+        );
         let hb = if *with_hud {
             Some(build_hud(
                 960.0,
                 540.0,
                 &world,
+                z16_world.as_ref(),
                 entities.as_ref(),
                 &m,
                 &HudConfig {
@@ -439,6 +543,8 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     selected_element: 1,
                     focus_radius: 4.0,
                     style_label: st.label,
+                    z16_active,
+                    z16_style_label: z16_style_label(*z16_st),
                     fps: fps_1080,
                     rtt_ms: 1.2,
                     chat_open: false,
@@ -455,11 +561,16 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let (px, _, _) = renderer.render_to_rgba(960, 540, st, atmo, cam, &m, sim_time, &fr, hb.as_ref());
         panels.push(px);
     }
+    renderer.set_z16_mode(z16_active, 0);
     let grid = compose_2x2_grid([&panels[0], &panels[1], &panels[2], &panels[3]], 960, 540);
     save_rgba_png(&args.out_dir.join("unified_orbit_4view.png"), 1920, 1080, &grid)?;
 
     let tel = entities.as_ref().map(|e| e.telemetry.clone());
     let mesh_inst_cnt: usize = frame_main.mesh_batches.iter().map(|b| b.len()).sum();
+    let terrain_tris = z16_world
+        .as_ref()
+        .map(|z| z.total_triangles())
+        .unwrap_or_else(|| frame_main.terrain_idxs.len() / 3);
     let metrics = UnifiedMetrics {
         server: args.server.to_string(),
         gpu_adapter: renderer.adapter_name.clone(),
@@ -484,7 +595,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         dirty_update_p99_ms: (dirty_p99 * 1000.0).round() / 1000.0,
         full_sync_build_ms: (full_sync_build_ms * 1000.0).round() / 1000.0,
         visible_chunks: frame_main.visible_chunks,
-        terrain_triangles: frame_main.terrain_idxs.len() / 3,
+        terrain_triangles: terrain_tris,
         mesh_instances: mesh_inst_cnt,
         surfel_draws: frame_main.surfel_refs.len(),
         volumetric_splats: frame_main.vol_splats.len(),
@@ -709,6 +820,9 @@ struct InteractiveApp {
     meshes: StaticMeshBank,
     surfels: SurfelProtoBank,
     world: LiveApproach4World,
+    z16_world: Z16World,
+    z16_active: bool,
+    z16_style_mode: u32,
     camera: MobaCamera,
     style_clean: bool,
     layer_slice_mode: u8,
@@ -752,6 +866,7 @@ struct InteractiveApp {
     smooth_bodies: HashMap<u32, (f32, f32, f32)>,
     pending_inputs: VecDeque<PendingMoveInput>,
     pred_hero_pos: Option<(f32, f32, f32)>,
+    pred_hero_vz: f32,
     hero_visual_err: (f32, f32),
     hero_dash_pred_until: Option<Instant>,
     local_aim_dir: (f32, f32),
@@ -781,6 +896,9 @@ impl InteractiveApp {
             meshes,
             surfels,
             world: LiveApproach4World::new(GRID_W, GRID_H, GRID_D),
+            z16_world: Z16World::new(128, 128, 16),
+            z16_active: false,
+            z16_style_mode: 0,
             camera: MobaCamera {
                 target: Vec3::new(0.0, 1.6, 0.0),
                 yaw: 0.42,
@@ -831,6 +949,7 @@ impl InteractiveApp {
             smooth_bodies: HashMap::new(),
             pending_inputs: VecDeque::with_capacity(96),
             pred_hero_pos: None,
+            pred_hero_vz: 0.0,
             hero_visual_err: (0.0, 0.0),
             hero_dash_pred_until: None,
             local_aim_dir: (0.0, -1.0),
@@ -857,18 +976,32 @@ impl InteractiveApp {
             }
         }
 
-        // Pull latest 3D volumetric A+ dirty chunks (budgeted per frame, zero 4MB clone!) + entities from QUIC
+        // Pull latest 3D volumetric dirty bricks (Z=16) OR A+ dirty chunks (L4) + entities from QUIC
         let (mut entities, rtt_ms) = if let Some(ref quic) = self.quic {
             let mut st = quic.state.lock().unwrap();
             let gw = st.width;
             let gh = st.height;
             let gd = st.depth;
-            let dirty = st.take_dirty_budget(20);
             let ent = st.entities.clone();
             let rtt = st.rtt_ms;
             self.world.resize_if_needed(gw, gh, gd);
-            if !dirty.is_empty() {
-                self.world.update_dirty_chunks(&st.aplus_layers, &dirty);
+            if gd >= 16 || st.has_z16_bricks {
+                self.z16_active = true;
+                self.z16_world.resize_if_needed(gw, gh, gd);
+                let dirty_z16 = st.take_dirty_z16_bricks();
+                if !dirty_z16.is_empty() {
+                    self.z16_world.apply_dirty_bricks(
+                        &st.z16_density_mat,
+                        &st.z16_albedo_thermal,
+                        &dirty_z16,
+                    );
+                }
+            } else {
+                self.z16_active = false;
+                let dirty = st.take_dirty_budget(20);
+                if !dirty.is_empty() {
+                    self.world.update_dirty_chunks(&st.aplus_layers, &dirty);
+                }
             }
             drop(st);
             (ent, rtt)
@@ -923,24 +1056,53 @@ impl InteractiveApp {
                                 break;
                             }
                         }
-                        let (mut rx, mut ry) = (p.x, p.y);
+                        let (mut rx, mut ry, mut rz, mut rvz) = (p.x, p.y, p.z, p.vz);
                         for pin in &self.pending_inputs {
-                            let (nx, ny) = predict_hero_step(
-                                &self.world,
-                                rx,
-                                ry,
-                                p.z,
-                                pin.move_x,
-                                pin.move_y,
-                                pin.dt,
-                                p.class_id,
-                                p.carrying_relic,
-                                pin.dash,
-                                hasted,
-                                &bodies_ref,
-                            );
-                            rx = nx;
-                            ry = ny;
+                            if self.z16_active {
+                                let mlen = pin.move_x.hypot(pin.move_y);
+                                let (dx, dy) = if mlen >= 0.01 { (pin.move_x / mlen, pin.move_y / mlen) } else { (0.0, 0.0) };
+                                let speed = if pin.dash {
+                                    42.0
+                                } else if mlen < 0.01 {
+                                    0.0
+                                } else {
+                                    let mut s = hero_class_base_speed(p.class_id);
+                                    if p.carrying_relic { s *= 0.78; }
+                                    if hasted { s *= 1.32; }
+                                    s
+                                };
+                                if pin.dash && rvz < 0.5 {
+                                    rvz = 6.2;
+                                }
+                                let ((nx, ny, nz), (_, _, nvz), _) = self.z16_world.step_capsule_3d(
+                                    (rx, ry, rz),
+                                    (dx * speed, dy * speed, rvz),
+                                    0.55,
+                                    1.80,
+                                    pin.dt,
+                                );
+                                rx = nx;
+                                ry = ny;
+                                rz = nz;
+                                rvz = nvz;
+                            } else {
+                                let (nx, ny) = predict_hero_step(
+                                    &self.world,
+                                    rx,
+                                    ry,
+                                    p.z,
+                                    pin.move_x,
+                                    pin.move_y,
+                                    pin.dt,
+                                    p.class_id,
+                                    p.carrying_relic,
+                                    pin.dash,
+                                    hasted,
+                                    &bodies_ref,
+                                );
+                                rx = nx;
+                                ry = ny;
+                            }
                         }
                         if let Some((old_x, old_y, old_z)) = self.pred_hero_pos {
                             let old_disp_x = old_x + self.hero_visual_err.0;
@@ -953,9 +1115,16 @@ impl InteractiveApp {
                                 // Absorb tiny residual into visual offset so hero NEVER snaps backwards!
                                 self.hero_visual_err = (old_disp_x - rx, old_disp_y - ry);
                             }
-                            self.pred_hero_pos = Some((rx, ry, old_z + (p.z - old_z) * alpha_other));
+                            let next_z = if self.z16_active {
+                                old_z + (rz - old_z) * alpha_other
+                            } else {
+                                old_z + (p.z - old_z) * alpha_other
+                            };
+                            self.pred_hero_pos = Some((rx, ry, next_z));
+                            self.pred_hero_vz = rvz;
                         } else {
-                            self.pred_hero_pos = Some((rx, ry, p.z));
+                            self.pred_hero_pos = Some((rx, ry, if self.z16_active { rz } else { p.z }));
+                            self.pred_hero_vz = rvz;
                             self.hero_visual_err = (0.0, 0.0);
                         }
                     }
@@ -968,24 +1137,52 @@ impl InteractiveApp {
                         } else {
                             (local_move_v.x, local_move_v.z)
                         };
-                        let (nx, ny) = predict_hero_step(
-                            &self.world,
-                            px,
-                            py,
-                            pz,
-                            step_mx,
-                            step_my,
-                            dt,
-                            p.class_id,
-                            p.carrying_relic,
-                            pred_dashing,
-                            hasted,
-                            &bodies_ref,
-                        );
-                        px = nx;
-                        py = ny;
+                        if self.z16_active {
+                            let mlen = step_mx.hypot(step_my);
+                            let (dx, dy) = if mlen >= 0.01 { (step_mx / mlen, step_my / mlen) } else { (0.0, 0.0) };
+                            let speed = if pred_dashing {
+                                42.0
+                            } else if mlen < 0.01 {
+                                0.0
+                            } else {
+                                let mut s = hero_class_base_speed(p.class_id);
+                                if p.carrying_relic { s *= 0.78; }
+                                if hasted { s *= 1.32; }
+                                s
+                            };
+                            let ((nx, ny, nz), (_, _, nvz), _) = self.z16_world.step_capsule_3d(
+                                (px, py, pz),
+                                (dx * speed, dy * speed, self.pred_hero_vz),
+                                0.55,
+                                1.80,
+                                dt,
+                            );
+                            px = nx;
+                            py = ny;
+                            pz = nz;
+                            self.pred_hero_vz = nvz;
+                        } else {
+                            let (nx, ny) = predict_hero_step(
+                                &self.world,
+                                px,
+                                py,
+                                pz,
+                                step_mx,
+                                step_my,
+                                dt,
+                                p.class_id,
+                                p.carrying_relic,
+                                pred_dashing,
+                                hasted,
+                                &bodies_ref,
+                            );
+                            px = nx;
+                            py = ny;
+                            pz += (p.z - pz) * alpha_other;
+                        }
+                    } else {
+                        pz += (p.z - pz) * alpha_other;
                     }
-                    pz += (p.z - pz) * alpha_other;
                     self.pred_hero_pos = Some((px, py, pz));
 
                     // Smoothly decay any tiny visual reconciliation residual
@@ -1071,8 +1268,16 @@ impl InteractiveApp {
         // Smooth 3D camera follow onto your predicted hero's exact altitude
         if let Some(ref ent) = entities {
             if let Some(me) = ent.players.iter().find(|p| p.id == ent.your_player_id) {
-                let (wx, wz) = self.world.grid_to_world_xz(me.x, me.y);
-                let gy = self.world.sample_3d_y(me.x, me.y, me.z);
+                let (wx, wz) = if self.z16_active {
+                    self.z16_world.grid_to_world_xz(me.x, me.y)
+                } else {
+                    self.world.grid_to_world_xz(me.x, me.y)
+                };
+                let gy = if self.z16_active {
+                    me.z
+                } else {
+                    self.world.sample_3d_y(me.x, me.y, me.z)
+                };
                 let desired = Vec3::new(wx, gy + 0.8, wz);
                 let cam_alpha = 1.0 - (-12.0 * dt).exp();
                 self.camera.target = self.camera.target.lerp(desired, cam_alpha);
@@ -1085,7 +1290,18 @@ impl InteractiveApp {
             return;
         };
 
-        if self.world.minimap_dirty {
+        renderer.set_z16_mode(self.z16_active, self.z16_style_mode);
+        if self.z16_active {
+            renderer.upload_z16_world(&mut self.z16_world);
+            if self.z16_world.minimap_dirty {
+                renderer.upload_minimap(
+                    self.z16_world.width as u32,
+                    self.z16_world.height as u32,
+                    &self.z16_world.minimap_rgba,
+                );
+                self.z16_world.minimap_dirty = false;
+            }
+        } else if self.world.minimap_dirty {
             renderer.upload_minimap(
                 self.world.grid_w as u32,
                 self.world.grid_h as u32,
@@ -1125,7 +1341,11 @@ impl InteractiveApp {
                 (pan, gain)
             };
 
-            let (nearest_wf, nearby_fire) = self.world.sample_ambient_audio_sources(listener_pos);
+            let (nearest_wf, nearby_fire) = if self.z16_active {
+                self.z16_world.sample_ambient_audio_sources(listener_pos)
+            } else {
+                self.world.sample_ambient_audio_sources(listener_pos)
+            };
             let (wf_gain, wf_pan) = if let Some((wp, _)) = nearest_wf {
                 let (p, g) = spatial_pan_gain(wp, 38.0);
                 (g, p)
@@ -1211,7 +1431,11 @@ impl InteractiveApp {
             .and_then(|e| e.players.iter().find(|p| p.id == e.your_player_id))
             .map(|me| (me.x, me.y, me.z, me.team, me.stamina, me.hp))
             .unwrap_or((self.world.grid_w as f32 * 0.5, self.world.grid_h as f32 * 0.5, 1.0, 0, 100, 100));
-        let hero_plane_y = self.world.sample_3d_y(hero_gx, hero_gy, hero_gz);
+        let hero_plane_y = if self.z16_active {
+            hero_gz
+        } else {
+            self.world.sample_3d_y(hero_gx, hero_gy, hero_gz)
+        };
 
         let mut aim_x = fwd_xz.x;
         let mut aim_y = fwd_xz.z;
@@ -1432,8 +1656,10 @@ impl InteractiveApp {
         } else {
             RenderStyle::pixel_art(if out_h >= 2100 { 3 } else { 2 })
         };
+        let z16_ref = if self.z16_active { Some(&self.z16_world) } else { None };
         let frame = assemble_live_frame(
             &self.world,
+            z16_ref,
             entities.as_ref(),
             &self.surfels,
             &mats,
@@ -1447,6 +1673,7 @@ impl InteractiveApp {
             out_w as f32,
             out_h as f32,
             &self.world,
+            z16_ref,
             entities.as_ref(),
             &mats,
             &HudConfig {
@@ -1457,6 +1684,8 @@ impl InteractiveApp {
                 selected_element: self.selected_element,
                 focus_radius: self.focus_radius,
                 style_label: style.label,
+                z16_active: self.z16_active,
+                z16_style_label: z16_style_label(self.z16_style_mode),
                 fps: self.fps_ema,
                 rtt_ms,
                 chat_open: self.chat_open,
@@ -1743,6 +1972,13 @@ impl ApplicationHandler for InteractiveApp {
                                 KeyCode::KeyE => self.pending_ability_e = true,
                                 KeyCode::KeyR => self.pending_ult_r = true,
                                 KeyCode::KeyT => self.style_clean = !self.style_clean,
+                                KeyCode::KeyY => {
+                                    self.z16_style_mode = (self.z16_style_mode + 1) % 3;
+                                    println!(
+                                        "[Unified] Switched client visual style -> {} [Y]",
+                                        z16_style_label(self.z16_style_mode)
+                                    );
+                                }
                                 KeyCode::KeyL => self.layer_slice_mode = (self.layer_slice_mode + 1) % 3,
                                 KeyCode::KeyH => self.show_hud = !self.show_hud,
                                 KeyCode::KeyU => {

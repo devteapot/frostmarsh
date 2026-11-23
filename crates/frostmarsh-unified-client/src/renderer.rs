@@ -15,6 +15,7 @@ use crate::mesh_gen::{MeshInstance, MeshSlice, MeshVertex, StaticMeshBank, MESH_
 use crate::palette::{palette_resolve_64, palette_tex_bytes_at};
 use crate::surfel_gen::{SplatPlacement, SplatProto, SplatRef, SurfelProtoBank};
 use crate::world_bridge::{AssembledFrame, VolSplat};
+use crate::z16_world::{SurfaceVertex, Z16World, OCC_BRICK_SIZE, SN_BRICK_SIZE};
 use bytemuck::{Pod, Zeroable};
 use frostmarsh_proto::{WEATHER_BLIZZARD, WEATHER_EMBER, WEATHER_SQUALL};
 use glam::Vec3;
@@ -67,6 +68,25 @@ struct BlitUniforms {
 struct HudUniforms {
     screen_size: [f32; 2],
     _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Z16Uniforms {
+    inv_vp: [[f32; 4]; 4],
+    vol_dims: [f32; 4],
+    brick_dims: [f32; 4],
+    world_offset: [f32; 4],
+    sky_top: [f32; 4],
+    sky_horizon: [f32; 4],
+}
+
+pub fn z16_style_label(style_mode: u32) -> &'static str {
+    match style_mode % 3 {
+        1 => "VOLCANIC",
+        2 => "ARCANE",
+        _ => "NORDIC",
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -263,6 +283,8 @@ pub struct Approach4Renderer {
     pipe_resolve: wgpu::RenderPipeline,
     pipe_blit: wgpu::RenderPipeline,
     pipe_hud: wgpu::RenderPipeline,
+    pipe_field_z16: wgpu::RenderPipeline,
+    pipe_vol_z16: wgpu::RenderPipeline,
 
     shadow_bgl: wgpu::BindGroupLayout,
     mesh_bgl: wgpu::BindGroupLayout,
@@ -271,6 +293,26 @@ pub struct Approach4Renderer {
     resolve_bgl: wgpu::BindGroupLayout,
     blit_bgl: wgpu::BindGroupLayout,
     hud_bgl: wgpu::BindGroupLayout,
+    z16_mesh_bgl: wgpu::BindGroupLayout,
+    z16_vol_bgl: wgpu::BindGroupLayout,
+
+    z16_active: bool,
+    z16_style_mode: u32,
+    z16_dims: (u32, u32, u32),
+    z16_occ_dims: (u32, u32, u32),
+    z16_density_tex: Option<wgpu::Texture>,
+    z16_density_view: Option<wgpu::TextureView>,
+    z16_albedo_tex: Option<wgpu::Texture>,
+    z16_albedo_view: Option<wgpu::TextureView>,
+    z16_occ_tex: Option<wgpu::Texture>,
+    z16_occ_view: Option<wgpu::TextureView>,
+    z16_vol_samp: wgpu::Sampler,
+    z16_ubuf: wgpu::Buffer,
+    z16_vbuf: Option<wgpu::Buffer>,
+    z16_vcap: usize,
+    z16_ibuf: Option<wgpu::Buffer>,
+    z16_icap: usize,
+    z16_icount: u32,
 
     static_vbuf: wgpu::Buffer,
     static_ibuf: wgpu::Buffer,
@@ -460,6 +502,18 @@ impl Approach4Renderer {
             label: Some("hud_pass"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
                 "../assets/shaders/hud_pass.wgsl"
+            ))),
+        });
+        let field_z16_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("field_mesh_z16"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                "../assets/shaders/field_mesh_z16.wgsl"
+            ))),
+        });
+        let vol_z16_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("volumetric_overlay_z16"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                "../assets/shaders/volumetric_overlay_z16.wgsl"
             ))),
         });
 
@@ -720,6 +774,104 @@ impl Approach4Renderer {
             ],
         });
 
+        let z16_mesh_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("z16_mesh_bgl"),
+            entries: &[
+                ubuf_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                ubuf_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let z16_vol_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("z16_vol_bgl"),
+            entries: &[
+                ubuf_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                ubuf_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
         let depth_opaque = Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
@@ -943,6 +1095,98 @@ impl Approach4Renderer {
             cache: None,
         });
 
+        let sn_vbl = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<SurfaceVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            }],
+        };
+
+        let pipe_field_z16 = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_field_z16"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&z16_mesh_bgl)],
+                immediate_size: 0,
+            })),
+            vertex: wgpu::VertexState {
+                module: &field_z16_mod,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(sn_vbl)],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &field_z16_mod,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let pipe_vol_z16 = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_vol_z16"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&z16_vol_bgl)],
+                immediate_size: 0,
+            })),
+            vertex: wgpu::VertexState {
+                module: &vol_z16_mod,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &vol_z16_mod,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let z16_vol_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("z16_vol_trilinear_samp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
         let mk_ubuf = |sz: usize| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -955,6 +1199,7 @@ impl Approach4Renderer {
         let resolve_ubuf = mk_ubuf(std::mem::size_of::<ResolveUniforms>());
         let blit_ubuf = mk_ubuf(std::mem::size_of::<BlitUniforms>());
         let hud_ubuf = mk_ubuf(std::mem::size_of::<HudUniforms>());
+        let z16_ubuf = mk_ubuf(std::mem::size_of::<Z16Uniforms>());
 
         let identity = MeshInstance {
             pos_yaw: [0.0, 0.0, 0.0, 0.0],
@@ -1010,6 +1255,8 @@ impl Approach4Renderer {
             pipe_resolve,
             pipe_blit,
             pipe_hud,
+            pipe_field_z16,
+            pipe_vol_z16,
             shadow_bgl,
             mesh_bgl,
             surfel_bgl,
@@ -1017,6 +1264,25 @@ impl Approach4Renderer {
             resolve_bgl,
             blit_bgl,
             hud_bgl,
+            z16_mesh_bgl,
+            z16_vol_bgl,
+            z16_active: false,
+            z16_style_mode: 0,
+            z16_dims: (0, 0, 0),
+            z16_occ_dims: (0, 0, 0),
+            z16_density_tex: None,
+            z16_density_view: None,
+            z16_albedo_tex: None,
+            z16_albedo_view: None,
+            z16_occ_tex: None,
+            z16_occ_view: None,
+            z16_vol_samp,
+            z16_ubuf,
+            z16_vbuf: None,
+            z16_vcap: 0,
+            z16_ibuf: None,
+            z16_icap: 0,
+            z16_icount: 0,
             static_vbuf,
             static_ibuf,
             mesh_slices: meshes.slices,
@@ -1080,6 +1346,208 @@ impl Approach4Renderer {
         let blend = ((solar + 0.15) / 0.20).clamp(0.0, 1.0);
         let s_blend = blend * blend * (3.0 - 2.0 * blend);
         moon_v.lerp(sun_v, s_blend).normalize()
+    }
+
+    pub fn set_z16_mode(&mut self, active: bool, style_mode: u32) {
+        self.z16_active = active;
+        self.z16_style_mode = style_mode % 3;
+    }
+
+    /// Lazily allocate/resize the 3D `Rgba8Unorm` GPU textures (`z16_density_tex`, `z16_albedo_tex`,
+    /// `z16_occ_tex`) and Surface-Nets vertex/index buffers, uploading only dirty `16×16×D` bricks!
+    pub fn upload_z16_world(&mut self, z16: &mut Z16World) {
+        let dims = (z16.width as u32, z16.depth as u32, z16.height as u32);
+        let occ_dims = (z16.occ_bx as u32, z16.occ_by as u32, z16.occ_bz as u32);
+        if dims.0 == 0 || dims.1 == 0 || dims.2 == 0 {
+            return;
+        }
+
+        let mk_d3 = |device: &wgpu::Device, label: &str, (w, d, h): (u32, u32, u32)| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: d,
+                    depth_or_array_layers: h,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
+            (tex, view)
+        };
+
+        if self.z16_dims != dims || self.z16_density_tex.is_none() {
+            let (dt, dv) = mk_d3(&self.device, "z16_density_tex", dims);
+            let (at, av) = mk_d3(&self.device, "z16_albedo_tex", dims);
+            self.z16_density_tex = Some(dt);
+            self.z16_density_view = Some(dv);
+            self.z16_albedo_tex = Some(at);
+            self.z16_albedo_view = Some(av);
+            self.z16_dims = dims;
+            z16.gpu_tex_full_dirty = true;
+        }
+        if self.z16_occ_dims != occ_dims || self.z16_occ_tex.is_none() {
+            let (ot, ov) = mk_d3(&self.device, "z16_occ_tex", occ_dims);
+            self.z16_occ_tex = Some(ot);
+            self.z16_occ_view = Some(ov);
+            self.z16_occ_dims = occ_dims;
+            z16.gpu_occ_dirty = true;
+        }
+
+        // Upload 3D density & albedo textures (full or sub-brick incremental)
+        if z16.gpu_tex_full_dirty {
+            let sz = wgpu::Extent3d {
+                width: dims.0,
+                height: dims.1,
+                depth_or_array_layers: dims.2,
+            };
+            let layout = wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(dims.0 * 4),
+                rows_per_image: Some(dims.1),
+            };
+            if let Some(ref dt) = self.z16_density_tex {
+                self.queue.write_texture(dt.as_image_copy(), &z16.density_mat, layout, sz);
+            }
+            if let Some(ref at) = self.z16_albedo_tex {
+                self.queue.write_texture(at.as_image_copy(), &z16.albedo_thermal, layout, sz);
+            }
+            z16.gpu_tex_full_dirty = false;
+            z16.gpu_dirty_bricks.clear();
+        } else if !z16.gpu_dirty_bricks.is_empty() {
+            let dirty = std::mem::take(&mut z16.gpu_dirty_bricks);
+            let w = z16.width;
+            let d = z16.depth;
+            let h = z16.height;
+            let mut tmp_dm = Vec::with_capacity(SN_BRICK_SIZE * d * SN_BRICK_SIZE * 4);
+            let mut tmp_at = Vec::with_capacity(SN_BRICK_SIZE * d * SN_BRICK_SIZE * 4);
+            for (bx, bz) in dirty {
+                let x0 = bx * SN_BRICK_SIZE;
+                let z0 = bz * SN_BRICK_SIZE;
+                let cw = SN_BRICK_SIZE.min(w.saturating_sub(x0));
+                let ch = SN_BRICK_SIZE.min(h.saturating_sub(z0));
+                if cw == 0 || ch == 0 {
+                    continue;
+                }
+                let row_bytes = cw * 4;
+                tmp_dm.clear();
+                tmp_at.clear();
+                for dz in 0..ch {
+                    let iz = z0 + dz;
+                    for iy in 0..d {
+                        let off = ((iz * d + iy) * w + x0) * 4;
+                        tmp_dm.extend_from_slice(&z16.density_mat[off..off + row_bytes]);
+                        tmp_at.extend_from_slice(&z16.albedo_thermal[off..off + row_bytes]);
+                    }
+                }
+                let origin = wgpu::Origin3d {
+                    x: x0 as u32,
+                    y: 0,
+                    z: z0 as u32,
+                };
+                let sz = wgpu::Extent3d {
+                    width: cw as u32,
+                    height: d as u32,
+                    depth_or_array_layers: ch as u32,
+                };
+                let layout = wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some((cw * 4) as u32),
+                    rows_per_image: Some(d as u32),
+                };
+                if let Some(ref dt) = self.z16_density_tex {
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: dt,
+                            mip_level: 0,
+                            origin,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &tmp_dm,
+                        layout,
+                        sz,
+                    );
+                }
+                if let Some(ref at) = self.z16_albedo_tex {
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: at,
+                            mip_level: 0,
+                            origin,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &tmp_at,
+                        layout,
+                        sz,
+                    );
+                }
+            }
+        }
+
+        // Upload 8×8×8 brick occupancy 3D texture
+        if z16.gpu_occ_dirty {
+            if let Some(ref ot) = self.z16_occ_tex {
+                self.queue.write_texture(
+                    ot.as_image_copy(),
+                    &z16.occ_data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(occ_dims.0 * 4),
+                        rows_per_image: Some(occ_dims.1),
+                    },
+                    wgpu::Extent3d {
+                        width: occ_dims.0,
+                        height: occ_dims.1,
+                        depth_or_array_layers: occ_dims.2,
+                    },
+                );
+            }
+            z16.gpu_occ_dirty = false;
+        }
+
+        // Upload Surface-Nets vertex & index buffers
+        if z16.gpu_mesh_dirty {
+            let vlen = z16.flat_verts.len();
+            let ilen = z16.flat_idxs.len();
+            if vlen > self.z16_vcap || self.z16_vbuf.is_none() {
+                self.z16_vcap = (vlen * 2).max(4096);
+                self.z16_vbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("z16_sn_vbuf"),
+                    size: (self.z16_vcap * std::mem::size_of::<SurfaceVertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if ilen > self.z16_icap || self.z16_ibuf.is_none() {
+                self.z16_icap = (ilen * 2).max(16_384);
+                self.z16_ibuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("z16_sn_ibuf"),
+                    size: (self.z16_icap * 4) as u64,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if vlen > 0 {
+                if let Some(ref vb) = self.z16_vbuf {
+                    self.queue.write_buffer(vb, 0, bytemuck::cast_slice(&z16.flat_verts));
+                }
+            }
+            if ilen > 0 {
+                if let Some(ref ib) = self.z16_ibuf {
+                    self.queue.write_buffer(ib, 0, bytemuck::cast_slice(&z16.flat_idxs));
+                }
+            }
+            self.z16_icount = ilen as u32;
+            z16.gpu_mesh_dirty = false;
+        }
     }
 
     pub fn upload_minimap(&mut self, w: u32, h: u32, rgba: &[u8]) {
@@ -1276,10 +1744,48 @@ impl Approach4Renderer {
                 target_atmo
             }
         };
-        let sun_col = cur_atmo.sun_col;
-        let sky_col = cur_atmo.sky_col;
-        let bounce_col = cur_atmo.bounce_col;
-        let fog_col = cur_atmo.fog_col;
+        let mut sun_col = cur_atmo.sun_col;
+        let mut sky_col = cur_atmo.sky_col;
+        let mut bounce_col = cur_atmo.bounce_col;
+        let mut fog_col = cur_atmo.fog_col;
+
+        // Style-aware sky/atmosphere harmonization when live Z=16 client style swap (`Y`-key) is active!
+        let (z16_sky_top, z16_sky_hor, z16_bg_srgb) = if self.z16_active {
+            match self.z16_style_mode % 3 {
+                1 => {
+                    // Style 1: VOLCANIC EMBER — blazing fiery amber sun, smoky crimson-charcoal sky
+                    sun_col = [1.45, 0.72, 0.34];
+                    sky_col = [0.46, 0.18, 0.16];
+                    bounce_col = [0.34, 0.13, 0.10];
+                    fog_col = [0.22, 0.09, 0.08];
+                    ([0.22, 0.07, 0.07], [0.48, 0.19, 0.11], [0.22, 0.09, 0.08])
+                }
+                2 => {
+                    // Style 2: ARCANE THERMAL — cool electric-cyan moonlight, deep midnight-indigo sky
+                    sun_col = [0.68, 0.94, 1.32];
+                    sky_col = [0.14, 0.28, 0.56];
+                    bounce_col = [0.12, 0.14, 0.36];
+                    fog_col = [0.06, 0.10, 0.22];
+                    ([0.04, 0.09, 0.28], [0.11, 0.24, 0.44], [0.06, 0.10, 0.22])
+                }
+                _ => {
+                    // Style 0: NORDIC — crisp alpine sky modulated by live diurnal/weather atmosphere
+                    let top = [
+                        (sky_col[0] * 0.62).powf(1.6),
+                        (sky_col[1] * 0.88).powf(1.5),
+                        (sky_col[2] * 1.15).powf(1.4),
+                    ];
+                    let hor = [
+                        (fog_col[0] * 1.35 + 0.12).powf(1.6),
+                        (fog_col[1] * 1.45 + 0.16).powf(1.5),
+                        (fog_col[2] * 1.55 + 0.20).powf(1.4),
+                    ];
+                    (top, hor, fog_col)
+                }
+            }
+        } else {
+            ([0.14, 0.30, 0.62], [0.42, 0.56, 0.76], fog_col)
+        };
 
         let scene_u = SceneUniforms {
             view: mats.view.to_cols_array_2d(),
@@ -1300,6 +1806,38 @@ impl Approach4Renderer {
         };
         self.queue.write_buffer(&self.scene_ubuf, 0, bytemuck::bytes_of(&scene_u));
 
+        let z16_ready = self.z16_active
+            && self.z16_density_view.is_some()
+            && self.z16_albedo_view.is_some()
+            && self.z16_occ_view.is_some();
+
+        if z16_ready {
+            let z16_u = Z16Uniforms {
+                inv_vp: mats.vp.inverse().to_cols_array_2d(),
+                vol_dims: [
+                    self.z16_dims.0 as f32,
+                    self.z16_dims.1 as f32,
+                    self.z16_dims.2 as f32,
+                    (self.z16_style_mode % 3) as f32,
+                ],
+                brick_dims: [
+                    self.z16_occ_dims.0 as f32,
+                    self.z16_occ_dims.1 as f32,
+                    self.z16_occ_dims.2 as f32,
+                    OCC_BRICK_SIZE as f32,
+                ],
+                world_offset: [
+                    self.z16_dims.0 as f32 * 0.5,
+                    0.0,
+                    self.z16_dims.2 as f32 * 0.5,
+                    if style.crisp_resolve { 1.0 } else { 0.0 },
+                ],
+                sky_top: [z16_sky_top[0], z16_sky_top[1], z16_sky_top[2], sim_time],
+                sky_horizon: [z16_sky_hor[0], z16_sky_hor[1], z16_sky_hor[2], cur_atmo.exposure * 1.05],
+            };
+            self.queue.write_buffer(&self.z16_ubuf, 0, bytemuck::bytes_of(&z16_u));
+        }
+
         let (pal_arr, pal_n) = palette_resolve_64();
         let resolve_u = ResolveUniforms {
             low_res: [art_w as f32, art_h as f32],
@@ -1309,7 +1847,7 @@ impl Approach4Renderer {
             dither: style.dither,
             crisp: if style.crisp_resolve { 1.0 } else { 0.0 },
             palette_count: pal_n,
-            background: [fog_col[0], fog_col[1], fog_col[2], 1.0],
+            background: [z16_bg_srgb[0], z16_bg_srgb[1], z16_bg_srgb[2], 1.0],
             palette: pal_arr,
         };
         self.queue.write_buffer(&self.resolve_ubuf, 0, bytemuck::bytes_of(&resolve_u));
@@ -1411,6 +1949,67 @@ impl Approach4Renderer {
             ],
         });
 
+        let z16_mesh_bg = if z16_ready {
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("z16_mesh_bg"),
+                layout: &self.z16_mesh_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.scene_ubuf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.z16_ubuf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(self.z16_density_view.as_ref().unwrap()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(self.z16_albedo_view.as_ref().unwrap()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(self.z16_occ_view.as_ref().unwrap()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&self.z16_vol_samp),
+                    },
+                ],
+            }))
+        } else {
+            None
+        };
+        let z16_vol_bg = if z16_ready {
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("z16_vol_bg"),
+                layout: &self.z16_vol_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.scene_ubuf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.z16_ubuf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(self.z16_density_view.as_ref().unwrap()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(self.z16_albedo_view.as_ref().unwrap()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(self.z16_occ_view.as_ref().unwrap()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&self.z16_vol_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&self.ss_depth_view),
+                    },
+                ],
+            }))
+        } else {
+            None
+        };
+
         let mut enc = self.device.create_command_encoder(&Default::default());
 
         // PASS 1: Shadow Map
@@ -1426,7 +2025,7 @@ impl Approach4Renderer {
                 ..Default::default()
             });
             rp.set_pipeline(&self.pipe_shadow);
-            if !frame.terrain_idxs.is_empty() {
+            if !z16_ready && !frame.terrain_idxs.is_empty() {
                 rp.set_bind_group(0, &shadow_terrain_bg, &[]);
                 rp.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
                 rp.set_index_buffer(self.terrain_ibuf.slice(..), wgpu::IndexFormat::Uint32);
@@ -1445,8 +2044,8 @@ impl Approach4Renderer {
             }
         }
 
-        // PASS 2 + 3: Hard-Z Geometry (Terrain + Parametric Heroes/Shrines + Hard-Z Surfels)
-        //           + Depth-Tested Tier 3 Hybrid Soft Volumetric 3DGS (Fire, Smoke, Steam, Wisps)
+        // PASS 2: Hard-Z Geometry (Z=16 Surface-Nets OR L4 Terrain + Parametric Heroes/Shrines + Hard-Z Surfels)
+        //         (In L4 mode, also draws Tier 3 Vol-3DGS right here in the same pass!)
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("geometry_and_volumetrics_pass"),
@@ -1464,14 +2063,28 @@ impl Approach4Renderer {
                 ..Default::default()
             });
 
-            rp.set_pipeline(&self.pipe_mesh);
-            if !frame.terrain_idxs.is_empty() {
+            if z16_ready {
+                if self.z16_icount > 0 {
+                    if let (Some(bg), Some(vb), Some(ib)) =
+                        (z16_mesh_bg.as_ref(), self.z16_vbuf.as_ref(), self.z16_ibuf.as_ref())
+                    {
+                        rp.set_pipeline(&self.pipe_field_z16);
+                        rp.set_bind_group(0, bg, &[]);
+                        rp.set_vertex_buffer(0, vb.slice(..));
+                        rp.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..self.z16_icount, 0, 0..1);
+                    }
+                }
+            } else if !frame.terrain_idxs.is_empty() {
+                rp.set_pipeline(&self.pipe_mesh);
                 rp.set_bind_group(0, &mesh_terrain_bg, &[]);
                 rp.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
                 rp.set_index_buffer(self.terrain_ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..frame.terrain_idxs.len() as u32, 0, 0..1);
             }
+
             if !flat_meshes.is_empty() {
+                rp.set_pipeline(&self.pipe_mesh);
                 rp.set_bind_group(0, &mesh_props_bg, &[]);
                 rp.set_vertex_buffer(0, self.static_vbuf.slice(..));
                 rp.set_index_buffer(self.static_ibuf.slice(..), wgpu::IndexFormat::Uint32);
@@ -1487,7 +2100,48 @@ impl Approach4Renderer {
                 rp.set_bind_group(0, &surfel_bg, &[]);
                 rp.draw(0..6, 0..frame.surfel_refs.len() as u32);
             }
+            if !z16_ready && !frame.vol_splats.is_empty() {
+                rp.set_pipeline(&self.pipe_vol);
+                rp.set_bind_group(0, &vol_bg, &[]);
+                rp.draw(0..6, 0..frame.vol_splats.len() as u32);
+            }
+        }
+
+        // PASS 2B (Z=16 only): Depth-Tested Volumetric Fluid & Blackbody Gas Raymarch Overlay
+        if z16_ready {
+            if let Some(ref bg) = z16_vol_bg {
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("volumetric_overlay_z16_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.ss_color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                rp.set_pipeline(&self.pipe_vol_z16);
+                rp.set_bind_group(0, bg, &[]);
+                rp.draw(0..3, 0..1);
+            }
+            // PASS 2C (Z=16 only): Depth-Tested Dynamic Volumetric Splats (Actuator beams, Time Domes, spells, motes)
             if !frame.vol_splats.is_empty() {
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("volumetric_splats_z16_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.ss_color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.ss_depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
                 rp.set_pipeline(&self.pipe_vol);
                 rp.set_bind_group(0, &vol_bg, &[]);
                 rp.draw(0..6, 0..frame.vol_splats.len() as u32);

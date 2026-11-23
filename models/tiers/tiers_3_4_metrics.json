@@ -1,0 +1,240 @@
+{
+  "platform": {
+    "host": "spark-2b4e",
+    "gpu": "NVIDIA GB10",
+    "pytorch": "2.14.1+cu130"
+  },
+  "tier3_3dgs": {
+    "device": "NVIDIA GB10",
+    "triton_grad_check_max_rel_err": 0.152408,
+    "training": {
+      "param_count": 93860,
+      "train_steps": 1500,
+      "train_time_s": 61.27,
+      "final_loss": 0.05406,
+      "hero_multiview_psnr_db": 24.04,
+      "unseen_multiview_psnr_db": 22.68,
+      "total_gaussians_per_scene": 32768,
+      "active_gaussians_pruned": 21389
+    },
+    "export": {
+      "pt_path": "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_gs_gen.pt",
+      "onnx_path": "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_gs_gen.onnx",
+      "onnx_size_kb": 369.7,
+      "opset": 17,
+      "ort_max_abs_err": 6.67572021484375e-06,
+      "ort_dirty_max_abs_err": 5.245208740234375e-06,
+      "dirty_chunk_interior_equiv_err": 0.0
+    },
+    "benchmarks": {
+      "neural_10hz_update": {
+        "gpu_fp32_full_128x128": {
+          "median_ms": 0.512,
+          "p95_ms": 0.52,
+          "fps": 1953.5
+        },
+        "gpu_fp32_dirty_15pct_slice": {
+          "median_ms": 0.175,
+          "p95_ms": 0.28,
+          "fps": 5714.0
+        },
+        "gpu_fp32_dirty_15pct_10tiles": {
+          "median_ms": 0.174,
+          "p95_ms": 0.183,
+          "fps": 5747.1
+        },
+        "gpu_fp16_full_128x128": {
+          "median_ms": 0.312,
+          "p95_ms": 0.509,
+          "fps": 3205.6
+        },
+        "gpu_fp16_dirty_15pct_slice": {
+          "median_ms": 0.163,
+          "p95_ms": 0.377,
+          "fps": 6133.5
+        },
+        "cpu_ort4t_full_128x128": {
+          "median_ms": 9.699,
+          "p95_ms": 10.165,
+          "fps": 103.1
+        },
+        "cpu_ort4t_dirty_15pct_slice": {
+          "median_ms": 1.43,
+          "p95_ms": 1.467,
+          "fps": 699.2
+        },
+        "budget_100ms_pct_gpu_fp16_full": 0.312,
+        "budget_100ms_pct_gpu_fp16_dirty": 0.163,
+        "budget_100ms_pct_cpu_dirty": 1.43
+      },
+      "rasterization_zero_neural": {
+        "active_gaussians": 21389,
+        "total_gaussians": 32768,
+        "res_256x256_active": {
+          "median_ms": 3.364,
+          "p95_ms": 3.941,
+          "fps": 297.3
+        },
+        "res_512x512_active": {
+          "median_ms": 3.416,
+          "p95_ms": 4.095,
+          "fps": 292.8
+        },
+        "res_256x256_all32k": {
+          "median_ms": 3.473,
+          "p95_ms": 3.909,
+          "fps": 288.0
+        },
+        "res_512x512_all32k": {
+          "median_ms": 3.568,
+          "p95_ms": 4.159,
+          "fps": 280.3
+        }
+      },
+      "geometric_temporal_consistency": {
+        "static_camera_repeat_max_abs_diff": 0.0,
+        "orbit_0p5deg_smooth_l1": 0.01934,
+        "geometric_consistency_pct": 100.0
+      },
+      "peak_vram_mb": 1286.6
+    },
+    "visuals": {
+      "orbit_image_path": "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_3dgs_orbit.png",
+      "battle_frame_paths": [
+        "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_battle_frames/battle_frame_00.png",
+        "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_battle_frames/battle_frame_01.png",
+        "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_battle_frames/battle_frame_02.png",
+        "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_battle_frames/battle_frame_03.png",
+        "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_battle_frames/battle_frame_04.png",
+        "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_battle_frames/battle_frame_05.png",
+        "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_battle_frames/battle_frame_06.png",
+        "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier3_battle_frames/battle_frame_07.png"
+      ]
+    }
+  },
+  "tier4_diffusion": {
+    "device": "NVIDIA GB10",
+    "model_id": "stabilityai/sd-turbo",
+    "scheduler": "EulerDiscreteScheduler (trailing, epsilon)",
+    "dtype": "float16",
+    "resolution": "512x512",
+    "model_load_time_s": 26.64,
+    "vram_peak_allocated_mb": 3385.1,
+    "vram_peak_reserved_mb": 3572.0,
+    "latency_fps": {
+      "standard_vae": {
+        "vae_encode_ms": 192.97,
+        "vae_decode_ms": 372.31,
+        "steps_1": {
+          "median_ms": 605.47,
+          "p95_ms": 644.7,
+          "fps": 1.65,
+          "verified_unet_nfe": 1,
+          "unet_est_ms": 40.19,
+          "unet_only_fps": 24.88
+        },
+        "steps_2": {
+          "median_ms": 662.95,
+          "p95_ms": 687.27,
+          "fps": 1.51,
+          "verified_unet_nfe": 2,
+          "unet_est_ms": 97.67,
+          "unet_only_fps": 10.24
+        },
+        "steps_4": {
+          "median_ms": 771.78,
+          "p95_ms": 783.88,
+          "fps": 1.3,
+          "verified_unet_nfe": 4,
+          "unet_est_ms": 206.5,
+          "unet_only_fps": 4.84
+        }
+      },
+      "taesd_fast_vae": {
+        "vae_encode_ms": 13.5,
+        "vae_decode_ms": 11.4,
+        "steps_1": {
+          "median_ms": 87.49,
+          "p95_ms": 102.41,
+          "fps": 11.43,
+          "verified_unet_nfe": 1
+        },
+        "steps_2": {
+          "median_ms": 141.38,
+          "p95_ms": 159.22,
+          "fps": 7.07,
+          "verified_unet_nfe": 2
+        },
+        "steps_4": {
+          "median_ms": 239.38,
+          "p95_ms": 270.65,
+          "fps": 4.18,
+          "verified_unet_nfe": 4
+        }
+      }
+    },
+    "temporal_stability": {
+      "num_frames": 8,
+      "step_count_tested": 2,
+      "strength_tested": 0.72,
+      "input_3dgs_baseline": {
+        "unwarped_l1": 0.06222,
+        "warped_flicker_l1": 0.00808,
+        "warped_flicker_l1_255": 2.06,
+        "warped_flicker_rmse": 0.01745,
+        "temporal_psnr_db": 35.18
+      },
+      "raw_img2img_unseeded": {
+        "unwarped_l1": 0.1279,
+        "warped_flicker_l1": 0.12155,
+        "warped_flicker_l1_255": 30.99,
+        "warped_flicker_rmse": 0.17434,
+        "temporal_psnr_db": 15.18
+      },
+      "raw_img2img_fixed_seed": {
+        "unwarped_l1": 0.04854,
+        "warped_flicker_l1": 0.04311,
+        "warped_flicker_l1_255": 10.99,
+        "warped_flicker_rmse": 0.07304,
+        "temporal_psnr_db": 22.78
+      },
+      "stabilized_flow_latent_ema": {
+        "unwarped_l1": 0.0416,
+        "warped_flicker_l1": 0.02911,
+        "warped_flicker_l1_255": 7.42,
+        "warped_flicker_rmse": 0.0447,
+        "temporal_psnr_db": 27.04
+      },
+      "flicker_reduction_vs_raw_pct": 76.1,
+      "flicker_reduction_vs_fixed_seed_pct": 32.5,
+      "optical_flow_median_ms": 7.6,
+      "latent_warp_blend_overhead_ms": 2.57
+    },
+    "visuals": {
+      "showcase_path": "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier4_multistyle.png",
+      "styles": [
+        {
+          "id": "dark_fantasy",
+          "title": "Style 1: Dark Fantasy Photoreal",
+          "path": "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier4_style_dark_fantasy.png",
+          "steps": 4,
+          "strength": 0.82
+        },
+        {
+          "id": "ghibli_painterly",
+          "title": "Style 2: Studio Ghibli Painterly",
+          "path": "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier4_style_ghibli_painterly.png",
+          "steps": 4,
+          "strength": 0.82
+        },
+        {
+          "id": "cyberpunk_neon",
+          "title": "Style 3: Cyberpunk Neon Tactical",
+          "path": "/home/gooning/.t3/scratch/frostmarsh-tiers-3-4/tier4_style_cyberpunk_neon.png",
+          "steps": 4,
+          "strength": 0.84
+        }
+      ]
+    }
+  }
+}

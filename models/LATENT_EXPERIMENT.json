@@ -1,0 +1,284 @@
+{
+  "device": "NVIDIA GB10",
+  "total_runtime_s": 695.4,
+  "train_config": {
+    "steps_per_arm": 2000,
+    "batch_size": 16,
+    "loss": "L1 + 0.2 * SobelEdgeLoss",
+    "train_frames": 640,
+    "val_indist_frames": 64,
+    "val_unseen_frames": 48
+  },
+  "decoder_params": {
+    "arm_a": 98883,
+    "arm_aplus": 98883,
+    "arm_c_decoder": 100035,
+    "arm_c_encoder": 69508,
+    "arm_d_decoder": 99171,
+    "arm_d_encoder": 121104
+  },
+  "train_times_s": {
+    "arm_a": 117.6,
+    "arm_aplus": 131.0,
+    "arm_c": 134.6,
+    "arm_d_s1": 142.6,
+    "arm_d_s2": 149.2
+  },
+  "wire_cost_10hz": {
+    "arm_a": {
+      "avg_dirty_chunks_of_64": 13.65,
+      "raw_bytes_per_tick": 10488.5,
+      "raw_kbps": 102.43,
+      "zlib_kbps": 20.92,
+      "lz4_kbps": 41.39,
+      "brotli_kbps": 22.99
+    },
+    "arm_aplus": {
+      "avg_dirty_chunks_of_64": 14.85,
+      "raw_bytes_per_tick": 15212.8,
+      "raw_kbps": 148.56,
+      "zlib_kbps": 25.32,
+      "lz4_kbps": 54.9,
+      "brotli_kbps": 27.6
+    },
+    "arm_c": {
+      "avg_dirty_chunks_of_64": 14.1,
+      "raw_bytes_per_tick": 10557.3,
+      "raw_kbps": 103.1,
+      "zlib_kbps": 21.59,
+      "lz4_kbps": 42.0,
+      "brotli_kbps": 23.61
+    },
+    "arm_d": {
+      "avg_dirty_chunks_of_64": 2.29,
+      "raw_bytes_per_tick": 595.0,
+      "raw_kbps": 5.81,
+      "zlib_kbps": 5.84,
+      "lz4_kbps": 6.04,
+      "brotli_kbps": 5.78
+    },
+    "arm_d_plus_hazard": {
+      "avg_dirty_chunks_of_64": 13.73,
+      "raw_bytes_per_tick": 3938.7,
+      "raw_kbps": 38.46,
+      "zlib_kbps": 12.89,
+      "lz4_kbps": 19.38,
+      "brotli_kbps": 12.73
+    }
+  },
+  "in_distribution": {
+    "arm_a": {
+      "psnr_db": 26.91,
+      "mae": 0.026
+    },
+    "arm_aplus": {
+      "psnr_db": 30.63,
+      "mae": 0.0176
+    },
+    "arm_c_full": {
+      "psnr_db": 29.25,
+      "mae": 0.0202
+    },
+    "arm_c_z0": {
+      "psnr_db": 26.81,
+      "mae": 0.0274
+    },
+    "arm_d_matched": {
+      "psnr_db": 29.3,
+      "mae": 0.0198
+    },
+    "arm_d_seed2": {
+      "psnr_db": 29.08,
+      "mae": 0.02
+    },
+    "arm_d_swap_1to2": {
+      "psnr_db": 15.84,
+      "mae": 0.1185
+    },
+    "arm_d_swap_2to1": {
+      "psnr_db": 14.73,
+      "mae": 0.1338
+    }
+  },
+  "held_out_unseen": {
+    "arm_a": {
+      "psnr_db": 16.29,
+      "mae": 0.1187
+    },
+    "arm_aplus": {
+      "psnr_db": 20.86,
+      "mae": 0.0676
+    },
+    "arm_c_full": {
+      "psnr_db": 19.18,
+      "mae": 0.077
+    },
+    "arm_c_z0": {
+      "psnr_db": 16.44,
+      "mae": 0.1162
+    },
+    "arm_d_matched": {
+      "psnr_db": 24.34,
+      "mae": 0.0459
+    },
+    "arm_d_seed2": {
+      "psnr_db": 23.73,
+      "mae": 0.0492
+    },
+    "arm_d_swap_1to2": {
+      "psnr_db": 14.97,
+      "mae": 0.131
+    },
+    "arm_d_swap_2to1": {
+      "psnr_db": 13.49,
+      "mae": 0.16
+    },
+    "per_mixture": {
+      "burning_oil_on_ice": {
+        "arm_a": {
+          "psnr_db": 18.74,
+          "mae": 0.0887
+        },
+        "arm_aplus": {
+          "psnr_db": 20.7,
+          "mae": 0.0686
+        },
+        "arm_c_full": {
+          "psnr_db": 20.53,
+          "mae": 0.0709
+        },
+        "arm_c_z0": {
+          "psnr_db": 18.36,
+          "mae": 0.0943
+        },
+        "arm_d_matched": {
+          "psnr_db": 23.44,
+          "mae": 0.0519
+        },
+        "arm_d_seed2": {
+          "psnr_db": 23.06,
+          "mae": 0.0546
+        },
+        "arm_d_swap_1to2": {
+          "psnr_db": 12.31,
+          "mae": 0.1908
+        },
+        "arm_d_swap_2to1": {
+          "psnr_db": 10.75,
+          "mae": 0.2377
+        }
+      },
+      "dense_steam_over_brush": {
+        "arm_a": {
+          "psnr_db": 18.31,
+          "mae": 0.1006
+        },
+        "arm_aplus": {
+          "psnr_db": 21.72,
+          "mae": 0.0636
+        },
+        "arm_c_full": {
+          "psnr_db": 25.73,
+          "mae": 0.0384
+        },
+        "arm_c_z0": {
+          "psnr_db": 19.23,
+          "mae": 0.0912
+        },
+        "arm_d_matched": {
+          "psnr_db": 28.51,
+          "mae": 0.0281
+        },
+        "arm_d_seed2": {
+          "psnr_db": 28.51,
+          "mae": 0.0286
+        },
+        "arm_d_swap_1to2": {
+          "psnr_db": 16.94,
+          "mae": 0.1046
+        },
+        "arm_d_swap_2to1": {
+          "psnr_db": 16.49,
+          "mae": 0.1088
+        }
+      },
+      "frozen_oil_mud_slush": {
+        "arm_a": {
+          "psnr_db": 13.74,
+          "mae": 0.1669
+        },
+        "arm_aplus": {
+          "psnr_db": 20.29,
+          "mae": 0.0708
+        },
+        "arm_c_full": {
+          "psnr_db": 16.06,
+          "mae": 0.1218
+        },
+        "arm_c_z0": {
+          "psnr_db": 13.81,
+          "mae": 0.1631
+        },
+        "arm_d_matched": {
+          "psnr_db": 22.92,
+          "mae": 0.0577
+        },
+        "arm_d_seed2": {
+          "psnr_db": 21.98,
+          "mae": 0.0644
+        },
+        "arm_d_swap_1to2": {
+          "psnr_db": 17.83,
+          "mae": 0.0976
+        },
+        "arm_d_swap_2to1": {
+          "psnr_db": 15.54,
+          "mae": 0.1335
+        }
+      }
+    }
+  },
+  "renderer_v2_onnx": {
+    "path": "/home/gooning/.t3/scratch/frostmarsh-latent-exp/renderer_v2.onnx",
+    "size_bytes": 408406,
+    "size_kb": 398.83,
+    "opset": 17,
+    "n_params": 98883,
+    "input_name": "aplus_state",
+    "input_shape": [
+      "batch",
+      17,
+      "height",
+      "width"
+    ],
+    "output_name": "rgb_frame",
+    "output_shape": [
+      "batch",
+      3,
+      "out_height",
+      "out_width"
+    ],
+    "max_abs_diff": {
+      "1x17x128x128": 5.960464477539062e-07,
+      "2x17x128x128": 5.960464477539062e-07,
+      "1x17x64x64": 5.364418029785156e-07
+    },
+    "ort_cpu_latency_ms": {
+      "1_threads": {
+        "mean_ms": 36.253,
+        "median_ms": 36.239,
+        "p95_ms": 36.395
+      },
+      "4_threads": {
+        "mean_ms": 10.988,
+        "median_ms": 10.6,
+        "p95_ms": 13.053
+      },
+      "8_threads": {
+        "mean_ms": 17.068,
+        "median_ms": 16.635,
+        "p95_ms": 19.784
+      }
+    }
+  }
+}

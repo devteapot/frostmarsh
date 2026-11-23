@@ -1,0 +1,16 @@
+[package]
+name = "neural-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+frostmarsh-proto = { path = "../frostmarsh-proto" }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+ort = { version = "2.0.0-rc.15" }
+minifb = "0.28"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"

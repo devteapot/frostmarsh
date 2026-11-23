@@ -1,0 +1,21 @@
+[package]
+name = "frostmarsh-server"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["onnx"]
+onnx = ["dep:ort"]
+
+[dependencies]
+field-core = { path = "../field-core" }
+frostmarsh-proto = { path = "../frostmarsh-proto" }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+ort = { version = "2.0.0-rc.15", optional = true }
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"

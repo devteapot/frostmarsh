@@ -1,0 +1,193 @@
+{
+  "rasterization_fps": {
+    "res_512x512": {
+      "pure_soft_3dgs": {
+        "median_ms": 1.127,
+        "p95_ms": 1.33,
+        "fps": 887.2
+      },
+      "hybrid_hardz": {
+        "median_ms": 0.96,
+        "p95_ms": 1.011,
+        "fps": 1041.6
+      },
+      "hybrid_pass_breakdown_ms": {
+        "pass1_solid_dda_ms": 0.066,
+        "pass2_hardz_surfels_ms": 0.096,
+        "pass3_unpack_ao_ms": 0.026,
+        "pass4_volumetric_3dgs_ms": 0.761,
+        "total_ms": 0.95
+      },
+      "speedup_x": 1.17
+    },
+    "res_1920x1080": {
+      "pure_soft_3dgs": {
+        "median_ms": 2.532,
+        "p95_ms": 2.919,
+        "fps": 394.9
+      },
+      "hybrid_hardz": {
+        "median_ms": 2.108,
+        "p95_ms": 2.153,
+        "fps": 474.5
+      },
+      "hybrid_pass_breakdown_ms": {
+        "pass1_solid_dda_ms": 0.299,
+        "pass2_hardz_surfels_ms": 0.336,
+        "pass3_unpack_ao_ms": 0.261,
+        "pass4_volumetric_3dgs_ms": 1.011,
+        "total_ms": 1.911
+      },
+      "speedup_x": 1.2
+    },
+    "on_3axis_smooth_normals_128x128x32_10hz": {
+      "median_ms": 0.888,
+      "p95_ms": 1.157,
+      "fps": 1125.5
+    }
+  },
+  "edge_sharpness": {
+    "rock_silhouette_sobel_mean": {
+      "pure_soft_3dgs": 0.1344,
+      "hybrid_hardz": 0.6647,
+      "sharpness_gain_x": 4.95
+    },
+    "rock_silhouette_sobel_p90": {
+      "pure_soft_3dgs": 0.3631,
+      "hybrid_hardz": 1.5973,
+      "sharpness_gain_x": 4.4
+    },
+    "tree_silhouette_sobel_mean": {
+      "pure_soft_3dgs": 0.1675,
+      "hybrid_hardz": 0.6619,
+      "sharpness_gain_x": 3.95
+    },
+    "tree_silhouette_sobel_p90": {
+      "pure_soft_3dgs": 0.4279,
+      "hybrid_hardz": 1.5951,
+      "sharpness_gain_x": 3.73
+    },
+    "full_frame_sobel_mean": {
+      "pure_soft_3dgs": 0.114,
+      "hybrid_hardz": 0.3213,
+      "sharpness_gain_x": 2.82
+    }
+  },
+  "temporal_stability": {
+    "orbit_0p5deg_mean_l1": {
+      "pure_soft_3dgs": 0.01879,
+      "hybrid_hardz": 0.04528,
+      "note": "Raw pixel L1 scales linearly with image sharpness (4-5x sharper edges move cleanly across pixel boundaries); see sort_inversions and spike_ratio for pop artifacts."
+    },
+    "orbit_0p5deg_sharpness_normalized_l1": {
+      "pure_soft_3dgs": 0.1649,
+      "hybrid_hardz": 0.1409
+    },
+    "orbit_0p5deg_max_to_median_spike_ratio": {
+      "pure_soft_3dgs": 1.0321,
+      "hybrid_hardz": 1.027
+    },
+    "orbit_0p5deg_jerk_2nd_diff_l1": {
+      "pure_soft_3dgs": 0.01096,
+      "hybrid_hardz": 0.07886
+    },
+    "turn_180deg_view_delta_l1": {
+      "pure_soft_3dgs": 0.18081,
+      "hybrid_hardz": 0.2127
+    },
+    "overlapping_depth_sort_inversions": {
+      "pure_soft_3dgs_0p5deg": {
+        "tested_overlapping_pairs": 20000,
+        "depth_order_swaps": 42,
+        "swap_rate_pct": 0.21
+      },
+      "pure_soft_3dgs_180deg": {
+        "tested_overlapping_pairs": 20000,
+        "depth_order_swaps": 16732,
+        "swap_rate_pct": 83.66
+      },
+      "hybrid_hardz_terrain_and_surfels_0p5deg": {
+        "depth_order_swaps": 0,
+        "swap_rate_pct": 0.0
+      },
+      "hybrid_hardz_terrain_and_surfels_180deg": {
+        "depth_order_swaps": 0,
+        "swap_rate_pct": 0.0
+      },
+      "hybrid_volumetric_only_0p5deg": {
+        "tested_overlapping_pairs": 17176,
+        "depth_order_swaps": 39,
+        "swap_rate_pct": 0.227
+      }
+    },
+    "primitive_order_permutation_max_abs_diff": {
+      "pure_soft_3dgs": 3e-06,
+      "hybrid_hardz_surfels": 0.0
+    },
+    "return_to_origin_max_abs_diff": {
+      "pure_soft_3dgs": 0.0,
+      "hybrid_hardz": 0.0
+    }
+  },
+  "gameplay_boundary_alignment": {
+    "tactical_overhead": {
+      "px_per_cell": 3.963,
+      "rock_wall": {
+        "hybrid_hardz_iou": 0.9666,
+        "hybrid_hardz_boundary_err_cells": 0.1594,
+        "pure_soft_3dgs_core50_iou": 0.7964,
+        "pure_soft_3dgs_core50_boundary_err_cells": 1.1633,
+        "pure_soft_3dgs_halo15_iou": 0.7372,
+        "pure_soft_3dgs_halo15_boundary_err_cells": 1.634,
+        "pure_soft_halo15_area_bleed_ratio": 1.345,
+        "hybrid_area_ratio": 0.967
+      },
+      "ice": {
+        "hybrid_hardz_iou": 0.9761,
+        "hybrid_hardz_boundary_err_cells": 0.0574,
+        "pure_soft_3dgs_core50_iou": 0.8844,
+        "pure_soft_3dgs_core50_boundary_err_cells": 0.4277,
+        "pure_soft_3dgs_halo15_iou": 0.793,
+        "pure_soft_3dgs_halo15_boundary_err_cells": 0.932,
+        "pure_soft_halo15_area_bleed_ratio": 1.26,
+        "hybrid_area_ratio": 0.976
+      }
+    },
+    "orbit_battle_se": {
+      "px_per_cell": 4.668,
+      "rock_wall": {
+        "hybrid_hardz_iou": 0.8721,
+        "hybrid_hardz_boundary_err_cells": 0.6928,
+        "pure_soft_3dgs_core50_iou": 0.6416,
+        "pure_soft_3dgs_core50_boundary_err_cells": 2.8315,
+        "pure_soft_3dgs_halo15_iou": 0.6445,
+        "pure_soft_3dgs_halo15_boundary_err_cells": 2.8853,
+        "pure_soft_halo15_area_bleed_ratio": 1.292,
+        "hybrid_area_ratio": 0.872
+      },
+      "ice": {
+        "hybrid_hardz_iou": 0.9339,
+        "hybrid_hardz_boundary_err_cells": 0.127,
+        "pure_soft_3dgs_core50_iou": 0.553,
+        "pure_soft_3dgs_core50_boundary_err_cells": 1.9347,
+        "pure_soft_3dgs_halo15_iou": 0.5452,
+        "pure_soft_3dgs_halo15_boundary_err_cells": 2.1377,
+        "pure_soft_halo15_area_bleed_ratio": 1.495,
+        "hybrid_area_ratio": 0.934
+      }
+    }
+  },
+  "peak_vram_mb": 1246.6,
+  "device": "NVIDIA GB10",
+  "scene_stats": {
+    "n_tree_clusters": 159,
+    "n_surfel_placements": 221,
+    "n_hardz_surfels": 17172,
+    "n_volumetric_gaussians": 757,
+    "n_pure_soft_active_gaussians": 21325,
+    "n_fire_lights": 6
+  },
+  "visuals": {
+    "comparison_4panel_png": "/home/gooning/.t3/scratch/frostmarsh-tier3-hybrid/tier3_hybrid_comparison.png"
+  }
+}

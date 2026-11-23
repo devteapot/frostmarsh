@@ -1,0 +1,210 @@
+{
+  "device": "NVIDIA GB10",
+  "total_runtime_s": 736.1,
+  "dataset": {
+    "train_frames": 432,
+    "val_frames": 36,
+    "grid_size": "128x128"
+  },
+  "tier1_train": {
+    "train_time_s": 465.7,
+    "steps": 1400,
+    "warmup_steps": 300,
+    "batch_size": 8,
+    "final_losses": {
+      "g_l1": 0.043762415647506714,
+      "g_sobel": 0.11366750299930573,
+      "g_adv": 0.60546875,
+      "g_fm": 0.016550298780202866,
+      "d_loss": 1.640625
+    }
+  },
+  "tier1": {
+    "n_params": 387719,
+    "val_frames": 32,
+    "tier1_psnr_db": 22.86,
+    "tier1_mae": 0.0463,
+    "renderer_v2_upscaled_psnr_db": 19.7,
+    "renderer_v2_upscaled_mae": 0.0657,
+    "edge_contrast": {
+      "target_512": {
+        "sobel_mean": 0.06375,
+        "sobel_p90": 0.1437,
+        "laplacian_rms": 0.1284
+      },
+      "tier1_painterly_512": {
+        "sobel_mean": 0.05246,
+        "sobel_p90": 0.11987,
+        "laplacian_rms": 0.07027
+      },
+      "renderer_v2_256_up512": {
+        "sobel_mean": 0.02625,
+        "sobel_p90": 0.05728,
+        "laplacian_rms": 0.04109
+      },
+      "tier1_vs_v2_sobel_ratio": 2.0,
+      "tier1_vs_v2_laplacian_ratio": 1.71
+    },
+    "temporal_stability": {
+      "static_scene_full_rms_flicker": 0.00367,
+      "static_scene_solid_terrain_rms_flicker": 0.00103,
+      "target_static_full_rms": 0.01693,
+      "target_static_solid_rms": 0.00432,
+      "shifting_scene_world_locked_rms": 0.00221,
+      "shifting_scene_unlocked_ablation_rms": 0.05379,
+      "anti_swimming_reduction_x": 24.38
+    }
+  },
+  "tier1_onnx": {
+    "path": "/home/gooning/.t3/scratch/frostmarsh-tiers-1-2/tier1_painterly.onnx",
+    "size_bytes": 1576939,
+    "size_kb": 1539.98,
+    "opset": 17,
+    "n_params": 387719,
+    "input_name": "aplus_world",
+    "input_shape": [
+      "batch",
+      19,
+      "height",
+      "width"
+    ],
+    "output_name": "rgb_512",
+    "output_shape": [
+      "batch",
+      3,
+      "out_height",
+      "out_width"
+    ],
+    "max_abs_diff": {
+      "1x19x128x128": 1.0132789611816406e-06,
+      "2x19x128x128": 1.0132789611816406e-06,
+      "1x19x64x64": 9.5367431640625e-07
+    },
+    "gpu_fp16_latency_ms": {
+      "128_to_512_fp16": {
+        "mean_ms": 4.41,
+        "median_ms": 4.296,
+        "p95_ms": 5.143,
+        "fps": 232.8
+      }
+    },
+    "ort_cpu_latency_ms": {
+      "1_threads": {
+        "mean_ms": 341.16,
+        "median_ms": 341.47,
+        "p95_ms": 344.0
+      },
+      "4_threads": {
+        "mean_ms": 90.79,
+        "median_ms": 90.8,
+        "p95_ms": 91.11
+      },
+      "8_threads": {
+        "mean_ms": 52.03,
+        "median_ms": 51.91,
+        "p95_ms": 52.39
+      }
+    }
+  },
+  "tier2_train": {
+    "train_time_s": 228.3,
+    "steps": 1600,
+    "batch_size": 8,
+    "final_l1": 0.019160350784659386,
+    "final_sobel": 0.021495163440704346
+  },
+  "tier2": {
+    "n_params": 162211,
+    "val_256_psnr_db": 27.78,
+    "val_256_mae": 0.0177,
+    "zero_shot_512_psnr_db": 24.56,
+    "zero_shot_512_mae": 0.0267,
+    "orbit_4angles_psnr_db": {
+      "1. Isometric Tactical": 23.18,
+      "2. Low Dramatic Battle": 25.46,
+      "3. High Tactical Overview": 24.49,
+      "4. Reverse Orbit Firelight": 25.13
+    },
+    "multiview_360_consistency": {
+      "n_views": 36,
+      "step_deg": 10.0,
+      "avg_covisible_fraction": 0.6365,
+      "neural_reproj_rms": 0.01941,
+      "neural_reproj_psnr_db": 34.27,
+      "raytraced_ref_reproj_rms": 0.02016,
+      "excess_view_flicker_rms": 0.0
+    }
+  },
+  "tier2_onnx": {
+    "path": "/home/gooning/.t3/scratch/frostmarsh-tiers-1-2/tier2_deferred_3d.onnx",
+    "size_bytes": 663284,
+    "size_kb": 647.74,
+    "opset": 17,
+    "n_params": 162211,
+    "input_name": "gbuf",
+    "input_shape": [
+      "batch",
+      18,
+      "height",
+      "width"
+    ],
+    "output_name": "rgb_3d",
+    "output_shape": [
+      "batch",
+      3,
+      "height",
+      "width"
+    ],
+    "max_abs_diff": {
+      "1x18x256x256": 3.5762786865234375e-07,
+      "2x18x256x256": 4.172325134277344e-07,
+      "1x18x512x512": 4.172325134277344e-07,
+      "1x18x192x320": 4.172325134277344e-07
+    },
+    "gpu_fp16_latency_ms": {
+      "256x256_fp16": {
+        "mean_ms": 2.188,
+        "median_ms": 2.091,
+        "p95_ms": 2.619,
+        "fps": 478.2
+      },
+      "512x512_fp16": {
+        "mean_ms": 11.87,
+        "median_ms": 11.721,
+        "p95_ms": 12.856,
+        "fps": 85.3
+      }
+    },
+    "ort_cpu_latency_ms": {
+      "256x256": {
+        "1_threads": {
+          "mean_ms": 204.24,
+          "median_ms": 204.26,
+          "p95_ms": 204.96
+        },
+        "4_threads": {
+          "mean_ms": 52.62,
+          "median_ms": 52.54,
+          "p95_ms": 52.92
+        },
+        "8_threads": {
+          "mean_ms": 31.78,
+          "median_ms": 31.56,
+          "p95_ms": 32.01
+        }
+      },
+      "512x512": {
+        "4_threads": {
+          "mean_ms": 221.67,
+          "median_ms": 221.73,
+          "p95_ms": 222.33
+        },
+        "8_threads": {
+          "mean_ms": 117.75,
+          "median_ms": 117.68,
+          "p95_ms": 118.16
+        }
+      }
+    }
+  }
+}

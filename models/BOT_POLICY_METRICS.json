@@ -1,0 +1,56 @@
+{
+  "device": "NVIDIA GB10",
+  "world_latent_shape": [
+    4,
+    48,
+    256,
+    256
+  ],
+  "eco_latent_shape": [
+    1,
+    32,
+    256,
+    256
+  ],
+  "shared_latent_bot": {
+    "name": "SharedLatent (+Z_world +Z_eco)",
+    "params": 152157,
+    "train_time_s": 27.1,
+    "val_move_cosine": 0.9278,
+    "val_aim_cosine": 0.9724,
+    "val_ability_acc_pct": 97.84,
+    "val_element_acc_pct": 95.63,
+    "val_physics_combo_elem_acc_pct": 92.97,
+    "val_wildfire_evasion_cosine": 0.7473,
+    "val_sanctuary_retreat_cosine": 0.1774
+  },
+  "blind_ablation_bot": {
+    "name": "Blind Ablation (Ledger-Only)",
+    "params": 152157,
+    "train_time_s": 29.28,
+    "val_move_cosine": 0.8788,
+    "val_aim_cosine": 0.9721,
+    "val_ability_acc_pct": 96.22,
+    "val_element_acc_pct": 74.05,
+    "val_physics_combo_elem_acc_pct": 42.68,
+    "val_wildfire_evasion_cosine": -0.1239,
+    "val_sanctuary_retreat_cosine": 0.1501
+  },
+  "batched_gpu_latency": {
+    "bots_12": {
+      "p50_ms": 0.659,
+      "p95_ms": 2.836,
+      "per_bot_us": 54.9
+    },
+    "bots_64": {
+      "p50_ms": 0.7,
+      "p95_ms": 0.817,
+      "per_bot_us": 10.94
+    },
+    "bots_256": {
+      "p50_ms": 1.491,
+      "p95_ms": 3.845,
+      "per_bot_us": 5.82
+    }
+  }
+}

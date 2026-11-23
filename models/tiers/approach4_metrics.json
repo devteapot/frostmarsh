@@ -1,0 +1,106 @@
+{
+  "server": "127.0.0.1:4433",
+  "gpu_adapter": "NVIDIA GB10",
+  "gpu_backend": "Vulkan",
+  "parametric_build_ms": 5.96,
+  "static_mesh_vertices": 38404,
+  "static_mesh_triangles": 19198,
+  "surfel_proto_count": 387,
+  "live_server_telemetry": {
+    "mode": "neural",
+    "backend": "cuda-fp16",
+    "ecosystem_on": true,
+    "sim_tick": 168231,
+    "field_tick": 55026,
+    "infer_ms_last": 0.801,
+    "infer_ms_p99": 3.63,
+    "proj_active_pct": 19.309793,
+    "mass_error": 0,
+    "energy_error": 0,
+    "wire_kbps": 248.90796,
+    "score_west": 0,
+    "score_east": 0,
+    "players_count": 7,
+    "projectiles_count": 2,
+    "carved_rafts_count": 0,
+    "chunks_received_total": 1612,
+    "snapshots_received_total": 133,
+    "avg_lz4_decompress_us": 0.6
+  },
+  "live_world_composition": {
+    "wood_cells": 412,
+    "plant_cells": 2502,
+    "water_cells": 2967,
+    "ice_cells": 17,
+    "oil_cells": 1060,
+    "rock_cells": 1115,
+    "ash_cells": 462,
+    "burning_cells": 198,
+    "freezing_cells": 0,
+    "critter_cells": 113,
+    "pine_surfel_trees": 395,
+    "marsh_brush_clusters": 1166,
+    "wildfire_flame_plumes": 316,
+    "wildlife_deer_instances": 3
+  },
+  "dirty_chunk_10hz_bench": {
+    "observation_secs": 4.08,
+    "ticks_observed": 40,
+    "total_dirty_chunks_rebuilt": 1474,
+    "avg_dirty_chunks_per_10hz_tick": 36.85,
+    "dirty_update_p50_ms": 0.724,
+    "dirty_update_p99_ms": 0.877,
+    "dirty_update_mean_ms": 0.721,
+    "full_64_chunk_build_ms": 1.856
+  },
+  "gpu_benchmarks": [
+    {
+      "label": "1080p Pixel-Art (px=2)",
+      "resolution": "1920x1080",
+      "art_resolution": "960x540",
+      "style": "pixel_art",
+      "p50_ms": 0.809,
+      "p99_ms": 1.049,
+      "mean_ms": 0.804,
+      "fps_p50": 1235.4
+    },
+    {
+      "label": "1080p Clean 3D (px=1)",
+      "resolution": "1920x1080",
+      "art_resolution": "1920x1080",
+      "style": "clean_3d",
+      "p50_ms": 0.727,
+      "p99_ms": 1.133,
+      "mean_ms": 0.769,
+      "fps_p50": 1374.7
+    },
+    {
+      "label": "4K Pixel-Art (px=4)",
+      "resolution": "3840x2160",
+      "art_resolution": "960x540",
+      "style": "pixel_art",
+      "p50_ms": 0.833,
+      "p99_ms": 1.125,
+      "mean_ms": 0.866,
+      "fps_p50": 1200.4
+    },
+    {
+      "label": "4K Clean 3D (px=1)",
+      "resolution": "3840x2160",
+      "art_resolution": "3840x2160",
+      "style": "clean_3d",
+      "p50_ms": 1.482,
+      "p99_ms": 1.838,
+      "mean_ms": 1.49,
+      "fps_p50": 674.7
+    }
+  ],
+  "frame_geometry_stats": {
+    "terrain_vertices": 24765,
+    "terrain_triangles": 35528,
+    "mesh_instances": 431,
+    "surfel_placements": 1880,
+    "surfel_draws": 47959,
+    "flash_palette_bytes": 1024
+  }
+}

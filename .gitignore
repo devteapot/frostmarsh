@@ -1,0 +1,31 @@
+# Rust / Cargo build outputs (root and nested spacetimedb)
+target/
+**/target/
+
+# Python environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS & editor files
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local runtime / SpacetimeDB deployment state
+spacetimedb/spacetime.local.json
+*.log
+*.pid
+
+# Trained model weights (hosted on Hugging Face Hub — fetch via ./scripts/download_models.sh)
+models/*.onnx
+models/*.pt
+models/checkpoints/
+models/tiers/*.onnx
+models/tiers/*.pt
+
+# Temporary staging
+hf_staging/

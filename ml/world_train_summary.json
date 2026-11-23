@@ -1,0 +1,40 @@
+{
+  "n_params": 112817,
+  "train_time_s": 583.4114184379578,
+  "total_steps": 2200,
+  "final_metrics": {
+    "step": 2200,
+    "k": 8,
+    "loss": 0.04939667135477066,
+    "delta": 0.026250897208228707,
+    "state": 0.0007140250454540364,
+    "proj": 0.004241990158334374,
+    "proj_active_pct": 82.0466436445713,
+    "flux": 3.794834628934041e-05,
+    "heat": 0.0005629353690892458,
+    "rxn": 6.999933975748718e-05,
+    "lr": 8e-05,
+    "elapsed_s": 583.4105231761932
+  },
+  "onnx": {
+    "path": "/home/gooning/.t3/scratch/frostmarsh-ml/world_model.onnx",
+    "size_bytes": 472047,
+    "opset": 17,
+    "input_name": "state",
+    "input_shape": [
+      "batch",
+      18,
+      "height",
+      "width"
+    ],
+    "output_name": "deltas",
+    "output_shape": [
+      "batch",
+      17,
+      "height",
+      "width"
+    ],
+    "ort_max_diff_128x128": 7.510185241699219e-06,
+    "ort_max_diff_256x256": 1.3053417205810547e-05
+  }
+}

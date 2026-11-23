@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/field-core",
+    "crates/frostmarsh-proto",
+    "crates/frostmarsh-server",
+    "crates/stdb-bindings",
+    "crates/world-worker",
+    "crates/neural-client",
+    "crates/frostmarsh-unified-client",
+]
+exclude = [
+    "spacetimedb",
+]
+resolver = "2"

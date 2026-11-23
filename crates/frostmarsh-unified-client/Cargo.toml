@@ -1,0 +1,19 @@
+[package]
+name = "frostmarsh-unified-client"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+frostmarsh-proto = { path = "../frostmarsh-proto" }
+wgpu = "30.0.2"
+winit = "0.30"
+glam = "0.33"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

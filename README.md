@@ -81,6 +81,10 @@
     - **Smooth Surface-Nets + 3D-Tex Shading + Raymarched Vol Overlay (Winner, `2.8–3.2×` faster, `1.33/255` MAE parity):** **`339–384 FPS` @ 1080p** (`2.60–2.95 ms`), **`100–115 FPS` @ 4K** (`8.70–9.99 ms`), **`365–652 FPS` in vaulted caves**, and **`0.031–0.033 ms` (`33 µs`)** per dirty `16×16×16` brick!
     - **Sparse `8×8×8` Brick DDA Raymarch:** `105–139 FPS` @ 1080p (`7.19–9.51 ms`), `31.5–39.6 FPS` @ 4K.
   - **Live on Spark GB10 (`512×512×4 = 1,048,576` voxels, 6 Concurrent Neural Models):** Wired `WorldModelDT` (`op=9`, **`J`-key** `0.15×` Stasis / `3.0×` Haste Time-Dilation Domes), non-blocking **`Qwen/Qwen2.5-1.5B-Instruct` (`SLM:ON`)** live `Enter`-key acoustic chat, and **1:1 continuous bilinear solid-density gradient capsule wall-sliding collisions** (smoothly weaving between towering pine trunks with `0` warnings and `mass_err = 0`, `energy_err = 0`).
+- **Iteration 9 — Client-Side WGSL `NeuralMaterialHead(Z_world)` + Swappable Styles + True 3D `Z=16` Server (`Brick3D`) + WebGPU/WASM Browser Client:**
+  - **Client-Side WGSL Neural Decoder & Swappable Client Styles (`ml/export_client_material_wgsl.py`, `crates/frostmarsh-3d-sandbox`, [STYLIZED_3D_Z16_METRICS.json](models/STYLIZED_3D_Z16_METRICS.json)):** Server exports ONLY compressed `Z_world_3d` latent bricks (`z16_latent_bricks.bin`, zero baked RGB). Client GPU caches **`4 KB`** of active style weights in workgroup SRAM (`neural_material_decode.wgsl`) and decodes all **`1,048,576` voxels in `0.935 ms`** (`12.2 µs` / dirty `16³` brick, bit-exact `0` diff vs CPU, `R² = 0.994–0.997`). Layers Frostmarsh triplanar masonry/terrain detail, Hard-Z sculpted pine surfels (`22.4K`), and 2×SS ink outlines on top of true 3D `Z=16` caves & arched bridges at **`238 FPS` @ 1080p `PIXEL-2×SS`** (`331 FPS` Clean-3D, `101 FPS` @ 4K), with **`Y`-key** live `0.92 ms` client style swapping (`NORDIC` ↔ `VOLCANIC EMBER` ↔ `ARCANE THERMAL`) on the same `Z_world_3d`!
+  - **True 3D `Z=16` Authoritative Engine (`field-core` + `frostmarsh-proto` + `frostmarsh-server`):** Added `VolumeField::init_shattered_reach_z16()` (`11/11` `field-core` conservation & 3D cave/bridge capsule tests passing, `mass_err = 0`, `energy_err = 0`), LZ4 `ServerDatagram::VolumetricBrick3D` streaming, and `--layers 16` server (`7.5 ms/tick` @ `128×128×16`) while keeping `--layers 4` 100% compatible.
+  - **WebGPU/WASM Browser Client (`crates/frostmarsh-web-client` → `web/pkg/`):** Compiled true 3D `Z=16` Smooth Surface-Nets + Volumetric Overlay + 3D Hero Knights + `T`-key `Pixel-2×SS` ↔ `Clean-3D` + `C`-key `∇solid_density` capsule walk to `wasm32-unknown-unknown` (`993 KB` gzipped, `0` warnings under `-D warnings`, `python3 web/serve.py` → `http://127.0.0.1:8080`).
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
@@ -95,9 +99,9 @@
 
 ## Visual Showcase
 
-| True 3D `Z=16` Direct-3D-Texture Head-to-Head (`339 FPS` Surface-Nets vs `105 FPS` Raymarch) | End-to-End Neural `Z_world` → `NeuralMaterialHead` → `384 FPS` Metal |
+| Client-Side WGSL `NeuralMaterialHead(Z_world)`: Stylized True 3D `Z=16` & Live `0.92 ms` Style Swap | True 3D `Z=16` Direct-3D-Texture Head-to-Head (`339 FPS` Surface-Nets vs `105 FPS` Raymarch) |
 |---|---|
-| ![True 3D Z=16 Head-to-Head](models/render_3d_headtohead_viz.png) | ![Neural Z_world to 384 FPS Metal](models/neural_e2e_z16_metal.png) |
+| ![Client-Side WGSL Neural Style Swap on True 3D Z=16](models/stylized_3d_z16_showcase.png) | ![True 3D Z=16 Head-to-Head](models/render_3d_headtohead_viz.png) |
 
 | `WorldModelDT` Continuous Δt Time-Dilation & Destructible Structures | True 3D `Z=16` Neural Material Field & `13.1×` Sparse Brick Scaling |
 |---|---|

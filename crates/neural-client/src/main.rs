@@ -932,6 +932,7 @@ fn main() {
                                 }
                             }
                         }
+                        ServerDatagram::VolumetricBrick3D(_) => {}
                     }
                 }
             }

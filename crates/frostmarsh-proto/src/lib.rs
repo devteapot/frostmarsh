@@ -285,6 +285,17 @@ pub struct TelemetrySnap {
     pub system2_slm_active: bool,
 }
 
+/// Additive `16×16×D` 3D volumetric column brick payload (`density_mat` + `albedo_thermal` RGBA8, LZ4-compressed).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Brick3DPayload {
+    pub brick_id: u32,
+    pub bx: u16,
+    pub by: u16,
+    pub depth: u8,
+    pub density_mat_lz4: Vec<u8>,
+    pub albedo_thermal_lz4: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerDatagram {
     /// 30 Hz authoritative combat/entity/shrine/event snapshot (unreliable — always take latest!)
@@ -329,6 +340,8 @@ pub enum ServerDatagram {
         cy: u8,
         lz4_cells: Vec<u8>,
     },
+    /// 10 Hz LZ4-compressed `16×16×D` 3D volumetric brick (`density_mat` + `albedo_thermal` RGBA8).
+    VolumetricBrick3D(Brick3DPayload),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -349,6 +362,32 @@ pub fn decompress_aplus_cells(compressed: &[u8]) -> Option<Vec<u8>> {
     lz4_flex::decompress_size_prepended(compressed).ok()
 }
 
+/// Compress raw Z-major `[depth][16][16][4]` `density_mat` and `albedo_thermal` brick buffers with LZ4.
+pub fn encode_brick3d_lz4(
+    brick_id: u32,
+    bx: u16,
+    by: u16,
+    depth: u8,
+    density_mat_raw: &[u8],
+    albedo_thermal_raw: &[u8],
+) -> Brick3DPayload {
+    Brick3DPayload {
+        brick_id,
+        bx,
+        by,
+        depth,
+        density_mat_lz4: lz4_flex::compress_prepend_size(density_mat_raw),
+        albedo_thermal_lz4: lz4_flex::compress_prepend_size(albedo_thermal_raw),
+    }
+}
+
+/// Decompress a `Brick3DPayload` back into raw `(density_mat, albedo_thermal)` RGBA8 byte buffers.
+pub fn decode_brick3d_lz4(payload: &Brick3DPayload) -> Option<(Vec<u8>, Vec<u8>)> {
+    let density_mat = lz4_flex::decompress_size_prepended(&payload.density_mat_lz4).ok()?;
+    let albedo_thermal = lz4_flex::decompress_size_prepended(&payload.albedo_thermal_lz4).ok()?;
+    Some((density_mat, albedo_thermal))
+}
+
 pub fn encode_msg<T: Serialize>(msg: &T) -> Vec<u8> {
     bincode::serialize(msg).expect("bincode serialize")
 }
@@ -367,4 +406,36 @@ pub fn encode_server_datagram(msg: &ServerDatagram) -> Vec<u8> {
 pub fn decode_server_datagram(bytes: &[u8]) -> Option<ServerDatagram> {
     let raw = lz4_flex::decompress_size_prepended(bytes).ok()?;
     bincode::deserialize(&raw).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_brick3d_lz4_and_datagram_roundtrip() {
+        let len = 16 * 16 * 16 * 4;
+        let mut dm = vec![0u8; len];
+        let mut at = vec![0u8; len];
+        dm[0..4].copy_from_slice(&[255, 0, 0, 200]);
+        dm[len - 4..len].copy_from_slice(&[0, 128, 64, 30]);
+        at[0..4].copy_from_slice(&[90, 95, 105, 0]);
+        at[len - 4..len].copy_from_slice(&[255, 140, 20, 240]);
+
+        let payload = encode_brick3d_lz4(42, 3, 5, 16, &dm, &at);
+        assert!(payload.density_mat_lz4.len() < len);
+        assert!(payload.albedo_thermal_lz4.len() < len);
+
+        let wire = encode_server_datagram(&ServerDatagram::VolumetricBrick3D(payload));
+        let decoded = decode_server_datagram(&wire).expect("decode ServerDatagram::VolumetricBrick3D");
+        match decoded {
+            ServerDatagram::VolumetricBrick3D(b) => {
+                assert_eq!((b.brick_id, b.bx, b.by, b.depth), (42, 3, 5, 16));
+                let (dm2, at2) = decode_brick3d_lz4(&b).expect("decompress brick3d");
+                assert_eq!(dm2, dm);
+                assert_eq!(at2, at);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
 }

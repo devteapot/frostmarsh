@@ -246,3 +246,54 @@ pub fn showcase_hero_instances() -> Vec<HeroInstance> {
         },
     ]
 }
+
+/// Find the exact solid isosurface floor Y near `(x, z)` starting downward from `y_start`.
+fn snap_floor_y(vol: &crate::volume::WorldVolume3D, x: f32, y_start: f32, z: f32) -> f32 {
+    let mut y = y_start;
+    while y > 0.6 {
+        if vol.sample_solid(Vec3::new(x, y, z)) >= 0.5 {
+            // Refine upward in small steps to sit right on the isosurface
+            let mut y_top = y;
+            for _ in 0..10 {
+                if vol.sample_solid(Vec3::new(x, y_top, z)) < 0.5 {
+                    break;
+                }
+                y_top += 0.06;
+            }
+            return y_top;
+        }
+        y -= 0.15;
+    }
+    y_start
+}
+
+/// Hero knight placements snapped directly to the true 3D neural latent world (`FMLT`):
+/// 1. Frost Paladin walking across the 3-span arched bridge deck!
+/// 2. Crimson Vanguard standing cleanly underneath the West bridge arch!
+/// 3. Emerald Warden standing at the vaulted basalt cave entrance!
+/// 4. Solar Amber Scout standing deeper inside the glowing basalt cavern near the magma vents!
+pub fn latent_showcase_hero_instances(vol: &crate::volume::WorldVolume3D) -> Vec<HeroInstance> {
+    let y_bridge = snap_floor_y(vol, 128.0, 11.5, 126.5);
+    let y_under = snap_floor_y(vol, 108.5, 5.2, 127.0).max(3.45);
+    let y_cave_entry = snap_floor_y(vol, 65.5, 4.0, 128.0);
+    let y_cave_deep = snap_floor_y(vol, 54.0, 3.8, 127.0);
+
+    vec![
+        HeroInstance {
+            pos_yaw: [128.0, y_bridge, 126.5, 1.15],
+            faction_scale: [0.16, 0.58, 1.00, 1.05], // Frost Cobalt Paladin on bridge
+        },
+        HeroInstance {
+            pos_yaw: [108.5, y_under, 127.0, 0.35],
+            faction_scale: [0.96, 0.24, 0.24, 1.05], // Pyro Crimson Vanguard under bridge arch
+        },
+        HeroInstance {
+            pos_yaw: [65.5, y_cave_entry, 128.0, -1.20],
+            faction_scale: [0.18, 0.86, 0.52, 1.0], // Emerald Warden beside glowing magma vent
+        },
+        HeroInstance {
+            pos_yaw: [54.0, y_cave_deep, 127.0, -1.65],
+            faction_scale: [0.98, 0.68, 0.18, 1.0], // Solar Amber Scout deeper in basalt vault
+        },
+    ]
+}

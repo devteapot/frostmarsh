@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Frostmarsh 3D — WebGPU Surface-Nets + Volumetric Overlay</title>
+  <style>
+    :root {
+      --bg: #080c14;
+      --panel: rgba(10, 15, 26, 0.78);
+      --panel-border: rgba(125, 170, 230, 0.22);
+      --text: #edf4ff;
+      --muted: #93a7c4;
+      --accent: #56b9ff;
+      --accent-green: #58e39a;
+      --accent-amber: #ffae4d;
+      --danger: #ff6b72;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    #frostmarsh-canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: grab;
+      touch-action: none;
+    }
+
+    #frostmarsh-canvas.dragging {
+      cursor: grabbing;
+    }
+
+    .hud-card {
+      position: fixed;
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+      pointer-events: auto;
+    }
+
+    #hud-stats {
+      top: 16px;
+      left: 16px;
+      padding: 13px 16px;
+      min-width: 295px;
+      max-width: 350px;
+    }
+
+    .hud-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid rgba(148, 184, 232, 0.16);
+    }
+
+    .hud-title {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #ffffff;
+    }
+
+    .badge {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(86, 185, 255, 0.16);
+      color: var(--accent);
+      border: 1px solid rgba(86, 185, 255, 0.35);
+    }
+
+    .badge.green {
+      background: rgba(88, 227, 154, 0.14);
+      color: var(--accent-green);
+      border-color: rgba(88, 227, 154, 0.35);
+    }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 5px 14px;
+      font-size: 12px;
+      align-items: baseline;
+    }
+
+    .stat-label {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .stat-val {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text);
+      text-align: right;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .stat-val.fps {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--accent-green);
+    }
+
+    #hud-toolbar {
+      top: 16px;
+      right: 16px;
+      padding: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      max-width: 520px;
+      justify-content: flex-end;
+    }
+
+    .btn {
+      appearance: none;
+      border: 1px solid rgba(148, 184, 232, 0.25);
+      background: rgba(24, 35, 56, 0.72);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 7px 11px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.12s ease, border-color 0.12s ease, transform 0.08s ease;
+    }
+
+    .btn:hover {
+      background: rgba(38, 56, 88, 0.9);
+      border-color: rgba(148, 198, 255, 0.55);
+    }
+
+    .btn:active {
+      transform: translateY(1px);
+    }
+
+    .btn.active {
+      background: rgba(86, 185, 255, 0.24);
+      border-color: var(--accent);
+      color: #ffffff;
+    }
+
+    .btn.active-amber {
+      background: rgba(255, 174, 77, 0.22);
+      border-color: var(--accent-amber);
+      color: #fff6e8;
+    }
+
+    .kbd {
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.12);
+      color: #dcebff;
+    }
+
+    #hud-controls {
+      bottom: 16px;
+      left: 16px;
+      padding: 10px 14px;
+      font-size: 11.5px;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      max-width: calc(100vw - 32px);
+    }
+
+    #hud-controls span {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    #overlay-status {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(circle at 50% 40%, rgba(16, 26, 46, 0.94), rgba(6, 10, 18, 0.98));
+      z-index: 30;
+      padding: 24px;
+      transition: opacity 0.25s ease;
+    }
+
+    #overlay-status.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .status-box {
+      max-width: 480px;
+      width: 100%;
+      padding: 24px 26px;
+      border-radius: 14px;
+      background: rgba(14, 21, 36, 0.92);
+      border: 1px solid var(--panel-border);
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+      text-align: center;
+    }
+
+    .status-box h1 {
+      font-size: 18px;
+      margin-bottom: 8px;
+      letter-spacing: 0.02em;
+    }
+
+    .status-box p {
+      font-size: 13px;
+      line-height: 1.5;
+      color: var(--muted);
+    }
+
+    .status-box .error-text {
+      margin-top: 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(255, 107, 114, 0.12);
+      border: 1px solid rgba(255, 107, 114, 0.35);
+      color: #ffb8bc;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      text-align: left;
+      word-break: break-word;
+      display: none;
+    }
+
+    .spinner {
+      width: 28px;
+      height: 28px;
+      border: 3px solid rgba(86, 185, 255, 0.22);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      margin: 0 auto 14px;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="frostmarsh-canvas"></canvas>
+
+  <div id="hud-stats" class="hud-card" aria-live="polite">
+    <div class="hud-header">
+      <div class="hud-title">Frostmarsh WebGPU 3D</div>
+      <span id="stat-backend" class="badge">WebGPU</span>
+    </div>
+    <div class="stat-grid">
+      <span class="stat-label">Performance</span>
+      <span id="stat-fps" class="stat-val fps">-- FPS (-- ms)</span>
+
+      <span class="stat-label">GPU Adapter</span>
+      <span id="stat-adapter" class="stat-val">Initializing…</span>
+
+      <span class="stat-label">Surface-Nets</span>
+      <span id="stat-mesh" class="stat-val">-- tris</span>
+
+      <span class="stat-label">Voxel Grid</span>
+      <span id="stat-voxels" class="stat-val">256×256×16 (1.05M)</span>
+
+      <span class="stat-label">8³ Bricks</span>
+      <span id="stat-bricks" class="stat-val">-- / --</span>
+
+      <span class="stat-label">Render Style</span>
+      <span id="stat-style" class="stat-val">Clean-3D</span>
+
+      <span class="stat-label">Navigation</span>
+      <span id="stat-walk" class="stat-val">Free-Fly</span>
+
+      <span class="stat-label">Camera XYZ</span>
+      <span id="stat-cam" class="stat-val">--</span>
+
+      <span class="stat-label">Volume</span>
+      <span id="stat-source" class="stat-val">Loading…</span>
+    </div>
+  </div>
+
+  <div id="hud-toolbar" class="hud-card">
+    <button id="btn-preset-1" class="btn active" title="Arched Stone Bridge & Alpine Waterfall">
+      <span class="kbd">1</span> Bridge
+    </button>
+    <button id="btn-preset-2" class="btn" title="Vaulted Basalt Cave & Magma Fissure">
+      <span class="kbd">2</span> Cave
+    </button>
+    <button id="btn-style" class="btn" title="Toggle Stylized Pixel-2xSS vs Clean-3D">
+      <span class="kbd">T</span> <span id="lbl-style">Clean-3D</span>
+    </button>
+    <button id="btn-capsule" class="btn" title="Toggle Continuous ∇solid_density 3D Capsule Walk Mode">
+      <span class="kbd">C</span> <span id="lbl-capsule">Free-Fly</span>
+    </button>
+    <button id="btn-volume" class="btn" title="Switch between Procedural Showcase and Neural FM3D volume">
+      <span class="kbd">V</span> <span id="lbl-volume">Load FM3D</span>
+    </button>
+  </div>
+
+  <div id="hud-controls" class="hud-card">
+    <span><span class="kbd">WASD</span> Move</span>
+    <span><span class="kbd">Q</span>/<span class="kbd">E</span> Fly Down/Up</span>
+    <span><span class="kbd">Space</span> Jump / Up</span>
+    <span><span class="kbd">Shift</span> Sprint</span>
+    <span><span class="kbd">Drag</span> Orbit</span>
+    <span><span class="kbd">Scroll</span> Zoom</span>
+    <span><span class="kbd">1</span>/<span class="kbd">2</span> Presets</span>
+    <span><span class="kbd">T</span> Pixel-2×SS</span>
+    <span><span class="kbd">C</span> 3D Capsule Walk</span>
+    <span><span class="kbd">Drop .bin</span> Load FM3D</span>
+  </div>
+
+  <div id="overlay-status">
+    <div class="status-box">
+      <div id="status-spinner" class="spinner"></div>
+      <h1 id="status-title">Booting Frostmarsh WebGPU…</h1>
+      <p id="status-msg">Compiling WASM Surface-Nets isosurface extractor and requesting WebGPU adapter.</p>
+      <div id="status-error" class="error-text"></div>
+    </div>
+  </div>
+
+  <script type="module">
+    import init, { FrostmarshApp } from "./pkg/frostmarsh_web_client.js";
+
+    const canvas = document.getElementById("frostmarsh-canvas");
+    const overlay = document.getElementById("overlay-status");
+    const statusSpinner = document.getElementById("status-spinner");
+    const statusTitle = document.getElementById("status-title");
+    const statusMsg = document.getElementById("status-msg");
+    const statusError = document.getElementById("status-error");
+
+    const statFps = document.getElementById("stat-fps");
+    const statAdapter = document.getElementById("stat-adapter");
+    const statBackend = document.getElementById("stat-backend");
+    const statMesh = document.getElementById("stat-mesh");
+    const statVoxels = document.getElementById("stat-voxels");
+    const statBricks = document.getElementById("stat-bricks");
+    const statStyle = document.getElementById("stat-style");
+    const statWalk = document.getElementById("stat-walk");
+    const statCam = document.getElementById("stat-cam");
+    const statSource = document.getElementById("stat-source");
+
+    const btnPreset1 = document.getElementById("btn-preset-1");
+    const btnPreset2 = document.getElementById("btn-preset-2");
+    const btnStyle = document.getElementById("btn-style");
+    const lblStyle = document.getElementById("lbl-style");
+    const btnCapsule = document.getElementById("btn-capsule");
+    const lblCapsule = document.getElementById("lbl-capsule");
+    const btnVolume = document.getElementById("btn-volume");
+    const lblVolume = document.getElementById("lbl-volume");
+
+    function showFatal(title, message, detail) {
+      statusSpinner.style.display = "none";
+      statusTitle.textContent = title;
+      statusMsg.textContent = message;
+      if (detail) {
+        statusError.style.display = "block";
+        statusError.textContent = String(detail);
+      }
+      overlay.classList.remove("hidden");
+    }
+
+    function syncCanvasSize(app) {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.floor(window.innerWidth * dpr));
+      const h = Math.max(1, Math.floor(window.innerHeight * dpr));
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      if (app) {
+        app.resize(w, h);
+      }
+    }
+
+    async function tryFetchDemoVolume() {
+      try {
+        const res = await fetch("./assets/z16_demo_volume.bin", { cache: "no-cache" });
+        if (!res.ok) return null;
+        const buf = await res.arrayBuffer();
+        if (buf.byteLength < 16) return null;
+        const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 4));
+        if (magic !== "FM3D") return null;
+        return new Uint8Array(buf);
+      } catch {
+        return null;
+      }
+    }
+
+    async function boot() {
+      syncCanvasSize(null);
+
+      if (!navigator.gpu) {
+        statusMsg.textContent = "WebGPU API not detected; attempting fallback adapter…";
+      }
+
+      try {
+        await init();
+      } catch (err) {
+        showFatal(
+          "WASM Module Load Failed",
+          "Could not initialize web/pkg/frostmarsh_web_client.wasm. Serve via python3 web/serve.py.",
+          err
+        );
+        return;
+      }
+
+      const params = new URLSearchParams(window.location.search);
+      const wantFm3dFirst = params.get("volume") === "fm3d";
+      let initialFm3d = null;
+      let usingFm3d = false;
+
+      if (wantFm3dFirst) {
+        statusMsg.textContent = "Fetching Neural FM3D volume (assets/z16_demo_volume.bin)…";
+        initialFm3d = await tryFetchDemoVolume();
+        usingFm3d = initialFm3d !== null;
+      } else {
+        statusMsg.textContent = "Generating isotropic 256×256×16 Frostmarsh world & Surface-Nets mesh in WASM…";
+      }
+
+      let app;
+      try {
+        app = await FrostmarshApp.create("frostmarsh-canvas", initialFm3d);
+      } catch (err) {
+        showFatal(
+          "WebGPU Initialization Failed",
+          "This demo requires a WebGPU-capable browser (Chrome 113+, Edge 113+, Safari 18+, or Firefox Nightly with WebGPU enabled).",
+          err
+        );
+        return;
+      }
+
+      lblVolume.textContent = usingFm3d ? "Showcase" : "Neural FM3D";
+      btnVolume.classList.toggle("active", usingFm3d);
+
+      function updateStyleButtons(isPixel) {
+        lblStyle.textContent = isPixel ? "Pixel-2×SS" : "Clean-3D";
+        btnStyle.classList.toggle("active", isPixel);
+      }
+
+      function updateCapsuleButtons(isCapsule) {
+        lblCapsule.textContent = isCapsule ? "Capsule-3D" : "Free-Fly";
+        btnCapsule.classList.toggle("active-amber", isCapsule);
+      }
+
+      function selectPreset(id) {
+        app.set_camera_preset(id);
+        updateCapsuleButtons(false);
+        btnPreset1.classList.toggle("active", id === 1);
+        btnPreset2.classList.toggle("active", id === 2);
+      }
+
+      async function toggleVolumeSource() {
+        btnVolume.disabled = true;
+        try {
+          if (usingFm3d) {
+            app.load_procedural_showcase();
+            usingFm3d = false;
+            lblVolume.textContent = "Neural FM3D";
+            btnVolume.classList.remove("active");
+          } else {
+            lblVolume.textContent = "Loading…";
+            const bytes = await tryFetchDemoVolume();
+            if (!bytes) {
+              lblVolume.textContent = "No FM3D Asset";
+              setTimeout(() => { lblVolume.textContent = "Neural FM3D"; }, 1800);
+              return;
+            }
+            app.load_fm3d_volume(bytes, "Neural FM3D (z16_demo_volume.bin)");
+            usingFm3d = true;
+            lblVolume.textContent = "Showcase";
+            btnVolume.classList.add("active");
+          }
+        } catch (err) {
+          console.error("Volume switch failed:", err);
+        } finally {
+          btnVolume.disabled = false;
+        }
+      }
+
+      // Toolbar button bindings
+      btnPreset1.addEventListener("click", () => selectPreset(1));
+      btnPreset2.addEventListener("click", () => selectPreset(2));
+      btnStyle.addEventListener("click", () => updateStyleButtons(app.toggle_pixel_style()));
+      btnCapsule.addEventListener("click", () => updateCapsuleButtons(app.toggle_capsule_mode()));
+      btnVolume.addEventListener("click", toggleVolumeSource);
+
+      // Keyboard input
+      window.addEventListener("keydown", (e) => {
+        if (e.target && ["INPUT", "TEXTAREA"].includes(e.target.tagName)) return;
+        if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) {
+          e.preventDefault();
+        }
+        app.set_key(e.code, true);
+        if (!e.repeat) {
+          if (e.code === "Digit1") selectPreset(1);
+          else if (e.code === "Digit2") selectPreset(2);
+          else if (e.code === "KeyT") updateStyleButtons(app.toggle_pixel_style());
+          else if (e.code === "KeyC") updateCapsuleButtons(app.toggle_capsule_mode());
+          else if (e.code === "KeyV") toggleVolumeSource();
+        }
+      });
+
+      window.addEventListener("keyup", (e) => {
+        app.set_key(e.code, false);
+      });
+
+      window.addEventListener("blur", () => {
+        app.clear_keys();
+      });
+
+      // Mouse & pointer orbit drag + scroll zoom
+      let dragging = false;
+      let lastX = 0;
+      let lastY = 0;
+
+      canvas.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        dragging = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        canvas.classList.add("dragging");
+        canvas.setPointerCapture(e.pointerId);
+      });
+
+      canvas.addEventListener("pointermove", (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - lastX;
+        const dy = e.clientY - lastY;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        app.orbit_drag(dx, dy);
+      });
+
+      const endDrag = () => {
+        dragging = false;
+        canvas.classList.remove("dragging");
+      };
+      canvas.addEventListener("pointerup", endDrag);
+      canvas.addEventListener("pointercancel", endDrag);
+
+      canvas.addEventListener(
+        "wheel",
+        (e) => {
+          e.preventDefault();
+          app.zoom_wheel(e.deltaY);
+        },
+        { passive: false }
+      );
+
+      // Drag-and-drop any FM3D .bin volume onto the viewport
+      window.addEventListener("dragover", (e) => e.preventDefault());
+      window.addEventListener("drop", async (e) => {
+        e.preventDefault();
+        const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+        if (!file) return;
+        try {
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          app.load_fm3d_volume(bytes, `FM3D (${file.name})`);
+          usingFm3d = true;
+          lblVolume.textContent = "Showcase";
+          btnVolume.classList.add("active");
+        } catch (err) {
+          console.error("Failed to load dropped FM3D file:", err);
+        }
+      });
+
+      window.addEventListener("resize", () => syncCanvasSize(app));
+
+      // Reveal live WebGPU viewport!
+      overlay.classList.add("hidden");
+
+      let lastTime = performance.now();
+      let lastHudUpdate = 0;
+
+      function frame(now) {
+        const dt = Math.min(Math.max((now - lastTime) / 1000.0, 0.001), 0.1);
+        lastTime = now;
+
+        app.tick_and_render(dt);
+
+        if (now - lastHudUpdate > 120) {
+          lastHudUpdate = now;
+          const s = JSON.parse(app.get_hud_stats());
+          statFps.textContent = `${s.fps.toFixed(0)} FPS (${s.frame_ms.toFixed(1)} ms)`;
+          statAdapter.textContent = s.adapter;
+          statBackend.textContent = s.backend;
+          statBackend.classList.toggle("green", s.backend === "BrowserWebGpu");
+          statMesh.textContent = `${s.triangles.toLocaleString()} tris (${s.sn_build_ms.toFixed(0)} ms)`;
+          statVoxels.textContent = `${s.vol_w}×${s.vol_h}×${s.vol_d} (${(s.voxels / 1e6).toFixed(2)}M)`;
+          statBricks.textContent = `${s.non_empty_bricks} / ${s.total_bricks} active`;
+          statStyle.textContent = s.style;
+          statWalk.textContent =
+            s.walk_mode === "Capsule-3D"
+              ? `Capsule-3D (${s.grounded ? "Grounded" : "Airborne"})`
+              : "Free-Fly";
+          statCam.textContent = `${s.cam_x.toFixed(1)}, ${s.cam_y.toFixed(1)}, ${s.cam_z.toFixed(1)}`;
+          statSource.textContent = `${s.volume_source}`;
+        }
+
+        requestAnimationFrame(frame);
+      }
+
+      requestAnimationFrame(frame);
+    }
+
+    boot();
+  </script>
+</body>
+</html>

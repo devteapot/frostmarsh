@@ -5,11 +5,13 @@
 struct SceneUniforms {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
+    view: mat4x4<f32>,
+    proj: mat4x4<f32>,
     cam_pos: vec4<f32>,     // xyz = camera world pos, w = sim_time
     sun_dir: vec4<f32>,     // xyz = unit vector toward sun, w = exposure
-    sun_col: vec4<f32>,     // rgb = directional sun radiance
-    sky_top: vec4<f32>,     // rgb = zenith sky
-    sky_horizon: vec4<f32>, // rgb = horizon sky / alpine fog
+    sun_col: vec4<f32>,     // rgb = directional sun radiance, w = focal_px
+    sky_top: vec4<f32>,     // rgb = zenith sky, w = style_id
+    sky_horizon: vec4<f32>, // rgb = horizon sky / alpine fog, w = stylized
     vol_dims: vec4<f32>,    // xyz = (256, 16, 256), w = tonemap_flag (1.0 = output tonemapped)
     brick_dims: vec4<f32>,  // xyz = (32, 2, 32), w = brick_size (8.0)
     viewport: vec4<f32>,    // xy = (w, h), zw = (1/w, 1/h)

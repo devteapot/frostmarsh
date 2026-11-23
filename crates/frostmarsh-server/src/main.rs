@@ -55,7 +55,7 @@ struct Args {
     /// Horizontal square grid dimension (128, 256, or 512)
     #[arg(long, default_value_t = 256)]
     size: usize,
-    /// Number of physically coupled 3D vertical strata (1, 4, or 8; default 4 => 262,144 voxels!)
+    /// Number of physically coupled 3D vertical strata (1, 4, 8, or 16; default 4 => 262,144 voxels, 16 => isotropic 3D!)
     #[arg(long, default_value_t = 4)]
     layers: usize,
     /// Number of role-aware AI bots (6v6 = 12)
@@ -855,8 +855,30 @@ struct GameState {
 }
 
 impl GameState {
+    #[inline]
+    fn is_z16(&self) -> bool {
+        self.grid_d >= 16
+    }
+
     fn surf_layer(&self) -> usize {
-        if self.grid_d >= 2 { 1 } else { 0 }
+        if self.grid_d >= 16 {
+            4
+        } else if self.grid_d >= 2 {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn find_z16_surface_z(&self, x: f32, y: f32, start_z: f32) -> f32 {
+        let mut z = start_z.clamp(1.0, (self.grid_d as f32) - 1.5);
+        while z > 0.6 {
+            if self.volume.sample_solid_density_3d(x, y, z) >= 0.5 {
+                return (z + 0.25).min((self.grid_d as f32) - 2.0);
+            }
+            z -= 0.2;
+        }
+        1.5
     }
 
     fn build_shrines(w: usize, h: usize) -> Vec<ShrineEntity> {
@@ -879,7 +901,7 @@ impl GameState {
     ) -> Self {
         let grid_w = (size / CHUNK_SIZE).max(4) * CHUNK_SIZE;
         let grid_h = grid_w;
-        let grid_d = layers.clamp(1, 8);
+        let grid_d = layers.clamp(1, 16);
         let chunks_x = chunks_for_dim(grid_w);
         let chunks_y = chunks_for_dim(grid_h);
         let volume = VolumeField::new_shattered_reach_3d(grid_w, grid_h, grid_d);
@@ -1248,6 +1270,24 @@ impl GameState {
     fn spawn_point(&self, team: u8, salt: u32) -> (f32, f32, f32) {
         let wf = self.grid_w as f32;
         let hf = self.grid_h as f32;
+        if self.is_z16() {
+            let off = ((salt % 7) as f32 - 3.0) * (hf * 0.014);
+            let (sx, sy, scan_z) = if salt % 3 == 1 {
+                if team == 0 {
+                    // Near the East mouth of the vaulted basalt cave (z ≈ 1.6..2.0)
+                    (wf * 0.375, hf * 0.700, 4.5)
+                } else {
+                    // East bridge approach overlooking the 3-span stone & timber bridge (z ≈ 8.1)
+                    (wf * 0.715, hf * 0.500, 12.5)
+                }
+            } else if team == 0 {
+                (wf * 0.22, hf * 0.50 + off, 12.5)
+            } else {
+                (wf * 0.80, hf * 0.50 + off, 12.5)
+            };
+            let sz = self.find_z16_surface_z(sx, sy, scan_z);
+            return (sx, sy, sz);
+        }
         let surf_z = self.surf_layer() as f32;
         // Put every 3rd hero onto the Layer 2 Highland Plateau (when depth >= 3) for immediate 3D verticality!
         if self.grid_d >= 3 && salt % 3 == 1 {
@@ -1619,7 +1659,7 @@ impl GameState {
                 let (ddx, ddy) = if mlen > 0.01 { (dx, dy) } else { (p.aim_x, p.aim_y) };
                 p.vx = ddx * 42.0;
                 p.vy = ddy * 42.0;
-                p.vz = 1.8; // small vertical leap when dashing!
+                p.vz = if self.grid_d >= 16 { 6.2 } else { 1.8 }; // vertical leap when dashing!
             } else if tick >= p.dash_until {
                 let mut speed = if p.carrying_relic { base_spd * 0.78 } else { base_spd };
                 if tick < p.haste_until {
@@ -1713,11 +1753,12 @@ impl GameState {
         }
 
         if let Some((team, px, py, pz, ax, ay, dmg)) = melee_hit_check {
+            let z_tol = if self.is_z16() { 2.2 } else { 0.75 };
             let targets: Vec<u32> = self
                 .players
                 .values()
                 .filter(|t| {
-                    if t.id == pid || t.team == team || tick < t.dash_until || (t.z - pz).abs() > 0.75 {
+                    if t.id == pid || t.team == team || tick < t.dash_until || (t.z - pz).abs() > z_tol {
                         return false;
                     }
                     let rx = t.x - px;
@@ -2488,14 +2529,30 @@ impl GameState {
             let desired_owner = if team == 0 { -1 } else { 1 };
             let (tx, ty) = if carrying {
                 if team == 0 { (gw * 0.12, gh * 0.50) } else { (gw * 0.88, gh * 0.50) }
-            } else if mz >= 1.6 && bid % 3 == 1 {
+            } else if self.is_z16() && bid % 3 == 1 {
+                if team == 0 {
+                    // Vaulted basalt cave & under-bridge patrol
+                    let phase = ((tick as f32 * 0.008 + bid as f32).sin() + 1.0) * 0.5;
+                    (gw * (0.235 + 0.145 * phase), gh * (0.720 - 0.025 * phase))
+                } else {
+                    // 3-span arched bridge patrol across the canyon
+                    let patrol_x = gw * (0.50 + 0.18 * ((tick as f32 * 0.01 + bid as f32).sin()));
+                    (patrol_x, gh * 0.50)
+                }
+            } else if !self.is_z16() && mz >= 1.6 && bid % 3 == 1 {
                 // Highland Skybridge squad — actively duels across the Layer 2 Stone Sky-Arch!
                 let patrol_x = gw * (0.50 + 0.14 * ((tick as f32 * 0.01 + bid as f32).sin()));
                 (patrol_x, gh * 0.29)
             } else if bid % 3 == 0 {
                 let on_home_side = (team == 0) == (mx < gw * 0.50);
                 if (mx - gw * 0.50).abs() > gw * 0.14 && on_home_side {
-                    let bridge_y = if bid % 2 == 0 { gh * 0.31 } else { gh * 0.71 };
+                    let bridge_y = if self.is_z16() {
+                        gh * 0.50
+                    } else if bid % 2 == 0 {
+                        gh * 0.31
+                    } else {
+                        gh * 0.71
+                    };
                     (gw * 0.50, bridge_y)
                 } else {
                     (self.relic_x + (bid as f32 * 1.9).sin() * 5.0, self.relic_y + (bid as f32 * 2.3).cos() * 5.0)
@@ -2748,14 +2805,19 @@ impl GameState {
                     p.chilled_until, p.team, p.last_phys_blast_field_tick,
                 )
             };
-            let cur_layer = (pz.round() as usize).clamp(surf_l, self.grid_d - 1);
+            let is_z16 = self.is_z16();
+            let cur_layer = if is_z16 {
+                (pz.round() as usize).clamp(0, self.grid_d - 1)
+            } else {
+                (pz.round() as usize).clamp(surf_l, self.grid_d - 1)
+            };
             let hz_here = self.sample_hazard(px, py, cur_layer);
             let phys = if physics_native {
                 self.volume.sample_entity_physics(px, py, cur_layer)
             } else {
                 EntityVoxelPhysics::default()
             };
-            let on_raft = if pz < 1.35 {
+            let on_raft = if !is_z16 && pz < 1.35 {
                 self.rafts.iter().find_map(|b| {
                     if (px - b.x).powi(2) + (py - b.y).powi(2) <= (b.radius + 1.0).powi(2) {
                         Some((b.vx, b.vy))
@@ -2801,86 +2863,100 @@ impl GameState {
             if kb_vx.abs() < 0.05 { kb_vx = 0.0; }
             if kb_vy.abs() < 0.05 { kb_vy = 0.0; }
 
-            // Continuous bilinear solid-density gradient capsule collider (R = 0.65, probes at 0.55)
-            // Exact 1:1 parity with client `predict_hero_step`: weaves between 3×3 pine trunks and glides smoothly along walls!
-            let coll_layer = if pz >= 1.55 { 2.min(self.grid_d - 1) } else { surf_l };
-            let dashing_now = tick < dash_until;
-            let capsule_at = |tx: f32, ty: f32| -> f32 {
-                let allow_water = dashing_now
-                    || on_raft.is_some()
-                    || (pz < 1.35
-                        && self.rafts.iter().any(|b| {
-                            (tx - b.x).powi(2) + (ty - b.y).powi(2) <= (b.radius + 1.0).powi(2)
-                        }));
-                self.sample_capsule_density(tx, ty, coll_layer, allow_water)
-            };
+            let (fx, fy, fz);
+            if is_z16 {
+                // True isotropic 3D continuous ∇solid_density capsule locomotion (caves, slopes, 3-span arched bridge!)
+                let ((nx, ny, nz), (_nvx, _nvy, nvz), _grounded) =
+                    self.volume.step_capsule_3d((px, py, pz), (vx_s, vy_s, vz), 0.55, 1.80, dt);
+                fx = nx;
+                fy = ny;
+                fz = nz.clamp(0.0, (self.grid_d as f32) - 0.5);
+                vz = nvz;
+            } else {
+                // Continuous bilinear solid-density gradient capsule collider (R = 0.65, probes at 0.55)
+                // Exact 1:1 parity with client `predict_hero_step`: weaves between 3×3 pine trunks and glides smoothly along walls!
+                let coll_layer = if pz >= 1.55 { 2.min(self.grid_d - 1) } else { surf_l };
+                let dashing_now = tick < dash_until;
+                let capsule_at = |tx: f32, ty: f32| -> f32 {
+                    let allow_water = dashing_now
+                        || on_raft.is_some()
+                        || (pz < 1.35
+                            && self.rafts.iter().any(|b| {
+                                (tx - b.x).powi(2) + (ty - b.y).powi(2) <= (b.radius + 1.0).powi(2)
+                            }));
+                    self.sample_capsule_density(tx, ty, coll_layer, allow_water)
+                };
 
-            let mut fx = (px + vx_s * dt).clamp(3.5, gw - 3.5);
-            let mut fy = (py + vy_s * dt).clamp(3.5, gh - 3.5);
-            for _ in 0..2 {
-                let dens = capsule_at(fx, fy);
-                if dens <= 0.35 {
-                    break;
-                }
-                let eps = 0.35f32;
-                let gx = (capsule_at(fx + eps, fy) - capsule_at(fx - eps, fy)) / (2.0 * eps);
-                let gy = (capsule_at(fx, fy + eps) - capsule_at(fx, fy - eps)) / (2.0 * eps);
-                let gmag = gx.hypot(gy);
-                if gmag > 1e-4 {
-                    let nx = gx / gmag;
-                    let ny = gy / gmag;
-                    let vn = vx_s * nx + vy_s * ny;
-                    if vn > 0.0 {
-                        vx_s -= vn * nx;
-                        vy_s -= vn * ny;
+                let mut mx = (px + vx_s * dt).clamp(3.5, gw - 3.5);
+                let mut my = (py + vy_s * dt).clamp(3.5, gh - 3.5);
+                for _ in 0..2 {
+                    let dens = capsule_at(mx, my);
+                    if dens <= 0.35 {
+                        break;
                     }
-                    let push = ((dens - 0.35) * 0.65).min(0.45);
-                    fx = (px + vx_s * dt - nx * push).clamp(3.5, gw - 3.5);
-                    fy = (py + vy_s * dt - ny * push).clamp(3.5, gh - 3.5);
-                } else {
-                    fx = px;
-                    fy = py;
-                    break;
+                    let eps = 0.35f32;
+                    let gx = (capsule_at(mx + eps, my) - capsule_at(mx - eps, my)) / (2.0 * eps);
+                    let gy = (capsule_at(mx, my + eps) - capsule_at(mx, my - eps)) / (2.0 * eps);
+                    let gmag = gx.hypot(gy);
+                    if gmag > 1e-4 {
+                        let nx = gx / gmag;
+                        let ny = gy / gmag;
+                        let vn = vx_s * nx + vy_s * ny;
+                        if vn > 0.0 {
+                            vx_s -= vn * nx;
+                            vy_s -= vn * ny;
+                        }
+                        let push = ((dens - 0.35) * 0.65).min(0.45);
+                        mx = (px + vx_s * dt - nx * push).clamp(3.5, gw - 3.5);
+                        my = (py + vy_s * dt - ny * push).clamp(3.5, gh - 3.5);
+                    } else {
+                        mx = px;
+                        my = py;
+                        break;
+                    }
                 }
-            }
-            let d_final = capsule_at(fx, fy);
-            if d_final > 0.62 && capsule_at(px, py) < d_final {
-                fx = px;
-                fy = py;
-            }
-
-            // 3D Vertical Altitude Update:
-            // - In physics_native: structural support comes directly from `sample_entity_physics(..., 2).support_solid`!
-            //   If a timber skybridge burns or ice bridge melts beneath an L2 entity, gravity drops them cleanly to L1!
-            let l2_deck = if self.grid_d >= 3 {
-                if physics_native {
-                    let p2 = self.volume.sample_entity_physics(fx, fy, 2);
-                    p2.support_solid && (self.sample_hazard(fx, fy, 2) & (1 << 1)) == 0
-                } else {
-                    self.layer2_has_walkable_deck(fx, fy)
+                let d_final = capsule_at(mx, my);
+                if d_final > 0.62 && capsule_at(px, py) < d_final {
+                    mx = px;
+                    my = py;
                 }
-            } else {
-                false
-            };
-            let nx_norm = fx / gw;
-            let ny_norm = fy / gh;
-            let on_ramp = self.grid_d >= 3
-                && (((ny_norm - 0.33).abs() < 0.025 && (nx_norm < 0.36 || nx_norm > 0.64))
-                    || (((nx_norm - 0.76).powi(2) + (ny_norm - 0.66).powi(2)).sqrt() > 0.08
-                        && ((nx_norm - 0.76).powi(2) + (ny_norm - 0.66).powi(2)).sqrt() < 0.11));
+                fx = mx;
+                fy = my;
 
-            let mut fz = pz;
-            if l2_deck && (pz >= 1.45 || on_ramp) {
-                fz = (pz + 3.2 * dt).min(2.0);
-                vz = 0.0;
-            } else {
-                // Apply gravity toward surface layer
-                vz -= 8.5 * dt;
-                fz += vz * dt;
-                if fz <= surf_z {
-                    fz = surf_z;
+                // 3D Vertical Altitude Update:
+                // - In physics_native: structural support comes directly from `sample_entity_physics(..., 2).support_solid`!
+                //   If a timber skybridge burns or ice bridge melts beneath an L2 entity, gravity drops them cleanly to L1!
+                let l2_deck = if self.grid_d >= 3 {
+                    if physics_native {
+                        let p2 = self.volume.sample_entity_physics(fx, fy, 2);
+                        p2.support_solid && (self.sample_hazard(fx, fy, 2) & (1 << 1)) == 0
+                    } else {
+                        self.layer2_has_walkable_deck(fx, fy)
+                    }
+                } else {
+                    false
+                };
+                let nx_norm = fx / gw;
+                let ny_norm = fy / gh;
+                let on_ramp = self.grid_d >= 3
+                    && (((ny_norm - 0.33).abs() < 0.025 && (nx_norm < 0.36 || nx_norm > 0.64))
+                        || (((nx_norm - 0.76).powi(2) + (ny_norm - 0.66).powi(2)).sqrt() > 0.08
+                            && ((nx_norm - 0.76).powi(2) + (ny_norm - 0.66).powi(2)).sqrt() < 0.11));
+
+                let mut mz = pz;
+                if l2_deck && (pz >= 1.45 || on_ramp) {
+                    mz = (pz + 3.2 * dt).min(2.0);
                     vz = 0.0;
+                } else {
+                    // Apply gravity toward surface layer
+                    vz -= 8.5 * dt;
+                    mz += vz * dt;
+                    if mz <= surf_z {
+                        mz = surf_z;
+                        vz = 0.0;
+                    }
                 }
+                fz = mz;
             }
 
             let critter_here = (self.sample_hazard(fx, fy, surf_l) >> 5) & 0x07;
@@ -2972,19 +3048,25 @@ impl GameState {
         let old_proj = std::mem::take(&mut self.projectiles);
         let mut next_proj = Vec::with_capacity(old_proj.len());
         let mut proj_hits: Vec<(u32, u32, u8, f32, f32, f32, bool)> = Vec::new();
+        let proj_min_z = if self.is_z16() { 0.5 } else { surf_z };
+        let proj_z_tol = if self.is_z16() { 2.2 } else { 1.25 };
         for mut pr in old_proj {
             let dome_dt = self.sample_time_dome_scale(pr.x, pr.y);
             let pr_dt = dt * dome_dt;
             let nx = pr.x + pr.vx * pr_dt;
             let ny = pr.y + pr.vy * pr_dt;
-            let nz = (pr.z + pr.vz * pr_dt).clamp(surf_z, (self.grid_d - 1) as f32);
+            let nz = (pr.z + pr.vz * pr_dt).clamp(proj_min_z, (self.grid_d - 1) as f32);
             let pl = (nz.round() as usize).clamp(0, self.grid_d - 1);
 
             let mut hit = nx < 3.0
                 || nx >= gw - 3.0
                 || ny < 3.0
                 || ny >= gh - 3.0
-                || (self.sample_hazard(nx, ny, pl) & (1 << 1)) != 0;
+                || if self.is_z16() {
+                    self.volume.sample_solid_density_3d(nx, ny, nz) >= 0.55
+                } else {
+                    (self.sample_hazard(nx, ny, pl) & (1 << 1)) != 0
+                };
 
             let mut hit_pid = None;
             let mut high_ground = false;
@@ -2994,7 +3076,7 @@ impl GameState {
                         continue;
                     }
                     if (p.x - nx).powi(2) + (p.y - ny).powi(2) <= (2.1 + pr.radius).powi(2)
-                        && (p.z - nz).abs() <= 1.25
+                        && (p.z - nz).abs() <= proj_z_tol
                     {
                         hit = true;
                         hit_pid = Some(p.id);
@@ -3172,7 +3254,7 @@ impl GameState {
         } else if let Some((pid, team, name, px, py)) = self
             .players
             .values()
-            .find(|p| (p.x - self.relic_x).hypot(p.y - self.relic_y) <= 3.6 && p.z < 1.55)
+            .find(|p| (p.x - self.relic_x).hypot(p.y - self.relic_y) <= 3.6 && (self.is_z16() || p.z < 1.55))
             .map(|p| (p.id, p.team, p.name.clone(), p.x, p.y))
         {
             if let Some(p) = self.players.get_mut(&pid) {
@@ -3239,11 +3321,12 @@ impl GameState {
         }
         let tick = self.sim_tick;
         let surf_l = self.surf_layer();
+        let is_z16 = self.is_z16();
         let players: Vec<PlayerSnap> = self
             .players
             .values()
             .map(|p| {
-                let pl = (p.z.round() as usize).clamp(surf_l, self.grid_d - 1);
+                let pl = (p.z.round() as usize).clamp(if is_z16 { 0 } else { surf_l }, self.grid_d - 1);
                 let mut status = 0u8;
                 if self.physics_native {
                     let phys = self.volume.sample_entity_physics(p.x, p.y, pl);
@@ -3465,18 +3548,46 @@ impl GameState {
         Bytes::from(encode_server_datagram(&pkt))
     }
 
+    fn encode_brick3d_pkt(&self, bx: u16, by: u16) -> Bytes {
+        let brick_id = (by as u32) * (self.chunks_x as u32) + (bx as u32);
+        let (dm, at) = self.volume.encode_3d_brick_16(bx as usize, by as usize);
+        let brick = encode_brick3d_lz4(brick_id, bx, by, self.grid_d as u8, &dm, &at);
+        let pkt = ServerDatagram::VolumetricBrick3D(brick);
+        Bytes::from(encode_server_datagram(&pkt))
+    }
+
+    fn send_packet_datagram_or_uni(conn: &Connection, raw: Bytes) {
+        if let Err(quinn::SendDatagramError::TooLarge) = conn.send_datagram(raw.clone()) {
+            let conn_c = conn.clone();
+            tokio::spawn(async move {
+                if let Ok(mut send) = conn_c.open_uni().await {
+                    let mut framed = Vec::with_capacity(1 + raw.len());
+                    framed.push(0xFE);
+                    framed.extend_from_slice(&raw);
+                    let _ = send.write_all(&framed).await;
+                    let _ = send.finish();
+                }
+            });
+        }
+    }
+
     fn broadcast_chunks_10hz(&mut self, dirty: &[(u8, u16, u16)]) {
         if self.peers.is_empty() {
             return;
         }
+        let is_z16 = self.is_z16();
         let surf_l = self.surf_layer() as u8;
         let total_2d = self.chunks_x * self.chunks_y;
         let aoi_r = self.aoi_radius as i32;
 
         // Pre-encode dirty 3D chunks once (skipping completely empty air chunks on upper layers except when clearing)
         let mut dirty_map: HashMap<(u8, u16, u16), Bytes> = HashMap::with_capacity(dirty.len());
+        let mut dirty_bricks: HashMap<(u16, u16), Bytes> = HashMap::new();
         for &(layer, cx, cy) in dirty {
             dirty_map.insert((layer, cx, cy), self.encode_chunk_pkt(layer, cx, cy));
+            if is_z16 && !dirty_bricks.contains_key(&(cx, cy)) {
+                dirty_bricks.insert((cx, cy), self.encode_brick3d_pkt(cx, cy));
+            }
         }
 
         let any_full = self.peers.values().any(|p| p.needs_full_sync);
@@ -3485,7 +3596,7 @@ impl GameState {
             // Always send full surface layer (L1) + sparse non-empty chunks on L2 & L3!
             for layer in 0..(self.grid_d as u8) {
                 if layer == 0 && self.grid_d >= 2 {
-                    // L0 is deep riverbed beneath L1; only L1, L2, L3 need client visuals!
+                    // L0 is deep riverbed beneath L1; only upper layers need client visuals!
                     continue;
                 }
                 for cy in 0..(self.chunks_y as u16) {
@@ -3497,6 +3608,17 @@ impl GameState {
                             v.push(b.clone());
                         } else {
                             v.push(self.encode_chunk_pkt(layer, cx, cy));
+                        }
+                    }
+                }
+            }
+            if is_z16 {
+                for by in 0..(self.chunks_y as u16) {
+                    for bx in 0..(self.chunks_x as u16) {
+                        if let Some(b) = dirty_bricks.get(&(bx, by)) {
+                            v.push(b.clone());
+                        } else {
+                            v.push(self.encode_brick3d_pkt(bx, by));
                         }
                     }
                 }
@@ -3542,7 +3664,7 @@ impl GameState {
                 for b in &full_pkts {
                     peer_b += b.len() as u64;
                     sent_cnt += 1;
-                    let _ = peer.conn.send_datagram(b.clone());
+                    Self::send_packet_datagram_or_uni(&peer.conn, b.clone());
                 }
             } else {
                 let (pcx, pcy) = player_chunks
@@ -3559,6 +3681,17 @@ impl GameState {
                         peer_b += b.len() as u64;
                         sent_cnt += 1;
                         let _ = peer.conn.send_datagram(b.clone());
+                    }
+                }
+                if is_z16 {
+                    for (&(bx, by), b) in &dirty_bricks {
+                        let in_aoi = aoi_r == 0
+                            || ((bx as i32 - pcx).abs() <= aoi_r && (by as i32 - pcy).abs() <= aoi_r);
+                        if in_aoi {
+                            peer_b += b.len() as u64;
+                            sent_cnt += 1;
+                            Self::send_packet_datagram_or_uni(&peer.conn, b.clone());
+                        }
                     }
                 }
                 if aoi_r > 0 {

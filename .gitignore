@@ -20,12 +20,13 @@ spacetimedb/spacetime.local.json
 *.log
 *.pid
 
-# Trained model weights (hosted on Hugging Face Hub — fetch via ./scripts/download_models.sh)
+# Trained model weights & large binary volumes (hosted on Hugging Face Hub — fetch via ./scripts/download_models.sh)
 models/*.onnx
 models/*.pt
 models/checkpoints/
 models/tiers/*.onnx
 models/tiers/*.pt
+web/assets/*.bin
 
 # Temporary staging
 hf_staging/

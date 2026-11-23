@@ -21,6 +21,7 @@ pub struct CameraMatrices {
     pub forward: Vec3,
     pub right: Vec3,
     pub up: Vec3,
+    pub focal_px: f32,
 }
 
 impl Camera3D {
@@ -38,7 +39,7 @@ impl Camera3D {
         }
     }
 
-    /// View 1: Wide Arched Stone Bridge + Alpine Mountain Waterfall + Hero on & under bridge + Wildfire
+    /// View 1 (Procedural World): Wide Arched Stone Bridge + Alpine Waterfall + Heroes + Wildfire
     pub fn preset_bridge_waterfall() -> Self {
         Self::look_at(
             Vec3::new(107.5, 12.3, 153.5),
@@ -47,7 +48,7 @@ impl Camera3D {
         )
     }
 
-    /// View 2: Dramatic Vaulted Basalt Cave Mouth + Glowing Magma/Crystal Interior + Hero at entrance
+    /// View 2 (Procedural World): Dramatic Vaulted Basalt Cave Mouth + Glowing Magma + Hero
     pub fn preset_cave_mouth() -> Self {
         Self::look_at(
             Vec3::new(111.5, 6.8, 147.2),
@@ -56,12 +57,32 @@ impl Camera3D {
         )
     }
 
+    /// View 1 (Neural Latent `FMLT` Z=16 World): Sweeping 3-Span Arched Stone/Timber Bridge +
+    /// Towering Sculpted Nordic Pines + Plunging 3D Waterfall + Heroes on & under bridge!
+    pub fn preset_bridge_latent() -> Self {
+        Self::look_at(
+            Vec3::new(102.5, 13.6, 163.5),
+            Vec3::new(138.0, 7.3, 108.0),
+            50.0,
+        )
+    }
+
+    /// View 2 (Neural Latent `FMLT` Z=16 World): Dramatic Vaulted Basalt Cave Interior +
+    /// Sculpted Basalt Pillars + Dual Glowing Magma Vents + Subterranean Stream + Hero Knights!
+    pub fn preset_cave_latent() -> Self {
+        Self::look_at(
+            Vec3::new(77.5, 3.05, 122.0),
+            Vec3::new(50.0, 2.15, 131.0),
+            62.0,
+        )
+    }
+
     pub fn forward(&self) -> Vec3 {
         let cp = self.pitch.cos();
         Vec3::new(self.yaw.cos() * cp, self.pitch.sin(), self.yaw.sin() * cp).normalize()
     }
 
-    pub fn matrices(&self, aspect: f32) -> CameraMatrices {
+    pub fn matrices(&self, aspect: f32, viewport_h: f32) -> CameraMatrices {
         let forward = self.forward();
         let right = forward.cross(Vec3::Y).normalize_or(Vec3::X);
         let up = right.cross(forward).normalize_or(Vec3::Y);
@@ -74,6 +95,7 @@ impl Camera3D {
         );
         let view_proj = proj * view;
         let inv_view_proj = view_proj.inverse();
+        let focal_px = 0.5 * viewport_h.max(1.0) / (self.fov_y * 0.5).tan().max(1e-4);
         CameraMatrices {
             view,
             proj,
@@ -82,6 +104,7 @@ impl Camera3D {
             forward,
             right,
             up,
+            focal_px,
         }
     }
 }

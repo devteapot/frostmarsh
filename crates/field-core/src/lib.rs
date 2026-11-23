@@ -1702,6 +1702,22 @@ impl VolumeField {
     pub fn new_shattered_reach_3d(width: usize, height: usize, depth: usize) -> Self {
         let d = depth.max(1);
         let mut layers: Vec<Field> = (0..d).map(|_| Field::new_empty(width, height)).collect();
+        if d >= 16 {
+            let vlen = d * width * height;
+            let mut vf = Self {
+                width,
+                height,
+                depth: d,
+                layers,
+                prev_temp: vec![T_AMB as i32; vlen],
+                prev_steam: vec![0i32; vlen],
+                initial_total_mass: 0,
+                initial_total_energy: 0,
+                tick: 0,
+            };
+            vf.init_shattered_reach_z16();
+            return vf;
+        }
         let wf = width as f32;
         let hf = height as f32;
 
@@ -1903,8 +1919,41 @@ impl VolumeField {
         self.layers.iter().map(|l| l.refsim_raw_outputs()).collect()
     }
 
-    /// Apply zero-violation weather across the 3D volume (and maintain Layer 2 highland waterfall springs).
+    /// Apply zero-violation weather across the 3D volume (and maintain highland waterfall springs).
     pub fn apply_weather_and_springs_3d(&mut self, weather_kind: u8, tick: u64) {
+        if self.depth >= 16 {
+            let surf_l = 4usize.min(self.depth - 1);
+            self.layers[surf_l].apply_weather_tick(weather_kind, tick);
+            // Replenish the Z=10 upper highland glacial basin so the plunging 3D waterfall cascades continuously
+            // (tracked explicitly in `faucet_mass` / `faucet_energy` -> zero conservation error!)
+            let w = self.width;
+            let h = self.height;
+            let wf = w as f32;
+            let hf = h as f32;
+            let l10 = &mut self.layers[10];
+            let cy = (0.17 * hf) as usize;
+            let cx = (0.50 * wf) as usize;
+            let rx = (w / 48).clamp(2, 6);
+            let ry = (h / 64).clamp(1, 4);
+            for y in cy.saturating_sub(ry)..=(cy + ry).min(h - 3) {
+                for x in cx.saturating_sub(rx)..=(cx + rx).min(w - 3) {
+                    let idx = y * w + x;
+                    let cur = l10.mass[SP_WATER][idx];
+                    if cur < 1050 && l10.mass[SP_ROCK][idx] < 500 && l10.mass[SP_ICE][idx] < 500 {
+                        let room = H_CAP.saturating_sub(l10.cell_volume(idx)) as u16;
+                        let add = (1050 - cur).min(140).min(room);
+                        if add > 0 {
+                            l10.mass[SP_WATER][idx] += add;
+                            let e_add = (add as i64) * SPECIES[SP_WATER].c * 28_000;
+                            l10.energy[idx] += e_add;
+                            l10.faucet_mass[SP_WATER] += add as i64;
+                            l10.faucet_energy += e_add;
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let surf_l = if self.depth >= 2 { 1 } else { 0 };
         self.layers[surf_l].apply_weather_tick(weather_kind, tick);
         if self.depth >= 3 {
@@ -2624,6 +2673,924 @@ impl VolumeField {
         let l = layer.min(self.depth - 1);
         self.layers[l].apply_steam_burst(cx, cy, radius)
     }
+
+    // =========================================================================
+    // TRUE ISOTROPIC 3D Z=16 WORLD, FM3D BRICK ENCODER & CAPSULE LOCOMOTION
+    // =========================================================================
+
+    /// Initialize a true isotropic 3D `W × H × 16` (`1m × 1m × 1m`) **Shattered Reach** world
+    /// (used when `depth >= 16`; leaves `depth == 4` completely intact):
+    /// - Vaulted basalt cave tunnel (`z=1..5`) with ceiling arch, pillars, subterranean stream & magma vents
+    /// - Sculpted alpine mountain slopes & river canyon (`z=3..13`)
+    /// - True 3-span arched stone & timber bridge (`z=4..9`) with masonry piers & open flowing river underneath
+    /// - Upper highland glacial basin (`z=10`) with plunging 3D waterfall into the river
+    /// - Biomass-scaled conifers (`wood` trunks + `plant` canopy reaching `z=12..14`) + active wildfire!
+    pub fn init_shattered_reach_z16(&mut self) {
+        let w = self.width;
+        let h = self.height;
+        let d = self.depth;
+        if w == 0 || h == 0 || d == 0 {
+            return;
+        }
+        let wf = w as f32;
+        let hf = h as f32;
+
+        // Reset all layers cleanly so this initializer is completely idempotent
+        self.layers = (0..d).map(|_| Field::new_empty(w, h)).collect();
+        self.tick = 0;
+
+        // Bridge geometry parameters (proportional in X/Y, metric in Z!)
+        let bridge_cy = 0.50 * hf;
+        let bridge_hw_y = (hf * 0.032).clamp(3.8, 5.6);
+        let bridge_x0 = 0.29 * wf;
+        let bridge_x1 = 0.71 * wf;
+        let bridge_cx = 0.50 * wf;
+        let bridge_half_span = 0.21 * wf;
+
+        // Vaulted basalt cave tunnel spline in SW mountain (world X, world Y, floor_z, half_w_m, vault_h_m)
+        let cave_hw = (wf * 0.042).max(4.6);
+        let cave_pts: [(f32, f32, f32, f32, f32); 4] = [
+            (0.375 * wf, 0.700 * hf, 1.55, cave_hw * 1.05, 4.30),
+            (0.305 * wf, 0.710 * hf, 1.55, cave_hw, 4.25),
+            (0.235 * wf, 0.720 * hf, 1.55, cave_hw * 1.15, 4.40),
+            (0.155 * wf, 0.745 * hf, 1.55, cave_hw * 0.92, 4.00),
+        ];
+        // Cave basalt pillars offset cleanly off the central walkway so capsule traversal stays clear
+        let cave_pillars: [(f32, f32, f32); 2] = [
+            (0.275 * wf, 0.715 * hf + 3.2, 0.85),
+            (0.220 * wf, 0.722 * hf - 3.2, 0.90),
+        ];
+
+        // Deterministic biomass-scaled conifer placements (nx, ny, height_m, canopy_r_m)
+        let conifers: &[(f32, f32, f32, f32)] = &[
+            // East alpine bluff & ridge (canopies reaching z=12..14)
+            (0.76, 0.24, 5.8, 2.3),
+            (0.82, 0.30, 6.0, 2.4),
+            (0.70, 0.20, 5.4, 2.2),
+            (0.78, 0.64, 5.8, 2.4),
+            (0.72, 0.72, 5.6, 2.3),
+            (0.84, 0.70, 5.5, 2.2),
+            // West alpine bluff & cave mountain crest (proving solid mountain roof thickness!)
+            (0.22, 0.24, 5.6, 2.3),
+            (0.16, 0.32, 5.8, 2.4),
+            (0.28, 0.20, 5.4, 2.2),
+            (0.20, 0.64, 4.2, 2.0),
+            (0.26, 0.80, 4.4, 2.0),
+            (0.14, 0.84, 5.2, 2.2),
+            // North highland ridges flanking the glacial basin
+            (0.36, 0.14, 4.2, 2.0),
+            (0.64, 0.14, 4.2, 2.0),
+        ];
+
+        // 1. Precompute 2D sculpted alpine & canyon base heightfield (in metric Z units, 0..14)
+        let mut base_h = vec![0.0f32; w * h];
+        for y in 0..h {
+            let wy = y as f32 + 0.5;
+            let ny = wy / hf;
+            let river_cx_n = 0.50 + 0.032 * ((ny - 0.50) * std::f32::consts::TAU * 1.1).sin();
+            for x in 0..w {
+                let wx = x as f32 + 0.5;
+                let nx = wx / wf;
+
+                let n_big = z16_fbm2(nx * 5.2, ny * 5.2);
+                let n_med = z16_fbm2(nx * 14.0 + 11.3, ny * 14.0 - 7.1);
+                let dist_r = (nx - river_cx_n).abs();
+
+                // Sculpted river canyon: riverbed at z=0.95, banks rising smoothly to z=6.2..7.5
+                let canyon_t = z16_smoothstep(0.042, 0.145, dist_r);
+                let mut gh = 0.95 + canyon_t * 5.35 + n_big * 1.15 + n_med * 0.35;
+
+                // Dry West under-bridge riverside path (nx ≈ 0.388, ny ∈ [0.34..0.67]) at z=2.85
+                let under_w_x = 1.0 - z16_smoothstep(0.020, 0.046, (nx - 0.388).abs());
+                let under_w_y = z16_smoothstep(0.32, 0.37, ny) * (1.0 - z16_smoothstep(0.63, 0.68, ny));
+                let under_w = under_w_x * under_w_y;
+                gh = gh * (1.0 - under_w) + 2.85 * under_w;
+
+                // Dry East under-bridge riverside terrace (nx ≈ 0.612, ny ∈ [0.38..0.62]) at z=2.95
+                let under_e_x = 1.0 - z16_smoothstep(0.018, 0.044, (nx - 0.612).abs());
+                let under_e_y = z16_smoothstep(0.36, 0.41, ny) * (1.0 - z16_smoothstep(0.59, 0.64, ny));
+                let under_e = under_e_x * under_e_y;
+                gh = gh * (1.0 - under_e) + 2.95 * under_e;
+
+                // Smooth bridge approach ramps & abutments meeting bridge ends at nx=0.29 and nx=0.71, ny=0.50
+                let y_bridge_env = 1.0 - z16_smoothstep(0.030, 0.085, (ny - 0.50).abs());
+                let w_abut = (1.0 - z16_smoothstep(0.025, 0.085, (nx - 0.285).abs())) * y_bridge_env;
+                let e_abut = (1.0 - z16_smoothstep(0.025, 0.085, (nx - 0.715).abs())) * y_bridge_env;
+                gh = gh * (1.0 - w_abut) + 8.05 * w_abut;
+                gh = gh * (1.0 - e_abut) + 8.05 * e_abut;
+
+                // North Alpine Mountain Massif (ny ∈ [0.05..0.28], peaking up to z=12.8!)
+                let mtn_n_y = z16_smoothstep(0.02, 0.09, ny) * (1.0 - z16_smoothstep(0.21, 0.30, ny));
+                let mtn_n_x = 1.0 - z16_smoothstep(0.14, 0.42, (nx - 0.50).abs());
+                let peak_nw = (1.0 - z16_smoothstep(0.0, 0.16, (nx - 0.36).hypot(ny - 0.15))) * 5.6;
+                let peak_ne = (1.0 - z16_smoothstep(0.0, 0.16, (nx - 0.64).hypot(ny - 0.15))) * 5.8;
+                gh += mtn_n_x * mtn_n_y * 4.8 + peak_nw + peak_ne;
+
+                // Upper Highland Glacial Basin at (nx=0.50, ny=0.14) with basin floor at z=9.2 & water at z=10!
+                let basin_r = (((nx - 0.50) / 0.095).powi(2) + ((ny - 0.145) / 0.060).powi(2)).sqrt();
+                let basin_w = 1.0 - z16_smoothstep(0.48, 1.05, basin_r);
+                gh = gh * (1.0 - basin_w) + 9.25 * basin_w;
+
+                // Waterfall spillway notch at (nx=0.50, ny=0.195..0.225) & plunge pool at (nx=0.50, ny=0.24..0.30)
+                let notch_x = 1.0 - z16_smoothstep(0.020, 0.040, (nx - 0.50).abs());
+                let notch_y = z16_smoothstep(0.185, 0.205, ny) * (1.0 - z16_smoothstep(0.218, 0.236, ny));
+                let notch_w = notch_x * notch_y;
+                gh = gh * (1.0 - notch_w) + 9.65 * notch_w;
+
+                let pool_r = (((nx - 0.50) / 0.065).powi(2) + ((ny - 0.265) / 0.042).powi(2)).sqrt();
+                let pool_w = 1.0 - z16_smoothstep(0.42, 1.05, pool_r);
+                gh = gh * (1.0 - pool_w) + 0.90 * pool_w;
+
+                // SW Basalt Mountain Massif housing the vaulted cave tunnel (nx=0.12..0.35, ny=0.60..0.85)
+                let cave_mtn_r = (((nx - 0.235) / 0.135).powi(2) + ((ny - 0.725) / 0.135).powi(2)).sqrt();
+                let cave_mtn_w = 1.0 - z16_smoothstep(0.45, 1.08, cave_mtn_r);
+                let cave_mtn_h = 11.4 + n_med * 0.75 + (1.0 - cave_mtn_r.min(1.0)) * 1.3;
+                gh = gh.max(gh * (1.0 - cave_mtn_w) + cave_mtn_h * cave_mtn_w);
+
+                // Smooth gravel apron right outside East cave mouth (nx=0.35..0.42, ny=0.65..0.74) at z=1.60
+                let apron_r = (((nx - 0.385) / 0.048).powi(2) + ((ny - 0.695) / 0.052).powi(2)).sqrt();
+                let apron_w = 1.0 - z16_smoothstep(0.50, 1.05, apron_r);
+                gh = gh * (1.0 - apron_w) + 1.60 * apron_w;
+
+                // East Wildfire Bluff terrace at (nx=0.74, ny=0.38) at z=6.6
+                let fire_r = (((nx - 0.74) / 0.065).powi(2) + ((ny - 0.38) / 0.065).powi(2)).sqrt();
+                let fire_w = 1.0 - z16_smoothstep(0.45, 1.05, fire_r);
+                gh = gh * (1.0 - fire_w) + 6.60 * fire_w;
+
+                // West & East team spawn clearings gently leveled around z=5.8
+                let sp_w_r = ((nx - 0.14).powi(2) + (ny - 0.50).powi(2)).sqrt();
+                let sp_w = 1.0 - z16_smoothstep(0.04, 0.09, sp_w_r);
+                gh = gh * (1.0 - sp_w) + 5.80 * sp_w;
+
+                let sp_e_r = ((nx - 0.86).powi(2) + (ny - 0.50).powi(2)).sqrt();
+                let sp_e = 1.0 - z16_smoothstep(0.04, 0.09, sp_e_r);
+                gh = gh * (1.0 - sp_e) + 5.80 * sp_e;
+
+                base_h[y * w + x] = gh.clamp(0.85, 13.2);
+            }
+        }
+
+        // 2. Populate all Z=0..depth layers with exact conserved integer masses & temperatures
+        for y in 0..h {
+            let wy = y as f32 + 0.5;
+            let ny = wy / hf;
+            let river_cx_n = 0.50 + 0.032 * ((ny - 0.50) * std::f32::consts::TAU * 1.1).sin();
+            let river_slope = ((1.0 - ny) * 5.0) as u8;
+
+            for x in 0..w {
+                let wx = x as f32 + 0.5;
+                let nx = wx / wf;
+                let idx = y * w + x;
+                let gh = base_h[idx];
+                let dist_r = (nx - river_cx_n).abs();
+                let is_perimeter = x < 2 || x + 2 >= w || y < 2 || y + 2 >= h;
+
+                for z in 0..d {
+                    let wz = z as f32 + 0.5;
+                    let f = &mut self.layers[z];
+                    f.elevation[idx] = ((z * 2).min(26) as u8).saturating_add(if z <= 3 { river_slope } else { 0 });
+
+                    // Solid bedrock at Z=0 everywhere and perimeter cliffs on Z<=9
+                    if z == 0 {
+                        f.mass[SP_ROCK][idx] = 1200;
+                        f.set_cell_temp(idx, T_AMB);
+                        continue;
+                    }
+                    if is_perimeter && z <= 9 {
+                        f.mass[SP_ROCK][idx] = 1200;
+                        f.set_cell_temp(idx, T_AMB);
+                        continue;
+                    }
+
+                    // --- Base Terrain SDF ---
+                    let mut sdf = wz - gh;
+                    // Material tag: 0=terrain, 1=bridge_stone, 2=bridge_timber, 3=basalt_cave,
+                    // 4=conifer_wood, 5=conifer_plant, 6=magma_rock, 7=glacial_ice
+                    let mut mat_kind = 0u8;
+
+                    // --- True 3-Span Arched Stone & Timber Bridge (ny ≈ 0.50, nx ∈ [0.29..0.71], z=4..9) ---
+                    let dy_b = (wy - bridge_cy).abs();
+                    if wx >= bridge_x0 - 1.5
+                        && wx <= bridge_x1 + 1.5
+                        && dy_b <= bridge_hw_y + 1.5
+                        && wz <= 10.6
+                    {
+                        let u = ((wx - bridge_cx) / bridge_half_span).clamp(-1.0, 1.0);
+                        let deck_top = 8.80 - 0.72 * u * u;
+                        let prism_x = (wx - bridge_cx).abs() - bridge_half_span;
+                        let prism_y = dy_b - bridge_hw_y;
+                        let prism_z = wz - deck_top;
+                        let mut bridge_sdf = prism_x.max(prism_y).max(prism_z);
+
+                        // 3 generous elliptical archways:
+                        // West dry-path arch (nx=0.388), Center flowing-river arch (nx=0.500), East arch (nx=0.612)
+                        let arches: [(f32, f32, f32, f32); 3] = [
+                            (0.388 * wf, 0.045 * wf, 3.0, 3.80), // crown at z=6.80 -> >=3.9m over z=2.85 path!
+                            (0.500 * wf, 0.047 * wf, 2.8, 4.25), // crown at z=7.05 -> open flowing river underneath!
+                            (0.612 * wf, 0.045 * wf, 3.0, 3.80), // crown at z=6.80
+                        ];
+                        for &(ax, rx, spring_z, rz) in &arches {
+                            let adx = (wx - ax) / rx.max(1.0);
+                            let adz = (wz - spring_z).max(0.0) / rz;
+                            let arch_r = (adx * adx + adz * adz).sqrt();
+                            let open_sdf = (arch_r - 1.0) * rx.min(rz);
+                            let rect_open = (wx - ax).abs() - rx;
+                            let hole_sdf = if wz < spring_z { rect_open } else { open_sdf };
+                            bridge_sdf = bridge_sdf.max(-hole_sdf);
+                        }
+
+                        // Cutwater masonry pier buttresses between the 3 arches
+                        for &pier_nx in &[0.443f32, 0.557f32] {
+                            let px = pier_nx * wf;
+                            let butt_x = (wx - px).abs() - (wf * 0.011).max(1.25);
+                            let butt_y = dy_b - (bridge_hw_y + 0.8);
+                            let butt_z = wz - (deck_top - 0.6);
+                            bridge_sdf = bridge_sdf.min(butt_x.max(butt_y).max(butt_z));
+                        }
+
+                        // Low stone parapet rails along north & south bridge edges (leaving central roadway wide open)
+                        let para_y = (dy_b - (bridge_hw_y - 0.35)).abs() - 0.38;
+                        let para_x = (wx - bridge_cx).abs() - (bridge_half_span - 0.6);
+                        let para_z = (wz - (deck_top + 0.65)).max((deck_top - 0.3) - wz);
+                        bridge_sdf = bridge_sdf.min(para_x.max(para_y).max(para_z));
+
+                        if bridge_sdf < sdf {
+                            sdf = bridge_sdf;
+                            if dy_b < bridge_hw_y - 1.0 && wz > deck_top - 1.1 && wz <= deck_top + 0.25 {
+                                mat_kind = 2; // Walkable timber roadway deck inset!
+                            } else {
+                                mat_kind = 1; // Cut-stone masonry piers, arches & parapets
+                            }
+                        }
+                    }
+
+                    // --- Vaulted Basalt Cave Tunnel (z=1..5) under SW Mountain ---
+                    let mut inside_cave_air = false;
+                    let mut cave_stream_zone = false;
+                    let mut magma_vent_zone = false;
+                    if nx >= 0.10 && nx <= 0.43 && ny >= 0.60 && ny <= 0.86 && wz <= 7.5 {
+                        let mut best_tunnel_sdf = 999.0f32;
+                        let mut best_lat_y = 0.0f32;
+                        for seg in 0..(cave_pts.len() - 1) {
+                            let (ax, ay, afz, ahw, avh) = cave_pts[seg];
+                            let (bx, by, bfz, bhw, bvh) = cave_pts[seg + 1];
+                            let abx = bx - ax;
+                            let aby = by - ay;
+                            let len2 = (abx * abx + aby * aby).max(1e-6);
+                            let t = (((wx - ax) * abx + (wy - ay) * aby) / len2).clamp(0.0, 1.0);
+                            let cx = ax + abx * t;
+                            let cy = ay + aby * t;
+                            let fz = afz + (bfz - afz) * t;
+                            let hw = ahw + (bhw - ahw) * t;
+                            let vh = avh + (bvh - avh) * t;
+
+                            let horiz_d = (wx - cx).hypot(wy - cy);
+                            let z_rel = wz - fz;
+                            let norm_x = horiz_d / hw;
+                            let norm_z = if z_rel < 1.1 {
+                                ((1.1 - z_rel) / 1.1).max(0.0)
+                            } else {
+                                (z_rel - 1.1) / (vh - 1.1)
+                            };
+                            let vault_r = (norm_x * norm_x + norm_z * norm_z).sqrt();
+                            let floor_cut = -z_rel; // < 0 above floor
+                            let tunnel_d = ((vault_r - 1.0) * hw.min(vh)).max(floor_cut);
+                            if tunnel_d < best_tunnel_sdf {
+                                best_tunnel_sdf = tunnel_d;
+                                best_lat_y = wy - cy;
+                            }
+                        }
+
+                        if best_tunnel_sdf < 0.0 {
+                            inside_cave_air = true;
+                            sdf = sdf.max(-best_tunnel_sdf);
+                            // Shallow subterranean stream along northern cave wall (z=1..2)
+                            if z == 2 && best_lat_y < -2.3 && best_lat_y > -4.2 && nx < 0.36 && nx > 0.18 {
+                                cave_stream_zone = true;
+                            }
+                        }
+                        if best_tunnel_sdf < 1.8 && sdf < 0.8 && mat_kind == 0 {
+                            mat_kind = 3; // dark volcanic basalt cave rock!
+                        }
+
+                        // Sculpted Basalt Pillars offset from centerline
+                        for &(px, py, prad) in &cave_pillars {
+                            if wz >= 1.2 && wz <= 6.2 {
+                                let d_pil = (wx - px).hypot(wy - py) - prad;
+                                if d_pil < sdf {
+                                    sdf = d_pil;
+                                    mat_kind = 3;
+                                    inside_cave_air = false;
+                                }
+                            }
+                        }
+
+                        // Warm glowing magma vents embedded in the southern inner cave floor (z=1)
+                        if z == 1 && !inside_cave_air {
+                            let d_vent1 = (nx - 0.245).hypot(ny - 0.742);
+                            let d_vent2 = (nx - 0.205).hypot(ny - 0.748);
+                            if d_vent1 < 0.018 || d_vent2 < 0.016 {
+                                magma_vent_zone = true;
+                                mat_kind = 6;
+                            }
+                        }
+                    }
+
+                    // --- Biomass-Scaled Conifers (wood trunks + plant canopy reaching z=12..14) ---
+                    for &(cnx, cny, tree_h, max_r) in conifers {
+                        let tx = cnx * wf;
+                        let ty = cny * hf;
+                        let d_xy = (wx - tx).hypot(wy - ty);
+                        if d_xy < max_r + 1.5 {
+                            let txi = (tx as usize).min(w - 1);
+                            let tyi = (ty as usize).min(h - 1);
+                            let t_base = base_h[tyi * w + txi] - 0.3;
+                            let top_z = (t_base + tree_h).min((d as f32) - 1.2);
+                            let rel_z = wz - t_base;
+                            if rel_z >= -0.4 && wz <= top_z + 0.5 {
+                                let trunk_r = 0.72;
+                                let trunk_sdf = (d_xy - trunk_r).max(wz - (top_z - 0.8)).max(-0.4 - rel_z);
+                                if trunk_sdf < sdf {
+                                    sdf = trunk_sdf;
+                                    mat_kind = 4; // SP_WOOD trunk
+                                }
+                                if rel_z >= 1.4 && wz <= top_z + 0.3 {
+                                    let ft = ((wz - (t_base + 1.4)) / (top_z - (t_base + 1.4)).max(0.5)).clamp(0.0, 1.0);
+                                    let canopy_r = (max_r * (1.0 - ft * 0.75)).max(0.65);
+                                    let foli_sdf = (d_xy - canopy_r).max(wz - top_z).max((t_base + 1.4) - wz);
+                                    if foli_sdf < sdf {
+                                        sdf = foli_sdf;
+                                        mat_kind = 5; // SP_PLANT canopy
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Glacial ice rim around the Z=10 highland basin
+                    if z >= 10 && z <= 11 && mat_kind == 0 && sdf <= 0.4 {
+                        let br = (((nx - 0.50) / 0.115).powi(2) + ((ny - 0.145) / 0.080).powi(2)).sqrt();
+                        if br > 0.62 && br < 1.18 && ny < 0.205 {
+                            mat_kind = 7;
+                        }
+                    }
+
+                    // Convert solid SDF -> smooth trilinear density in [0, 1] -> exact integer species mass
+                    let band = if mat_kind == 1 || mat_kind == 2 { 0.48 } else { 0.60 };
+                    let solid_d = z16_sdf_to_density(sdf, band);
+                    let solid_m = (solid_d * (C_NOM as f32)).round() as u16;
+
+                    let mut cell_temp = if ny < 0.24 && z >= 9 { 27_100 } else { T_AMB };
+
+                    if solid_m >= 15 {
+                        match mat_kind {
+                            1 => {
+                                f.mass[SP_ROCK][idx] = solid_m;
+                            }
+                            2 => {
+                                // Timber roadway deck (mix of wood planks over stone support)
+                                f.mass[SP_WOOD][idx] = solid_m;
+                            }
+                            3 => {
+                                f.mass[SP_ROCK][idx] = solid_m;
+                            }
+                            4 => {
+                                f.mass[SP_WOOD][idx] = solid_m;
+                            }
+                            5 => {
+                                // Conifer canopy: 1.33x plant mass so 0.75 weight gives crisp canopy solid_density
+                                f.mass[SP_PLANT][idx] = ((solid_m as u32 * 4) / 3).min(1100) as u16;
+                            }
+                            6 => {
+                                f.mass[SP_ROCK][idx] = solid_m.max(950);
+                                cell_temp = 105_000; // Molten magma vent (1050 K)!
+                            }
+                            7 => {
+                                f.mass[SP_ICE][idx] = solid_m;
+                                cell_temp = 26_600;
+                            }
+                            _ => {
+                                // Natural alpine terrain: rock below surface / high peaks, soil on slopes
+                                if wz < gh - 1.3 || wz > 8.6 || wz < 2.2 {
+                                    f.mass[SP_ROCK][idx] = solid_m;
+                                } else {
+                                    f.mass[SP_SOIL][idx] = solid_m;
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Fluids: Canyon River (z=1..2), Subterranean Cave Stream, Glacial Basin (z=10) & 3D Waterfall ---
+                    if solid_d < 0.45 {
+                        // Main flowing river in canyon (z=1..2)
+                        if z <= 2 && dist_r < 0.058 && !inside_cave_air {
+                            f.mass[SP_WATER][idx] = 1100;
+                            f.flow_s[idx] = 130;
+                            cell_temp = 28_400;
+                        } else if cave_stream_zone {
+                            // Subterranean cave stream flowing east!
+                            f.mass[SP_WATER][idx] = 680;
+                            f.flow_e[idx] = 85;
+                            cell_temp = 28_500;
+                        } else if z == 10 {
+                            // Upper highland glacial basin water at Z=10!
+                            let br = (((nx - 0.50) / 0.088).powi(2) + ((ny - 0.145) / 0.056).powi(2)).sqrt();
+                            let in_spill = (nx - 0.50).abs() < 0.028 && ny >= 0.18 && ny <= 0.228;
+                            if br < 0.95 || in_spill {
+                                f.mass[SP_WATER][idx] = 1080;
+                                f.flow_s[idx] = 120;
+                                cell_temp = 28_000;
+                            }
+                        } else if (2..=9).contains(&z) {
+                            // Plunging 3D parabolic waterfall curtain from lip (z=10, ny=0.222) -> river plunge pool (z=2, ny=0.262)!
+                            let drop_t = ((10.0 - z as f32) / 8.0).clamp(0.0, 1.0);
+                            let wf_ny = 0.220 + 0.040 * drop_t.sqrt();
+                            let wf_hw_x = 0.024 + 0.008 * drop_t;
+                            if (nx - 0.50).abs() < wf_hw_x && (ny - wf_ny).abs() < 0.015 {
+                                f.mass[SP_WATER][idx] = 860;
+                                f.flow_s[idx] = 90;
+                                cell_temp = 28_100;
+                            }
+                        }
+                    }
+
+                    // --- Plunge Pool Mist (SP_STEAM) ---
+                    if (3..=4).contains(&z) && solid_d < 0.30 {
+                        let mr = (((nx - 0.50) / 0.048).powi(2) + ((ny - 0.265) / 0.036).powi(2)).sqrt();
+                        if mr < 1.0 {
+                            f.mass[SP_STEAM][idx] = (240.0 * (1.0 - mr)) as u16;
+                            cell_temp = 37_600;
+                        }
+                    }
+
+                    // --- Active Wildfire on East Pine Bluff (nx=0.74, ny=0.38, z=7..12) ---
+                    let fire_d = (nx - 0.74).hypot(ny - 0.38);
+                    if fire_d < 0.036 && z == 7 && solid_d < 0.50 {
+                        let fall = (1.0 - fire_d / 0.036).clamp(0.2, 1.0);
+                        f.mass[SP_WOOD][idx] = f.mass[SP_WOOD][idx].max((720.0 * fall) as u16);
+                        f.mass[SP_OIL][idx] = (380.0 * fall) as u16;
+                        f.mass[SP_PLANT][idx] = (320.0 * fall) as u16;
+                        cell_temp = 78_000; // Actively burning (>520 K wood & >440 K oil)!
+                    } else if (8..=12).contains(&z) && solid_d < 0.35 {
+                        // Rising buoyant smoke plume above the active wildfire
+                        let drift_x = 0.74 + ((z - 7) as f32) * 0.004;
+                        let drift_y = 0.38 + ((z - 7) as f32) * 0.002;
+                        let plume_r = 0.025 + ((z - 7) as f32) * 0.005;
+                        let pd = (nx - drift_x).hypot(ny - drift_y) / plume_r;
+                        if pd < 1.0 {
+                            f.mass[SP_SMOKE][idx] = (360.0 * (1.0 - pd)) as u16;
+                            cell_temp = 54_000 - ((z - 8) as i64) * 3_500;
+                        }
+                    }
+
+                    // Warm cave air slightly right above magma vents
+                    if magma_vent_zone {
+                        cell_temp = 105_000;
+                    }
+
+                    f.set_cell_temp(idx, cell_temp);
+                }
+            }
+        }
+
+        self.snapshot_conservation_baseline();
+        self.snapshot_prev_sensors();
+    }
+
+    /// Physical per-voxel solid density in `[0.0, 1.0]` computed directly from conserved solid species masses.
+    /// Shared 1:1 by `encode_3d_brick_16` (GPU rendering) and `sample_solid_density_3d` (3D capsule physics).
+    #[inline]
+    pub fn voxel_solid_density(&self, ix: usize, iy: usize, iz: usize) -> f32 {
+        let f = &self.layers[iz];
+        let idx = iy * self.width + ix;
+        let solid_m = (f.mass[SP_ROCK][idx] as u32)
+            + (f.mass[SP_SOIL][idx] as u32)
+            + (f.mass[SP_WOOD][idx] as u32)
+            + (f.mass[SP_ICE][idx] as u32)
+            + ((f.mass[SP_ASH][idx] as u32) / 2)
+            + ((f.mass[SP_PLANT][idx] as u32 * 3) / 4);
+        (solid_m as f32 / (C_NOM as f32)).clamp(0.0, 1.0)
+    }
+
+    /// Continuous hardware-matched trilinear sample of `solid_density` in `(x, y, z)` world coordinates
+    /// (voxel `(ix, iy, iz)` centered at `(ix + 0.5, iy + 0.5, iz + 0.5)`).
+    #[inline]
+    pub fn sample_solid_density_3d(&self, x: f32, y: f32, z: f32) -> f32 {
+        if self.width == 0 || self.height == 0 || self.depth == 0 {
+            return 0.0;
+        }
+        let fx = x - 0.5;
+        let fy = y - 0.5;
+        let fz = z - 0.5;
+
+        let max_x = (self.width - 1) as i32;
+        let max_y = (self.height - 1) as i32;
+        let max_z = (self.depth - 1) as i32;
+
+        let x0 = (fx.floor() as i32).clamp(0, max_x);
+        let y0 = (fy.floor() as i32).clamp(0, max_y);
+        let z0 = (fz.floor() as i32).clamp(0, max_z);
+        let x1 = (x0 + 1).clamp(0, max_x);
+        let y1 = (y0 + 1).clamp(0, max_y);
+        let z1 = (z0 + 1).clamp(0, max_z);
+
+        let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+        let tz = (fz - z0 as f32).clamp(0.0, 1.0);
+
+        let (x0, x1) = (x0 as usize, x1 as usize);
+        let (y0, y1) = (y0 as usize, y1 as usize);
+        let (z0, z1) = (z0 as usize, z1 as usize);
+
+        let c000 = self.voxel_solid_density(x0, y0, z0);
+        let c100 = self.voxel_solid_density(x1, y0, z0);
+        let c010 = self.voxel_solid_density(x0, y1, z0);
+        let c110 = self.voxel_solid_density(x1, y1, z0);
+        let c001 = self.voxel_solid_density(x0, y0, z1);
+        let c101 = self.voxel_solid_density(x1, y0, z1);
+        let c011 = self.voxel_solid_density(x0, y1, z1);
+        let c111 = self.voxel_solid_density(x1, y1, z1);
+
+        let x00 = c000 + (c100 - c000) * tx;
+        let x10 = c010 + (c110 - c010) * tx;
+        let x01 = c001 + (c101 - c001) * tx;
+        let x11 = c011 + (c111 - c011) * tx;
+
+        let y0v = x00 + (x10 - x00) * ty;
+        let y1v = x01 + (x11 - x01) * ty;
+        y0v + (y1v - y0v) * tz
+    }
+
+    /// Analytical 3D central-difference gradient `∇solid_density(x, y, z)`.
+    /// Points INTO solid (increasing density); negate for outward surface normal.
+    #[inline]
+    pub fn sample_solid_gradient_3d(&self, x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+        const EPS: f32 = 0.25;
+        let gx = self.sample_solid_density_3d(x + EPS, y, z)
+            - self.sample_solid_density_3d(x - EPS, y, z);
+        let gy = self.sample_solid_density_3d(x, y + EPS, z)
+            - self.sample_solid_density_3d(x, y - EPS, z);
+        let gz = self.sample_solid_density_3d(x, y, z + EPS)
+            - self.sample_solid_density_3d(x, y, z - EPS);
+        let inv = 1.0 / (2.0 * EPS);
+        (gx * inv, gy * inv, gz * inv)
+    }
+
+    /// Directly encode a `16 × 16 × depth` column brick `(bx, by)` into the two compact `FM3D` `RGBA8`
+    /// 3D GPU fields (Z-major `[z][dy][dx][4]`, length `depth * 16 * 16 * 4` bytes each):
+    /// - `density_mat`: `[solid_density, fluid_density, gas_optical_density, roughness_wetness]`
+    /// - `albedo_thermal`: `[albedo_r, albedo_g, albedo_b, blackbody_temp_glow]`
+    /// Zero client species heuristics: derived purely from exact physical masses & temperatures.
+    pub fn encode_3d_brick_16(&self, bx: usize, by: usize) -> (Vec<u8>, Vec<u8>) {
+        let d = self.depth;
+        let total_bytes = d * CHUNK_SIZE * CHUNK_SIZE * 4;
+        let mut density_mat = vec![0u8; total_bytes];
+        let mut albedo_thermal = vec![0u8; total_bytes];
+        if self.width == 0 || self.height == 0 || d == 0 {
+            return (density_mat, albedo_thermal);
+        }
+
+        // Physical species base linear albedos & matte roughness values
+        const SP_ALBEDO: [[f32; 3]; NUM_SPECIES] = [
+            [0.12, 0.44, 0.66], // water (glacial azure)
+            [0.76, 0.89, 0.96], // ice (frost cyan-white)
+            [0.88, 0.94, 1.00], // steam (bright mist)
+            [0.24, 0.36, 0.21], // soil (boreal meadow/moss)
+            [0.35, 0.37, 0.41], // rock (granite/basalt)
+            [0.42, 0.27, 0.16], // wood (weathered timber)
+            [0.22, 0.21, 0.21], // ash
+            [0.23, 0.22, 0.21], // smoke
+            [0.11, 0.09, 0.13], // oil
+            [0.13, 0.31, 0.17], // plant (alpine pine)
+        ];
+        const SP_ROUGH: [f32; NUM_SPECIES] = [
+            0.06, // water
+            0.22, // ice
+            0.90, // steam
+            0.86, // soil
+            0.80, // rock
+            0.78, // wood
+            0.92, // ash
+            0.92, // smoke
+            0.12, // oil
+            0.85, // plant
+        ];
+
+        let x0 = bx * CHUNK_SIZE;
+        let y0 = by * CHUNK_SIZE;
+        let mut out_i = 0usize;
+
+        for z in 0..d {
+            let f = &self.layers[z];
+            for dy in 0..CHUNK_SIZE {
+                let gy = (y0 + dy).min(self.height - 1);
+                let row = gy * self.width;
+                for dx in 0..CHUNK_SIZE {
+                    let gx = (x0 + dx).min(self.width - 1);
+                    let idx = row + gx;
+
+                    let solid_d = self.voxel_solid_density(gx, gy, z);
+                    let water = f.mass[SP_WATER][idx] as f32;
+                    let oil = f.mass[SP_OIL][idx] as f32;
+                    let steam = f.mass[SP_STEAM][idx] as f32;
+                    let smoke = f.mass[SP_SMOKE][idx] as f32;
+
+                    let fluid_d = ((water + oil) / (C_NOM as f32)).clamp(0.0, 1.0);
+                    let gas_d = ((steam + smoke) / 650.0).clamp(0.0, 1.0);
+
+                    let mut r_sum = 0.0f32;
+                    let mut g_sum = 0.0f32;
+                    let mut b_sum = 0.0f32;
+                    let mut rough_sum = 0.0f32;
+                    let mut w_sum = 0.0f32;
+
+                    for s in 0..NUM_SPECIES {
+                        let m = f.mass[s][idx] as f32;
+                        if m > 0.0 {
+                            r_sum += m * SP_ALBEDO[s][0];
+                            g_sum += m * SP_ALBEDO[s][1];
+                            b_sum += m * SP_ALBEDO[s][2];
+                            rough_sum += m * SP_ROUGH[s];
+                            w_sum += m;
+                        }
+                    }
+
+                    let (mut ar, mut ag, mut ab, mut rough) = if w_sum > 0.0 {
+                        let inv = 1.0 / w_sum;
+                        (r_sum * inv, g_sum * inv, b_sum * inv, rough_sum * inv)
+                    } else {
+                        (0.36, 0.40, 0.44, 0.85)
+                    };
+
+                    // Wetness gloss reduction when liquid coats solid
+                    if solid_d > 0.1 && fluid_d > 0.05 {
+                        rough *= (1.0 - 0.65 * fluid_d).clamp(0.15, 1.0);
+                    }
+
+                    // Physical blackbody thermal glow directly from voxel temperature (cK)
+                    let t_ck = f.cell_temp_ck(idx);
+                    let glow = if w_sum > 0.0 && t_ck > 42_000 {
+                        ((t_ck - 42_000) as f32 / 65_000.0).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if glow > 0.02 {
+                        // Blend incandescent blackbody orange-amber into albedo
+                        let k = (glow * 0.85).clamp(0.0, 0.92);
+                        ar = ar * (1.0 - k) + 1.0 * k;
+                        ag = ag * (1.0 - k) + (0.42 + 0.34 * glow) * k;
+                        ab = ab * (1.0 - k) + (0.08 + 0.12 * glow) * k;
+                    }
+
+                    density_mat[out_i] = z16_to_u8(solid_d);
+                    density_mat[out_i + 1] = z16_to_u8(fluid_d);
+                    density_mat[out_i + 2] = z16_to_u8(gas_d);
+                    density_mat[out_i + 3] = z16_to_u8(rough);
+
+                    albedo_thermal[out_i] = z16_to_u8(ar);
+                    albedo_thermal[out_i + 1] = z16_to_u8(ag);
+                    albedo_thermal[out_i + 2] = z16_to_u8(ab);
+                    albedo_thermal[out_i + 3] = z16_to_u8(glow);
+                    out_i += 4;
+                }
+            }
+        }
+
+        (density_mat, albedo_thermal)
+    }
+
+    /// Measure maximum solid penetration (in meters) across a vertical 3D capsule shell at foot base `pos`.
+    pub fn measure_capsule_penetration_3d(
+        &self,
+        pos: (f32, f32, f32),
+        radius: f32,
+        height: f32,
+    ) -> f32 {
+        let mut max_pen = 0.0f32;
+        for (qx, qy, qz) in z16_capsule_shell_samples(pos, radius, height) {
+            let d = self.sample_solid_density_3d(qx, qy, qz);
+            if d > 0.5 {
+                let (gx, gy, gz) = self.sample_solid_gradient_3d(qx, qy, qz);
+                let g_len = (gx * gx + gy * gy + gz * gz).sqrt().max(0.55);
+                let pen = (d - 0.5) / g_len;
+                max_pen = max_pen.max(pen);
+            }
+        }
+        max_pen
+    }
+
+    /// Measure vertical open-air headroom clearance (in meters) directly above foot base `pos = (x, y, z)`.
+    pub fn measure_vertical_clearance_3d(&self, pos: (f32, f32, f32)) -> f32 {
+        let step = 0.1f32;
+        let max_z = self.depth as f32 - 0.25;
+        let mut z = pos.2 + 0.15;
+        while z < max_z {
+            if self.sample_solid_density_3d(pos.0, pos.1, z) >= 0.5 {
+                return (z - pos.2).max(0.0);
+            }
+            z += step;
+        }
+        (self.depth as f32 - pos.2).max(0.0)
+    }
+
+    /// Continuous trilinear `∇solid_density` 3D capsule collision & locomotion solver.
+    /// - `pos`: `(x, y, z)` foot base center in metric world coordinates (`z` is altitude UP).
+    /// - `vel`: `(vx, vy, vz)` velocity in meters/sec.
+    /// - `radius`, `height`: capsule radius & total height in meters (e.g. `0.55`, `1.80`).
+    /// - `dt`: timestep in seconds.
+    /// Returns `(new_pos, new_vel, grounded)` with smooth wall sliding, floor settling,
+    /// cave ceiling clearance, and 3-span arched bridge traversal!
+    pub fn step_capsule_3d(
+        &self,
+        pos: (f32, f32, f32),
+        vel: (f32, f32, f32),
+        radius: f32,
+        height: f32,
+        dt: f32,
+    ) -> ((f32, f32, f32), (f32, f32, f32), bool) {
+        const GRAVITY: f32 = 18.0;
+        if self.width < 4 || self.height < 4 || self.depth < 2 || dt <= 0.0 {
+            return (pos, vel, false);
+        }
+
+        let substeps = ((dt / 0.008).ceil() as usize).clamp(1, 8);
+        let sub_dt = dt / substeps as f32;
+        let mut grounded = false;
+
+        let (mut px, mut py, mut pz) = pos;
+        let (mut vx, mut vy, mut vz) = vel;
+
+        let min_x = radius + 2.0;
+        let max_x = self.width as f32 - radius - 2.0;
+        let min_y = radius + 2.0;
+        let max_y = self.height as f32 - radius - 2.0;
+        let max_z = (self.depth as f32 - height - 0.1).max(0.5);
+
+        for _ in 0..substeps {
+            vz -= GRAVITY * sub_dt;
+            px = (px + vx * sub_dt).clamp(min_x, max_x);
+            py = (py + vy * sub_dt).clamp(min_y, max_y);
+            pz = (pz + vz * sub_dt).clamp(0.5, max_z);
+
+            // Iterative Gauss-Seidel pushout along analytical -∇solid_density
+            for _iter in 0..10 {
+                let mut worst_pen = 0.0f32;
+                let mut best_n = (0.0f32, 0.0f32, 1.0f32);
+
+                let samples = z16_capsule_shell_samples((px, py, pz), radius, height);
+                for (sidx, &(qx, qy, qz)) in samples.iter().enumerate() {
+                    let d = self.sample_solid_density_3d(qx, qy, qz);
+                    if d > 0.5 {
+                        let (gx, gy, gz) = self.sample_solid_gradient_3d(qx, qy, qz);
+                        let g_len = (gx * gx + gy * gy + gz * gz).sqrt();
+                        let outward_n = if g_len > 1e-3 {
+                            (-gx / g_len, -gy / g_len, -gz / g_len)
+                        } else if sidx < 5 {
+                            (0.0, 0.0, 1.0)
+                        } else if sidx >= 21 {
+                            (0.0, 0.0, -1.0)
+                        } else {
+                            let dx = px - qx;
+                            let dy = py - qy;
+                            let dl = dx.hypot(dy);
+                            if dl > 1e-4 { (dx / dl, dy / dl, 0.0) } else { (0.0, 0.0, 1.0) }
+                        };
+                        let pen = (d - 0.5) / g_len.max(0.55);
+                        if pen > worst_pen {
+                            worst_pen = pen;
+                            best_n = outward_n;
+                        }
+                    }
+                }
+
+                if worst_pen <= 1e-4 {
+                    break;
+                }
+
+                let push = worst_pen.min(0.35);
+                px = (px + best_n.0 * push).clamp(min_x, max_x);
+                py = (py + best_n.1 * push).clamp(min_y, max_y);
+                pz = (pz + best_n.2 * push).clamp(0.5, max_z);
+
+                if best_n.2 >= 0.55 {
+                    grounded = true;
+                    if vz < 0.0 {
+                        vz = 0.0;
+                    }
+                }
+
+                // Project velocity onto tangent plane for smooth wall sliding & ceiling deflection
+                let vn = vx * best_n.0 + vy * best_n.1 + vz * best_n.2;
+                if vn < 0.0 {
+                    vx -= best_n.0 * vn;
+                    vy -= best_n.1 * vn;
+                    vz -= best_n.2 * vn;
+                }
+            }
+        }
+
+        ((px, py, pz), (vx, vy, vz), grounded)
+    }
+}
+
+#[inline]
+fn z16_to_u8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+#[inline]
+fn z16_smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline]
+fn z16_sdf_to_density(sdf: f32, band: f32) -> f32 {
+    let t = (0.5 - sdf / (2.0 * band)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline]
+fn z16_hash2(ix: i32, iy: i32) -> f32 {
+    let mut h = ix
+        .wrapping_mul(374_761_393)
+        .wrapping_add(iy.wrapping_mul(668_265_263));
+    h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+    ((h ^ (h >> 16)) as u32 as f32) / (u32::MAX as f32)
+}
+
+fn z16_value_noise2(x: f32, y: f32) -> f32 {
+    let ix = x.floor() as i32;
+    let iy = y.floor() as i32;
+    let fx = x - ix as f32;
+    let fy = y - iy as f32;
+    let ux = fx * fx * (3.0 - 2.0 * fx);
+    let uy = fy * fy * (3.0 - 2.0 * fy);
+    let c00 = z16_hash2(ix, iy);
+    let c10 = z16_hash2(ix + 1, iy);
+    let c01 = z16_hash2(ix, iy + 1);
+    let c11 = z16_hash2(ix + 1, iy + 1);
+    let x0 = c00 + (c10 - c00) * ux;
+    let x1 = c01 + (c11 - c01) * ux;
+    x0 + (x1 - x0) * uy
+}
+
+fn z16_fbm2(x: f32, y: f32) -> f32 {
+    let mut sum = 0.0f32;
+    let mut amp = 0.5f32;
+    let mut freq = 1.0f32;
+    for _ in 0..4 {
+        sum += amp * (z16_value_noise2(x * freq, y * freq) * 2.0 - 1.0);
+        freq *= 2.07;
+        amp *= 0.48;
+    }
+    sum
+}
+
+/// 26 shell sample points on a vertical capsule with foot base `pos = (x, y, z)` (`z` up).
+fn z16_capsule_shell_samples(pos: (f32, f32, f32), radius: f32, height: f32) -> [(f32, f32, f32); 26] {
+    let (px, py, pz) = pos;
+    let r = radius;
+    let z_bot = r;
+    let z_top = (height - r).max(r + 0.05);
+    let z_mid = 0.5 * (z_bot + z_top);
+    let d = r * std::f32::consts::FRAC_1_SQRT_2;
+    let cap_r = r * 0.7071;
+    let cap_dz = r * 0.7071;
+
+    [
+        // Bottom pole + 4 lower hemisphere points (5)
+        (px, py, pz),
+        (px + cap_r, py, pz + z_bot - cap_dz),
+        (px - cap_r, py, pz + z_bot - cap_dz),
+        (px, py + cap_r, pz + z_bot - cap_dz),
+        (px, py - cap_r, pz + z_bot - cap_dz),
+        // Lower cylinder ring (8)
+        (px + r, py, pz + z_bot),
+        (px - r, py, pz + z_bot),
+        (px, py + r, pz + z_bot),
+        (px, py - r, pz + z_bot),
+        (px + d, py + d, pz + z_bot),
+        (px - d, py + d, pz + z_bot),
+        (px + d, py - d, pz + z_bot),
+        (px - d, py - d, pz + z_bot),
+        // Mid-waist ring (4)
+        (px + r, py, pz + z_mid),
+        (px - r, py, pz + z_mid),
+        (px, py + r, pz + z_mid),
+        (px, py - r, pz + z_mid),
+        // Upper cylinder ring (4)
+        (px + r, py, pz + z_top),
+        (px - r, py, pz + z_top),
+        (px, py + r, pz + z_top),
+        (px, py - r, pz + z_top),
+        // Top hemisphere + top pole (5)
+        (px + cap_r, py, pz + z_top + cap_dz),
+        (px - cap_r, py, pz + z_top + cap_dz),
+        (px, py + cap_r, pz + z_top + cap_dz),
+        (px, py - cap_r, pz + z_top + cap_dz),
+        (px, py, pz + height),
+    ]
 }
 
 #[inline]
@@ -2963,5 +3930,191 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_volume_z16_conservation_cave_bridge() {
+        let mut vf = VolumeField::new_shattered_reach_3d(128, 128, 16);
+        assert_eq!((vf.width, vf.height, vf.depth), (128, 128, 16));
+        assert_eq!(vf.layers.len(), 16);
+
+        // Verify key isotropic 3D landmarks exist:
+        // 1. Arched bridge deck at (x=64, y=64, z=7..8) with open air (z=5) & flowing river (z=1..2) directly underneath!
+        assert!(
+            vf.sample_solid_density_3d(64.0, 64.0, 7.8) >= 0.75,
+            "expected solid bridge deck at crown"
+        );
+        assert!(
+            vf.sample_solid_density_3d(64.0, 64.0, 5.0) < 0.15,
+            "expected open archway air directly under bridge center"
+        );
+        assert!(
+            vf.layers[1].mass[SP_WATER][vf.layers[1].idx(64, 64)] >= 500,
+            "expected flowing river water beneath center bridge arch"
+        );
+
+        // 2. Vaulted basalt cave tunnel (z=1..5) with solid mountain roof overhead (z=8..10)
+        let cave_x = 0.24 * 128.0;
+        let cave_y = 0.72 * 128.0;
+        assert!(
+            vf.sample_solid_density_3d(cave_x, cave_y, 3.5) < 0.15,
+            "expected hollow vaulted cave interior at z=3.5"
+        );
+        assert!(
+            vf.sample_solid_density_3d(cave_x, cave_y, 8.5) >= 0.85,
+            "expected solid basalt mountain roof above cave at z=8.5"
+        );
+
+        // 3. Upper highland glacial basin at z=10 & plunging waterfall
+        let basin_idx = vf.layers[10].idx(64, (0.15 * 128.0) as usize);
+        assert!(
+            vf.layers[10].mass[SP_WATER][basin_idx] >= 500,
+            "expected glacial basin water at z=10"
+        );
+
+        // 4. Verify 16x16x16 FM3D brick encoding dimensions and non-trivial channels (bridge + wildfire)
+        let (dm_br, at_br) = vf.encode_3d_brick_16(4, 4);
+        assert_eq!(dm_br.len(), 16 * 16 * 16 * 4);
+        assert_eq!(at_br.len(), 16 * 16 * 16 * 4);
+        let (_, at_fire) = vf.encode_3d_brick_16(5, 3); // contains East wildfire bluff (x≈94, y≈48)
+        let max_glow = at_fire.chunks_exact(4).map(|c| c[3]).max().unwrap_or(0);
+        assert!(max_glow > 40, "expected active wildfire thermal glow in FM3D brick, got {}", max_glow);
+
+        // 5. Apply physical actuators across multiple layers (cave, bridge, waterfall) & step_3d with vertical exchange
+        let (dm1, de1) = vf.apply_physical_actuator(64.0, 64.0, 8, 0.85, 0.0, 0.6, 0.0, 3.5);
+        let (_dm2, _de2) = vf.apply_physical_actuator(cave_x, cave_y, 2, -0.75, 0.5, 0.0, 0.4, 3.0);
+        assert!(dm1 > 0 && de1 > 0);
+        assert_eq!(vf.current_accounted_mass() - vf.initial_total_mass, 0);
+        assert_eq!(vf.current_accounted_energy() - vf.initial_total_energy, 0);
+
+        let mut total_grav = 0i64;
+        let mut total_buoy = 0i64;
+        for tick in 0..8 {
+            vf.apply_weather_and_springs_3d((tick % 4) as u8, tick);
+            vf.apply_solar_cycle_3d(if tick % 2 == 0 { 0.1 } else { 0.5 }, tick);
+            let raws = vf.refsim_raw_outputs_all();
+            let stats = vf.step_3d(&raws);
+            assert_eq!(stats.mass_error, 0, "Z=16 mass_error != 0 at tick {}", tick);
+            assert_eq!(stats.energy_error, 0, "Z=16 energy_error != 0 at tick {}", tick);
+            total_grav += stats.vertical_gravity_mass;
+            total_buoy += stats.vertical_buoyancy_mass;
+        }
+        assert!(total_grav > 0, "expected 3D waterfall gravity transport in Z=16");
+        assert!(total_buoy > 0, "expected 3D wildfire/mist buoyancy rise in Z=16");
+    }
+
+    #[test]
+    fn test_volume_z16_capsule_cave_and_bridge() {
+        let vf = VolumeField::new_shattered_reach_3d(128, 128, 16);
+        let r = 0.55f32;
+        let h = 1.80f32;
+        let dt = 1.0 / 60.0f32;
+
+        // 1. Walk smoothly across the 3-span arched stone & timber bridge (x: 38 -> 90 along y=64)
+        let mut pos = (38.0f32, 64.0f32, 8.4f32);
+        let mut vel = (0.0f32, 0.0f32, 0.0f32);
+        for _ in 0..30 {
+            let (p, v, _) = vf.step_capsule_3d(pos, vel, r, h, dt);
+            pos = p;
+            vel = v;
+        }
+        let mut bridge_min_z = f32::MAX;
+        let mut bridge_max_z = f32::MIN;
+        let mut bridge_max_pen = 0.0f32;
+        for _ in 0..700 {
+            vel.0 = 5.2;
+            vel.1 = (64.0 - pos.1) * 2.0;
+            let (p, v, _) = vf.step_capsule_3d(pos, vel, r, h, dt);
+            pos = p;
+            vel = v;
+            bridge_min_z = bridge_min_z.min(pos.2);
+            bridge_max_z = bridge_max_z.max(pos.2);
+            bridge_max_pen = bridge_max_pen.max(vf.measure_capsule_penetration_3d(pos, r, h));
+            if pos.0 >= 89.5 {
+                break;
+            }
+        }
+        assert!(
+            pos.0 >= 88.5 && bridge_min_z >= 7.5 && bridge_max_z <= 9.4 && bridge_max_pen < 0.05,
+            "Bridge walk failed: end_x={:.2}, z=[{:.2}..{:.2}], max_pen={:.4}",
+            pos.0, bridge_min_z, bridge_max_z, bridge_max_pen
+        );
+
+        // 2. Walk cleanly underneath the West bridge archway along x = 0.388*128 ≈ 49.66, y: 48 -> 80
+        let arch_x = 0.388 * 128.0;
+        let mut pos = (arch_x, 48.0f32, 3.1f32);
+        let mut vel = (0.0f32, 0.0f32, 0.0f32);
+        for _ in 0..30 {
+            let (p, v, _) = vf.step_capsule_3d(pos, vel, r, h, dt);
+            pos = p;
+            vel = v;
+        }
+        let mut under_min_clear = f32::MAX;
+        let mut under_max_pen = 0.0f32;
+        for _ in 0..500 {
+            vel.1 = 4.8;
+            vel.0 = (arch_x - pos.0) * 2.0;
+            let (p, v, _) = vf.step_capsule_3d(pos, vel, r, h, dt);
+            pos = p;
+            vel = v;
+            if (pos.1 - 64.0).abs() <= 3.5 {
+                under_min_clear = under_min_clear.min(vf.measure_vertical_clearance_3d(pos));
+            }
+            under_max_pen = under_max_pen.max(vf.measure_capsule_penetration_3d(pos, r, h));
+            if pos.1 >= 79.0 {
+                break;
+            }
+        }
+        assert!(
+            pos.1 >= 78.0 && pos.2 < 4.0 && under_min_clear >= 2.5 && under_max_pen < 0.05,
+            "Under-bridge walk failed: end_y={:.2}, z={:.2}, min_clear={:.2}, max_pen={:.4}",
+            pos.1, pos.2, under_min_clear, under_max_pen
+        );
+
+        // 3. Enter and traverse the vaulted basalt cave (east mouth -> grand inner chamber)
+        let waypoints = [
+            (0.305 * 128.0, 0.710 * 128.0),
+            (0.235 * 128.0, 0.720 * 128.0),
+        ];
+        let mut pos = (0.375 * 128.0, 0.700 * 128.0, 1.9f32);
+        let mut vel = (0.0f32, 0.0f32, 0.0f32);
+        for _ in 0..30 {
+            let (p, v, _) = vf.step_capsule_3d(pos, vel, r, h, dt);
+            pos = p;
+            vel = v;
+        }
+        let mut wp_idx = 0usize;
+        let mut cave_min_clear = f32::MAX;
+        let mut cave_max_pen = 0.0f32;
+        for _ in 0..500 {
+            let (tx, ty) = waypoints[wp_idx];
+            let dx = tx - pos.0;
+            let dy = ty - pos.1;
+            let dist = dx.hypot(dy);
+            if dist < 1.2 {
+                if wp_idx + 1 < waypoints.len() {
+                    wp_idx += 1;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            vel.0 = (dx / dist) * 4.5;
+            vel.1 = (dy / dist) * 4.5;
+            let (p, v, _) = vf.step_capsule_3d(pos, vel, r, h, dt);
+            pos = p;
+            vel = v;
+            cave_max_pen = cave_max_pen.max(vf.measure_capsule_penetration_3d(pos, r, h));
+            if pos.0 <= 0.34 * 128.0 {
+                cave_min_clear = cave_min_clear.min(vf.measure_vertical_clearance_3d(pos));
+            }
+        }
+        let (goal_x, goal_y) = waypoints[waypoints.len() - 1];
+        let dist_goal = (pos.0 - goal_x).hypot(pos.1 - goal_y);
+        assert!(
+            wp_idx == waypoints.len() - 1 && dist_goal < 2.2 && cave_min_clear >= 2.5 && cave_max_pen < 0.05,
+            "Cave traversal failed: dist_goal={:.2}, pos=({:.2},{:.2},{:.2}), min_clear={:.2}, max_pen={:.4}",
+            dist_goal, pos.0, pos.1, pos.2, cave_min_clear, cave_max_pen
+        );
     }
 }

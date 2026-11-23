@@ -471,6 +471,7 @@ impl QuicClientHandle {
                             time_domes,
                         );
                     }
+                    ServerDatagram::VolumetricBrick3D(_) => {}
                 }
             }
         });

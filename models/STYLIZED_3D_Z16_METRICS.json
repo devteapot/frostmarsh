@@ -1,0 +1,219 @@
+{
+  "iteration": "9A",
+  "adapter": "Apple M4 Pro",
+  "backend": "Metal",
+  "volume_dims": [
+    256,
+    256,
+    16
+  ],
+  "latent_packet_bytes": 8388632,
+  "latent_packet_channels": 8,
+  "client_weights_bytes_per_style": 4064,
+  "client_weights_total_bytes": 12216,
+  "wgsl_neural_decode": {
+    "decode_full_1m_vox_p50_ms": 0.935167,
+    "decode_full_1m_vox_p99_ms": 1.502833,
+    "decode_full_1m_vox_mean_ms": 1.0033625000000002,
+    "decode_single_16x16x16_brick_p50_ms": 0.01219790625,
+    "decode_single_16x16x16_brick_p99_ms": 0.014790375,
+    "decode_single_16x16x16_brick_mean_ms": 0.012285630208333335,
+    "gpu_vs_cpu_max_u8_diff": 0,
+    "gpu_vs_cpu_mae_u8": 0.0
+  },
+  "surface_nets_build": {
+    "full_build_ms": 6.612375,
+    "dirty_brick_16x16x16_p50_ms": 0.030208,
+    "dirty_brick_16x16x16_max_ms": 0.042042,
+    "vertex_count": 91477,
+    "triangle_count": 162386,
+    "brick_count": 256
+  },
+  "pine_surfels": {
+    "pine_count": 31,
+    "snow_pine_count": 129,
+    "total_trees": 160,
+    "total_surfel_instances": 22400
+  },
+  "pixel_2xss_render": {
+    "res_1080p": {
+      "p50_ms": 4.20725,
+      "p99_ms": 4.6815,
+      "mean_ms": 4.2154736,
+      "fps_p50": 237.68494860062987
+    },
+    "res_4k": {
+      "p50_ms": 14.215125,
+      "p99_ms": 14.970041,
+      "mean_ms": 14.23735566666667,
+      "fps_p50": 70.34760510371875
+    },
+    "cave_1080p": {
+      "p50_ms": 4.87875,
+      "p99_ms": 5.36,
+      "mean_ms": 4.913491700000001,
+      "fps_p50": 204.97053548552395
+    }
+  },
+  "clean_3d_render": {
+    "res_1080p": {
+      "p50_ms": 3.016917,
+      "p99_ms": 3.098833,
+      "mean_ms": 3.0145790999999993,
+      "fps_p50": 331.46420667191046
+    },
+    "res_4k": {
+      "p50_ms": 9.906375,
+      "p99_ms": 10.416208999999998,
+      "mean_ms": 9.951411266666666,
+      "fps_p50": 100.9450984845617
+    },
+    "cave_1080p": {
+      "p50_ms": 3.746875,
+      "p99_ms": 3.846625,
+      "mean_ms": 3.7525847999999997,
+      "fps_p50": 266.8890742285238
+    }
+  },
+  "style_swap_live_ms": {
+    "nordic_ms": 1.111209,
+    "volcanic_ember_ms": 0.916875,
+    "arcane_thermal_ms": 0.916292
+  },
+  "distillation": {
+    "fmlt_packet": {
+      "bytes": 8388632,
+      "channels": 8,
+      "depth": 16,
+      "height": 256,
+      "magic": "FMLT",
+      "path": "/Users/carlid/.t3/scratch/2026-11-23-so-i-was-thinking-about-d3f73a75/models/checkpoints/z16_latent_bricks.bin",
+      "seed": 909,
+      "width": 256
+    },
+    "fmwg_weights": {
+      "arch": [
+        8,
+        24,
+        24,
+        8
+      ],
+      "bytes_per_style": 4064,
+      "floats_per_style": 1016,
+      "magic": "FMWG",
+      "num_styles": 3,
+      "path": "/Users/carlid/.t3/scratch/2026-11-23-so-i-was-thinking-about-d3f73a75/models/checkpoints/client_material_weights.bin",
+      "total_bytes": 12216
+    },
+    "landmarks": {
+      "cave_pillars": [
+        {
+          "r": 0.013,
+          "u": 0.185,
+          "v": 0.5359244870711738
+        },
+        {
+          "r": 0.013,
+          "u": 0.245,
+          "v": 0.4659244870711738
+        }
+      ],
+      "magma_vents": [
+        {
+          "u": 0.165,
+          "v": 0.4639244870711738,
+          "z": 1.25
+        },
+        {
+          "u": 0.265,
+          "v": 0.5359244870711738,
+          "z": 1.35
+        }
+      ],
+      "u_fire": 0.7815384698260045,
+      "v_bridge": 0.4944751887351471,
+      "v_cave": 0.49992448707117376,
+      "v_fire": 0.5365603513430284,
+      "v_waterfall": 0.2561613548713012,
+      "z_bridge_deck": 8.15,
+      "z_lake_water": 10.15,
+      "z_river_water": 3.65
+    },
+    "pca_compression": {
+      "active_voxel_fraction": 0.6223983764648438,
+      "pca_eigenvalues_top4": [
+        3.083606004714966,
+        1.4680051803588867,
+        1.008817434310913,
+        0.4699609875679016
+      ],
+      "pca_explained_variance_ratio_top4": 0.8045406937599182
+    },
+    "seed": 909,
+    "styles": [
+      {
+        "bytes": 4064,
+        "mae_overall": 0.008279412053525448,
+        "params_floats": 1016,
+        "r2_active_voxels": 0.9936099461390412,
+        "r2_albedo_thermal": 0.9730306367481748,
+        "r2_density_mat": 0.9959924349300888,
+        "r2_overall": 0.9942294619566774,
+        "r2_per_channel": {
+          "albedo_b": 0.8880831782394262,
+          "albedo_g": 0.9452445237715448,
+          "albedo_r": 0.9634731562559676,
+          "blackbody_temp_glow": 0.990497314588764,
+          "fluid_density": 0.9940931198658104,
+          "gas_optical_density": 0.9637869741917272,
+          "roughness_wetness": 0.93640760767563,
+          "solid_density": 0.9961752632935496
+        },
+        "style_name": "NORDIC PIXEL-2XSS",
+        "train_time_s": 0.67
+      },
+      {
+        "bytes": 4064,
+        "mae_overall": 0.008000718429684639,
+        "params_floats": 1016,
+        "r2_active_voxels": 0.993882625238985,
+        "r2_albedo_thermal": 0.9672954413555188,
+        "r2_density_mat": 0.9962330427843368,
+        "r2_overall": 0.9947185589041884,
+        "r2_per_channel": {
+          "albedo_b": 0.978617281535294,
+          "albedo_g": 0.9585941270207812,
+          "albedo_r": 0.9784524603236716,
+          "blackbody_temp_glow": 0.7618920628511354,
+          "fluid_density": 0.9945853456837084,
+          "gas_optical_density": 0.9382429074103512,
+          "roughness_wetness": 0.9512144438228556,
+          "solid_density": 0.9973081852972272
+        },
+        "style_name": "VOLCANIC EMBER",
+        "train_time_s": 0.621
+      },
+      {
+        "bytes": 4064,
+        "mae_overall": 0.0075288861989974976,
+        "params_floats": 1016,
+        "r2_active_voxels": 0.996428221161264,
+        "r2_albedo_thermal": 0.9894057097507306,
+        "r2_density_mat": 0.9978939857685478,
+        "r2_overall": 0.9967117699076165,
+        "r2_per_channel": {
+          "albedo_b": 0.981359174385247,
+          "albedo_g": 0.9713916188535584,
+          "albedo_r": 0.9391005975932144,
+          "blackbody_temp_glow": 0.9803798392693356,
+          "fluid_density": 0.9953325015997116,
+          "gas_optical_density": 0.981431065020786,
+          "roughness_wetness": 0.9433015521347904,
+          "solid_density": 0.9977522916411402
+        },
+        "style_name": "ARCANE THERMAL",
+        "train_time_s": 0.613
+      }
+    ]
+  }
+}

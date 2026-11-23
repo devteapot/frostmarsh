@@ -1,0 +1,34 @@
+[workspace]
+
+[package]
+name = "frostmarsh-web-client"
+version = "0.1.0"
+edition = "2024"
+description = "Frostmarsh Iteration 9C: True 3D Z=16 WebGPU Smooth Surface-Nets + Volumetric Overlay Browser Client"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wgpu = { version = "30.0.2", features = ["webgpu", "webgl"] }
+glam = "0.33"
+bytemuck = { version = "1", features = ["derive"] }
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "Performance",
+    "console",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,19 +1,32 @@
-//! Iteration 8B: Head-to-Head True 3D `Z=16` Direct-3D-Texture WGSL Renderer Sandbox
-//! (`Sparse 8x8x8 Brick Raymarching` vs. `Smooth Surface-Nets + Volumetric Overlay`)
-//! + Continuous `∇solid_density` 3D Capsule Collision Verification.
+//! Iteration 9A: Client-Side WGSL `NeuralMaterialHead(Z_world)` Compute Decoder,
+//! Swappable Client Visual Styles (`Y`-Key), and Signature Frostmarsh HD Pixel-2×SS +
+//! Hard-Z Sculpted Pine Surfels on True 3D `Z=16` Surface-Nets!
 //!
 //! Supports:
-//! - `--headless`: Benchmarks Renderer A & B at 1080p and 4K on Metal, runs the 4-scenario
-//!   continuous 3D capsule collision audit, writes `models/RENDER_3D_HEADTOHEAD_METRICS.json`,
-//!   and composites the 1920×1080 2×2 visual showcase into `models/render_3d_headtohead_viz.png`.
-//! - Interactive window (default): WASD fly/walk camera, mouse-drag orbit, `1`/`2` camera presets,
-//!   and `G` live hot-toggle between Renderer A (Raymarch) and Renderer B (Surface-Nets)!
+//! - `--stylized-showcase` (or `--headless --latent <path>`):
+//!     Decodes compact Server->Client `FMLT` latent bricks (`8-ch`, zero baked RGB!) directly
+//!     on Metal GPU via `neural_material_decode.wgsl`, benchmarks full-1M-voxel & single-brick
+//!     decode latency, benchmarks 1080p & 4K Pixel-2×SS + Clean-3D FPS, composites the
+//!     1920×1080 2×2 stylized showcase PNG (`models/stylized_3d_z16_showcase.png`), and writes
+//!     full metrics into `models/STYLIZED_3D_Z16_METRICS.json`.
+//! - `--headless` (without `--latent`/`--stylized-showcase`): Head-to-Head Renderer A vs B benchmark.
+//! - Interactive window (default):
+//!     WASD/QE fly, drag orbit, `1`/`2` Bridge/Cave camera presets,
+//!     `T` live toggle (`PIXEL-2XSS` ↔ `CLEAN-3D`),
+//!     `Y` live swap client `NeuralMaterialHead` style (`NORDIC` ↔ `VOLCANIC EMBER` ↔ `ARCANE THERMAL`),
+//!     `G` live toggle Renderer B (Surface-Nets) ↔ Renderer A (Raymarch).
 
 use clap::Parser;
 use frostmarsh_3d_sandbox::camera::Camera3D;
 use frostmarsh_3d_sandbox::collision::{run_capsule_audit, CapsuleAuditMetrics};
-use frostmarsh_3d_sandbox::hero_mesh::{build_hero_knight_mesh, showcase_hero_instances};
-use frostmarsh_3d_sandbox::renderer::{HeadToHeadRenderer, RenderMode};
+use frostmarsh_3d_sandbox::foliage_surfels::PineSurfelScene;
+use frostmarsh_3d_sandbox::hero_mesh::{
+    build_hero_knight_mesh, latent_showcase_hero_instances, showcase_hero_instances,
+};
+use frostmarsh_3d_sandbox::neural_decoder::{
+    ClientMaterialWeights, GpuDecodeBenchMetrics, LatentBrickPacket, VisualStyle,
+};
+use frostmarsh_3d_sandbox::renderer::{HeadToHeadRenderer, RenderMode, ResolveStyle};
 use frostmarsh_3d_sandbox::surface_nets_3d::SurfaceNetsWorld;
 use frostmarsh_3d_sandbox::volume::WorldVolume3D;
 use glam::Vec3;
@@ -32,25 +45,37 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 #[derive(Parser, Debug)]
 #[command(name = "frostmarsh-3d-sandbox")]
-#[command(about = "Head-to-Head True 3D Z=16 Direct-3D-Texture WGSL Renderer Benchmark & Sandbox")]
+#[command(about = "Iteration 9A: Client-Side WGSL NeuralMaterialHead(Z_world) + Stylized 3D Z=16 Sandbox")]
 struct Args {
     /// Run headless benchmark + 2x2 showcase PNG + metrics JSON
     #[arg(long)]
     headless: bool,
 
-    /// Optional external FM3D binary volume path (defaults to rich procedural 256x256x16 scene)
+    /// Run Iteration 9A Stylized 3D Z=16 2x2 Showcase (Nordic Bridge, Nordic Cave, Volcanic Ember, Arcane Thermal)
+    #[arg(long)]
+    stylized_showcase: bool,
+
+    /// Compact Server->Client `FMLT` latent brick packet path (zero baked RGB!)
+    #[arg(long)]
+    latent: Option<PathBuf>,
+
+    /// Optional external `FMWG` client style weights path (defaults to baked 12 KB 3-style weights)
+    #[arg(long)]
+    weights: Option<PathBuf>,
+
+    /// Optional external FM3D binary volume path (legacy Iteration 8B mode)
     #[arg(long)]
     volume: Option<PathBuf>,
 
-    /// Output path for the 1920x1080 2x2 head-to-head showcase PNG
-    #[arg(long, default_value = "../../models/render_3d_headtohead_viz.png")]
-    out_png: PathBuf,
+    /// Output path for the 1920x1080 2x2 showcase PNG
+    #[arg(long)]
+    out_png: Option<PathBuf>,
 
-    /// Output path for the head-to-head benchmark metrics JSON
-    #[arg(long, default_value = "../../models/RENDER_3D_HEADTOHEAD_METRICS.json")]
-    out_json: PathBuf,
+    /// Output path for the metrics JSON
+    #[arg(long)]
+    out_json: Option<PathBuf>,
 
-    /// Benchmark iterations per resolution & renderer
+    /// Benchmark iterations per resolution & mode
     #[arg(long, default_value_t = 30)]
     iters: usize,
 }
@@ -81,6 +106,20 @@ struct SurfaceNetsBuildMetrics {
 }
 
 #[derive(Serialize)]
+struct BrickStats {
+    grid_dims: [usize; 3],
+    non_empty_bricks: usize,
+    total_bricks: usize,
+    occupancy_pct: f64,
+}
+
+#[derive(Serialize)]
+struct VisualParityMetrics {
+    bridge_view_mae: f64,
+    cave_view_mae: f64,
+}
+
+#[derive(Serialize)]
 struct HeadToHeadMetricsReport {
     adapter: String,
     backend: String,
@@ -97,17 +136,37 @@ struct HeadToHeadMetricsReport {
 }
 
 #[derive(Serialize)]
-struct BrickStats {
-    grid_dims: [usize; 3],
-    non_empty_bricks: usize,
-    total_bricks: usize,
-    occupancy_pct: f64,
+struct PineSurfelStats {
+    pine_count: usize,
+    snow_pine_count: usize,
+    total_trees: usize,
+    total_surfel_instances: u32,
 }
 
 #[derive(Serialize)]
-struct VisualParityMetrics {
-    bridge_view_mae: f64,
-    cave_view_mae: f64,
+struct StylizedShowcaseMetricsReport {
+    iteration: &'static str,
+    adapter: String,
+    backend: String,
+    volume_dims: [usize; 3],
+    latent_packet_bytes: usize,
+    latent_packet_channels: usize,
+    client_weights_bytes_per_style: usize,
+    client_weights_total_bytes: usize,
+    wgsl_neural_decode: GpuDecodeBenchMetrics,
+    surface_nets_build: SurfaceNetsBuildMetrics,
+    pine_surfels: PineSurfelStats,
+    pixel_2xss_render: RendererMetrics,
+    clean_3d_render: RendererMetrics,
+    style_swap_live_ms: StyleSwapTimings,
+    distillation: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct StyleSwapTimings {
+    nordic_ms: f64,
+    volcanic_ember_ms: f64,
+    arcane_thermal_ms: f64,
 }
 
 // Crisp built-in 5x7 bitmap font for clean non-overlapping quadrant labels on the 2x2 showcase PNG!
@@ -155,6 +214,8 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
         ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
         '/' => [0b00001, 0b00010, 0b00100, 0b00100, 0b01000, 0b10000, 0b00000],
         '|' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        '&' => [0b01100, 0b10010, 0b10100, 0b01000, 0b10101, 0b10010, 0b01101],
+        '_' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111],
         _ => [0; 7],
     }
 }
@@ -171,14 +232,12 @@ fn draw_badge(img: &mut RgbaImage, x0: u32, y0: u32, text: &str, accent: [u8; 3]
     for py in y0..(y0 + box_h).min(ih) {
         for px in x0..(x0 + box_w).min(iw) {
             let p = img.get_pixel_mut(px, py);
-            let is_bar = px < x0 + 4;
-            if is_bar {
+            if px < x0 + 4 {
                 *p = Rgba([accent[0], accent[1], accent[2], 255]);
             } else {
-                // Dark translucent frosted HUD bar
-                p[0] = ((p[0] as u32 * 55 + 14 * 200) / 255) as u8;
-                p[1] = ((p[1] as u32 * 55 + 18 * 200) / 255) as u8;
-                p[2] = ((p[2] as u32 * 55 + 28 * 200) / 255) as u8;
+                p[0] = ((p[0] as u32 * 52 + 12 * 203) / 255) as u8;
+                p[1] = ((p[1] as u32 * 52 + 16 * 203) / 255) as u8;
+                p[2] = ((p[2] as u32 * 52 + 26 * 203) / 255) as u8;
                 p[3] = 255;
             }
         }
@@ -228,12 +287,35 @@ fn mae_rgb(a: &[u8], b: &[u8]) -> f64 {
     sum as f64 / (pixels * 3).max(1) as f64
 }
 
+fn resolve_default_latent_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p.to_path_buf());
+    }
+    let candidates = [
+        PathBuf::from("../../models/checkpoints/z16_latent_bricks.bin"),
+        PathBuf::from("models/checkpoints/z16_latent_bricks.bin"),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn resolve_out_path(explicit: Option<&Path>, default_name: &str) -> PathBuf {
+    if let Some(p) = explicit {
+        return p.to_path_buf();
+    }
+    let rel_root = PathBuf::from(format!("../../models/{default_name}"));
+    if Path::new("../../models").exists() {
+        rel_root
+    } else {
+        PathBuf::from(format!("models/{default_name}"))
+    }
+}
+
 fn load_or_generate_volume(path: Option<&Path>) -> Result<WorldVolume3D, Box<dyn std::error::Error>> {
     if let Some(p) = path {
         println!("[3D-Sandbox] Loading FM3D volume from {}", p.display());
         WorldVolume3D::load_fm3d(p)
     } else {
-        println!("[3D-Sandbox] Generating procedural isotropic 256x256x16 alpine/bridge/cave/waterfall/wildfire volume...");
+        println!("[3D-Sandbox] Generating procedural isotropic 256x256x16 showcase volume...");
         let t0 = Instant::now();
         let vol = WorldVolume3D::generate_showcase();
         println!(
@@ -244,25 +326,289 @@ fn load_or_generate_volume(path: Option<&Path>) -> Result<WorldVolume3D, Box<dyn
     }
 }
 
-fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+fn run_stylized_showcase(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_current_thread().build()?;
+    let latent_path = resolve_default_latent_path(args.latent.as_deref())
+        .ok_or("Could not locate models/checkpoints/z16_latent_bricks.bin (pass --latent <path>)")?;
+
+    println!("[Iter 9A] Loading Server->Client FMLT latent bricks from {}", latent_path.display());
+    let packet = LatentBrickPacket::load_fmlt(&latent_path)?;
+    let weights = ClientMaterialWeights::load_or_baked(args.weights.as_deref())?;
+    println!(
+        "[Iter 9A] FMLT packet: {}x{}x{} x {}ch ({:.2} MB, ZERO RGB!) | FMWG weights: {} styles ({} B/style)",
+        packet.width,
+        packet.height,
+        packet.depth,
+        packet.channels,
+        packet.byte_size() as f64 / (1024.0 * 1024.0),
+        weights.num_styles,
+        (weights.weights_f32.len() / weights.num_styles) * 4,
+    );
+
+    // Decode reference volume on CPU once to build Surface-Nets geometry, 8x8x8 brick occupancy,
+    // sculpted pine surfel placements, and verify exact GPU-vs-CPU WGSL compute parity!
+    let cpu_vol = weights.decode_to_volume_cpu(&packet, VisualStyle::NordicPixel2xSS);
+    let bricks = cpu_vol.build_brick_occupancy();
+    let (mut sn_world, sn_full_ms) = SurfaceNetsWorld::build_all(&cpu_vol);
+    let mut dirty_samples = Vec::with_capacity(20);
+    for &(bx, bz) in &[
+        (7, 7), (8, 7), (8, 8), (9, 8), (6, 8),
+        (5, 8), (4, 8), (8, 6), (9, 7), (7, 8),
+    ] {
+        for _ in 0..2 {
+            dirty_samples.push(sn_world.rebuild_brick(&cpu_vol, bx, bz));
+        }
+    }
+    dirty_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let dirty_p50 = dirty_samples[dirty_samples.len() / 2];
+    let dirty_max = *dirty_samples.last().unwrap_or(&0.0);
+
+    let pines = PineSurfelScene::build_for_volume(&cpu_vol, true);
+    let hero_mesh = build_hero_knight_mesh();
+    let hero_instances = latent_showcase_hero_instances(&cpu_vol);
+    println!(
+        "[Iter 9A] Surface-Nets: {} verts, {} tris ({:.2} ms full / {:.3} ms dirty brick) | Sculpted Pines: {} green + {} snow ({} surfels)",
+        sn_world.total_vertices(),
+        sn_world.total_triangles(),
+        sn_full_ms,
+        dirty_p50,
+        pines.pine_count,
+        pines.snow_pine_count,
+        pines.draw_refs.len(),
+    );
+
+    // Initialize renderer & attach WGSL NeuralMaterialHead(Z_world) Compute Decoder!
+    let mut renderer = rt.block_on(HeadToHeadRenderer::new_headless(
+        &cpu_vol,
+        &bricks,
+        &sn_world,
+        &hero_mesh,
+        &hero_instances,
+        &pines,
+    ))?;
+    renderer.attach_neural_decoder(&packet, &weights);
+    println!(
+        "[GPU] Adapter: {} ({})",
+        renderer.adapter_name, renderer.adapter_backend
+    );
+
+    // Benchmark WGSL Compute Decoder (full 1M voxels + single 16x16x16 dirty brick) + verify parity!
+    let decode_metrics = renderer
+        .benchmark_neural_decode(&cpu_vol, VisualStyle::NordicPixel2xSS, 8, 30)
+        .expect("neural decoder attached");
+    println!(
+        "[WGSL Decode] Full 1,048,576 voxels: p50={:.3} ms (p99={:.3} ms) | Single 16x16x16 brick: p50={:.4} ms | GPU vs CPU max_diff={} u8 (MAE={:.4})",
+        decode_metrics.decode_full_1m_vox_p50_ms,
+        decode_metrics.decode_full_1m_vox_p99_ms,
+        decode_metrics.decode_single_16x16x16_brick_p50_ms,
+        decode_metrics.gpu_vs_cpu_max_u8_diff,
+        decode_metrics.gpu_vs_cpu_mae_u8,
+    );
+
+    let cam_bridge = Camera3D::preset_bridge_latent();
+    let cam_cave = Camera3D::preset_cave_latent();
+    let warmup = 6;
+    let iters = args.iters.max(12);
+
+    // Benchmark Stylized PIXEL-2XSS & CLEAN-3D at 1080p and 4K on Metal!
+    renderer.resolve_style = ResolveStyle::Pixel2xSS;
+    let p_1080 = renderer.benchmark(1920, 1080, RenderMode::SurfaceNets, &cam_bridge, warmup, iters);
+    let p_4k = renderer.benchmark(3840, 2160, RenderMode::SurfaceNets, &cam_bridge, warmup, iters);
+    let p_cave = renderer.benchmark(1920, 1080, RenderMode::SurfaceNets, &cam_cave, warmup, iters);
+
+    renderer.resolve_style = ResolveStyle::Clean3D;
+    let c_1080 = renderer.benchmark(1920, 1080, RenderMode::SurfaceNets, &cam_bridge, warmup, iters);
+    let c_4k = renderer.benchmark(3840, 2160, RenderMode::SurfaceNets, &cam_bridge, warmup, iters);
+    let c_cave = renderer.benchmark(1920, 1080, RenderMode::SurfaceNets, &cam_cave, warmup, iters);
+
+    println!(
+        "[Bench PIXEL-2XSS] 1080p Bridge: {:.2}ms ({:.0} FPS) | 4K: {:.2}ms ({:.0} FPS) | 1080p Cave: {:.2}ms ({:.0} FPS)",
+        p_1080.p50_ms, p_1080.fps_p50, p_4k.p50_ms, p_4k.fps_p50, p_cave.p50_ms, p_cave.fps_p50,
+    );
+    println!(
+        "[Bench CLEAN-3D  ] 1080p Bridge: {:.2}ms ({:.0} FPS) | 4K: {:.2}ms ({:.0} FPS) | 1080p Cave: {:.2}ms ({:.0} FPS)",
+        c_1080.p50_ms, c_1080.fps_p50, c_4k.p50_ms, c_4k.fps_p50, c_cave.p50_ms, c_cave.fps_p50,
+    );
+
+    // Render 1920x1080 2x2 Stylized Showcase (each quadrant 960x540 in signature PIXEL-2XSS!)
+    renderer.resolve_style = ResolveStyle::Pixel2xSS;
+    let qw = 960u32;
+    let qh = 540u32;
+
+    // Top-Left & Top-Right: Style 0 (NORDIC PIXEL-2XSS)
+    let swap_nordic_ms = renderer.set_visual_style(VisualStyle::NordicPixel2xSS);
+    let tl = renderer.render_to_rgba(qw, qh, RenderMode::SurfaceNets, &cam_bridge, 1.5);
+    let tr = renderer.render_to_rgba(qw, qh, RenderMode::SurfaceNets, &cam_cave, 1.5);
+
+    // Bottom-Left: Style 1 (VOLCANIC EMBER) — live GPU decode of EXACT same Z_world_3d latent!
+    let swap_volcanic_ms = renderer.set_visual_style(VisualStyle::VolcanicEmber);
+    let bl = renderer.render_to_rgba(qw, qh, RenderMode::SurfaceNets, &cam_bridge, 1.5);
+
+    // Bottom-Right: Style 2 (ARCANE THERMAL) — live GPU decode of EXACT same Z_world_3d latent!
+    let swap_arcane_ms = renderer.set_visual_style(VisualStyle::ArcaneThermal);
+    let br = renderer.render_to_rgba(qw, qh, RenderMode::SurfaceNets, &cam_bridge, 1.5);
+
+    let mut canvas = RgbaImage::new(1920, 1080);
+    blit_quadrant(&mut canvas, &tl, qw, qh, 0, 0);
+    blit_quadrant(&mut canvas, &tr, qw, qh, qw, 0);
+    blit_quadrant(&mut canvas, &bl, qw, qh, 0, qh);
+    blit_quadrant(&mut canvas, &br, qw, qh, qw, qh);
+
+    // Crisp 2px dark divider crosshair between quadrants
+    for x in 0..1920 {
+        canvas.put_pixel(x, qh - 1, Rgba([16, 18, 28, 255]));
+        canvas.put_pixel(x, qh, Rgba([16, 18, 28, 255]));
+    }
+    for y in 0..1080 {
+        canvas.put_pixel(qw - 1, y, Rgba([16, 18, 28, 255]));
+        canvas.put_pixel(qw, y, Rgba([16, 18, 28, 255]));
+    }
+
+    draw_badge(
+        &mut canvas,
+        14,
+        12,
+        &format!(
+            "STYLE 0: NORDIC PIXEL-2XSS | BRIDGE + PINES + WATERFALL | {:.0} FPS",
+            p_1080.fps_p50
+        ),
+        [92, 232, 152],
+    );
+    draw_badge(
+        &mut canvas,
+        qw + 14,
+        12,
+        &format!(
+            "STYLE 0: NORDIC PIXEL-2XSS | VAULTED BASALT CAVE + MAGMA | {:.0} FPS",
+            p_cave.fps_p50
+        ),
+        [108, 198, 255],
+    );
+    draw_badge(
+        &mut canvas,
+        14,
+        qh + 12,
+        &format!(
+            "STYLE 1: VOLCANIC EMBER | LIVE WGSL DECODE {:.2}MS (SAME Z_WORLD)",
+            decode_metrics.decode_full_1m_vox_p50_ms
+        ),
+        [255, 138, 56],
+    );
+    draw_badge(
+        &mut canvas,
+        qw + 14,
+        qh + 12,
+        &format!(
+            "STYLE 2: ARCANE THERMAL | LIVE WGSL DECODE {:.2}MS (SAME Z_WORLD)",
+            decode_metrics.decode_full_1m_vox_p50_ms
+        ),
+        [68, 238, 255],
+    );
+
+    let out_png = resolve_out_path(args.out_png.as_deref(), "stylized_3d_z16_showcase.png");
+    if let Some(parent) = out_png.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    canvas.save(&out_png)?;
+    println!("[Output] Saved 1920x1080 2x2 Stylized Showcase PNG to {}", out_png.display());
+
+    // Merge with distillation metrics already written by `ml/export_client_material_wgsl.py` if present!
+    let out_json = resolve_out_path(args.out_json.as_deref(), "STYLIZED_3D_Z16_METRICS.json");
+    let existing_distill: Option<serde_json::Value> = std::fs::read_to_string(&out_json)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("distillation").cloned());
+
+    let report = StylizedShowcaseMetricsReport {
+        iteration: "9A",
+        adapter: renderer.adapter_name.clone(),
+        backend: renderer.adapter_backend.clone(),
+        volume_dims: [packet.width, packet.height, packet.depth],
+        latent_packet_bytes: packet.byte_size(),
+        latent_packet_channels: packet.channels,
+        client_weights_bytes_per_style: (weights.weights_f32.len() / weights.num_styles) * 4,
+        client_weights_total_bytes: weights.weights_f32.len() * 4 + 24,
+        wgsl_neural_decode: decode_metrics,
+        surface_nets_build: SurfaceNetsBuildMetrics {
+            full_build_ms: sn_full_ms,
+            dirty_brick_16x16x16_p50_ms: dirty_p50,
+            dirty_brick_16x16x16_max_ms: dirty_max,
+            vertex_count: sn_world.total_vertices(),
+            triangle_count: sn_world.total_triangles(),
+            brick_count: sn_world.bricks.len(),
+        },
+        pine_surfels: PineSurfelStats {
+            pine_count: pines.pine_count,
+            snow_pine_count: pines.snow_pine_count,
+            total_trees: pines.pine_count + pines.snow_pine_count,
+            total_surfel_instances: pines.draw_refs.len() as u32,
+        },
+        pixel_2xss_render: RendererMetrics {
+            res_1080p: ResBenchMetrics {
+                p50_ms: p_1080.p50_ms,
+                p99_ms: p_1080.p99_ms,
+                mean_ms: p_1080.mean_ms,
+                fps_p50: p_1080.fps_p50,
+            },
+            res_4k: ResBenchMetrics {
+                p50_ms: p_4k.p50_ms,
+                p99_ms: p_4k.p99_ms,
+                mean_ms: p_4k.mean_ms,
+                fps_p50: p_4k.fps_p50,
+            },
+            cave_1080p: ResBenchMetrics {
+                p50_ms: p_cave.p50_ms,
+                p99_ms: p_cave.p99_ms,
+                mean_ms: p_cave.mean_ms,
+                fps_p50: p_cave.fps_p50,
+            },
+        },
+        clean_3d_render: RendererMetrics {
+            res_1080p: ResBenchMetrics {
+                p50_ms: c_1080.p50_ms,
+                p99_ms: c_1080.p99_ms,
+                mean_ms: c_1080.mean_ms,
+                fps_p50: c_1080.fps_p50,
+            },
+            res_4k: ResBenchMetrics {
+                p50_ms: c_4k.p50_ms,
+                p99_ms: c_4k.p99_ms,
+                mean_ms: c_4k.mean_ms,
+                fps_p50: c_4k.fps_p50,
+            },
+            cave_1080p: ResBenchMetrics {
+                p50_ms: c_cave.p50_ms,
+                p99_ms: c_cave.p99_ms,
+                mean_ms: c_cave.mean_ms,
+                fps_p50: c_cave.fps_p50,
+            },
+        },
+        style_swap_live_ms: StyleSwapTimings {
+            nordic_ms: swap_nordic_ms,
+            volcanic_ember_ms: swap_volcanic_ms,
+            arcane_thermal_ms: swap_arcane_ms,
+        },
+        distillation: existing_distill,
+    };
+
+    if let Some(parent) = out_json.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&out_json, serde_json::to_string_pretty(&report)?)?;
+    println!("[Output] Saved Iteration 9A metrics JSON to {}", out_json.display());
+    Ok(())
+}
+
+fn run_headless_headtohead(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_current_thread().build()?;
     let volume = load_or_generate_volume(args.volume.as_deref())?;
     let bricks = volume.build_brick_occupancy();
 
-    // 1. Build Smooth Surface-Nets & benchmark single 16x16x16 dirty-brick rebuilds!
     let (mut sn_world, sn_full_ms) = SurfaceNetsWorld::build_all(&volume);
     let mut dirty_samples = Vec::with_capacity(20);
     for &(bx, bz) in &[
-        (7, 7),
-        (8, 7),
-        (8, 8),
-        (9, 8),
-        (6, 9),
-        (5, 9),
-        (8, 6),
-        (9, 7),
-        (7, 8),
-        (5, 10),
+        (7, 7), (8, 7), (8, 8), (9, 8), (6, 9),
+        (5, 9), (8, 6), (9, 7), (7, 8), (5, 10),
     ] {
         for _ in 0..2 {
             dirty_samples.push(sn_world.rebuild_brick(&volume, bx, bz));
@@ -271,35 +617,9 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     dirty_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let dirty_p50 = dirty_samples[dirty_samples.len() / 2];
     let dirty_max = *dirty_samples.last().unwrap_or(&0.0);
-    println!(
-        "[Surface-Nets] Full 256x16x256 build: {:.2} ms | 16x16x16 dirty brick p50: {:.3} ms (max {:.3} ms) | {} verts, {} tris",
-        sn_full_ms,
-        dirty_p50,
-        dirty_max,
-        sn_world.total_vertices(),
-        sn_world.total_triangles()
-    );
 
-    // 2. Run continuous ∇solid_density 3D capsule collision audit
     let capsule_audit = run_capsule_audit(&volume);
-    println!(
-        "[Capsule-3D] Bridge={} (y={:.2}..{:.2}, pen={:.4}m) | UnderBridge={} (clr={:.2}m, pen={:.4}m) | Cave={} (clr={:.2}m, pen={:.4}m) | 45degWallSlide={} (v_tan={:.2}m/s, pen={:.4}m)",
-        capsule_audit.bridge_walk_ok,
-        capsule_audit.bridge_min_y,
-        capsule_audit.bridge_max_y,
-        capsule_audit.bridge_max_penetration_m,
-        capsule_audit.under_bridge_walk_ok,
-        capsule_audit.under_bridge_min_clearance_m,
-        capsule_audit.under_bridge_max_penetration_m,
-        capsule_audit.cave_traverse_ok,
-        capsule_audit.cave_min_ceiling_clearance_m,
-        capsule_audit.cave_max_penetration_m,
-        capsule_audit.wall_slide_45deg_ok,
-        capsule_audit.wall_slide_min_tangent_speed,
-        capsule_audit.wall_slide_max_penetration_m
-    );
-
-    // 3. Init GPU Head-to-Head Renderer
+    let pines = PineSurfelScene::build_for_volume(&volume, false);
     let hero_mesh = build_hero_knight_mesh();
     let hero_instances = showcase_hero_instances();
     let mut renderer = rt.block_on(HeadToHeadRenderer::new_headless(
@@ -308,44 +628,22 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         &sn_world,
         &hero_mesh,
         &hero_instances,
+        &pines,
     ))?;
-    println!(
-        "[GPU] Adapter: {} ({})",
-        renderer.adapter_name, renderer.adapter_backend
-    );
+    renderer.resolve_style = ResolveStyle::Clean3D;
 
     let cam_bridge = Camera3D::preset_bridge_waterfall();
     let cam_cave = Camera3D::preset_cave_mouth();
 
-    // 4. Benchmark BOTH renderers at 1920x1080 and 3840x2160 (4K)
     let warmup = 6;
     let iters = args.iters.max(10);
-
     let a_1080 = renderer.benchmark(1920, 1080, RenderMode::Raymarch, &cam_bridge, warmup, iters);
     let a_4k = renderer.benchmark(3840, 2160, RenderMode::Raymarch, &cam_bridge, warmup, iters);
     let a_cave = renderer.benchmark(1920, 1080, RenderMode::Raymarch, &cam_cave, warmup, iters);
-
     let b_1080 = renderer.benchmark(1920, 1080, RenderMode::SurfaceNets, &cam_bridge, warmup, iters);
     let b_4k = renderer.benchmark(3840, 2160, RenderMode::SurfaceNets, &cam_bridge, warmup, iters);
     let b_cave = renderer.benchmark(1920, 1080, RenderMode::SurfaceNets, &cam_cave, warmup, iters);
 
-    println!(
-        "[Bench 1080p Bridge] A Raymarch: p50={:.2}ms p99={:.2}ms ({:.1} FPS) | B Surface-Nets: p50={:.2}ms p99={:.2}ms ({:.1} FPS)",
-        a_1080.p50_ms, a_1080.p99_ms, a_1080.fps_p50,
-        b_1080.p50_ms, b_1080.p99_ms, b_1080.fps_p50
-    );
-    println!(
-        "[Bench 4K    Bridge] A Raymarch: p50={:.2}ms p99={:.2}ms ({:.1} FPS) | B Surface-Nets: p50={:.2}ms p99={:.2}ms ({:.1} FPS)",
-        a_4k.p50_ms, a_4k.p99_ms, a_4k.fps_p50,
-        b_4k.p50_ms, b_4k.p99_ms, b_4k.fps_p50
-    );
-    println!(
-        "[Bench 1080p Cave  ] A Raymarch: p50={:.2}ms p99={:.2}ms ({:.1} FPS) | B Surface-Nets: p50={:.2}ms p99={:.2}ms ({:.1} FPS)",
-        a_cave.p50_ms, a_cave.p99_ms, a_cave.fps_p50,
-        b_cave.p50_ms, b_cave.p99_ms, b_cave.fps_p50
-    );
-
-    // 5. Render 1920x1080 2x2 Head-to-Head Visual Showcase (each quadrant 960x540)
     let qw = 960u32;
     let qh = 540u32;
     let tl = renderer.render_to_rgba(qw, qh, RenderMode::Raymarch, &cam_bridge, 1.5);
@@ -362,64 +660,12 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     blit_quadrant(&mut canvas, &bl, qw, qh, 0, qh);
     blit_quadrant(&mut canvas, &br, qw, qh, qw, qh);
 
-    // Crisp 2px dark divider crosshair between quadrants
-    for x in 0..1920 {
-        canvas.put_pixel(x, qh - 1, Rgba([18, 22, 32, 255]));
-        canvas.put_pixel(x, qh, Rgba([18, 22, 32, 255]));
-    }
-    for y in 0..1080 {
-        canvas.put_pixel(qw - 1, y, Rgba([18, 22, 32, 255]));
-        canvas.put_pixel(qw, y, Rgba([18, 22, 32, 255]));
-    }
-
-    draw_badge(
-        &mut canvas,
-        14,
-        12,
-        &format!(
-            "A: RAYMARCH (8X8X8 BRICK DDA) | 1080P {:.2}MS ({:.0} FPS) | 4K {:.2}MS",
-            a_1080.p50_ms, a_1080.fps_p50, a_4k.p50_ms
-        ),
-        [68, 178, 255],
-    );
-    draw_badge(
-        &mut canvas,
-        qw + 14,
-        12,
-        &format!(
-            "B: SURFACE-NETS + VOL OVERLAY | 1080P {:.2}MS ({:.0} FPS) | 4K {:.2}MS",
-            b_1080.p50_ms, b_1080.fps_p50, b_4k.p50_ms
-        ),
-        [92, 232, 152],
-    );
-    draw_badge(
-        &mut canvas,
-        14,
-        qh + 12,
-        &format!(
-            "A: RAYMARCH - VAULTED BASALT CAVE + MAGMA | 1080P {:.2}MS ({:.0} FPS)",
-            a_cave.p50_ms, a_cave.fps_p50
-        ),
-        [255, 168, 68],
-    );
-    draw_badge(
-        &mut canvas,
-        qw + 14,
-        qh + 12,
-        &format!(
-            "B: SURFACE-NETS - VAULTED CAVE ({:.2}MS DIRTY BRICK) | 1080P {:.2}MS",
-            dirty_p50, b_cave.p50_ms
-        ),
-        [92, 232, 152],
-    );
-
-    if let Some(parent) = args.out_png.parent() {
+    let out_png = resolve_out_path(args.out_png.as_deref(), "render_3d_headtohead_viz.png");
+    if let Some(parent) = out_png.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    canvas.save(&args.out_png)?;
-    println!("[Output] Saved 1920x1080 2x2 showcase PNG to {}", args.out_png.display());
+    canvas.save(&out_png)?;
 
-    // 6. Save structured metrics JSON
     let report = HeadToHeadMetricsReport {
         adapter: renderer.adapter_name.clone(),
         backend: renderer.adapter_backend.clone(),
@@ -440,64 +686,30 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             brick_count: sn_world.bricks.len(),
         },
         renderer_a_raymarch: RendererMetrics {
-            res_1080p: ResBenchMetrics {
-                p50_ms: a_1080.p50_ms,
-                p99_ms: a_1080.p99_ms,
-                mean_ms: a_1080.mean_ms,
-                fps_p50: a_1080.fps_p50,
-            },
-            res_4k: ResBenchMetrics {
-                p50_ms: a_4k.p50_ms,
-                p99_ms: a_4k.p99_ms,
-                mean_ms: a_4k.mean_ms,
-                fps_p50: a_4k.fps_p50,
-            },
-            cave_1080p: ResBenchMetrics {
-                p50_ms: a_cave.p50_ms,
-                p99_ms: a_cave.p99_ms,
-                mean_ms: a_cave.mean_ms,
-                fps_p50: a_cave.fps_p50,
-            },
+            res_1080p: ResBenchMetrics { p50_ms: a_1080.p50_ms, p99_ms: a_1080.p99_ms, mean_ms: a_1080.mean_ms, fps_p50: a_1080.fps_p50 },
+            res_4k: ResBenchMetrics { p50_ms: a_4k.p50_ms, p99_ms: a_4k.p99_ms, mean_ms: a_4k.mean_ms, fps_p50: a_4k.fps_p50 },
+            cave_1080p: ResBenchMetrics { p50_ms: a_cave.p50_ms, p99_ms: a_cave.p99_ms, mean_ms: a_cave.mean_ms, fps_p50: a_cave.fps_p50 },
         },
         renderer_b_surface_nets: RendererMetrics {
-            res_1080p: ResBenchMetrics {
-                p50_ms: b_1080.p50_ms,
-                p99_ms: b_1080.p99_ms,
-                mean_ms: b_1080.mean_ms,
-                fps_p50: b_1080.fps_p50,
-            },
-            res_4k: ResBenchMetrics {
-                p50_ms: b_4k.p50_ms,
-                p99_ms: b_4k.p99_ms,
-                mean_ms: b_4k.mean_ms,
-                fps_p50: b_4k.fps_p50,
-            },
-            cave_1080p: ResBenchMetrics {
-                p50_ms: b_cave.p50_ms,
-                p99_ms: b_cave.p99_ms,
-                mean_ms: b_cave.mean_ms,
-                fps_p50: b_cave.fps_p50,
-            },
+            res_1080p: ResBenchMetrics { p50_ms: b_1080.p50_ms, p99_ms: b_1080.p99_ms, mean_ms: b_1080.mean_ms, fps_p50: b_1080.fps_p50 },
+            res_4k: ResBenchMetrics { p50_ms: b_4k.p50_ms, p99_ms: b_4k.p99_ms, mean_ms: b_4k.mean_ms, fps_p50: b_4k.fps_p50 },
+            cave_1080p: ResBenchMetrics { p50_ms: b_cave.p50_ms, p99_ms: b_cave.p99_ms, mean_ms: b_cave.mean_ms, fps_p50: b_cave.fps_p50 },
         },
         speedup_b_over_a_1080p: a_1080.p50_ms / b_1080.p50_ms.max(1e-4),
         speedup_b_over_a_4k: a_4k.p50_ms / b_4k.p50_ms.max(1e-4),
-        visual_parity_mae_rgb_255: VisualParityMetrics {
-            bridge_view_mae: bridge_mae,
-            cave_view_mae: cave_mae,
-        },
+        visual_parity_mae_rgb_255: VisualParityMetrics { bridge_view_mae: bridge_mae, cave_view_mae: cave_mae },
         capsule_collision_3d: capsule_audit,
     };
-
-    if let Some(parent) = args.out_json.parent() {
+    let out_json = resolve_out_path(args.out_json.as_deref(), "RENDER_3D_HEADTOHEAD_METRICS.json");
+    if let Some(parent) = out_json.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&args.out_json, serde_json::to_string_pretty(&report)?)?;
-    println!("[Output] Saved metrics JSON to {}", args.out_json.display());
+    std::fs::write(&out_json, serde_json::to_string_pretty(&report)?)?;
     Ok(())
 }
 
 // =========================================================================
-// Interactive Window Mode (WASD Fly/Walk, Mouse Orbit, G-Key Live Toggle!)
+// Interactive Window Mode (T: Pixel-2xSS/Clean-3D, Y: Swap Style, G: A/B!)
 // =========================================================================
 
 struct InteractiveApp {
@@ -508,6 +720,7 @@ struct InteractiveApp {
     surface_cfg: Option<wgpu::SurfaceConfiguration>,
     renderer: Option<HeadToHeadRenderer>,
     mode: RenderMode,
+    is_latent_world: bool,
     cam: Camera3D,
     keys: HashSet<KeyCode>,
     dragging: bool,
@@ -528,8 +741,9 @@ impl InteractiveApp {
             surface: None,
             surface_cfg: None,
             renderer: None,
-            mode: RenderMode::Raymarch,
-            cam: Camera3D::preset_bridge_waterfall(),
+            mode: RenderMode::SurfaceNets,
+            is_latent_world: false,
+            cam: Camera3D::preset_bridge_latent(),
             keys: HashSet::new(),
             dragging: false,
             last_cursor: None,
@@ -539,10 +753,12 @@ impl InteractiveApp {
     }
 
     fn update_title(&self) {
-        if let Some(ref w) = self.window {
+        if let (Some(w), Some(r)) = (&self.window, &self.renderer) {
             w.set_title(&format!(
-                "Frostmarsh 3D Sandbox [G: Toggle] — {} | WASD Move, Drag Orbit, 1/2 Presets",
-                self.mode.label()
+                "Frostmarsh 3D Z=16 | [Y] {} | [T] {} | [G] {} | 1/2 Presets",
+                r.visual_style.label(),
+                r.resolve_style.label(),
+                self.mode.label(),
             ));
         }
     }
@@ -552,7 +768,6 @@ impl InteractiveApp {
         let dt = (now - self.last_frame).as_secs_f32().clamp(0.001, 0.1);
         self.last_frame = now;
 
-        // WASD + Q/E free-fly camera movement
         let speed = if self.keys.contains(&KeyCode::ShiftLeft) { 22.0 } else { 10.0 };
         let fwd = self.cam.forward();
         let right = fwd.cross(Vec3::Y).normalize_or(Vec3::X);
@@ -601,16 +816,41 @@ impl ApplicationHandler for InteractiveApp {
             return;
         }
         let attrs = WindowAttributes::default()
-            .with_title("Frostmarsh 3D Sandbox — Loading...")
+            .with_title("Frostmarsh 3D Z=16 — Loading...")
             .with_inner_size(LogicalSize::new(1440.0, 900.0));
         let win = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let sz = win.inner_size();
 
-        let volume = load_or_generate_volume(self.args.volume.as_deref()).expect("load volume");
+        let latent_opt = if self.args.volume.is_none() {
+            resolve_default_latent_path(self.args.latent.as_deref())
+        } else {
+            self.args.latent.clone()
+        };
+
+        let (volume, packet_and_weights) = if let Some(lp) = latent_opt {
+            let pkt = LatentBrickPacket::load_fmlt(&lp).expect("load FMLT");
+            let wts = ClientMaterialWeights::load_or_baked(self.args.weights.as_deref())
+                .expect("load FMWG");
+            let vol = wts.decode_to_volume_cpu(&pkt, VisualStyle::NordicPixel2xSS);
+            self.is_latent_world = true;
+            self.cam = Camera3D::preset_bridge_latent();
+            (vol, Some((pkt, wts)))
+        } else {
+            let vol = load_or_generate_volume(self.args.volume.as_deref()).expect("load volume");
+            self.is_latent_world = false;
+            self.cam = Camera3D::preset_bridge_waterfall();
+            (vol, None)
+        };
+
         let bricks = volume.build_brick_occupancy();
         let (sn_world, _) = SurfaceNetsWorld::build_all(&volume);
+        let pines = PineSurfelScene::build_for_volume(&volume, self.is_latent_world);
         let hero_mesh = build_hero_knight_mesh();
-        let hero_instances = showcase_hero_instances();
+        let hero_instances = if self.is_latent_world {
+            latent_showcase_hero_instances(&volume)
+        } else {
+            showcase_hero_instances()
+        };
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(win.clone()).expect("create surface");
@@ -632,7 +872,7 @@ impl ApplicationHandler for InteractiveApp {
             .find(|f| !f.is_srgb())
             .unwrap_or(caps.formats[0]);
 
-        let renderer = self
+        let mut renderer = self
             .rt
             .block_on(HeadToHeadRenderer::from_adapter(
                 adapter.clone(),
@@ -642,8 +882,12 @@ impl ApplicationHandler for InteractiveApp {
                 &sn_world,
                 &hero_mesh,
                 &hero_instances,
+                &pines,
             ))
             .expect("init renderer");
+        if let Some((pkt, wts)) = packet_and_weights {
+            renderer.attach_neural_decoder(&pkt, &wts);
+        }
 
         let mut cfg = surface
             .get_default_config(&adapter, sz.width.max(1), sz.height.max(1))
@@ -698,10 +942,41 @@ impl ApplicationHandler for InteractiveApp {
                                 KeyCode::KeyG => {
                                     self.mode = self.mode.toggle();
                                     self.update_title();
-                                    println!("[3D-Sandbox] Switched to {}", self.mode.label());
+                                    println!("[3D-Sandbox] Renderer -> {}", self.mode.label());
                                 }
-                                KeyCode::Digit1 => self.cam = Camera3D::preset_bridge_waterfall(),
-                                KeyCode::Digit2 => self.cam = Camera3D::preset_cave_mouth(),
+                                KeyCode::KeyT => {
+                                    if let Some(ref mut r) = self.renderer {
+                                        r.resolve_style = r.resolve_style.toggle();
+                                        println!("[3D-Sandbox] Resolve -> {}", r.resolve_style.label());
+                                    }
+                                    self.update_title();
+                                }
+                                KeyCode::KeyY => {
+                                    if let Some(ref mut r) = self.renderer {
+                                        let next = r.visual_style.next();
+                                        let ms = r.set_visual_style(next);
+                                        println!(
+                                            "[3D-Sandbox] Live Style Swap -> {} (GPU WGSL decode: {:.3} ms)",
+                                            next.label(),
+                                            ms
+                                        );
+                                    }
+                                    self.update_title();
+                                }
+                                KeyCode::Digit1 => {
+                                    self.cam = if self.is_latent_world {
+                                        Camera3D::preset_bridge_latent()
+                                    } else {
+                                        Camera3D::preset_bridge_waterfall()
+                                    };
+                                }
+                                KeyCode::Digit2 => {
+                                    self.cam = if self.is_latent_world {
+                                        Camera3D::preset_cave_latent()
+                                    } else {
+                                        Camera3D::preset_cave_mouth()
+                                    };
+                                }
                                 _ => {}
                             }
                         }
@@ -723,8 +998,10 @@ impl ApplicationHandler for InteractiveApp {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    if args.headless {
-        run_headless(args)
+    if args.stylized_showcase || (args.headless && args.latent.is_some()) {
+        run_stylized_showcase(args)
+    } else if args.headless {
+        run_headless_headtohead(args)
     } else {
         let event_loop = EventLoop::new()?;
         event_loop.set_control_flow(ControlFlow::Poll);

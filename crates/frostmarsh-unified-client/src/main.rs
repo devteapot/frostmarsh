@@ -545,6 +545,11 @@ struct InteractiveApp {
     start_time: Instant,
     last_frame: Instant,
     fps_ema: f32,
+    smooth_players: HashMap<u32, (f32, f32, f32)>,
+    smooth_projs: HashMap<u32, (f32, f32, f32)>,
+    smooth_bodies: HashMap<u32, (f32, f32, f32)>,
+    last_snap_tick: u64,
+    snap_age_s: f32,
 }
 
 impl InteractiveApp {
@@ -609,6 +614,11 @@ impl InteractiveApp {
             start_time: Instant::now(),
             last_frame: Instant::now(),
             fps_ema: 60.0,
+            smooth_players: HashMap::new(),
+            smooth_projs: HashMap::new(),
+            smooth_bodies: HashMap::new(),
+            last_snap_tick: 0,
+            snap_age_s: 0.0,
         }
     }
 
@@ -629,30 +639,128 @@ impl InteractiveApp {
             }
         }
 
-        // Pull latest 3D volumetric A+ dirty chunks + entities from QUIC
-        let (entities, rtt_ms) = if let Some(ref quic) = self.quic {
-            let (gw, gh, gd, dirty, layers_opt, ent, rtt) = {
-                let mut st = quic.state.lock().unwrap();
-                let d = st.take_dirty_list();
-                let c = if !d.is_empty() { Some(st.aplus_layers.clone()) } else { None };
-                (st.width, st.height, st.depth, d, c, st.entities.clone(), st.rtt_ms)
-            };
+        // Pull latest 3D volumetric A+ dirty chunks (budgeted per frame, zero 4MB clone!) + entities from QUIC
+        let (mut entities, rtt_ms) = if let Some(ref quic) = self.quic {
+            let mut st = quic.state.lock().unwrap();
+            let gw = st.width;
+            let gh = st.height;
+            let gd = st.depth;
+            let dirty = st.take_dirty_budget(20);
+            let ent = st.entities.clone();
+            let rtt = st.rtt_ms;
             self.world.resize_if_needed(gw, gh, gd);
-            if let Some(layers) = layers_opt {
-                self.world.update_dirty_chunks(&layers, &dirty);
+            if !dirty.is_empty() {
+                self.world.update_dirty_chunks(&st.aplus_layers, &dirty);
             }
+            drop(st);
             (ent, rtt)
         } else {
             (None, 0.0)
         };
 
-        // Smooth 3D camera follow onto your hero's exact altitude
+        // Compute camera-basis WASD right away so client-side hero prediction runs every single frame at native FPS!
+        let pre_fwd_xz = Vec3::new(-self.camera.yaw.sin(), 0.0, -self.camera.yaw.cos()).normalize_or(Vec3::NEG_Z);
+        let pre_right_xz = Vec3::new(-pre_fwd_xz.z, 0.0, pre_fwd_xz.x);
+        let (mut f_in_now, mut r_in_now) = (0.0f32, 0.0f32);
+        if !self.chat_open {
+            if self.keys.contains(&KeyCode::KeyW) { f_in_now += 1.0; }
+            if self.keys.contains(&KeyCode::KeyS) { f_in_now -= 1.0; }
+            if self.keys.contains(&KeyCode::KeyD) { r_in_now += 1.0; }
+            if self.keys.contains(&KeyCode::KeyA) { r_in_now -= 1.0; }
+        }
+        let local_move_v = (pre_fwd_xz * f_in_now + pre_right_xz * r_in_now).clamp_length_max(1.0);
+
+        // Smooth 60-120 FPS Client-Side Hero Prediction + Velocity-Extrapolated Entity Interpolation!
+        // Eliminates 10-30 Hz snapshot stepping so your hero, bots, projectiles, and camera glide smoothly.
+        if let Some(ref mut ent) = entities {
+            if ent.sim_tick != self.last_snap_tick {
+                self.last_snap_tick = ent.sim_tick;
+                self.snap_age_s = 0.0;
+            } else {
+                self.snap_age_s = (self.snap_age_s + dt).min(0.16);
+            }
+            let alpha_other = 1.0 - (-18.0 * dt).exp();
+            let alpha_self = 1.0 - (-11.0 * dt).exp();
+            let extrap_t = self.snap_age_s.min(0.12);
+            let gw_max = (self.world.grid_w.saturating_sub(2)) as f32;
+            let gh_max = (self.world.grid_h.saturating_sub(2)) as f32;
+            let self_speed = 14.0 * (self.world.grid_w as f32 / 256.0).clamp(1.0, 2.0);
+
+            let mut live_pids = HashSet::with_capacity(ent.players.len());
+            for p in &mut ent.players {
+                live_pids.insert(p.id);
+                let target_x = (p.x + p.vx * extrap_t).clamp(1.0, gw_max);
+                let target_y = (p.y + p.vy * extrap_t).clamp(1.0, gh_max);
+                let target_z = (p.z + p.vz * extrap_t).clamp(0.0, (self.world.grid_d.saturating_sub(1)) as f32);
+
+                let entry = self.smooth_players.entry(p.id).or_insert((p.x, p.y, p.z));
+                let err = (entry.0 - p.x).hypot(entry.1 - p.y);
+                if err > 14.0 {
+                    *entry = (p.x, p.y, p.z);
+                } else if p.id == ent.your_player_id {
+                    // Advance local hero smoothly on WASD input + softly reconcile to authoritative server position
+                    if local_move_v.length_squared() > 0.01 && p.hp > 0 {
+                        entry.0 = (entry.0 + local_move_v.x * self_speed * dt).clamp(1.0, gw_max);
+                        entry.1 = (entry.1 + local_move_v.z * self_speed * dt).clamp(1.0, gh_max);
+                    }
+                    let recon = if err > 3.5 { (alpha_self * 1.8).min(1.0) } else { alpha_self };
+                    entry.0 += (target_x - entry.0) * recon;
+                    entry.1 += (target_y - entry.1) * recon;
+                    entry.2 += (target_z - entry.2) * alpha_other;
+                } else {
+                    entry.0 += (target_x - entry.0) * alpha_other;
+                    entry.1 += (target_y - entry.1) * alpha_other;
+                    entry.2 += (target_z - entry.2) * alpha_other;
+                }
+                p.x = entry.0;
+                p.y = entry.1;
+                p.z = entry.2;
+            }
+            self.smooth_players.retain(|id, _| live_pids.contains(id));
+
+            let mut live_prids = HashSet::with_capacity(ent.projectiles.len());
+            for pr in &mut ent.projectiles {
+                live_prids.insert(pr.id);
+                let tx = (pr.x + pr.vx * extrap_t).clamp(0.0, gw_max);
+                let ty = (pr.y + pr.vy * extrap_t).clamp(0.0, gh_max);
+                let tz = pr.z + pr.vz * extrap_t;
+                let entry = self.smooth_projs.entry(pr.id).or_insert((pr.x, pr.y, pr.z));
+                if (entry.0 - pr.x).hypot(entry.1 - pr.y) > 16.0 {
+                    *entry = (pr.x, pr.y, pr.z);
+                } else {
+                    let a = 1.0 - (-24.0 * dt).exp();
+                    entry.0 += (tx - entry.0) * a;
+                    entry.1 += (ty - entry.1) * a;
+                    entry.2 += (tz - entry.2) * a;
+                }
+                pr.x = entry.0;
+                pr.y = entry.1;
+                pr.z = entry.2;
+            }
+            self.smooth_projs.retain(|id, _| live_prids.contains(id));
+
+            let mut live_bids = HashSet::with_capacity(ent.bodies.len());
+            for cb in &mut ent.bodies {
+                live_bids.insert(cb.id);
+                let entry = self.smooth_bodies.entry(cb.id).or_insert((cb.x, cb.y, cb.z));
+                entry.0 += (cb.x - entry.0) * alpha_other;
+                entry.1 += (cb.y - entry.1) * alpha_other;
+                entry.2 += (cb.z - entry.2) * alpha_other;
+                cb.x = entry.0;
+                cb.y = entry.1;
+                cb.z = entry.2;
+            }
+            self.smooth_bodies.retain(|id, _| live_bids.contains(id));
+        }
+
+        // Smooth 3D camera follow onto your predicted hero's exact altitude
         if let Some(ref ent) = entities {
             if let Some(me) = ent.players.iter().find(|p| p.id == ent.your_player_id) {
                 let (wx, wz) = self.world.grid_to_world_xz(me.x, me.y);
                 let gy = self.world.sample_3d_y(me.x, me.y, me.z);
                 let desired = Vec3::new(wx, gy + 0.8, wz);
-                self.camera.target = self.camera.target.lerp(desired, (dt * 9.0).min(1.0));
+                let cam_alpha = 1.0 - (-12.0 * dt).exp();
+                self.camera.target = self.camera.target.lerp(desired, cam_alpha);
             }
         }
 

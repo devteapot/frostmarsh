@@ -171,6 +171,22 @@ impl LiveWorldState {
         out
     }
 
+    pub fn take_dirty_budget(&mut self, max_chunks: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::with_capacity(max_chunks.min(64));
+        for (l, row) in self.dirty_chunks.iter_mut().enumerate() {
+            for (ci, d) in row.iter_mut().enumerate() {
+                if *d {
+                    *d = false;
+                    out.push((l, ci));
+                    if out.len() >= max_chunks {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn client_time_ms(&self) -> u32 {
         self.start_instant.elapsed().as_millis() as u32
     }
@@ -179,6 +195,7 @@ impl LiveWorldState {
 pub struct QuicClientHandle {
     pub state: Arc<Mutex<LiveWorldState>>,
     pub conn: Connection,
+    rt_handle: tokio::runtime::Handle,
     _endpoint: Endpoint,
 }
 
@@ -454,6 +471,7 @@ impl QuicClientHandle {
         Ok(Self {
             state,
             conn,
+            rt_handle: tokio::runtime::Handle::current(),
             _endpoint: endpoint,
         })
     }
@@ -471,7 +489,7 @@ impl QuicClientHandle {
 
     pub fn send_reliable_detached(&self, msg: ClientReliable) {
         let conn = self.conn.clone();
-        tokio::spawn(async move {
+        self.rt_handle.spawn(async move {
             let _ = Self::send_reliable_on(&conn, &msg).await;
         });
     }

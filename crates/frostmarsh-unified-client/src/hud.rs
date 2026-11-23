@@ -28,6 +28,8 @@ pub struct HudVertex {
 pub struct HudConfig {
     pub show_hud: bool,
     pub show_telemetry: bool,
+    pub show_brain_inspector: bool,
+    pub brain_selected_idx: Option<usize>,
     pub selected_element: u8,
     pub style_label: &'static str,
     pub fps: f32,
@@ -102,6 +104,30 @@ impl HudBatch {
 
     pub fn text_width(s: &str, scale: f32) -> f32 {
         (s.chars().count() as f32) * 6.0 * scale - scale
+    }
+}
+
+/// Maps normalized 4×4 `Z_world` saliency (`0..255`) through Indigo → Cyan → Gold → Flame Orange.
+fn saliency_color(v: u8) -> [f32; 4] {
+    let t = (v as f32 / 255.0).clamp(0.0, 1.0);
+    let lerp3 = |a: [f32; 3], b: [f32; 3], u: f32| -> [f32; 4] {
+        [
+            a[0] + (b[0] - a[0]) * u,
+            a[1] + (b[1] - a[1]) * u,
+            a[2] + (b[2] - a[2]) * u,
+            0.96,
+        ]
+    };
+    let c0 = [0.16, 0.13, 0.38]; // Cool Indigo
+    let c1 = [0.14, 0.78, 0.94]; // Electric Cyan
+    let c2 = [1.00, 0.84, 0.24]; // Radiant Gold
+    let c3 = [1.00, 0.36, 0.12]; // Flame Orange
+    if t < 0.35 {
+        lerp3(c0, c1, t / 0.35)
+    } else if t < 0.70 {
+        lerp3(c1, c2, (t - 0.35) / 0.35)
+    } else {
+        lerp3(c2, c3, (t - 0.70) / 0.30)
     }
 }
 
@@ -312,6 +338,221 @@ pub fn build_hud(
     b.text_shadow(mm_x + 4.0 * ui, mm_y + mm_sz + 5.0 * ui, 1.25 * ui, text_dim, &mm_lbl);
 
     // ------------------------------------------------------------------
+    // 3B. LIVE NEURAL-BRAIN INSPECTOR CARD (TOP-RIGHT BELOW MINIMAP)
+    // ------------------------------------------------------------------
+    let mut right_cursor_y = mm_y + mm_sz + 28.0 * ui;
+    if cfg.show_brain_inspector {
+        if let Some(ent) = entities {
+            if !ent.bot_brains.is_empty() {
+                let ref_pos = ent
+                    .players
+                    .iter()
+                    .find(|p| p.id == ent.your_player_id)
+                    .map(|p| (p.x, p.y))
+                    .unwrap_or((gw * 0.5, gh * 0.5));
+
+                let (sel_idx, brain) = if let Some(idx) = cfg.brain_selected_idx {
+                    let i = idx % ent.bot_brains.len();
+                    (i, &ent.bot_brains[i])
+                } else {
+                    // Auto-select the most active nearby neural bot
+                    let mut best_i = 0usize;
+                    let mut best_score = f32::NEG_INFINITY;
+                    for (i, br) in ent.bot_brains.iter().enumerate() {
+                        let ab_sum: f32 = br.ability_probs.iter().map(|&v| v as f32 / 255.0).sum();
+                        let sal_peak = br.z_heatmap_4x4.iter().copied().max().unwrap_or(0) as f32 / 255.0;
+                        let dist_pen = ent
+                            .players
+                            .iter()
+                            .find(|p| p.id == br.bot_id)
+                            .map(|p| ((p.x - ref_pos.0).hypot(p.y - ref_pos.1) / gw.max(1.0)) * 2.2)
+                            .unwrap_or(1.0);
+                        let score = ab_sum + sal_peak * 0.65 - dist_pen;
+                        if score > best_score {
+                            best_score = score;
+                            best_i = i;
+                        }
+                    }
+                    (best_i, &ent.bot_brains[best_i])
+                };
+
+                let bot_snap = ent.players.iter().find(|p| p.id == brain.bot_id);
+                let team_accent = if brain.team == 0 { west_col } else { east_col };
+                let layer_tag = bot_snap
+                    .map(|p| if p.z >= 1.55 { "L2" } else { "L1" })
+                    .unwrap_or("L1");
+                let raw_name = bot_snap
+                    .map(|p| p.name.as_str())
+                    .unwrap_or(match brain.class_id {
+                        CLASS_WARDEN => "WARDEN",
+                        CLASS_ALCHEMIST => "PYRO",
+                        _ => "RANGER",
+                    });
+                let short_name: String = raw_name.chars().take(12).collect();
+                let title = format!("BRAIN: {} {}", layer_tag, short_name);
+
+                let bi_w = 236.0 * ui;
+                let bi_h = 204.0 * ui;
+                let bi_x = sw - bi_w - 12.0 * ui;
+                let bi_y = right_cursor_y;
+
+                b.rect(bi_x, bi_y, bi_w, bi_h, panel_bg);
+                b.rect(bi_x, bi_y, bi_w, 3.0 * ui, team_accent);
+                b.rect_outline(bi_x, bi_y, bi_w, bi_h, 1.5 * ui, panel_border);
+
+                // Header + cycle indicator
+                b.text_shadow(bi_x + 8.0 * ui, bi_y + 8.0 * ui, 1.30 * ui, team_accent, &title);
+                let idx_tag = if cfg.brain_selected_idx.is_some() {
+                    format!("{}/{} [B]", sel_idx + 1, ent.bot_brains.len())
+                } else {
+                    "AUTO [B]".to_string()
+                };
+                let idx_w = HudBatch::text_width(&idx_tag, 1.05 * ui);
+                b.text(bi_x + bi_w - idx_w - 8.0 * ui, bi_y + 23.0 * ui, 1.05 * ui, text_dim, &idx_tag);
+                b.text(bi_x + 8.0 * ui, bi_y + 23.0 * ui, 1.05 * ui, text_dim, "Z_WORLD 4X4");
+
+                // Left: 4×4 Z_world Spatial Saliency Heatmap
+                let hm_x = bi_x + 10.0 * ui;
+                let hm_y = bi_y + 37.0 * ui;
+                let cell_sz = 20.5 * ui;
+                let cell_gap = 2.0 * ui;
+                let hm_tot = 4.0 * cell_sz + 3.0 * cell_gap;
+                b.rect(hm_x - 2.0 * ui, hm_y - 2.0 * ui, hm_tot + 4.0 * ui, hm_tot + 4.0 * ui, [0.05, 0.04, 0.11, 0.92]);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let v = brain.z_heatmap_4x4[r * 4 + c];
+                        let cx = hm_x + c as f32 * (cell_sz + cell_gap);
+                        let cy = hm_y + r as f32 * (cell_sz + cell_gap);
+                        b.rect(cx, cy, cell_sz, cell_sz, saliency_color(v));
+                    }
+                }
+                // Subtle center ego crosshair on the 4×4 grid
+                let mid_x = hm_x + hm_tot * 0.5;
+                let mid_y = hm_y + hm_tot * 0.5;
+                b.rect(mid_x - 4.0 * ui, mid_y - 0.75 * ui, 8.0 * ui, 1.5 * ui, [1.0, 1.0, 1.0, 0.75]);
+                b.rect(mid_x - 0.75 * ui, mid_y - 4.0 * ui, 1.5 * ui, 8.0 * ui, [1.0, 1.0, 1.0, 0.75]);
+
+                // Right: Element Intent Bars (FIR, FRS, OIL)
+                let ex = bi_x + 108.0 * ui;
+                let mut ey = bi_y + 38.0 * ui;
+                let bar_w = 84.0 * ui;
+                let bar_h = 9.0 * ui;
+                let dom_elem = if brain.elem_probs[0] >= brain.elem_probs[1]
+                    && brain.elem_probs[0] >= brain.elem_probs[2]
+                {
+                    0
+                } else if brain.elem_probs[1] >= brain.elem_probs[2] {
+                    1
+                } else {
+                    2
+                };
+                let elems: [(&str, u8, [f32; 4]); 3] = [
+                    ("FIR", brain.elem_probs[0], [1.00, 0.44, 0.16, 1.0]),
+                    ("FRS", brain.elem_probs[1], [0.34, 0.88, 1.00, 1.0]),
+                    ("OIL", brain.elem_probs[2], [0.78, 0.36, 0.96, 1.0]),
+                ];
+                for (ei, (lbl, prob, col)) in elems.iter().enumerate() {
+                    let frac = (*prob as f32 / 255.0).clamp(0.0, 1.0);
+                    b.text(ex, ey + 1.0 * ui, 1.05 * ui, if ei == dom_elem { *col } else { text_dim }, lbl);
+                    let bx0 = ex + 32.0 * ui;
+                    b.rect(bx0, ey, bar_w, bar_h, [0.13, 0.12, 0.22, 0.95]);
+                    b.rect(bx0, ey, bar_w * frac, bar_h, *col);
+                    if ei == dom_elem {
+                        b.rect_outline(bx0, ey, bar_w, bar_h, 1.0 * ui, *col);
+                    }
+                    ey += 16.0 * ui;
+                }
+
+                // Target / class readout below element bars
+                let tgt_str = if brain.target_id != 0 {
+                    ent.players
+                        .iter()
+                        .find(|p| p.id == brain.target_id)
+                        .map(|p| format!("TGT:{}", p.name.chars().take(10).collect::<String>()))
+                        .unwrap_or_else(|| format!("TGT:#{}", brain.target_id))
+                } else {
+                    "TGT:ROAM".to_string()
+                };
+                b.text(ex, ey + 4.0 * ui, 1.00 * ui, gold_col, &tgt_str);
+                let cls_tag = match brain.class_id {
+                    CLASS_WARDEN => "CLS:WARDEN",
+                    CLASS_ALCHEMIST => "CLS:ALCHEM",
+                    _ => "CLS:RANGER",
+                };
+                b.text(ex, ey + 18.0 * ui, 1.00 * ui, text_dim, cls_tag);
+
+                // Bottom: 5 Ability Intent Bars (BLT, MLE, DSH, E, R)
+                let ab_y = bi_y + 136.0 * ui;
+                b.text(bi_x + 10.0 * ui, ab_y, 1.00 * ui, text_dim, "ABILITY INTENT");
+                let abilities: [(&str, u8, [f32; 4]); 5] = [
+                    ("BLT", brain.ability_probs[2], [1.00, 0.58, 0.20, 1.0]),
+                    ("MLE", brain.ability_probs[1], [0.96, 0.86, 0.52, 1.0]),
+                    ("DSH", brain.ability_probs[0], [0.36, 0.92, 1.00, 1.0]),
+                    ("E", brain.ability_probs[4], [0.40, 0.96, 0.58, 1.0]),
+                    ("R", brain.ability_probs[5], [1.00, 0.36, 0.44, 1.0]),
+                ];
+                let col_w = 38.0 * ui;
+                let col_gap = 6.5 * ui;
+                let meter_h = 34.0 * ui;
+                let meter_y = ab_y + 13.0 * ui;
+                let ax0 = bi_x + 10.0 * ui;
+                for (ai, (lbl, prob, col)) in abilities.iter().enumerate() {
+                    let cx = ax0 + ai as f32 * (col_w + col_gap);
+                    let frac = (*prob as f32 / 255.0).clamp(0.0, 1.0);
+                    let fill_h = meter_h * frac;
+                    b.rect(cx, meter_y, col_w, meter_h, [0.13, 0.12, 0.22, 0.95]);
+                    b.rect(cx, meter_y + meter_h - fill_h, col_w, fill_h, *col);
+                    // 50% trigger threshold tick line
+                    b.rect(cx, meter_y + meter_h * 0.5, col_w, 1.0 * ui, [0.95, 0.95, 1.0, 0.35]);
+                    if frac >= 0.50 {
+                        b.rect_outline(cx, meter_y, col_w, meter_h, 1.2 * ui, *col);
+                    }
+                    let lw = HudBatch::text_width(lbl, 1.05 * ui);
+                    b.text(cx + (col_w - lw) * 0.5, meter_y + meter_h + 4.0 * ui, 1.05 * ui, if frac >= 0.50 { *col } else { text_hi }, lbl);
+                }
+
+                right_cursor_y += bi_h + 10.0 * ui;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 3C. LIVE KILL FEED (RIGHT EDGE BELOW BRAIN INSPECTOR)
+    // ------------------------------------------------------------------
+    if let Some(ent) = entities {
+        if !ent.kill_feed.is_empty() {
+            let mut ky = right_cursor_y;
+            let row_h = 20.0 * ui;
+            let ksc = 1.15 * ui;
+            for kf in ent.kill_feed.iter().rev().take(5) {
+                let (el_lbl, el_col) = match kf.elem {
+                    0 => ("FIR", [1.00, 0.46, 0.16, 1.0]),
+                    1 => ("FRS", [0.38, 0.90, 1.00, 1.0]),
+                    2 => ("OIL", [0.78, 0.36, 0.96, 1.0]),
+                    _ => ("MLE", [0.96, 0.86, 0.56, 1.0]),
+                };
+                let k_col = if kf.killer_team == 0 { west_col } else { east_col };
+                let v_col = if kf.killer_team == 0 { east_col } else { west_col };
+                let k_short: String = kf.killer_name.chars().take(11).collect();
+                let v_short: String = kf.victim_name.chars().take(11).collect();
+                let sep = format!(" {} ", el_lbl);
+                let kw = HudBatch::text_width(&k_short, ksc);
+                let sw_sep = HudBatch::text_width(&sep, ksc);
+                let vw = HudBatch::text_width(&v_short, ksc);
+                let pill_w = (kw + sw_sep + vw + 18.0 * ui).min(264.0 * ui);
+                let kx = sw - pill_w - 12.0 * ui;
+
+                b.rect(kx, ky, pill_w, row_h, [0.07, 0.06, 0.14, 0.80]);
+                b.rect(kx, ky, 3.0 * ui, row_h, k_col);
+                b.text_shadow(kx + 7.0 * ui, ky + 6.0 * ui, ksc, k_col, &k_short);
+                b.text_shadow(kx + 7.0 * ui + kw, ky + 6.0 * ui, ksc, el_col, &sep);
+                b.text_shadow(kx + 7.0 * ui + kw + sw_sep, ky + 6.0 * ui, ksc, v_col, &v_short);
+                ky += row_h + 4.0 * ui;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 4. TOP-LEFT NEURAL TELEMETRY + LIVE KILL/COMBO FEED
     // ------------------------------------------------------------------
     if cfg.show_telemetry {
@@ -374,14 +615,15 @@ pub fn build_hud(
             );
         }
 
-        // Compact Kill / Shrine / Combo Feed right below telemetry
+        // Compact Shrine / Combo / Weather Feed right below telemetry (kills live in dedicated right-edge Kill Feed)
         if let Some(ent) = entities {
+            let min_kind = if ent.kill_feed.is_empty() { 1 } else { 2 };
             let mut fy = ty + th + 10.0 * ui;
             for ev in ent
                 .events
                 .iter()
                 .rev()
-                .filter(|e| e.kind >= 1 && e.kind <= 5)
+                .filter(|e| e.kind >= min_kind && e.kind <= 5)
                 .take(5)
             {
                 let fcol = match ev.kind {
@@ -473,9 +715,9 @@ pub fn build_hud(
         b.text(
             bar_x,
             hy + 92.0 * ui,
-            1.15 * ui,
+            1.10 * ui,
             text_dim,
-            "1/2/3 ELEM  F1-F3 CLASS  T STYLE  M SIM",
+            "1/2/3 ELEM  F1-F3 CLS  B BRAIN  T STYLE",
         );
 
         // 5-Slot Spell Hotbar (right side of hero plate)
@@ -570,6 +812,12 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
         '%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
         '>' => [0b10000, 0b01000, 0b00100, 0b00010, 0b00100, 0b01000, 0b10000],
         '_' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111],
+        '[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
+        ']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
+        '(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
+        ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
+        '+' => [0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000],
+        '#' => [0b01010, 0b11111, 0b01010, 0b01010, 0b11111, 0b01010, 0b00000],
         _ => [0; 7],
     }
 }

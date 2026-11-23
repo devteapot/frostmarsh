@@ -2,15 +2,17 @@
 """
 Frostmarsh Ultra-Fast PyTorch CUDA FP16 3D World + Ecosystem + Shared-Latent Neural Bot Daemon.
 
-Serves low-latency GPU inference on TCP_NODELAY:
+Serves low-latency GPU inference on TCP_NODELAY and optional Unix domain socket:
   - op=1: WorldModel      ([B, 18, H, W] f32 -> [B, 17, H, W] f32) + ZERO-COPY caches Z_world [B, 48, H, W] in VRAM!
   - op=2: EcosystemModel  ([1,  8, H, W] f32 -> [1,  4, H, W] f32) + ZERO-COPY caches Z_eco   [1, 32, H, W] in VRAM!
   - op=4: BotPolicyNet    ([N, 168]      f32 -> [N, 13]       f32) reads cached Z_world & Z_eco ZERO-COPY from VRAM!
+  - op=5: BotPolicyInspect([N, 168]      f32 -> [N, 29]       f32) returns 13 action floats + 16 (4x4) Z_world saliency floats!
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import socket
 import struct
@@ -27,7 +29,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from bot_policy import ACTION_OUT_DIM, BOT_FEAT_DIM, BotPolicyNet  # noqa: E402
+from bot_policy import ACTION_OUT_DIM, BOT_FEAT_DIM, INSPECT_OUT_DIM, BotPolicyNet  # noqa: E402
 from model import EcosystemModel, WorldModel  # noqa: E402
 
 HEADER_STRUCT = struct.Struct("<BBHHHII")
@@ -36,6 +38,7 @@ HEADER_SIZE = HEADER_STRUCT.size  # 16 bytes
 OP_WORLD_STEP = 1
 OP_ECO_STEP = 2
 OP_BOT_POLICY = 4
+OP_BOT_POLICY_INSPECT = 5
 
 STATUS_OK = 0
 STATUS_BAD_REQUEST = 1
@@ -276,7 +279,7 @@ class InferenceEngine:
             out_copy = bytes(out_view)
         return out_ch, memoryview(out_copy), infer_us
 
-    def infer_bots(self, n_bots: int, raw_bytes: bytes) -> tuple[bytes, int]:
+    def infer_bots(self, n_bots: int, raw_bytes: bytes, return_saliency: bool = False) -> tuple[bytes, int]:
         if self.bot_policy is None:
             raise RuntimeError("bot_policy.pt not loaded")
         arr = np.frombuffer(raw_bytes, dtype=np.float32).reshape(n_bots, BOT_FEAT_DIM).copy()
@@ -286,21 +289,32 @@ class InferenceEngine:
                 bf = torch.from_numpy(arr).to(self.device, non_blocking=False)
                 if self.use_fp16:
                     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                        actions = self.bot_policy(self.last_z_world, self.last_z_eco, bf).float()
+                        res = self.bot_policy(
+                            self.last_z_world, self.last_z_eco, bf, return_saliency=return_saliency
+                        )
                 else:
-                    actions = self.bot_policy(self.last_z_world, self.last_z_eco, bf).float()
-                out_np = actions.cpu().numpy().astype(np.float32, copy=False)
+                    res = self.bot_policy(
+                        self.last_z_world, self.last_z_eco, bf, return_saliency=return_saliency
+                    )
+                if return_saliency:
+                    actions, saliency = res
+                    out_t = torch.cat([actions.float(), saliency.float()], dim=-1)
+                else:
+                    out_t = res.float()
+                out_np = out_t.cpu().numpy().astype(np.float32, copy=False)
             infer_us = int((time.perf_counter() - t0) * 1_000_000)
         return out_np.tobytes(), infer_us
 
 
 class GPUInferDaemon:
-    def __init__(self, host: str, port: int, engine: InferenceEngine):
+    def __init__(self, host: str, port: int, engine: InferenceEngine, unix_sock: str | None = None):
         self.host = host
         self.port = port
         self.engine = engine
+        self.unix_sock_path: Path | None = Path(unix_sock) if unix_sock else None
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
+        self._unix_sock: socket.socket | None = None
         self.actual_port: int = port
 
     def start_listening(self) -> None:
@@ -313,24 +327,56 @@ class GPUInferDaemon:
         self._sock = srv
         self.actual_port = srv.getsockname()[1]
 
-    def serve_forever(self) -> None:
-        if self._sock is None:
-            self.start_listening()
-        assert self._sock is not None
+        if self.unix_sock_path is not None:
+            self.unix_sock_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.unix_sock_path.exists() or self.unix_sock_path.is_symlink():
+                self.unix_sock_path.unlink()
+            usock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            usock.bind(str(self.unix_sock_path))
+            try:
+                os.chmod(self.unix_sock_path, 0o666)
+            except OSError:
+                pass
+            usock.listen(32)
+            usock.settimeout(0.5)
+            self._unix_sock = usock
+
+    def _accept_loop(self, srv_sock: socket.socket) -> None:
         while not self._stop.is_set():
             try:
-                conn, addr = self._sock.accept()
+                conn, addr = srv_sock.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
             threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
 
+    def serve_forever(self) -> None:
+        if self._sock is None:
+            self.start_listening()
+        assert self._sock is not None
+        unix_thread: threading.Thread | None = None
+        if self._unix_sock is not None:
+            unix_thread = threading.Thread(
+                target=self._accept_loop, args=(self._unix_sock,), daemon=True
+            )
+            unix_thread.start()
+        self._accept_loop(self._sock)
+        if unix_thread is not None:
+            unix_thread.join(timeout=1.0)
+
     def stop(self) -> None:
         self._stop.set()
-        if self._sock is not None:
+        for s in (self._sock, self._unix_sock):
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        if self.unix_sock_path is not None:
             try:
-                self._sock.close()
+                if self.unix_sock_path.exists() or self.unix_sock_path.is_symlink():
+                    self.unix_sock_path.unlink()
             except OSError:
                 pass
 
@@ -341,13 +387,16 @@ class GPUInferDaemon:
         hdr_buf = bytearray(HEADER_SIZE)
         hdr_view = memoryview(hdr_buf)
         try:
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if conn.family in (socket.AF_INET, socket.AF_INET6):
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             while not self._stop.is_set():
                 if not _recv_exact(conn, hdr_view):
                     break
                 op, pad_batch, channels, height, width, payload_bytes, _seq = HEADER_STRUCT.unpack(hdr_buf)
 
-                if op == OP_BOT_POLICY:
+                if op in (OP_BOT_POLICY, OP_BOT_POLICY_INSPECT):
+                    inspect = op == OP_BOT_POLICY_INSPECT
+                    out_dim = INSPECT_OUT_DIM if inspect else ACTION_OUT_DIM
                     n_bots = int(height)
                     expected_bytes = n_bots * BOT_FEAT_DIM * 4
                     if n_bots <= 0 or width != BOT_FEAT_DIM or payload_bytes != expected_bytes:
@@ -359,13 +408,15 @@ class GPUInferDaemon:
                     if not _recv_exact(conn, memoryview(raw_in)):
                         break
                     try:
-                        out_bytes, infer_us = self.engine.infer_bots(n_bots, bytes(raw_in))
+                        out_bytes, infer_us = self.engine.infer_bots(
+                            n_bots, bytes(raw_in), return_saliency=inspect
+                        )
                     except Exception as exc:
                         print(f"[gpu_infer_daemon] Bot policy error: {exc}", file=sys.stderr)
                         self._send_error(conn, STATUS_INTERNAL_ERROR, height, width)
                         continue
                     resp_hdr = HEADER_STRUCT.pack(
-                        STATUS_OK, 1, 1, n_bots, ACTION_OUT_DIM, len(out_bytes), infer_us
+                        STATUS_OK, 1, 1, n_bots, out_dim, len(out_bytes), infer_us
                     )
                     conn.sendall(resp_hdr)
                     conn.sendall(out_bytes)
@@ -417,6 +468,11 @@ def parse_bind(bind_str: str) -> tuple[str, int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Frostmarsh 3D World + Shared-Latent Neural Bot GPU Daemon")
     parser.add_argument("--bind", default="127.0.0.1:14440")
+    parser.add_argument(
+        "--unix-sock",
+        default=None,
+        help="Optional Unix domain socket path for zero-overhead local IPC (e.g. /tmp/frostmarsh-gpu.sock)",
+    )
     parser.add_argument("--world-model", type=Path, default=_SCRIPT_DIR / "world_model.pt")
     parser.add_argument("--eco-model", type=Path, default=_SCRIPT_DIR / "ecosystem_model.pt")
     parser.add_argument("--bot-policy", type=Path, default=_SCRIPT_DIR / "bot_policy.pt")
@@ -425,7 +481,7 @@ def main() -> None:
 
     host, port = parse_bind(args.bind)
     engine = InferenceEngine(args.world_model, args.eco_model, args.bot_policy, use_fp16=not args.fp32)
-    daemon = GPUInferDaemon(host, port, engine)
+    daemon = GPUInferDaemon(host, port, engine, unix_sock=args.unix_sock)
     daemon.start_listening()
 
     def _sig_handler(_signum, _frame):
@@ -435,8 +491,9 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _sig_handler)
 
     dev_name = torch.cuda.get_device_name(0) if engine.device.type == "cuda" else "CPU"
+    unix_info = f" | unix={daemon.unix_sock_path}" if daemon.unix_sock_path is not None else ""
     print(
-        f"[gpu_infer_daemon] Ready on {host}:{daemon.actual_port} | device={dev_name} | "
+        f"[gpu_infer_daemon] Ready on {host}:{daemon.actual_port}{unix_info} | device={dev_name} | "
         f"fp16={engine.use_fp16} | neural_bots={engine.bot_policy is not None}",
         flush=True,
     )

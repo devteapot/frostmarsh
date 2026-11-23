@@ -74,6 +74,8 @@ pub struct LiveEntityState {
     pub shrines: Vec<ShrineSnap>,
     pub events: Vec<CombatEvent>,
     pub telemetry: TelemetrySnap,
+    pub bot_brains: Vec<BotBrainSnap>,
+    pub kill_feed: Vec<KillFeedEntry>,
 }
 
 pub struct LiveWorldState {
@@ -218,7 +220,9 @@ impl QuicClientHandle {
                               bodies: Vec<CellBodySnap>,
                               shrines: Vec<ShrineSnap>,
                               events: Vec<CombatEvent>,
-                              telemetry: TelemetrySnap| {
+                              telemetry: TelemetrySnap,
+                              bot_brains: Vec<BotBrainSnap>,
+                              kill_feed: Vec<KillFeedEntry>| {
             st.resize_if_needed(
                 telemetry.grid_w as usize,
                 telemetry.grid_h as usize,
@@ -247,6 +251,8 @@ impl QuicClientHandle {
                 shrines,
                 events,
                 telemetry,
+                bot_brains,
+                kill_feed,
             });
         };
 
@@ -270,6 +276,8 @@ impl QuicClientHandle {
                             shrines,
                             events,
                             telemetry,
+                            bot_brains,
+                            kill_feed,
                         }) = decode_server_datagram(&bytes[1..])
                         {
                             let mut st = st_rel.lock().unwrap();
@@ -288,6 +296,8 @@ impl QuicClientHandle {
                                 shrines,
                                 events,
                                 telemetry,
+                                bot_brains,
+                                kill_feed,
                             );
                         }
                     } else if let Some(ServerReliable::Welcome {
@@ -372,6 +382,8 @@ impl QuicClientHandle {
                         shrines,
                         events,
                         telemetry,
+                        bot_brains,
+                        kill_feed,
                     } => {
                         let mut st = st_dg.lock().unwrap();
                         apply_snapshot(
@@ -389,6 +401,8 @@ impl QuicClientHandle {
                             shrines,
                             events,
                             telemetry,
+                            bot_brains,
+                            kill_feed,
                         );
                     }
                 }

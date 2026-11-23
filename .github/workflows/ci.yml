@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-checks:
+    name: Rust Conservation Tests & Workspace Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux wgpu/winit build headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test field-core exact conservation (2D & 3D VolumeField)
+        run: cargo test -p field-core
+
+      - name: Check frostmarsh-proto
+        run: cargo check -p frostmarsh-proto
+
+      - name: Check frostmarsh-server (no default ONNX feature)
+        run: cargo check --no-default-features -p frostmarsh-server
+
+      - name: Check frostmarsh-unified-client
+        run: cargo check -p frostmarsh-unified-client
+
+  python-syntax-and-gates:
+    name: Python Syntax & Metric Invariant Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile-check Python ML sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          py_files=(ml/*.py ml/tiers/*.py)
+          if [ ${#py_files[@]} -eq 0 ]; then
+            echo "No Python files found under ml/ or ml/tiers/" >&2
+            exit 1
+          fi
+          python3 -m py_compile "${py_files[@]}"
+          echo "Compiled ${#py_files[@]} Python files cleanly."
+
+      - name: Validate tracked metric JSON invariant gates
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          unified_path = Path("models/unified_neural_bots/unified_metrics.json")
+          bot_path = Path("models/BOT_POLICY_METRICS.json")
+
+          unified = json.loads(unified_path.read_text(encoding="utf-8"))
+          assert unified["mass_error"] == 0, f"Expected mass_error == 0, got {unified['mass_error']}"
+          assert unified["energy_error"] == 0, f"Expected energy_error == 0, got {unified['energy_error']}"
+
+          bot = json.loads(bot_path.read_text(encoding="utf-8"))
+          shared = bot["shared_latent_bot"]
+          blind = bot["blind_ablation_bot"]
+
+          combo_acc = float(shared["val_physics_combo_elem_acc_pct"])
+          evasion_cos = float(shared["val_wildfire_evasion_cosine"])
+
+          assert combo_acc >= 90.0, f"Regression: val_physics_combo_elem_acc_pct={combo_acc:.2f} < 90.0"
+          assert evasion_cos >= 0.65, f"Regression: val_wildfire_evasion_cosine={evasion_cos:.4f} < 0.65"
+          assert combo_acc > float(blind["val_physics_combo_elem_acc_pct"])
+          assert evasion_cos > float(blind["val_wildfire_evasion_cosine"])
+
+          for optional_rel in ("models/BOT_RL_TOURNAMENT.json", "models/SPARSE_WORLD_BENCH.json"):
+              opt_path = Path(optional_rel)
+              if opt_path.exists():
+                  data = json.loads(opt_path.read_text(encoding="utf-8"))
+                  assert isinstance(data, dict) and len(data) > 0
+                  for err_key in ("mass_error", "energy_error"):
+                      if err_key in data:
+                          assert data[err_key] == 0
+                  print(f"[PASS] Optional metrics valid: {optional_rel}")
+
+          print(f"[PASS] Metric gates verified: mass_err=0, energy_err=0, combo={combo_acc:.2f}%, wildfire={evasion_cos:.4f}")
+          PY

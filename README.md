@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Live 3D Neural World with Shared-Latent Neural Bots](models/unified_neural_bots/unified_live_1080p_hud.png)
+![Frostmarsh Live 3D Neural World with Shared-Latent RL Bots & Live Neural-Brain Inspector](models/unified_iter2/unified_live_1080p_hud.png)
 
 ---
 
@@ -46,24 +46,30 @@
 | **Move / Aim Direction Cosine** | **0.9278 / 0.9724** | 0.8788 / 0.9721 | **+0.0490 / +0.0003** |
 
 - **NVIDIA GB10 Batched GPU Latency (Zero-Copy VRAM):** `12` bots = **`0.659 ms`** (`54.9 µs/bot`) · `64` bots = **`0.700 ms`** (`10.9 µs/bot`) · `256` bots = **`1.491 ms`** (`5.8 µs/bot`).
-- **Live 30 Hz Server Loop (GB10, `256×256×4`, 12 bots):** `18.49 ms` World + `2.02 ms` Eco + `2.21 ms` Neural Bot RPC (`mass_err = 0`, `energy_err = 0`).
+- **GPU Self-Play RL (`BotPolicyNet-RL`, `ml/train_bot_rl.py` + `models/BOT_RL_TOURNAMENT.json`):** Warm-started from BC and trained across `32` parallel `Z_world` arenas (`384` concurrent bots on GB10). In a 24-match held-out `256×256×4` tournament, `BotPolicyNet-RL` beats **`BotPolicyNet-BC` `95.8%` (`23W–1L`, `51.8` vs. `25.4` physics combos/match, `423.0` vs. `244.5` score)** and **`Blind Ledger-Only` `100.0%` (`24W–0L`)**.
+- **Sparse Active-Tile `WorldModel` v2 (`ml/sparse_world_bench.py` + `models/SPARSE_WORLD_BENCH.json`):** Shrinking-halo (`halo=6`, exact FP32 `max_abs_diff = 0.0`) sparse tile batching accelerates `256×256×4` from `11.77 ms` → **`2.90 ms` (`4.06×`)** at `20%` activity (`4.60 ms` / `2.56×` at `30%`) and scales **`512×512×4` (`1,048,576` voxels)** from `52.43 ms` → **`17.22 ms` (`3.05×`)**.
+- **Physical 3D Acoustics, Emergent Neural Speech & Viewer Interpreter (`ml/acoustic_comm_poc.py` + [ACOUSTIC_COMM_REPORT.md](models/ACOUSTIC_COMM_REPORT.md)):**
+  - `AcousticField3D` runs `256×256×4` 10-step 3D wave/occlusion conv in **`0.144 ms`** (FP16) with `-12 dB/wall` basalt occlusion and `85 dB` waterfall / `77 dB` wildfire noise floors.
+  - Emergent unsupervised neural speech (`K=16` Gumbel-Softmax, zero symbol labels) lifts held-out coordination from `6.2%` (Silent) → **`61.3%`** (`91.2%` at High SNR) with `91.4%` symbol purity (`16/16` active), while learned adaptive volume cuts enemy eavesdropping by **`-31.5 pp`**.
+  - A `24.8K`-param Viewer Interpreter decodes neural speech into SNR-degraded text at **`98.5%`** High-SNR accuracy (`0.035 ms`), and a `63.3K`-param `g_i` Goal Injector redirects frozen `BotPolicyNet` on **unseen human paraphrases** at **`96.8%` compliance**.
+- **Live 30 Hz Server Loop (GB10, `256×256×4`, 12 RL bots, Unix Socket IPC + `op=5` Brain Inspector):** `18.41 ms` World + `2.03 ms` Eco + `2.47 ms` RL Bots+Saliency (`mass_err = 0`, `energy_err = 0`).
 
-### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
+### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC — Iteration 2 with Bot-Brain Inspector & Weather)
 
 | Render Mode | Resolution | p50 Frame Time | FPS |
 |---|---|---:|---:|
-| Pixel-2xSS + Vol3DGS + HUD | 1920×1080 | `8.39 ms` | **119.2 FPS** |
-| Clean 3D + Vol3DGS + HUD | 1920×1080 | `7.74 ms` | **129.1 FPS** |
-| Pixel-2xSS + Vol3DGS + HUD | 3840×2160 (4K) | `8.39 ms` | **119.2 FPS** |
-| Clean 3D + Vol3DGS + HUD | 3840×2160 (4K) | `12.15 ms` | **82.3 FPS** |
+| Pixel-2xSS + Vol3DGS + HUD + Brain Inspector | 1920×1080 | `7.80 ms` | **128.3 FPS** |
+| Clean 3D + Vol3DGS + HUD + Brain Inspector | 1920×1080 | `7.96 ms` | **125.6 FPS** |
+| Pixel-2xSS + Vol3DGS + HUD + Brain Inspector | 3840×2160 (4K) | `8.26 ms` | **121.0 FPS** |
+| Clean 3D + Vol3DGS + HUD + Brain Inspector | 3840×2160 (4K) | `9.60 ms` | **104.2 FPS** |
 
 ---
 
 ## Visual Showcase
 
-| Live 4-View 3D Orbit (`256×256×4`) | Tier 3 Hybrid (Hard-Z Surfels + Volumetric 3DGS) |
+| 3D Physical Acoustics & Emergent Neural Vocabulary (`256×256×4`) | Live 4-View 3D Orbit (`256×256×4`) |
 |---|---|
-| ![Unified 4-View Orbit](models/unified_neural_bots/unified_orbit_4view.png) | ![Tier 3 Hybrid](models/tiers/tier3_hybrid_comparison.png) |
+| ![3D Acoustics & Emergent Speech](models/acoustic_field_viz.png) | ![Unified 4-View Orbit](models/unified_iter2/unified_orbit_4view.png) |
 
 | Tier 1 (`512²` Painterly) | Tier 4 (Multi-Style Client Diffusion) |
 |---|---|
@@ -116,6 +122,8 @@ FROSTMARSH_SERVER=127.0.0.1:4433 ./play_frostmarsh.sh
 | `E` / `R` | Class signature ability & Ultimate |
 | `F1` / `F2` / `F3` | Switch class (**Frost Warden**, **Pyro Alchemist**, **Marsh Ranger**) |
 | **`N`** | **Live hot-toggle Shared-Latent Neural-Z Bots ↔ Scripted Bots** |
+| **`B`** | **Cycle Live Neural-Brain Inspector (`4×4` `Z_world` heatmap + intents)** |
+| **`V`** / `F6` | **Cycle dynamic weather (`Clear Frost`, `Blizzard`, `Squall`, `Ember Storm`)** |
 | **`L`** | **Cycle 3D Volumetric Layer Slice view** |
 | **`T`** | **Toggle Pixel-2xSS ↔ Clean 3D rendering** |
 | **`M`** | **Hot-toggle Neural World Model ↔ Exact RefSim** |

@@ -74,6 +74,7 @@ pub struct Atmosphere {
     pub weather_kind: u8,
     pub day_time: f32,
     pub wind_x: f32,
+    pub wind_y: f32,
 }
 
 impl Default for Atmosphere {
@@ -82,7 +83,80 @@ impl Default for Atmosphere {
             weather_kind: 0,
             day_time: 0.25,
             wind_x: 0.65,
+            wind_y: 0.35,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SmoothedAtmosphere {
+    sun_col: [f32; 3],
+    sky_col: [f32; 3],
+    bounce_col: [f32; 3],
+    fog_col: [f32; 3],
+    exposure: f32,
+    wind_drift: f32,
+}
+
+impl SmoothedAtmosphere {
+    fn target_for(atmo: Atmosphere) -> Self {
+        let (sun_col, sky_col, bounce_col, fog_col, exposure, wind_mul) = match atmo.weather_kind {
+            WEATHER_BLIZZARD => (
+                [0.76, 0.90, 1.12],
+                [0.46, 0.62, 0.86],
+                [0.28, 0.36, 0.52],
+                [0.28, 0.38, 0.54],
+                1.04,
+                2.35,
+            ),
+            WEATHER_SQUALL => (
+                [0.82, 0.84, 0.94],
+                [0.30, 0.38, 0.54],
+                [0.20, 0.23, 0.34],
+                [0.15, 0.20, 0.30],
+                1.00,
+                1.75,
+            ),
+            WEATHER_EMBER => (
+                [1.22, 0.76, 0.46],
+                [0.48, 0.28, 0.42],
+                [0.32, 0.19, 0.24],
+                [0.26, 0.15, 0.22],
+                1.14,
+                1.55,
+            ),
+            _ => (
+                [1.06, 0.97, 0.86],
+                [0.35, 0.50, 0.72],
+                [0.22, 0.26, 0.40],
+                [0.16, 0.22, 0.34],
+                1.12,
+                0.85,
+            ),
+        };
+        let wind_mag = atmo.wind_x.hypot(atmo.wind_y).max(0.45);
+        let sign = if atmo.wind_x < -0.05 { -1.0 } else { 1.0 };
+        let wind_drift = sign * (wind_mag * 0.50 + 0.50) * wind_mul;
+        Self {
+            sun_col,
+            sky_col,
+            bounce_col,
+            fog_col,
+            exposure,
+            wind_drift,
+        }
+    }
+
+    fn lerp_towards(&mut self, target: Self, alpha: f32) {
+        let a = alpha.clamp(0.0, 1.0);
+        for i in 0..3 {
+            self.sun_col[i] += (target.sun_col[i] - self.sun_col[i]) * a;
+            self.sky_col[i] += (target.sky_col[i] - self.sky_col[i]) * a;
+            self.bounce_col[i] += (target.bounce_col[i] - self.bounce_col[i]) * a;
+            self.fog_col[i] += (target.fog_col[i] - self.fog_col[i]) * a;
+        }
+        self.exposure += (target.exposure - self.exposure) * a;
+        self.wind_drift += (target.wind_drift - self.wind_drift) * a;
     }
 }
 
@@ -191,6 +265,8 @@ pub struct Approach4Renderer {
     art_w: u32,
     art_h: u32,
     art_color_view: wgpu::TextureView,
+    smooth_atmo: Option<SmoothedAtmosphere>,
+    last_render_sim_time: f32,
 }
 
 fn make_2d_targets(
@@ -302,11 +378,13 @@ impl Approach4Renderer {
                 "../assets/shaders/mesh_pass.wgsl"
             ))),
         });
+        let surfel_src = include_str!("../assets/shaders/surfel_instanced.wgsl").replace(
+            "let sway = sin(t * 2.2 + pl.lod_phase.y + rel_pos.x * 0.35 + rel_pos.z * 0.25) * 0.14 * h_factor;",
+            "let wind_mul = clamp(0.60 + abs(u.fog_col.w) * 0.85, 0.60, 2.80);\n        let sway = sin(t * (1.8 + wind_mul * 0.9) + pl.lod_phase.y + rel_pos.x * 0.35 + rel_pos.z * 0.25) * 0.14 * wind_mul * h_factor + u.fog_col.w * 0.05 * h_factor;",
+        );
         let surfel_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("surfel_instanced"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
-                "../assets/shaders/surfel_instanced.wgsl"
-            ))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(surfel_src)),
         });
         let vol_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("volumetric_splat"),
@@ -926,6 +1004,8 @@ impl Approach4Renderer {
             art_w: 960,
             art_h: 540,
             art_color_view: art_cv,
+            smooth_atmo: None,
+            last_render_sim_time: 0.0,
         })
     }
 
@@ -1114,12 +1194,24 @@ impl Approach4Renderer {
         );
 
         let sun_dir = Self::sun_dir(atmo);
-        let (sun_col, sky_col, fog_col) = match atmo.weather_kind {
-            WEATHER_BLIZZARD => ([0.84, 0.94, 1.08], [0.42, 0.56, 0.78], [0.22, 0.30, 0.44]),
-            WEATHER_SQUALL => ([0.78, 0.84, 0.92], [0.30, 0.40, 0.56], [0.16, 0.21, 0.30]),
-            WEATHER_EMBER => ([1.14, 0.84, 0.62], [0.40, 0.32, 0.46], [0.22, 0.16, 0.26]),
-            _ => ([1.05, 0.96, 0.84], [0.34, 0.48, 0.68], [0.16, 0.21, 0.32]),
+        let target_atmo = SmoothedAtmosphere::target_for(atmo);
+        let dt_atmo = (sim_time - self.last_render_sim_time).clamp(0.0, 0.25);
+        self.last_render_sim_time = sim_time;
+        let cur_atmo = match self.smooth_atmo.as_mut() {
+            Some(cur) => {
+                let alpha = 1.0 - (-dt_atmo * 2.4).exp();
+                cur.lerp_towards(target_atmo, alpha);
+                *cur
+            }
+            None => {
+                self.smooth_atmo = Some(target_atmo);
+                target_atmo
+            }
         };
+        let sun_col = cur_atmo.sun_col;
+        let sky_col = cur_atmo.sky_col;
+        let bounce_col = cur_atmo.bounce_col;
+        let fog_col = cur_atmo.fog_col;
 
         let scene_u = SceneUniforms {
             view: mats.view.to_cols_array_2d(),
@@ -1130,11 +1222,11 @@ impl Approach4Renderer {
             cam_fwd: [mats.fwd.x, mats.fwd.y, mats.fwd.z, if camera.ortho { 1.0 } else { 0.0 }],
             origin_time: [mats.origin.x, mats.origin.y, mats.origin.z, sim_time],
             viewport: [ss_w as f32, ss_h as f32, style.cel_bands, 0.0012],
-            sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 1.10],
+            sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, cur_atmo.exposure],
             sun_col: [sun_col[0], sun_col[1], sun_col[2], if style.shadows { 0.72 } else { 0.0 }],
             sky_col: [sky_col[0], sky_col[1], sky_col[2], 120.0],
-            bounce_col: [0.22, 0.25, 0.38, 280.0],
-            fog_col: [fog_col[0], fog_col[1], fog_col[2], atmo.wind_x],
+            bounce_col: [bounce_col[0], bounce_col[1], bounce_col[2], 280.0],
+            fog_col: [fog_col[0], fog_col[1], fog_col[2], cur_atmo.wind_drift],
             point_pos: frame.point_pos,
             point_col: frame.point_col,
         };

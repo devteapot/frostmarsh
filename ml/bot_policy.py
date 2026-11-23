@@ -30,6 +30,8 @@ NUM_TOKENS = 12  # 8 nearest players + 3 shrines + 1 golden relic
 TOKEN_DIM = 12
 BOT_FEAT_DIM = SELF_DIM + NUM_TOKENS * TOKEN_DIM  # 168 floats per bot
 ACTION_OUT_DIM = 13  # move_x, move_y, aim_x, aim_y, 6 ability probs, 3 element probs
+SALIENCY_DIM = 16  # 4x4 spatial saliency heatmap from spatial_enc layer 2
+INSPECT_OUT_DIM = ACTION_OUT_DIM + SALIENCY_DIM  # 29 floats per bot
 
 
 class BotPolicyNet(nn.Module):
@@ -142,18 +144,33 @@ class BotPolicyNet(nn.Module):
 
         return torch.cat([w_patch, eco_patch], dim=1)
 
-    def forward_logits(
+    def _forward_core(
         self,
         z_world: torch.Tensor,
         z_eco: torch.Tensor,
         bot_feats: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_saliency: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         self_feat = bot_feats[:, :SELF_DIM]
         tok_feat = bot_feats[:, SELF_DIM:].reshape(-1, NUM_TOKENS, TOKEN_DIM)
 
         patch = self.sample_shared_latents(z_world, z_eco, self_feat)
-        sp = self.spatial_enc(self.latent_adapter(patch))
+        adapted = self.latent_adapter(patch)
+        # First 2 strided conv blocks (Conv1->GELU->Conv2->GELU) yield the [N, 64, 4, 4] feature map
+        feat_4x4 = self.spatial_enc[:4](adapted)
+        sp = self.spatial_enc[4:](feat_4x4)
         h_world = self.spatial_proj(torch.cat([sp.mean(dim=(2, 3)), sp.amax(dim=(2, 3))], dim=-1))
+
+        saliency: torch.Tensor | None = None
+        if return_saliency:
+            # Zero-cost 4x4 spatial saliency: L2 norm across channels, per-bot min-max normalized to [0, 1]
+            sal_map = torch.linalg.vector_norm(feat_4x4.float(), ord=2, dim=1)  # [N, 4, 4]
+            if sal_map.shape[-2:] != (4, 4):
+                sal_map = F.adaptive_avg_pool2d(sal_map.unsqueeze(1), (4, 4)).squeeze(1)
+            sal_flat = sal_map.reshape(sal_map.shape[0], SALIENCY_DIM)
+            sal_min = sal_flat.amin(dim=-1, keepdim=True)
+            sal_max = sal_flat.amax(dim=-1, keepdim=True)
+            saliency = ((sal_flat - sal_min) / (sal_max - sal_min + 1e-6)).clamp(0.0, 1.0)
 
         q = self.self_enc(self_feat).unsqueeze(1)
         kv = self.tok_enc(tok_feat)
@@ -164,6 +181,17 @@ class BotPolicyNet(nn.Module):
         vec = torch.tanh(self.head_vec(h))
         bin_logits = self.head_bin(h)
         elem_logits = self.head_elem(h)
+        return vec, bin_logits, elem_logits, saliency
+
+    def forward_logits(
+        self,
+        z_world: torch.Tensor,
+        z_eco: torch.Tensor,
+        bot_feats: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        vec, bin_logits, elem_logits, _ = self._forward_core(
+            z_world, z_eco, bot_feats, return_saliency=False
+        )
         return vec, bin_logits, elem_logits
 
     def forward(
@@ -171,9 +199,16 @@ class BotPolicyNet(nn.Module):
         z_world: torch.Tensor,
         z_eco: torch.Tensor,
         bot_feats: torch.Tensor,
-    ) -> torch.Tensor:
-        vec, bin_logits, elem_logits = self.forward_logits(z_world, z_eco, bot_feats)
-        return torch.cat([vec, torch.sigmoid(bin_logits), F.softmax(elem_logits, dim=-1)], dim=-1)
+        return_saliency: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        vec, bin_logits, elem_logits, saliency = self._forward_core(
+            z_world, z_eco, bot_feats, return_saliency=return_saliency
+        )
+        actions = torch.cat([vec, torch.sigmoid(bin_logits), F.softmax(elem_logits, dim=-1)], dim=-1)
+        if return_saliency:
+            assert saliency is not None
+            return actions, saliency
+        return actions
 
 
 def count_parameters(model: nn.Module) -> int:

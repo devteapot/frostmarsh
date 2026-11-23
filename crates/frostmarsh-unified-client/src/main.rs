@@ -227,6 +227,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             weather_kind: e.telemetry.weather_kind,
             day_time: e.telemetry.day_time,
             wind_x: e.telemetry.wind_x,
+            wind_y: e.telemetry.wind_y,
         })
         .unwrap_or_default();
 
@@ -279,6 +280,8 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             &HudConfig {
                 show_hud: true,
                 show_telemetry: true,
+                show_brain_inspector: true,
+                brain_selected_idx: None,
                 selected_element: 0,
                 style_label: st.label,
                 fps: fps_1080,
@@ -330,6 +333,8 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         &HudConfig {
             show_hud: true,
             show_telemetry: true,
+            show_brain_inspector: true,
+            brain_selected_idx: None,
             selected_element: 0,
             style_label: style_main.label,
             fps: fps_1080,
@@ -395,6 +400,8 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 &HudConfig {
                     show_hud: true,
                     show_telemetry: true,
+                    show_brain_inspector: true,
+                    brain_selected_idx: None,
                     selected_element: 1,
                     style_label: st.label,
                     fps: fps_1080,
@@ -469,6 +476,8 @@ struct InteractiveApp {
     layer_slice_mode: u8,
     show_hud: bool,
     show_telemetry: bool,
+    brain_inspector_on: bool,
+    brain_selected_idx: Option<usize>,
     selected_element: u8,
     keys: HashSet<KeyCode>,
     mouse_pos: (f32, f32),
@@ -519,6 +528,8 @@ impl InteractiveApp {
             layer_slice_mode: 0,
             show_hud: true,
             show_telemetry: true,
+            brain_inspector_on: true,
+            brain_selected_idx: None,
             selected_element: 0,
             keys: HashSet::new(),
             mouse_pos: (720.0, 450.0),
@@ -603,6 +614,7 @@ impl InteractiveApp {
                 weather_kind: e.telemetry.weather_kind,
                 day_time: e.telemetry.day_time,
                 wind_x: e.telemetry.wind_x,
+                wind_y: e.telemetry.wind_y,
             })
             .unwrap_or_default();
         let sun_dir = Approach4Renderer::sun_dir(atmo);
@@ -694,6 +706,8 @@ impl InteractiveApp {
             &HudConfig {
                 show_hud: self.show_hud,
                 show_telemetry: self.show_telemetry,
+                show_brain_inspector: self.brain_inspector_on,
+                brain_selected_idx: self.brain_selected_idx,
                 selected_element: self.selected_element,
                 style_label: style.label,
                 fps: self.fps_ema,
@@ -886,6 +900,32 @@ impl ApplicationHandler for InteractiveApp {
                                     }
                                 }
                                 KeyCode::KeyB => {
+                                    let count = self
+                                        .quic
+                                        .as_ref()
+                                        .and_then(|q| q.state.lock().ok())
+                                        .and_then(|st| st.entities.as_ref().map(|e| e.bot_brains.len()))
+                                        .unwrap_or(0);
+                                    if !self.brain_inspector_on {
+                                        self.brain_inspector_on = true;
+                                        self.brain_selected_idx = None;
+                                    } else if count == 0 {
+                                        self.brain_inspector_on = false;
+                                        self.brain_selected_idx = None;
+                                    } else {
+                                        match self.brain_selected_idx {
+                                            None => self.brain_selected_idx = Some(0),
+                                            Some(idx) if idx + 1 < count => {
+                                                self.brain_selected_idx = Some(idx + 1);
+                                            }
+                                            Some(_) => {
+                                                self.brain_inspector_on = false;
+                                                self.brain_selected_idx = None;
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::KeyV | KeyCode::F6 => {
                                     if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::CycleWeather);
                                     }

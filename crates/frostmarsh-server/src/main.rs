@@ -30,6 +30,8 @@ use quinn::{Connection, Endpoint, ServerConfig};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 #[cfg(feature = "onnx")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -66,9 +68,43 @@ struct Args {
 
 // ---------------- Neural Backends ----------------
 
+enum RpcStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl Read for RpcStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            RpcStream::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            RpcStream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for RpcStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            RpcStream::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            RpcStream::Unix(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            RpcStream::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            RpcStream::Unix(s) => s.flush(),
+        }
+    }
+}
+
 struct CudaRpcClient {
     addr: String,
-    stream: Option<TcpStream>,
+    stream: Option<RpcStream>,
     seq: u32,
 }
 
@@ -83,14 +119,23 @@ impl CudaRpcClient {
         c
     }
 
-    fn ensure_connected(&mut self) -> Result<&mut TcpStream, Box<dyn std::error::Error>> {
+    fn ensure_connected(&mut self) -> Result<&mut RpcStream, Box<dyn std::error::Error>> {
         if self.stream.is_none() {
+            #[cfg(unix)]
+            if self.addr.starts_with('/') {
+                let s = UnixStream::connect(&self.addr)?;
+                s.set_read_timeout(Some(Duration::from_millis(3000)))?;
+                s.set_write_timeout(Some(Duration::from_millis(3000)))?;
+                log::info!("Connected to PyTorch CUDA FP16 3D daemon via Unix socket {}", self.addr);
+                self.stream = Some(RpcStream::Unix(s));
+                return Ok(self.stream.as_mut().unwrap());
+            }
             let s = TcpStream::connect_timeout(&self.addr.parse()?, Duration::from_millis(800))?;
             s.set_nodelay(true)?;
             s.set_read_timeout(Some(Duration::from_millis(3000)))?;
             s.set_write_timeout(Some(Duration::from_millis(3000)))?;
             log::info!("Connected to PyTorch CUDA FP16 3D daemon at {}", self.addr);
-            self.stream = Some(s);
+            self.stream = Some(RpcStream::Tcp(s));
         }
         Ok(self.stream.as_mut().unwrap())
     }
@@ -447,6 +492,8 @@ struct GameState {
     projectiles: Vec<ProjectileEntity>,
     rafts: Vec<RaftEntity>,
     events: VecDeque<(u64, CombatEvent)>,
+    bot_brains: Vec<BotBrainSnap>,
+    kill_feed: VecDeque<KillFeedEntry>,
     peers: HashMap<u32, ClientPeer>,
     hazard_layers: Vec<Vec<u8>>,
     weather_kind: u8,
@@ -528,6 +575,8 @@ impl GameState {
             projectiles: Vec::new(),
             rafts: Vec::new(),
             events: VecDeque::with_capacity(48),
+            bot_brains: Vec::new(),
+            kill_feed: VecDeque::with_capacity(8),
             peers: HashMap::new(),
             weather_kind: WEATHER_CLEAR,
             day_time: 0.25,
@@ -677,7 +726,7 @@ impl GameState {
         (hz & (1 << 0)) != 0 && (hz & (1 << 1)) == 0 && f.cell_volume(idx) >= 220
     }
 
-    fn apply_damage(&mut self, attacker: Option<u32>, victim_id: u32, mut dmg: i16, tag: &str) {
+    fn apply_damage(&mut self, attacker: Option<u32>, victim_id: u32, mut dmg: i16, tag: &str, elem: u8) {
         let tick = self.sim_tick;
         let mut killed_info = None;
         let hit_pos;
@@ -725,6 +774,16 @@ impl GameState {
                         self.push_event(2, ax, ay, 0, k_team, format!("LEVEL {}!", lvl));
                     }
                 }
+            }
+            self.kill_feed.push_back(KillFeedEntry {
+                killer_name: k_name.clone(),
+                victim_name: v_name.clone(),
+                killer_team: k_team,
+                elem,
+                tick: tick as u32,
+            });
+            while self.kill_feed.len() > 5 {
+                self.kill_feed.pop_front();
             }
             self.push_event(1, kx, ky, 0, k_team, format!("{} > {}", k_name, v_name));
             self.eco.inject_fear_pulse(kx, ky, 18.0, 0.8);
@@ -873,7 +932,7 @@ impl GameState {
                 .map(|t| t.id)
                 .collect();
             for tid in targets {
-                self.apply_damage(Some(pid), tid, dmg, "");
+                self.apply_damage(Some(pid), tid, dmg, "", 3);
             }
         }
 
@@ -928,7 +987,7 @@ impl GameState {
                         if let Some(t) = self.players.get_mut(&tid) {
                             t.chilled_until = tick + 90;
                         }
-                        self.apply_damage(Some(pid), tid, 32, "NOVA");
+                        self.apply_damage(Some(pid), tid, 32, "NOVA", 1);
                     }
                     self.push_event(2, px, py, 0, team, "GLACIAL NOVA!".into());
                 }
@@ -943,7 +1002,7 @@ impl GameState {
                         .map(|t| t.id)
                         .collect();
                     for tid in targets {
-                        self.apply_damage(Some(pid), tid, 42, "METEOR");
+                        self.apply_damage(Some(pid), tid, 42, "METEOR", 0);
                     }
                     self.eco.inject_fear_pulse(tx, ty, 24.0, 1.2);
                     self.push_event(2, tx, ty, 0, team, "METEOR STORM!".into());
@@ -1018,10 +1077,11 @@ impl GameState {
         if self.neural_bots_on && self.step_bots_neural_z() {
             return;
         }
+        self.bot_brains.clear();
         self.step_bots_scripted();
     }
 
-    /// Batched Shared-Latent Neural Bots (`op=4`):
+    /// Batched Shared-Latent Neural Bots (`op=5` inspect with `4x4` Z_world saliency, graceful fallback to `op=4`):
     /// Packs compact ledger/entity tokens (`168` f32/bot) and sends to GB10 `gpu_infer_daemon.py`,
     /// which samples `WorldModel`'s cached `[4, 48, 256, 256]` VRAM trunk `Z_world` + `Z_eco` ZERO-COPY!
     fn step_bots_neural_z(&mut self) -> bool {
@@ -1030,6 +1090,8 @@ impl GameState {
         const TOKEN_DIM: usize = 12;
         const BOT_FEAT_DIM: usize = SELF_DIM + NUM_TOKENS * TOKEN_DIM; // 168
         const ACTION_OUT_DIM: usize = 13;
+        const SALIENCY_DIM: usize = 16;
+        const INSPECT_OUT_DIM: usize = ACTION_OUT_DIM + SALIENCY_DIM; // 29
 
         let bot_ids: Vec<u32> = self.players.values().filter(|p| p.is_bot).map(|p| p.id).collect();
         let n = bot_ids.len();
@@ -1044,6 +1106,7 @@ impl GameState {
         let all_p: Vec<PlayerEntity> = self.players.values().cloned().collect();
 
         let mut feats = vec![0.0f32; n * BOT_FEAT_DIM];
+        let mut nearest_enemy_ids = vec![0u32; n];
         for (bi, &bid) in bot_ids.iter().enumerate() {
             let Some(p) = self.players.get(&bid) else { continue; };
             let base = bi * BOT_FEAT_DIM;
@@ -1072,6 +1135,9 @@ impl GameState {
                 .map(|o| ((o.x - p.x).hypot(o.y - p.y), o))
                 .collect();
             others.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(&(_, enemy)) = others.iter().find(|(_, o)| o.team != p.team) {
+                nearest_enemy_ids[bi] = enemy.id;
+            }
             for (ti, &(d, o)) in others.iter().take(8).enumerate() {
                 let tb = base + SELF_DIM + ti * TOKEN_DIM;
                 feats[tb] = ((o.x - p.x) / 80.0).clamp(-1.0, 1.0);
@@ -1105,22 +1171,26 @@ impl GameState {
             feats[tr + 11] = 1.0;
         }
 
-        let rpc_res = if let Some(ref mut rpc) = self.bot_rpc {
-            rpc.call_batched(4, 1, 1, n as u16, BOT_FEAT_DIM as u16, &feats)
+        // Try op=5 (OP_BOT_POLICY_INSPECT: 13 actions + 16 saliency floats), fallback gracefully to op=4
+        let (out_buf, gpu_ms, stride, has_saliency) = if let Some(ref mut rpc) = self.bot_rpc {
+            match rpc.call_batched(5, 1, 1, n as u16, BOT_FEAT_DIM as u16, &feats) {
+                Ok((v, ms)) if v.len() == n * INSPECT_OUT_DIM => (v, ms, INSPECT_OUT_DIM, true),
+                _ => match rpc.call_batched(4, 1, 1, n as u16, BOT_FEAT_DIM as u16, &feats) {
+                    Ok((v, ms)) if v.len() == n * ACTION_OUT_DIM => (v, ms, ACTION_OUT_DIM, false),
+                    _ => return false,
+                },
+            }
         } else {
             return false;
         };
-
-        let Ok((actions, gpu_ms)) = rpc_res else {
-            return false;
-        };
-        if actions.len() != n * ACTION_OUT_DIM {
-            return false;
-        }
         self.bot_infer_ms = gpu_ms;
 
+        let to_u8 = |v: f32| -> u8 { (v.clamp(0.0, 1.0) * 255.0).round() as u8 };
+        let mut brains = Vec::with_capacity(n);
+
         for (bi, &bid) in bot_ids.iter().enumerate() {
-            let a = &actions[bi * ACTION_OUT_DIM..(bi + 1) * ACTION_OUT_DIM];
+            let row = &out_buf[bi * stride..(bi + 1) * stride];
+            let a = &row[..ACTION_OUT_DIM];
             let elem = if a[10] >= a[11] && a[10] >= a[12] {
                 0
             } else if a[11] >= a[12] {
@@ -1143,8 +1213,33 @@ impl GameState {
                 bolt_element: elem,
                 client_time_ms: 0,
             };
+            if let Some(p) = self.players.get(&bid) {
+                let mut z_heatmap_4x4 = [0u8; 16];
+                if has_saliency {
+                    for k in 0..SALIENCY_DIM {
+                        z_heatmap_4x4[k] = to_u8(row[ACTION_OUT_DIM + k]);
+                    }
+                }
+                brains.push(BotBrainSnap {
+                    bot_id: bid,
+                    class_id: p.class_id,
+                    team: p.team,
+                    target_id: nearest_enemy_ids[bi],
+                    elem_probs: [to_u8(a[10]), to_u8(a[11]), to_u8(a[12])],
+                    ability_probs: [
+                        to_u8(a[4]),
+                        to_u8(a[5]),
+                        to_u8(a[6]),
+                        to_u8(a[7]),
+                        to_u8(a[8]),
+                        to_u8(a[9]),
+                    ],
+                    z_heatmap_4x4,
+                });
+            }
             self.apply_input(bid, &inp);
         }
+        self.bot_brains = brains;
         true
     }
 
@@ -1386,7 +1481,7 @@ impl GameState {
             }
         }
         for (vid, dmg) in burn_victims {
-            self.apply_damage(None, vid, dmg, "BURN");
+            self.apply_damage(None, vid, dmg, "BURN", 0);
         }
 
         // Advance 3D projectiles + High-Ground Damage Bonus + Elemental Combos!
@@ -1496,7 +1591,7 @@ impl GameState {
                 1.0
             };
             dmg = ((dmg as f32) * pwr * hg_mul).round() as i16;
-            self.apply_damage(Some(owner), vid, dmg, tag);
+            self.apply_damage(Some(owner), vid, dmg, tag, elem);
         }
 
         // 3 Capturable Shrines
@@ -1690,6 +1785,7 @@ impl GameState {
             score_east: self.score_east,
         };
         let match_secs = self.start_instant.elapsed().as_secs() as u32;
+        let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
 
         let mut dead = Vec::new();
         let mut total_bytes = 0u64;
@@ -1708,6 +1804,8 @@ impl GameState {
                 shrines: shrines.clone(),
                 events: events.clone(),
                 telemetry: telemetry.clone(),
+                bot_brains: self.bot_brains.clone(),
+                kill_feed: kill_feed.clone(),
             };
             let raw = encode_server_datagram(&msg);
             total_bytes += raw.len() as u64;

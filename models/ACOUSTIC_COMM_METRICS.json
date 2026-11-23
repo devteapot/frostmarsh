@@ -1,0 +1,1067 @@
+{
+  "hardware": "NVIDIA GB10",
+  "elapsed_total_sec": 120.74,
+  "dataset": {
+    "grid": [
+      256,
+      256,
+      4
+    ],
+    "train_worlds": 32,
+    "test_worlds": 12,
+    "train_episodes": 19200,
+    "test_episodes": 4800
+  },
+  "acoustic_physics_sanity": {
+    "noise_min_db": 28.0,
+    "noise_max_db": 90.0,
+    "waterfall_plunge_l1_db": 85.0,
+    "wildfire_l1_db": 77.0,
+    "quiet_cavern_l0_p20_db": 28.0,
+    "wall_attenuation_db": 12.0,
+    "cave_ceiling_attenuation_db": 18.0
+  },
+  "arms": {
+    "arm1_silent": {
+      "sector_acc": 0.31020835041999817,
+      "element_acc": 0.37020835280418396,
+      "tactic_acc": 0.21312500536441803,
+      "joint_coord_acc": 0.0625,
+      "mean_snr_tm_db": -25.0,
+      "mean_snr_en_db": 21.264150619506836,
+      "mean_volume": 0.8012655973434448,
+      "enemy_eavesdrop_rate": 0.8927083611488342,
+      "enemy_eavesdrop_open_air": 0.9431993365287781,
+      "enemy_eavesdrop_behind_wall": 0.8336347341537476,
+      "mean_vol_when_enemy_open": 0.8022016286849976,
+      "mean_vol_when_enemy_walled": 0.8001703023910522,
+      "snr_buckets": {
+        "high_ge_10dB": {
+          "count": 0,
+          "joint_acc": null,
+          "tactic_acc": null,
+          "sector_acc": null
+        },
+        "med_2_to_10dB": {
+          "count": 0,
+          "joint_acc": null,
+          "tactic_acc": null,
+          "sector_acc": null
+        },
+        "low_neg6_to_2dB": {
+          "count": 0,
+          "joint_acc": null,
+          "tactic_acc": null,
+          "sector_acc": null
+        },
+        "inaudible_lt_neg6dB": {
+          "count": 4800,
+          "joint_acc": 0.0625,
+          "tactic_acc": 0.21312500536441803,
+          "sector_acc": 0.31020835041999817
+        }
+      },
+      "vocab": {
+        "mi_bits": 0.38957895876962373,
+        "h_event_bits": 2.584926372779728,
+        "h_symbol_bits": 1.637865703632973,
+        "nmi": 0.18451249870705191,
+        "purity": 0.34479166666666666,
+        "active_symbols": 5,
+        "confusion_16x6": [
+          [
+            45,
+            1,
+            284,
+            380,
+            0,
+            148
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            7,
+            0
+          ],
+          [
+            0,
+            3,
+            0,
+            0,
+            3,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            26,
+            3,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            20,
+            84,
+            11,
+            14,
+            197,
+            65
+          ],
+          [
+            0,
+            3,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            3,
+            0,
+            1,
+            105,
+            0,
+            2
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            693,
+            472,
+            505,
+            277,
+            560,
+            531
+          ],
+          [
+            43,
+            241,
+            3,
+            2,
+            22,
+            46
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        ]
+      }
+    },
+    "arm2_physical_3d": {
+      "sector_acc": 0.6962500214576721,
+      "element_acc": 0.7750000357627869,
+      "tactic_acc": 0.7235416769981384,
+      "joint_coord_acc": 0.612708330154419,
+      "mean_snr_tm_db": 0.5108896493911743,
+      "mean_snr_en_db": 16.11229133605957,
+      "mean_volume": 0.6656903028488159,
+      "enemy_eavesdrop_rate": 0.6252083778381348,
+      "enemy_eavesdrop_open_air": 0.6472179293632507,
+      "enemy_eavesdrop_behind_wall": 0.5994575023651123,
+      "mean_vol_when_enemy_open": 0.6666271090507507,
+      "mean_vol_when_enemy_walled": 0.664594292640686,
+      "snr_buckets": {
+        "high_ge_10dB": {
+          "count": 3006,
+          "joint_acc": 0.9115102887153625,
+          "tactic_acc": 0.9790418744087219,
+          "sector_acc": 0.9264803528785706
+        },
+        "med_2_to_10dB": {
+          "count": 166,
+          "joint_acc": 0.5843373537063599,
+          "tactic_acc": 0.7831324934959412,
+          "sector_acc": 0.6987951397895813
+        },
+        "low_neg6_to_2dB": {
+          "count": 23,
+          "joint_acc": 0.17391304671764374,
+          "tactic_acc": 0.30434784293174744,
+          "sector_acc": 0.3478260934352875
+        },
+        "inaudible_lt_neg6dB": {
+          "count": 1605,
+          "joint_acc": 0.06230529397726059,
+          "tactic_acc": 0.24485979974269867,
+          "sector_acc": 0.2697819173336029
+        }
+      },
+      "vocab": {
+        "mi_bits": 2.2812276751443084,
+        "h_event_bits": 2.584926372779728,
+        "h_symbol_bits": 3.942915365915496,
+        "nmi": 0.6989224820270465,
+        "purity": 0.9141666666666667,
+        "active_symbols": 16,
+        "confusion_16x6": [
+          [
+            0,
+            310,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            116,
+            2,
+            264,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            264,
+            0,
+            0,
+            0
+          ],
+          [
+            16,
+            375,
+            7,
+            0,
+            125,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            186,
+            0,
+            0
+          ],
+          [
+            287,
+            1,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            263,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            281
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            329,
+            0
+          ],
+          [
+            4,
+            103,
+            22,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            243,
+            0,
+            0,
+            0
+          ],
+          [
+            279,
+            8,
+            4,
+            0,
+            0,
+            0
+          ],
+          [
+            102,
+            5,
+            0,
+            0,
+            0,
+            239
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            338,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            272
+          ],
+          [
+            0,
+            0,
+            0,
+            355,
+            0,
+            0
+          ]
+        ]
+      }
+    },
+    "arm3_telepathic": {
+      "sector_acc": 0.9197916984558105,
+      "element_acc": 0.9879167079925537,
+      "tactic_acc": 0.9856250286102295,
+      "joint_coord_acc": 0.908958375453949,
+      "mean_snr_tm_db": 40.0,
+      "mean_snr_en_db": 21.866329193115234,
+      "mean_volume": 0.8171123266220093,
+      "enemy_eavesdrop_rate": 0.8989583253860474,
+      "enemy_eavesdrop_open_air": 0.9443585276603699,
+      "enemy_eavesdrop_behind_wall": 0.8458408713340759,
+      "mean_vol_when_enemy_open": 0.8167229890823364,
+      "mean_vol_when_enemy_walled": 0.8175678849220276,
+      "snr_buckets": {
+        "high_ge_10dB": {
+          "count": 4800,
+          "joint_acc": 0.908958375453949,
+          "tactic_acc": 0.9856250286102295,
+          "sector_acc": 0.9197916984558105
+        },
+        "med_2_to_10dB": {
+          "count": 0,
+          "joint_acc": null,
+          "tactic_acc": null,
+          "sector_acc": null
+        },
+        "low_neg6_to_2dB": {
+          "count": 0,
+          "joint_acc": null,
+          "tactic_acc": null,
+          "sector_acc": null
+        },
+        "inaudible_lt_neg6dB": {
+          "count": 0,
+          "joint_acc": null,
+          "tactic_acc": null,
+          "sector_acc": null
+        }
+      },
+      "vocab": {
+        "mi_bits": 2.393691521830503,
+        "h_event_bits": 2.5849263727797274,
+        "h_symbol_bits": 3.929119928069581,
+        "nmi": 0.7349323020680435,
+        "purity": 0.948125,
+        "active_symbols": 16,
+        "confusion_16x6": [
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            256
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            401,
+            0
+          ],
+          [
+            3,
+            350,
+            6,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            143
+          ],
+          [
+            0,
+            0,
+            0,
+            268,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            384,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            276
+          ],
+          [
+            0,
+            0,
+            187,
+            0,
+            0,
+            111
+          ],
+          [
+            0,
+            0,
+            0,
+            134,
+            0,
+            0
+          ],
+          [
+            20,
+            287,
+            14,
+            0,
+            0,
+            6
+          ],
+          [
+            0,
+            0,
+            0,
+            402,
+            0,
+            0
+          ],
+          [
+            76,
+            0,
+            213,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            391,
+            0
+          ],
+          [
+            0,
+            154,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            313,
+            3,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            392,
+            10,
+            0,
+            0,
+            0,
+            0
+          ]
+        ]
+      }
+    }
+  },
+  "eavesdrop_tradeoff": {
+    "adaptive": {
+      "mean_volume": 0.6656903028488159,
+      "joint_coord_acc": 0.612708330154419,
+      "mean_snr_tm_db": 0.5108896493911743,
+      "enemy_eavesdrop_rate": 0.6252083778381348,
+      "enemy_eavesdrop_open_air": 0.6472179293632507,
+      "enemy_eavesdrop_behind_wall": 0.5994575023651123
+    },
+    "always_shout": {
+      "mean_volume": 1.0,
+      "joint_coord_acc": 0.6291666626930237,
+      "mean_snr_tm_db": 13.2146577835083,
+      "enemy_eavesdrop_rate": 0.940208375453949,
+      "enemy_eavesdrop_open_air": 0.9656105041503906,
+      "enemy_eavesdrop_behind_wall": 0.9104882478713989
+    },
+    "always_whisper": {
+      "mean_volume": 0.15,
+      "joint_coord_acc": 0.1458333432674408,
+      "mean_snr_tm_db": -19.085342407226562,
+      "enemy_eavesdrop_rate": 0.25562500953674316,
+      "enemy_eavesdrop_open_air": 0.4733384847640991,
+      "enemy_eavesdrop_behind_wall": 0.0009041591547429562
+    }
+  },
+  "viewer_interpreter": {
+    "overall_event_acc": 0.7491666674613953,
+    "overall_sector_acc": 0.7014583349227905,
+    "overall_element_acc": 0.8054167032241821,
+    "intelligibility_tier_acc": 0.9968750476837158,
+    "n_params": 24855,
+    "snr_buckets": {
+      "high_ge_10dB": {
+        "count": 3006,
+        "event_acc": 0.9853625893592834,
+        "sector_acc": 0.9324683547019958,
+        "element_acc": 0.9870259165763855
+      },
+      "med_2_to_10dB": {
+        "count": 166,
+        "event_acc": 0.8915662169456482,
+        "sector_acc": 0.7048192620277405,
+        "element_acc": 0.9216867089271545
+      },
+      "low_neg6_to_2dB": {
+        "count": 23,
+        "event_acc": 0.3913043439388275,
+        "sector_acc": 0.52173912525177,
+        "element_acc": 0.52173912525177
+      },
+      "inaudible_lt_neg6dB": {
+        "count": 1605,
+        "event_acc": 0.29719623923301697,
+        "sector_acc": 0.2710280418395996,
+        "element_acc": 0.4573208689689636
+      }
+    }
+  },
+  "human_goal_injector": {
+    "goal_dim": 16,
+    "adapter_trainable_params": 63341,
+    "seen_commands_unseen_worlds": {
+      "base_move_cos": 0.026826543733477592,
+      "injected_move_cos": 0.9981356859207153,
+      "base_element_acc": 0.351128488779068,
+      "injected_element_acc": 1.0,
+      "base_ability_acc": 0.4366319477558136,
+      "injected_ability_acc": 1.0,
+      "base_full_compliance": 0.0314670130610466,
+      "injected_full_compliance": 0.9995659589767456
+    },
+    "unseen_paraphrases_unseen_worlds": {
+      "base_move_cos": 0.01235276646912098,
+      "injected_move_cos": 0.9776569604873657,
+      "base_element_acc": 0.3444010615348816,
+      "injected_element_acc": 0.9993489980697632,
+      "base_ability_acc": 0.408203125,
+      "injected_ability_acc": 1.0,
+      "base_full_compliance": 0.03125,
+      "injected_full_compliance": 0.9680989980697632
+    }
+  },
+  "latency_gb10_ms": {
+    "acoustic_10step_3d_conv_256x256x4_fp16": {
+      "median_ms": 0.1439,
+      "p95_ms": 0.1678,
+      "mean_ms": 0.1534
+    },
+    "acoustic_ambient_noise_256x256x4_fp16": {
+      "median_ms": 0.3245,
+      "p95_ms": 0.5046,
+      "mean_ms": 0.3464
+    },
+    "acoustic_ambient_noise_256x256x4_fp32": {
+      "median_ms": 1.1766,
+      "p95_ms": 1.2186,
+      "mean_ms": 1.1913
+    },
+    "acoustic_full_snr_field_256x256x4": {
+      "median_ms": 8.7349,
+      "p95_ms": 17.6566,
+      "mean_ms": 9.7402
+    },
+    "pairwise_snr_query_12_bots": {
+      "median_ms": 0.2012,
+      "p95_ms": 0.2459,
+      "mean_ms": 0.2075
+    },
+    "comm_bot_pair_12_bots": {
+      "median_ms": 0.2088,
+      "p95_ms": 0.2417,
+      "mean_ms": 0.2223
+    },
+    "viewer_interpreter_12_bots": {
+      "median_ms": 0.0352,
+      "p95_ms": 0.075,
+      "mean_ms": 0.0612
+    },
+    "human_goal_bot_policy_12_bots": {
+      "median_ms": 0.2192,
+      "p95_ms": 0.2466,
+      "mean_ms": 0.2205
+    },
+    "pairwise_snr_query_64_bots": {
+      "median_ms": 0.1945,
+      "p95_ms": 0.2052,
+      "mean_ms": 0.1976
+    },
+    "comm_bot_pair_64_bots": {
+      "median_ms": 0.5097,
+      "p95_ms": 0.7195,
+      "mean_ms": 0.5176
+    },
+    "viewer_interpreter_64_bots": {
+      "median_ms": 0.1472,
+      "p95_ms": 0.1497,
+      "mean_ms": 0.1447
+    },
+    "human_goal_bot_policy_64_bots": {
+      "median_ms": 0.5775,
+      "p95_ms": 0.5848,
+      "mean_ms": 0.5552
+    },
+    "pairwise_snr_query_256_bots": {
+      "median_ms": 0.2067,
+      "p95_ms": 0.2243,
+      "mean_ms": 0.2123
+    },
+    "comm_bot_pair_256_bots": {
+      "median_ms": 1.1059,
+      "p95_ms": 1.1433,
+      "mean_ms": 1.1114
+    },
+    "viewer_interpreter_256_bots": {
+      "median_ms": 0.0938,
+      "p95_ms": 0.1394,
+      "mean_ms": 0.0971
+    },
+    "human_goal_bot_policy_256_bots": {
+      "median_ms": 1.0804,
+      "p95_ms": 1.2618,
+      "mean_ms": 1.1011
+    }
+  },
+  "sample_transcripts": [
+    {
+      "scenario": "Clear Oil Trap Coordination (Open Air)",
+      "world_seed": 900,
+      "gt_event": "OIL_SLICK_IGNITE",
+      "gt_sector": "SW Oil Basin",
+      "spotter_pos": [
+        54.4,
+        135.6,
+        1
+      ],
+      "teammate_pos": [
+        155.7,
+        171.3,
+        2
+      ],
+      "enemy_pos": [
+        27.0,
+        150.2,
+        1
+      ],
+      "distance_cells": 107.9,
+      "walls_crossed": 1.0,
+      "ceiling_muffled": false,
+      "ambient_noise_tm_db": 38.2,
+      "volume": 1.0,
+      "symbol_id": 11,
+      "snr_teammate_db": 12.9,
+      "snr_enemy_db": 43.1,
+      "enemy_eavesdropped": true,
+      "viewer_turn1": "[Shadow-Flanker @ L1 (SHOUT) | +12.9 dB] \"Oil slick pooled across SW Oil Basin \u2014 ignite it with Fire now!\"",
+      "teammate_turn2": "[Vanguard @ L2] \"Copy loud and clear! Rotating to SW Oil Basin \u2014 priming Fire for IGNITE_TRAP!\"",
+      "teammate_action": "SW Oil Basin | Fire | IGNITE_TRAP",
+      "coord_success": true
+    },
+    {
+      "scenario": "Whisper Behind Basalt Wall (Stealth vs Enemy)",
+      "world_seed": 901,
+      "gt_event": "OIL_SLICK_IGNITE",
+      "gt_sector": "SW Oil Basin",
+      "spotter_pos": [
+        45.8,
+        138.5,
+        1
+      ],
+      "teammate_pos": [
+        190.7,
+        125.9,
+        1
+      ],
+      "enemy_pos": [
+        77.6,
+        108.4,
+        1
+      ],
+      "distance_cells": 145.4,
+      "walls_crossed": 3.0,
+      "ceiling_muffled": false,
+      "ambient_noise_tm_db": 65.1,
+      "volume": 0.0,
+      "symbol_id": 1,
+      "snr_teammate_db": -72.0,
+      "snr_enemy_db": 1.9,
+      "enemy_eavesdropped": false,
+      "viewer_turn1": "[Shadow-Flanker @ L1 (whisper) | -72.0 dB] [inaudible \u2014 drowned out by 3 basalt walls + roaring wildfire crackle]",
+      "teammate_turn2": "[Vanguard @ L1] \"Didn't copy \u2014 too much interference here! Holding fallback stance (guessed NW Highland / Frost).\"",
+      "teammate_action": "NW Highland | Frost | FREEZE_CHOKE",
+      "coord_success": false
+    },
+    {
+      "scenario": "L2 North Skybridge Shout Across Valley",
+      "world_seed": 902,
+      "gt_event": "WATERFALL_CHOKE",
+      "gt_sector": "NW Highland",
+      "spotter_pos": [
+        93.5,
+        51.3,
+        2
+      ],
+      "teammate_pos": [
+        119.4,
+        14.0,
+        1
+      ],
+      "enemy_pos": [
+        140.6,
+        46.0,
+        1
+      ],
+      "distance_cells": 46.5,
+      "walls_crossed": 0.0,
+      "ceiling_muffled": false,
+      "ambient_noise_tm_db": 32.0,
+      "volume": 1.0,
+      "symbol_id": 8,
+      "snr_teammate_db": 37.9,
+      "snr_enemy_db": 15.8,
+      "enemy_eavesdropped": true,
+      "viewer_turn1": "[Vanguard @ L2 (SHOUT) | +37.9 dB] \"High-ground waterfall choke open at NW Highland \u2014 lock it down with Frost!\"",
+      "teammate_turn2": "[Pyromancer @ L1] \"Copy loud and clear! Rotating to NW Highland \u2014 priming Frost for FREEZE_CHOKE!\"",
+      "teammate_action": "NW Highland | Frost | FREEZE_CHOKE",
+      "coord_success": true
+    },
+    {
+      "scenario": "Muffled Wildfire Flanking Callout",
+      "world_seed": 903,
+      "gt_event": "OIL_SLICK_IGNITE",
+      "gt_sector": "NE Skybridge",
+      "spotter_pos": [
+        211.1,
+        111.5,
+        1
+      ],
+      "teammate_pos": [
+        46.9,
+        117.3,
+        1
+      ],
+      "enemy_pos": [
+        190.2,
+        75.1,
+        1
+      ],
+      "distance_cells": 164.3,
+      "walls_crossed": 1.0,
+      "ceiling_muffled": false,
+      "ambient_noise_tm_db": 77.0,
+      "volume": 0.0,
+      "symbol_id": 12,
+      "snr_teammate_db": -61.0,
+      "snr_enemy_db": 2.6,
+      "enemy_eavesdropped": false,
+      "viewer_turn1": "[Cryo-Scout @ L1 (whisper) | -61.0 dB] [inaudible \u2014 drowned out by 1 basalt wall + roaring wildfire crackle]",
+      "teammate_turn2": "[Shadow-Flanker @ L1] \"Didn't copy \u2014 too much interference here! Holding fallback stance (guessed NE Skybridge / Frost).\"",
+      "teammate_action": "NE Skybridge | Frost | FREEZE_CHOKE",
+      "coord_success": false
+    },
+    {
+      "scenario": "Drowned Out by L2\u2192L1 Plunging Waterfall",
+      "world_seed": 904,
+      "gt_event": "CAVERN_SHAFT_FLANK",
+      "gt_sector": "NW Highland",
+      "spotter_pos": [
+        82.4,
+        72.2,
+        0
+      ],
+      "teammate_pos": [
+        144.7,
+        34.4,
+        2
+      ],
+      "enemy_pos": [
+        123.6,
+        76.0,
+        1
+      ],
+      "distance_cells": 75.6,
+      "walls_crossed": 0.0,
+      "ceiling_muffled": false,
+      "ambient_noise_tm_db": 59.7,
+      "volume": 0.0,
+      "symbol_id": 14,
+      "snr_teammate_db": -33.7,
+      "snr_enemy_db": 0.7,
+      "enemy_eavesdropped": false,
+      "viewer_turn1": "[Cryo-Scout @ L0 (whisper) | -33.7 dB] [inaudible \u2014 drowned out by L2\u2192L1 plunging waterfall roar]",
+      "teammate_turn2": "[Shadow-Flanker @ L2] \"Didn't copy \u2014 too much interference here! Holding fallback stance (guessed SW Oil Basin / Oil).\"",
+      "teammate_action": "SW Oil Basin | Oil | OIL_AMBUSH",
+      "coord_success": false
+    },
+    {
+      "scenario": "Frozen River Bridge Shatter Callout",
+      "world_seed": 905,
+      "gt_event": "FROZEN_RIVER_BRIDGE",
+      "gt_sector": "NE Skybridge",
+      "spotter_pos": [
+        138.4,
+        98.6,
+        1
+      ],
+      "teammate_pos": [
+        131.4,
+        175.5,
+        2
+      ],
+      "enemy_pos": [
+        194.5,
+        149.9,
+        1
+      ],
+      "distance_cells": 77.9,
+      "walls_crossed": 1.0,
+      "ceiling_muffled": false,
+      "ambient_noise_tm_db": 34.0,
+      "volume": 1.0,
+      "symbol_id": 2,
+      "snr_teammate_db": 19.8,
+      "snr_enemy_db": 11.5,
+      "enemy_eavesdropped": true,
+      "viewer_turn1": "[Shadow-Flanker @ L1 (SHOUT) | +19.8 dB] \"Frozen river bridge spotted near NE Skybridge \u2014 shatter the ice with Fire!\"",
+      "teammate_turn2": "[Vanguard @ L2] \"Copy loud and clear! Rotating to NE Skybridge \u2014 priming Fire for SHATTER_BRIDGE!\"",
+      "teammate_action": "NE Skybridge | Fire | SHATTER_BRIDGE",
+      "coord_success": true
+    },
+    {
+      "scenario": "L0 Cavern Shaft Vertical Transmission (Clear via Shaft)",
+      "world_seed": 906,
+      "gt_event": "CAVERN_SHAFT_FLANK",
+      "gt_sector": "NE Skybridge",
+      "spotter_pos": [
+        151.9,
+        73.0,
+        0
+      ],
+      "teammate_pos": [
+        166.3,
+        200.0,
+        2
+      ],
+      "enemy_pos": [
+        121.0,
+        69.1,
+        0
+      ],
+      "distance_cells": 129.3,
+      "walls_crossed": 1.0,
+      "ceiling_muffled": false,
+      "ambient_noise_tm_db": 39.1,
+      "volume": 1.0,
+      "symbol_id": 7,
+      "snr_teammate_db": 13.0,
+      "snr_enemy_db": 35.1,
+      "enemy_eavesdropped": true,
+      "viewer_turn1": "[Vanguard @ L0 (SHOUT) | +13.0 dB] \"Cavern vertical shaft clear under NE Skybridge \u2014 drop in with Oil on my mark!\"",
+      "teammate_turn2": "[Pyromancer @ L2] \"Copy loud and clear! Rotating to NE Skybridge \u2014 priming Oil for CAVERN_DROP!\"",
+      "teammate_action": "NE Skybridge | Oil | CAVERN_DROP",
+      "coord_success": true
+    },
+    {
+      "scenario": "L0 Cave Rock Ceiling Muffling (Garbled)",
+      "world_seed": 908,
+      "gt_event": "WATERFALL_CHOKE",
+      "gt_sector": "NE Skybridge",
+      "spotter_pos": [
+        162.0,
+        42.1,
+        2
+      ],
+      "teammate_pos": [
+        215.4,
+        24.0,
+        0
+      ],
+      "enemy_pos": [
+        206.6,
+        10.0,
+        2
+      ],
+      "distance_cells": 59.9,
+      "walls_crossed": 2.0,
+      "ceiling_muffled": true,
+      "ambient_noise_tm_db": 28.0,
+      "volume": 1.0,
+      "symbol_id": 13,
+      "snr_teammate_db": 2.4,
+      "snr_enemy_db": 29.1,
+      "enemy_eavesdropped": true,
+      "viewer_turn1": "[Cryo-Scout @ L2 (SHOUT) | +2.4 dB, partial L0 rock ceiling + 2 basalt walls] \"Wildfire on the flank... NW Highland... hit it with Frost!\"",
+      "teammate_turn2": "[Shadow-Flanker @ L0] \"Copy loud and clear! Rotating to NW Highland \u2014 priming Frost for SUPPRESS_FLANK!\"",
+      "teammate_action": "NW Highland | Frost | SUPPRESS_FLANK",
+      "coord_success": false
+    },
+    {
+      "scenario": "Basalt Ridge Double-Wall Occlusion (Inaudible)",
+      "world_seed": 908,
+      "gt_event": "SHRINE_AMBUSH",
+      "gt_sector": "SE Shrine Valley",
+      "spotter_pos": [
+        205.0,
+        208.7,
+        1
+      ],
+      "teammate_pos": [
+        45.0,
+        109.5,
+        1
+      ],
+      "enemy_pos": [
+        166.0,
+        223.2,
+        1
+      ],
+      "distance_cells": 188.2,
+      "walls_crossed": 3.0,
+      "ceiling_muffled": false,
+      "ambient_noise_tm_db": 70.6,
+      "volume": 0.0,
+      "symbol_id": 15,
+      "snr_teammate_db": -79.7,
+      "snr_enemy_db": -14.6,
+      "enemy_eavesdropped": false,
+      "viewer_turn1": "[Cryo-Scout @ L1 (whisper) | -79.7 dB] [inaudible \u2014 drowned out by 3 basalt walls + roaring wildfire crackle]",
+      "teammate_turn2": "[Shadow-Flanker @ L1] \"Didn't copy \u2014 too much interference here! Holding fallback stance (guessed NE Skybridge / Frost).\"",
+      "teammate_action": "NE Skybridge | Frost | CAVERN_DROP",
+      "coord_success": false
+    },
+    {
+      "scenario": "High-Ground Waterfall Choke Defense",
+      "world_seed": 909,
+      "gt_event": "WATERFALL_CHOKE",
+      "gt_sector": "NW Highland",
+      "spotter_pos": [
+        85.3,
+        40.5,
+        2
+      ],
+      "teammate_pos": [
+        129.3,
+        42.3,
+        1
+      ],
+      "enemy_pos": [
+        151.9,
+        14.6,
+        2
+      ],
+      "distance_cells": 45.2,
+      "walls_crossed": 0.0,
+      "ceiling_muffled": false,
+      "ambient_noise_tm_db": 33.9,
+      "volume": 1.0,
+      "symbol_id": 8,
+      "snr_teammate_db": 36.3,
+      "snr_enemy_db": 33.9,
+      "enemy_eavesdropped": true,
+      "viewer_turn1": "[Vanguard @ L2 (SHOUT) | +36.3 dB] \"High-ground waterfall choke open at NW Highland \u2014 lock it down with Frost!\"",
+      "teammate_turn2": "[Pyromancer @ L1] \"Copy loud and clear! Rotating to NW Highland \u2014 priming Frost for FREEZE_CHOKE!\"",
+      "teammate_action": "NW Highland | Frost | FREEZE_CHOKE",
+      "coord_success": true
+    }
+  ]
+}

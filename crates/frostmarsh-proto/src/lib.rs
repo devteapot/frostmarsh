@@ -151,6 +151,28 @@ pub struct CombatEvent {
     pub label: String,
 }
 
+/// Live neural bot introspection snapshot (`op=5` zero-cost 4×4 `Z_world` saliency + policy intents).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BotBrainSnap {
+    pub bot_id: u32,
+    pub class_id: u8,
+    pub team: u8,
+    pub target_id: u32,
+    pub elem_probs: [u8; 3],
+    pub ability_probs: [u8; 6],
+    pub z_heatmap_4x4: [u8; 16],
+}
+
+/// Recent kill feed entry (`elem`: 0=Fire, 1=Frost, 2=Oil, 3=Melee/Physical).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KillFeedEntry {
+    pub killer_name: String,
+    pub victim_name: String,
+    pub killer_team: u8,
+    pub elem: u8,
+    pub tick: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TelemetrySnap {
     pub mode: String,
@@ -196,6 +218,10 @@ pub enum ServerDatagram {
         shrines: Vec<ShrineSnap>,
         events: Vec<CombatEvent>,
         telemetry: TelemetrySnap,
+        #[serde(default)]
+        bot_brains: Vec<BotBrainSnap>,
+        #[serde(default)]
+        kill_feed: Vec<KillFeedEntry>,
     },
     /// 10 Hz single dirty 16×16×1 `A+` volumetric chunk at vertical layer `layer` (`0..grid_d`).
     APlusChunk {

@@ -39,6 +39,47 @@ pub enum PlanetBrickUpdate {
     },
 }
 
+/// Wave 34B: Live `PlanetaryClimateNet` (`op=13`) `64×64` global weather/cloud/ash/snow overlay update.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct MacroClimateUpdate {
+    pub face: u8,
+    pub grid_n: u16,
+    pub tick: u64,
+    pub rgba: Vec<u8>,
+}
+
+/// Wave 34B: Hydrated `256×256×64` `1 m` macro-planet shard sub-brick update `(face, sx, sy, bx, by, bz)`.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum MacroShardBrickUpdate {
+    FullSubBrick {
+        face: u8,
+        sx: u8,
+        sy: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        density_mat: Vec<u8>,
+        albedo_thermal: Vec<u8>,
+    },
+    DeltaSubBrick {
+        face: u8,
+        sx: u8,
+        sy: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        patches: Vec<(u16, [u8; 4], [u8; 4])>,
+    },
+}
+
 static CURRENT_WORLD_LAW_PRESET: AtomicU8 = AtomicU8::new(0);
 
 #[inline]
@@ -151,6 +192,16 @@ pub struct LiveWorldState {
     pub planet_brick_queue: Vec<PlanetBrickUpdate>,
     pub received_planet_brick_keys: HashSet<(u8, u16, u16, u16)>,
     pub planet_bricks_rx: u64,
+    /// Wave 34B: Live Dual-Scale Locally-Flat Macro Planet (`R = 1,304 m`) queues & counters
+    pub macro_planet_mode: bool,
+    pub planet_shards_per_axis: u8,
+    pub planet_seed: u64,
+    pub macro_climate_queue: Vec<MacroClimateUpdate>,
+    pub macro_shard_brick_queue: Vec<MacroShardBrickUpdate>,
+    pub received_macro_shard_bricks: HashSet<(u8, u8, u8, u16, u16, u16)>,
+    pub received_macro_climate_faces: HashSet<u8>,
+    pub macro_shard_bricks_rx: u64,
+    pub macro_climate_faces_rx: u64,
     pub latest_field_tick: u64,
     pub entities: Option<LiveEntityState>,
     pub chunks_rx: u64,
@@ -196,6 +247,15 @@ impl LiveWorldState {
             planet_brick_queue: Vec::new(),
             received_planet_brick_keys: HashSet::new(),
             planet_bricks_rx: 0,
+            macro_planet_mode: false,
+            planet_shards_per_axis: 8,
+            planet_seed: 33_033,
+            macro_climate_queue: Vec::new(),
+            macro_shard_brick_queue: Vec::new(),
+            received_macro_shard_bricks: HashSet::new(),
+            received_macro_climate_faces: HashSet::new(),
+            macro_shard_bricks_rx: 0,
+            macro_climate_faces_rx: 0,
             latest_field_tick: 0,
             entities: None,
             chunks_rx: 0,
@@ -219,6 +279,10 @@ impl LiveWorldState {
         self.width = w;
         self.height = h;
         self.depth = d;
+        // Wave 34B: Never allocate gigabyte-scale flat grids for 2048×2048×64 macro planets!
+        if self.macro_planet_mode || w >= 1024 || h >= 1024 {
+            return;
+        }
         self.chunks_x = chunks_for_dim(w);
         self.chunks_y = chunks_for_dim(h);
         self.aplus_layers = vec![vec![[0xff, 0, 26, 1]; w * h]; d];
@@ -254,6 +318,145 @@ impl LiveWorldState {
 
     pub fn take_planet_brick_updates(&mut self) -> Vec<PlanetBrickUpdate> {
         std::mem::take(&mut self.planet_brick_queue)
+    }
+
+    pub fn received_macro_shard_brick_count(&self) -> usize {
+        self.received_macro_shard_bricks.len()
+    }
+
+    pub fn received_macro_climate_face_count(&self) -> usize {
+        self.received_macro_climate_faces.len()
+    }
+
+    pub fn take_macro_climate_updates(&mut self) -> Vec<MacroClimateUpdate> {
+        std::mem::take(&mut self.macro_climate_queue)
+    }
+
+    pub fn take_macro_shard_brick_updates(&mut self) -> Vec<MacroShardBrickUpdate> {
+        std::mem::take(&mut self.macro_shard_brick_queue)
+    }
+
+    pub fn apply_macro_climate_face(
+        &mut self,
+        raw_len: u64,
+        face: u8,
+        grid_n: u16,
+        tick: u64,
+        lz4_climate_rgba: &[u8],
+    ) {
+        if face >= 6 || grid_n == 0 {
+            return;
+        }
+        let Some(rgba) = decompress_aplus_cells(lz4_climate_rgba) else {
+            return;
+        };
+        let expected = (grid_n as usize) * (grid_n as usize) * 4;
+        if rgba.len() != expected {
+            return;
+        }
+        self.macro_planet_mode = true;
+        self.planet_mode = true;
+        self.bytes_rx += raw_len;
+        self.macro_climate_faces_rx += 1;
+        self.latest_field_tick = self.latest_field_tick.max(tick);
+        self.received_macro_climate_faces.insert(face);
+        self.macro_climate_queue.push(MacroClimateUpdate {
+            face,
+            grid_n,
+            tick,
+            rgba,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_macro_shard_brick3d(
+        &mut self,
+        raw_len: u64,
+        face: u8,
+        sx: u8,
+        sy: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_density_mat: &[u8],
+        lz4_albedo_thermal: &[u8],
+    ) {
+        if face >= 6 || total_depth == 0 || sub_depth == 0 {
+            return;
+        }
+        let Some((dm_raw, at_raw)) = decode_subbrick3d_lz4(lz4_density_mat, lz4_albedo_thermal) else {
+            return;
+        };
+        let expected = CHUNK_SIZE * CHUNK_SIZE * (sub_depth as usize) * 4;
+        if dm_raw.len() != expected || at_raw.len() != expected {
+            return;
+        }
+        self.macro_planet_mode = true;
+        self.planet_mode = true;
+        self.bytes_rx += raw_len;
+        self.bricks_3d_rx += 1;
+        self.macro_shard_bricks_rx += 1;
+        self.latest_field_tick = self.latest_field_tick.max(tick);
+        self.received_macro_shard_bricks.insert((face, sx, sy, bx, by, bz));
+        self.macro_shard_brick_queue.push(MacroShardBrickUpdate::FullSubBrick {
+            face,
+            sx,
+            sy,
+            bx,
+            by,
+            bz,
+            total_depth,
+            sub_depth,
+            tick,
+            density_mat: dm_raw,
+            albedo_thermal: at_raw,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_macro_shard_brick3d_delta(
+        &mut self,
+        raw_len: u64,
+        face: u8,
+        sx: u8,
+        sy: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_deltas: &[u8],
+    ) {
+        if face >= 6 || total_depth == 0 || sub_depth == 0 {
+            return;
+        }
+        let Ok(patches) = decode_brick3d_delta_voxels(lz4_deltas) else {
+            return;
+        };
+        self.macro_planet_mode = true;
+        self.planet_mode = true;
+        self.bytes_rx += raw_len;
+        self.bricks_3d_rx += 1;
+        self.bricks_3d_delta_rx += 1;
+        self.macro_shard_bricks_rx += 1;
+        self.latest_field_tick = self.latest_field_tick.max(tick);
+        self.received_macro_shard_bricks.insert((face, sx, sy, bx, by, bz));
+        self.macro_shard_brick_queue.push(MacroShardBrickUpdate::DeltaSubBrick {
+            face,
+            sx,
+            sy,
+            bx,
+            by,
+            bz,
+            total_depth,
+            sub_depth,
+            tick,
+            patches,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -810,7 +1013,21 @@ impl QuicClientHandle {
                               world_law_preset: u8| {
             st.world_law_preset = world_law_preset;
             CURRENT_WORLD_LAW_PRESET.store(world_law_preset, Ordering::Relaxed);
-            if telemetry.planet_mode {
+            if telemetry.macro_planet {
+                st.macro_planet_mode = true;
+                st.planet_mode = true;
+                if telemetry.planet_r_core > 1.0 {
+                    st.planet_r_core = telemetry.planet_r_core;
+                } else if st.planet_r_core < 100.0 {
+                    st.planet_r_core = 1280.0;
+                }
+                if telemetry.planet_shards_per_axis > 0 {
+                    st.planet_shards_per_axis = telemetry.planet_shards_per_axis;
+                }
+                if telemetry.planet_seed != 0 {
+                    st.planet_seed = telemetry.planet_seed;
+                }
+            } else if telemetry.planet_mode {
                 st.planet_mode = true;
                 if telemetry.planet_r_core > 1.0 {
                     st.planet_r_core = telemetry.planet_r_core;
@@ -1035,6 +1252,77 @@ impl QuicClientHandle {
                                         &lz4_deltas,
                                     );
                                 }
+                                ServerDatagram::PlanetMacroClimateFace {
+                                    face,
+                                    grid_n,
+                                    tick,
+                                    lz4_climate_rgba,
+                                } => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    st.apply_macro_climate_face(
+                                        raw_len,
+                                        face,
+                                        grid_n,
+                                        tick,
+                                        &lz4_climate_rgba,
+                                    );
+                                }
+                                ServerDatagram::PlanetShardBrick3D {
+                                    face,
+                                    sx,
+                                    sy,
+                                    bx,
+                                    by,
+                                    bz,
+                                    total_depth,
+                                    sub_depth,
+                                    tick,
+                                    lz4_density_mat,
+                                    lz4_albedo_thermal,
+                                } => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    st.apply_macro_shard_brick3d(
+                                        raw_len,
+                                        face,
+                                        sx,
+                                        sy,
+                                        bx,
+                                        by,
+                                        bz,
+                                        total_depth,
+                                        sub_depth,
+                                        tick,
+                                        &lz4_density_mat,
+                                        &lz4_albedo_thermal,
+                                    );
+                                }
+                                ServerDatagram::PlanetShardBrick3DDelta {
+                                    face,
+                                    sx,
+                                    sy,
+                                    bx,
+                                    by,
+                                    bz,
+                                    total_depth,
+                                    sub_depth,
+                                    tick,
+                                    lz4_deltas,
+                                } => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    st.apply_macro_shard_brick3d_delta(
+                                        raw_len,
+                                        face,
+                                        sx,
+                                        sy,
+                                        bx,
+                                        by,
+                                        bz,
+                                        total_depth,
+                                        sub_depth,
+                                        tick,
+                                        &lz4_deltas,
+                                    );
+                                }
                             }
                         }
                     } else if let Some(ServerReliable::Welcome {
@@ -1231,6 +1519,77 @@ impl QuicClientHandle {
                             &lz4_deltas,
                         );
                     }
+                    ServerDatagram::PlanetMacroClimateFace {
+                        face,
+                        grid_n,
+                        tick,
+                        lz4_climate_rgba,
+                    } => {
+                        let mut st = st_dg.lock().unwrap();
+                        st.apply_macro_climate_face(
+                            raw_len,
+                            face,
+                            grid_n,
+                            tick,
+                            &lz4_climate_rgba,
+                        );
+                    }
+                    ServerDatagram::PlanetShardBrick3D {
+                        face,
+                        sx,
+                        sy,
+                        bx,
+                        by,
+                        bz,
+                        total_depth,
+                        sub_depth,
+                        tick,
+                        lz4_density_mat,
+                        lz4_albedo_thermal,
+                    } => {
+                        let mut st = st_dg.lock().unwrap();
+                        st.apply_macro_shard_brick3d(
+                            raw_len,
+                            face,
+                            sx,
+                            sy,
+                            bx,
+                            by,
+                            bz,
+                            total_depth,
+                            sub_depth,
+                            tick,
+                            &lz4_density_mat,
+                            &lz4_albedo_thermal,
+                        );
+                    }
+                    ServerDatagram::PlanetShardBrick3DDelta {
+                        face,
+                        sx,
+                        sy,
+                        bx,
+                        by,
+                        bz,
+                        total_depth,
+                        sub_depth,
+                        tick,
+                        lz4_deltas,
+                    } => {
+                        let mut st = st_dg.lock().unwrap();
+                        st.apply_macro_shard_brick3d_delta(
+                            raw_len,
+                            face,
+                            sx,
+                            sy,
+                            bx,
+                            by,
+                            bz,
+                            total_depth,
+                            sub_depth,
+                            tick,
+                            &lz4_deltas,
+                        );
+                    }
                 }
             }
         });
@@ -1270,34 +1629,46 @@ impl QuicClientHandle {
         let start = Instant::now();
         let mut last_req = Instant::now();
         loop {
-            let (rc, tot, has_ent, is_planet) = {
+            let (rc, tot, has_ent, ready_override) = {
                 let st = self.state.lock().unwrap();
-                let is_planet = st.planet_mode
-                    || st.received_planet_brick_count() > 0
-                    || st.entities.as_ref().is_some_and(|e| e.telemetry.planet_mode);
-                if is_planet {
-                    (st.received_planet_brick_count(), 96usize, st.entities.is_some(), true)
+                let is_macro = st.macro_planet_mode
+                    || st.received_macro_shard_brick_count() > 0
+                    || st.received_macro_climate_face_count() > 0
+                    || st.entities.as_ref().is_some_and(|e| e.telemetry.macro_planet);
+                let is_planet = !is_macro
+                    && (st.planet_mode
+                        || st.received_planet_brick_count() > 0
+                        || st.entities.as_ref().is_some_and(|e| e.telemetry.planet_mode));
+                if is_macro {
+                    let sb = st.received_macro_shard_brick_count();
+                    let cf = st.received_macro_climate_face_count();
+                    (sb, 64usize, st.entities.is_some(), Some(sb >= 32 && cf >= 6))
+                } else if is_planet {
+                    let pb = st.received_planet_brick_count();
+                    (pb, 96usize, st.entities.is_some(), Some(pb >= 48))
                 } else {
                     let rc = if st.depth >= 16 {
                         st.received_z16_count()
                     } else {
                         st.received_surf_count()
                     };
-                    (rc, st.total_surf_chunks(), st.entities.is_some(), false)
+                    (rc, st.total_surf_chunks(), st.entities.is_some(), None)
                 }
             };
-            let target = if is_planet {
-                48usize
-            } else {
-                ((tot as f32) * min_frac).ceil() as usize
+            let is_ready = match ready_override {
+                Some(ok) => ok && has_ent,
+                None => {
+                    let target = ((tot as f32) * min_frac).ceil() as usize;
+                    rc >= target && has_ent
+                }
             };
-            if rc >= target && has_ent {
+            if is_ready {
                 return (rc, tot, true);
             }
             if start.elapsed() >= max_wait {
                 return (rc, tot, has_ent);
             }
-            if last_req.elapsed() >= Duration::from_millis(900) && rc < target {
+            if last_req.elapsed() >= Duration::from_millis(900) && !is_ready {
                 let _ = Self::send_reliable_on(&self.conn, &ClientReliable::RequestFullSync).await;
                 last_req = Instant::now();
             }

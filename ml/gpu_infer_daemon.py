@@ -15,6 +15,7 @@ Serves low-latency GPU inference on TCP_NODELAY and optional Unix domain socket:
   - op=10: ActuatorV3     ([N, 168]      f32 -> [N, 28]       f32) true 3D volumetric actuators (12 floats) + 16 (4x4) Z_world saliency!
   - op=11: WorldModelV8   ([L, 18, H, W] + [H, W] local_dt + [6] world_laws f32 -> [L, 17, H, W] + [L-1, 5, H, W] f32) live World-Law RPC!
   - op=12: PlanetV8Step   (6-Face Cubed-Sphere `[6, L, 18, N, N]` f16/f32 + `sun_dir[3]` -> `(infer_ms, active_frac)` + `[6, L, 17, N, N]` + `[6, L-1, 5, N, N]` f16/f32)!
+  - op=13: PlanetClimate  (Stateful `PlanetaryClimateNet` `[6, 4, 10, 64, 64]` FP16 + AMR upscale injections -> `(infer_ms, mean_temp_k)` + `6x64x64x4` RGBA8 + `6x64x64x2` f32 surface winds)!
 """
 
 from __future__ import annotations
@@ -95,12 +96,23 @@ OP_WORLD_DT_STEP = 9
 OP_ACTUATOR_V3 = 10
 OP_WORLD_V8_STEP = 11
 OP_PLANET_V8_STEP = 12
+OP_PLANET_CLIMATE_STEP = 13
 
 PLANET_META_STRUCT = struct.Struct("<HHfffB")  # (N:u16, L:u16, sun_x:f32, sun_y:f32, sun_z:f32, flags:u8) = 17 bytes
 PLANET_META_SIZE = PLANET_META_STRUCT.size
 PLANET_RESP_META_STRUCT = struct.Struct("<ff")  # (infer_ms:f32, active_frac:f32) = 8 bytes
 PLANET_FLAG_USE_SPARSE = 1 << 0
 PLANET_FLAG_FP16_IO = 1 << 1
+
+# Wave 34A: op=13 PlanetaryClimateNet binary framing
+PLANET_CLIMATE_GRID_N = 64
+PLANET_CLIMATE_REQ_STRUCT = struct.Struct("<QfffII")  # (seed:u64, sun_x:f32, sun_y:f32, sun_z:f32, steps:u32, n_inject:u32) = 28 bytes
+PLANET_CLIMATE_REQ_SIZE = PLANET_CLIMATE_REQ_STRUCT.size
+PLANET_CLIMATE_INJ_STRUCT = struct.Struct("<Bxxxffff")  # (face:u8, pad[3], u:f32, v:f32, delta_temp:f32, delta_ash:f32) = 20 bytes
+PLANET_CLIMATE_INJ_SIZE = PLANET_CLIMATE_INJ_STRUCT.size
+PLANET_CLIMATE_INJ_PACKED_STRUCT = struct.Struct("<Bffff")  # 17-byte unpadded compatibility stride
+PLANET_CLIMATE_INJ_PACKED_SIZE = PLANET_CLIMATE_INJ_PACKED_STRUCT.size
+PLANET_CLIMATE_RESP_META_STRUCT = struct.Struct("<ff")  # (infer_ms:f32, mean_temp_k:f32) = 8 bytes
 
 Z_FLUX_CH = 5
 WORLD_LAWS_DIM = 6
@@ -784,6 +796,201 @@ class _PlanetV8Adapter:
         return resp_bytes, z0, x0, active_frac, infer_us
 
 
+class _PlanetClimateAdapter:
+    """
+    Wave 34A: Stateful 6-Face Cubed-Sphere Macro Climate adapter for `op=13` (`OP_PLANET_CLIMATE_STEP`).
+    Wraps `PlanetaryClimateNet` (`286,684` params, `6 x 4 x 10 x 64 x 64`) on CUDA FP16 (`~5.9 ms` / `169 Hz` on GB10)
+    or CPU FP32:
+      - Auto-initializes live `[6, 4, 10, 64, 64]` climate state via `make_static_planet_geography` &
+        `make_initial_climate_state` seeded by `planet_seed`.
+      - Applies any incoming AMR macro-upscale injections `(face, u, v, delta_temp, delta_ash)` via
+        `upscale_shard_injection` before stepping `PlanetaryClimateNet` `steps.clamp(1, 4)` times.
+      - Packs compact response: `(infer_ms:f32, mean_temp_k:f32)` + `6*64*64*4` RGBA8 visual climate pack +
+        `6*64*64*2` f32 surface Coriolis wind vectors `(wind_u, wind_v)`.
+    """
+
+    def __init__(
+        self,
+        model_path: Path,
+        device: torch.device,
+        use_fp16: bool = True,
+    ):
+        from planetary_climate import (  # noqa: E402
+            CH_ASH_SMOKE,
+            CH_CLOUD,
+            CH_ICE_SNOW,
+            CH_TEMP,
+            CH_WIND_U,
+            CH_WIND_V,
+            PlanetaryClimateNet,
+            T_REF_K,
+            T_SCALE_K,
+            build_forcing_tensor,
+            make_initial_climate_state,
+            make_static_planet_geography,
+            upscale_shard_injection,
+        )
+
+        self.device = device
+        self.use_fp16 = bool(use_fp16) and (device.type == "cuda")
+        self.compute_dtype = torch.float16 if self.use_fp16 else torch.float32
+        self.model_path = Path(model_path)
+
+        ckpt = torch.load(str(self.model_path), map_location="cpu", weights_only=False)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            arch = ckpt.get("arch") or {}
+            sd = ckpt["state_dict"]
+        else:
+            arch = {}
+            sd = ckpt
+
+        model = PlanetaryClimateNet(
+            c_s=int(arch.get("c_s", 20)),
+            c_v=int(arch.get("c_v", 6)),
+            num_blocks=int(arch.get("num_blocks", 4)),
+            num_levels=int(arch.get("num_levels", 4)),
+        ).eval()
+        model.load_state_dict(sd, strict=True)
+        self.model = model.to(device=self.device, dtype=self.compute_dtype)
+
+        self._make_geo = make_static_planet_geography
+        self._init_state = make_initial_climate_state
+        self._build_forcing = build_forcing_tensor
+        self._upscale_inject = upscale_shard_injection
+        self._ch_temp = CH_TEMP
+        self._ch_cloud = CH_CLOUD
+        self._ch_ice = CH_ICE_SNOW
+        self._ch_wind_u = CH_WIND_U
+        self._ch_wind_v = CH_WIND_V
+        self._ch_ash = CH_ASH_SMOKE
+        self._t_ref_k = float(T_REF_K)
+        self._t_scale_k = float(T_SCALE_K)
+
+        self.seed: int | None = None
+        self.geo: Any = None
+        self.state: torch.Tensor | None = None
+        self.step_count: int = 0
+
+    def _ensure_state(self, seed: int, sun_dir: tuple[float, float, float]) -> None:
+        s_int = int(seed)
+        if self.state is not None and self.geo is not None and self.seed == s_int:
+            return
+        self.geo = self._make_geo(seed=s_int, N=PLANET_CLIMATE_GRID_N, device=self.device)
+        st = self._init_state(
+            self.geo,
+            sun_dir,
+            seed=s_int,
+            add_cyclones=True,
+            add_volcano=False,
+        )
+        self.state = st.to(device=self.device, dtype=self.compute_dtype)
+        self.seed = s_int
+        self.step_count = 0
+
+    @staticmethod
+    def _normalize_sun(sun_dir: tuple[float, float, float]) -> tuple[float, float, float]:
+        sx, sy, sz = float(sun_dir[0]), float(sun_dir[1]), float(sun_dir[2])
+        norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+        if norm > 1e-6 and math.isfinite(norm):
+            return (sx / norm, sy / norm, sz / norm)
+        return (0.78, 0.24, 0.58)
+
+    def step_bytes(self, payload: bytes | memoryview) -> tuple[bytes, int]:
+        mv = memoryview(payload)
+        if len(mv) < PLANET_CLIMATE_REQ_SIZE:
+            raise ValueError(f"op=13 payload too short: {len(mv)} < {PLANET_CLIMATE_REQ_SIZE}")
+
+        seed, sun_x, sun_y, sun_z, steps, n_inject = PLANET_CLIMATE_REQ_STRUCT.unpack_from(mv, 0)
+        rem = len(mv) - PLANET_CLIMATE_REQ_SIZE
+        if n_inject > 256:
+            raise ValueError(f"op=13 n_inject exceeds limit: {n_inject}")
+
+        injections: list[tuple[int, float, float, float, float]] = []
+        if n_inject > 0:
+            if rem == n_inject * PLANET_CLIMATE_INJ_SIZE:
+                inj_struct = PLANET_CLIMATE_INJ_STRUCT
+                stride = PLANET_CLIMATE_INJ_SIZE
+            elif rem == n_inject * PLANET_CLIMATE_INJ_PACKED_SIZE:
+                inj_struct = PLANET_CLIMATE_INJ_PACKED_STRUCT
+                stride = PLANET_CLIMATE_INJ_PACKED_SIZE
+            else:
+                raise ValueError(
+                    f"op=13 injection payload mismatch: rem={rem}, n_inject={n_inject} "
+                    f"(expected {n_inject * PLANET_CLIMATE_INJ_SIZE} or {n_inject * PLANET_CLIMATE_INJ_PACKED_SIZE})"
+                )
+            off = PLANET_CLIMATE_REQ_SIZE
+            for _ in range(n_inject):
+                face, u, v, d_temp, d_ash = inj_struct.unpack_from(mv, off)
+                injections.append((int(face) % 6, float(u), float(v), float(d_temp), float(d_ash)))
+                off += stride
+        elif rem != 0:
+            raise ValueError(f"op=13 unexpected trailing bytes: rem={rem} with n_inject=0")
+
+        sun_u = self._normalize_sun((sun_x, sun_y, sun_z))
+        n_steps = max(1, min(4, int(steps)))
+
+        with torch.inference_mode():
+            self._ensure_state(seed, sun_u)
+            assert self.state is not None and self.geo is not None
+
+            # Apply AMR macro-upscale injections (heat + volcanic/Sky-Island ash)
+            cell_r = 2.0 / float(PLANET_CLIMATE_GRID_N)
+            for face, u, v, d_temp, d_ash in injections:
+                uc = max(-1.0, min(1.0, u)) if math.isfinite(u) else 0.0
+                vc = max(-1.0, min(1.0, v)) if math.isfinite(v) else 0.0
+                dt_c = max(-2.5, min(3.5, d_temp)) if math.isfinite(d_temp) else 0.0
+                da_c = max(0.0, min(6.0, d_ash)) if math.isfinite(d_ash) else 0.0
+                self.state = self._upscale_inject(
+                    self.state,
+                    face=face,
+                    u0=max(-1.0, uc - cell_r),
+                    u1=min(1.0, uc + cell_r),
+                    v0=max(-1.0, vc - cell_r),
+                    v1=min(1.0, vc + cell_r),
+                    delta_temp=dt_c,
+                    delta_ash=da_c,
+                )
+
+            forcing = self._build_forcing(self.geo, sun_u).to(device=self.device, dtype=self.compute_dtype)
+
+            t0 = time.perf_counter()
+            for _ in range(n_steps):
+                self.state = self.model(self.state, forcing)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            infer_s = time.perf_counter() - t0
+            infer_ms = float(infer_s * 1000.0)
+            infer_us = int(infer_s * 1_000_000.0)
+            self.step_count += n_steps
+
+            st32 = self.state.float()
+            temp_k = self._t_ref_k + self._t_scale_k * st32[:, 0, self._ch_temp]  # [6, 64, 64]
+            mean_temp_k = float(temp_k.mean().item())
+
+            r_u8 = ((temp_k - 240.0) / 80.0).clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+            cloud_col = st32[:, 1:, self._ch_cloud].clamp(min=0.0).sum(dim=1)
+            g_u8 = (cloud_col / 0.65).clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+            ash_col = st32[:, :, self._ch_ash].clamp(min=0.0).sum(dim=1)
+            b_u8 = (ash_col / 0.80).clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+            ice_surf = st32[:, 0, self._ch_ice].clamp(min=0.0) + 0.5 * st32[:, 1, self._ch_ice].clamp(min=0.0)
+            a_u8 = (ice_surf / 0.80).clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+
+            rgba_np = torch.stack([r_u8, g_u8, b_u8, a_u8], dim=-1).contiguous().cpu().numpy()
+
+            wind_u = 0.45 * st32[:, 0, self._ch_wind_u] + 0.55 * st32[:, 1, self._ch_wind_u]
+            wind_v = 0.45 * st32[:, 0, self._ch_wind_v] + 0.55 * st32[:, 1, self._ch_wind_v]
+            wind_np = (
+                torch.stack([wind_u, wind_v], dim=-1)
+                .contiguous()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
+
+        resp_bytes = PLANET_CLIMATE_RESP_META_STRUCT.pack(infer_ms, mean_temp_k) + rgba_np.tobytes() + wind_np.tobytes()
+        return resp_bytes, infer_us
+
+
 class _AsyncSystem2Bridge:
     """
     Strictly non-blocking System-2 `Qwen2.5-1.5B-Instruct` dialogue adapter for `op=6`.
@@ -991,6 +1198,7 @@ class InferenceEngine:
         world_3d_pt: Path | None = None,
         world_dt_pt: Path | None = None,
         world_v5_pt: Path | None = None,
+        climate_pt: Path | None = None,
         enable_system2_slm: bool = False,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1106,6 +1314,30 @@ class InferenceEngine:
         self.world_model_v5_active: bool = False
         self._planet_v8_model: Any = None
         self._planet_v8_adapters: dict[tuple[int, int], _PlanetV8Adapter] = {}
+        self.climate_adapter: _PlanetClimateAdapter | None = None
+        clim_cand = climate_pt if climate_pt is not None else (_SCRIPT_DIR / "planetary_climate_v1.pt")
+        if not clim_cand.exists():
+            alt_clim = _SCRIPT_DIR.parent / "models" / "planetary_climate_v1.pt"
+            if alt_clim.exists():
+                clim_cand = alt_clim
+        if clim_cand.exists():
+            try:
+                self.climate_adapter = _PlanetClimateAdapter(
+                    model_path=clim_cand,
+                    device=self.device,
+                    use_fp16=self.use_fp16,
+                )
+                print(
+                    f"[gpu_infer_daemon] Loaded PlanetaryClimateNet (op=13) from {clim_cand} (fp16={self.climate_adapter.use_fp16})",
+                    flush=True,
+                )
+            except Exception as exc_clim:
+                print(
+                    f"[gpu_infer_daemon] PlanetaryClimateNet load failed ({exc_clim}); op=13 disabled",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.climate_adapter = None
         dt_candidate = world_v5_pt if (world_v5_pt is not None and world_v5_pt.exists()) else world_dt_pt
         if dt_candidate is not None and dt_candidate.exists():
             try:
@@ -1442,6 +1674,12 @@ class InferenceEngine:
             self._invalidate_strata_pool_cache()
             self.last_sparse_active_frac = active_frac
         return resp_bytes, infer_us
+
+    def infer_planet_climate_bytes(self, payload: bytes | memoryview) -> tuple[bytes, int]:
+        if self.climate_adapter is None:
+            raise RuntimeError("planetary_climate_v1.pt not loaded")
+        with self.lock:
+            return self.climate_adapter.step_bytes(payload)
 
     def _get_sparse_runner(self, h: int, w: int, batch: int) -> _SparseWorldAdapter | None:
         if not self.use_sparse_world or SparseWorldRunner is None:
@@ -2389,6 +2627,36 @@ class GPUInferDaemon:
                     break
                 op, pad_batch, channels, height, width, payload_bytes, _seq = HEADER_STRUCT.unpack(hdr_buf)
 
+                if op == OP_PLANET_CLIMATE_STEP:
+                    if (
+                        self.engine.climate_adapter is None
+                        or payload_bytes < PLANET_CLIMATE_REQ_SIZE
+                        or payload_bytes > PLANET_CLIMATE_REQ_SIZE + 256 * PLANET_CLIMATE_INJ_SIZE
+                    ):
+                        if 0 < payload_bytes <= 16 * 1024 * 1024:
+                            _recv_exact(conn, memoryview(bytearray(payload_bytes)))
+                        self._send_error(conn, STATUS_BAD_REQUEST, height, width)
+                        continue
+                    clim_buf = bytearray(payload_bytes)
+                    if not _recv_exact(conn, memoryview(clim_buf)):
+                        break
+                    try:
+                        out_bytes, infer_us = self.engine.infer_planet_climate_bytes(memoryview(clim_buf))
+                    except ValueError as exc:
+                        print(f"[gpu_infer_daemon] PlanetClimate op=13 bad request: {exc}", file=sys.stderr, flush=True)
+                        self._send_error(conn, STATUS_BAD_REQUEST, PLANET_CLIMATE_GRID_N, PLANET_CLIMATE_GRID_N)
+                        continue
+                    except Exception as exc:
+                        print(f"[gpu_infer_daemon] PlanetClimate op=13 error: {exc}", file=sys.stderr, flush=True)
+                        self._send_error(conn, STATUS_INTERNAL_ERROR, PLANET_CLIMATE_GRID_N, PLANET_CLIMATE_GRID_N)
+                        continue
+                    resp_hdr = HEADER_STRUCT.pack(
+                        STATUS_OK, 0, 4, PLANET_CLIMATE_GRID_N, PLANET_CLIMATE_GRID_N, len(out_bytes), infer_us
+                    )
+                    conn.sendall(resp_hdr)
+                    conn.sendall(out_bytes)
+                    continue
+
                 if op == OP_PLANET_V8_STEP:
                     if payload_bytes < PLANET_META_SIZE or payload_bytes > 512 * 1024 * 1024:
                         if 0 < payload_bytes <= 512 * 1024 * 1024:
@@ -2703,6 +2971,12 @@ def main() -> None:
         help="Optional conservation-distilled WorldModel3D-v7/v6/v5 checkpoint (auto-prefers v7 -> v6 -> v5 and overrides op=8/op=9 with 16x16x8 3D sparse bricks!)",
     )
     parser.add_argument(
+        "--climate-model",
+        type=Path,
+        default=_SCRIPT_DIR / "planetary_climate_v1.pt",
+        help="Optional PlanetaryClimateNet checkpoint path for op=13 macro spherical climate stepping",
+    )
+    parser.add_argument(
         "--system2-slm",
         action="store_true",
         default=False,
@@ -2743,6 +3017,7 @@ def main() -> None:
         world_3d_pt=args.world_model_3d,
         world_dt_pt=args.world_model_dt,
         world_v5_pt=args.world_model_v5,
+        climate_pt=args.climate_model,
         enable_system2_slm=args.system2_slm,
     )
     daemon = GPUInferDaemon(host, port, engine, unix_sock=args.unix_sock)
@@ -2761,6 +3036,7 @@ def main() -> None:
         f"fp16={engine.use_fp16} | world_3d={engine.world_model_3d is not None} | "
         f"world_dt={engine.world_model_dt is not None} | "
         f"world_v5={engine.world_model_v5_active} | "
+        f"climate_net={engine.climate_adapter is not None} | "
         f"system2_slm={args.system2_slm} | "
         f"neural_bots={engine.bot_policy is not None} | "
         f"actuator_policy={engine.actuator_policy is not None} | "

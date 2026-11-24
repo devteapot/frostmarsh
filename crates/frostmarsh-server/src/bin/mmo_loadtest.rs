@@ -147,15 +147,17 @@ fn record_server_datagram(
     match pkt {
         ServerDatagram::VolumetricBrick3D(_)
         | ServerDatagram::VolumetricSubBrick3D { .. }
-        | ServerDatagram::PlanetFaceBrick3D { .. } => {
+        | ServerDatagram::PlanetFaceBrick3D { .. }
+        | ServerDatagram::PlanetShardBrick3D { .. } => {
             m.bricks_full += 1;
         }
         ServerDatagram::VolumetricBrick3DDelta { .. }
         | ServerDatagram::VolumetricSubBrick3DDelta { .. }
-        | ServerDatagram::PlanetFaceBrick3DDelta { .. } => {
+        | ServerDatagram::PlanetFaceBrick3DDelta { .. }
+        | ServerDatagram::PlanetShardBrick3DDelta { .. } => {
             m.bricks_delta += 1;
         }
-        ServerDatagram::APlusChunk { .. } => {
+        ServerDatagram::APlusChunk { .. } | ServerDatagram::PlanetMacroClimateFace { .. } => {
             m.chunks_aplus += 1;
         }
         ServerDatagram::EntitySnapshot {

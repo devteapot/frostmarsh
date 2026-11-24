@@ -13,6 +13,7 @@
 //! - **3D Combat & Verticality:** Players/bots/projectiles move in 3D `(x, y, z)` with climbing ramps,
 //!   under-bridge rivers, cliff-drop gravity, destructible Layer 2 timber skybridges, and +25% High-Ground damage!
 
+mod macro_planet_runtime;
 mod persistence;
 mod planet_runtime;
 mod ws_bridge;
@@ -20,12 +21,18 @@ mod ws_bridge;
 use bytes::Bytes;
 use clap::Parser;
 use field_core::planet::{FACE_COUNT, face_uv_to_sphere_dir};
+use field_core::planet_macro::{MacroPlanetConfig, PlanetShardKey};
 use field_core::{
     biome_name, EntityVoxelPhysics, Field, INPUT_CHANNELS, NUM_BIOMES, NUM_WORLD_LAW_PRESETS,
     OUTPUT_CHANNELS, RawStepOutput, SP_ICE, SP_OIL, SP_PLANT, SP_ROCK, SP_STEAM, SP_WATER,
     SP_WOOD, VolumeField, WorldLaws,
 };
 use frostmarsh_proto::*;
+use macro_planet_runtime::{
+    CLIMATE_GRID_N, ClimateInjection, MacroPlanetRuntime, OP_PLANET_CLIMATE_STEP,
+    PlanetClimateOp13Response, ShardSubbrickKey, decode_planet_op13_response,
+    encode_planet_op13_request,
+};
 use planet_runtime::{
     OP_PLANET_V8_STEP, PLANET_FLAG_FP16_IO, PLANET_FLAG_USE_SPARSE, PlanetOp12Response,
     PlanetRuntime, decode_planet_op12_response, encode_planet_op12_request,
@@ -71,6 +78,9 @@ struct Args {
     /// Enable Wave 31A 6-Face Cubed-Sphere Planetary Mode
     #[arg(long, default_value_t = false)]
     planet: bool,
+    /// Enable Wave 34A Dual-Scale Locally-Flat Macro Planet Mode (R = 1,304 m, 6x2048^2x64 = 1.61B virtual voxels)
+    #[arg(long, default_value_t = false)]
+    planet_macro: bool,
     /// Inner core radius in voxel units for --planet mode (default: 48.0)
     #[arg(long, default_value_t = 48.0)]
     planet_r_core: f32,
@@ -360,6 +370,57 @@ impl CudaRpcClient {
             s.read_exact(&mut rbuf).map_err(|e| (None, e.to_string()))?;
             decode_planet_op12_response(&rbuf, n_face, l_depth, fp16_io)
                 .map_err(|e| (None, e))
+        })();
+
+        match res {
+            Ok(ok) => Ok(ok),
+            Err((status, msg)) => {
+                if status != Some(1) {
+                    self.stream = None;
+                }
+                Err(msg)
+            }
+        }
+    }
+
+    /// Wave 34A: Send pre-encoded `op=13` (`OP_PLANET_CLIMATE_STEP`) payload to GPU daemon
+    /// and decode `(infer_ms, mean_temp_k, rgba_faces[6], wind_uv_faces[6])`.
+    fn step_planet_climate_raw(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<PlanetClimateOp13Response, String> {
+        self.seq = self.seq.wrapping_add(1);
+        let seq = self.seq;
+        let payload_bytes = payload.len() as u32;
+        let mut hdr = [0u8; 16];
+        hdr[0] = OP_PLANET_CLIMATE_STEP;
+        hdr[1] = 0;
+        hdr[2..4].copy_from_slice(&4u16.to_le_bytes());
+        hdr[4..6].copy_from_slice(&(CLIMATE_GRID_N as u16).to_le_bytes());
+        hdr[6..8].copy_from_slice(&(CLIMATE_GRID_N as u16).to_le_bytes());
+        hdr[8..12].copy_from_slice(&payload_bytes.to_le_bytes());
+        hdr[12..16].copy_from_slice(&seq.to_le_bytes());
+
+        let res: Result<PlanetClimateOp13Response, (Option<u8>, String)> = (|| {
+            let s = self
+                .ensure_connected()
+                .map_err(|e| (None, e.to_string()))?;
+            s.write_all(&hdr).map_err(|e| (None, e.to_string()))?;
+            s.write_all(payload).map_err(|e| (None, e.to_string()))?;
+
+            let mut rhdr = [0u8; 16];
+            s.read_exact(&mut rhdr).map_err(|e| (None, e.to_string()))?;
+            let status = rhdr[0];
+            if status != 0 {
+                return Err((
+                    Some(status),
+                    format!("CUDA daemon op=13 returned error status {}", status),
+                ));
+            }
+            let rlen = u32::from_le_bytes(rhdr[8..12].try_into().unwrap()) as usize;
+            let mut rbuf = vec![0u8; rlen];
+            s.read_exact(&mut rbuf).map_err(|e| (None, e.to_string()))?;
+            decode_planet_op13_response(&rbuf).map_err(|e| (None, e))
         })();
 
         match res {
@@ -1275,6 +1336,9 @@ struct ClientPeer {
     pending_subbricks: HashSet<(u16, u16, u16)>,
     planet_subbrick_shadow: HashMap<(u8, u16, u16, u16), RawBrickArc>,
     pending_planet_subbricks: HashSet<(u8, u16, u16, u16)>,
+    macro_subbrick_shadow: HashMap<ShardSubbrickKey, RawBrickArc>,
+    pending_macro_subbricks: HashSet<ShardSubbrickKey>,
+    macro_synced_shards: HashSet<PlanetShardKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -1320,6 +1384,7 @@ struct GameState {
     subbrick_raw_cache: HashMap<(u16, u16, u16), (u8, RawBrickArc)>,
     volume: VolumeField,
     planet_runtime: Option<PlanetRuntime>,
+    macro_planet_runtime: Option<MacroPlanetRuntime>,
     planet_r_core: f32,
     eco: EcosystemState,
     sim_mode: String,
@@ -1499,26 +1564,213 @@ impl GameState {
     }
 
     #[inline]
+    fn is_macro_planet_mode(&self) -> bool {
+        self.macro_planet_runtime.is_some()
+    }
+
+    #[inline]
     fn is_planet_mode(&self) -> bool {
-        self.planet_runtime.is_some()
+        self.planet_runtime.is_some() || self.macro_planet_runtime.is_some()
     }
 
     #[inline]
-    fn face_volume(&self, face: u8) -> &VolumeField {
-        if let Some(ref pr) = self.planet_runtime {
-            &pr.planet.faces[(face as usize) % FACE_COUNT]
+    fn volume_at(&self, face: u8, x: f32, y: f32) -> Option<(&VolumeField, f32, f32)> {
+        if let Some(ref mr) = self.macro_planet_runtime {
+            mr.shard_at_virtual(face, x, y)
+        } else if let Some(ref pr) = self.planet_runtime {
+            Some((&pr.planet.faces[(face as usize) % FACE_COUNT], x, y))
         } else {
-            &self.volume
+            Some((&self.volume, x, y))
         }
     }
 
     #[inline]
-    fn face_volume_mut(&mut self, face: u8) -> &mut VolumeField {
-        if let Some(ref mut pr) = self.planet_runtime {
-            &mut pr.planet.faces[(face as usize) % FACE_COUNT]
+    fn volume_at_mut(&mut self, face: u8, x: f32, y: f32) -> Option<(&mut VolumeField, f32, f32)> {
+        if let Some(ref mut mr) = self.macro_planet_runtime {
+            mr.shard_at_virtual_mut(face, x, y)
+        } else if let Some(ref mut pr) = self.planet_runtime {
+            Some((&mut pr.planet.faces[(face as usize) % FACE_COUNT], x, y))
         } else {
-            &mut self.volume
+            Some((&mut self.volume, x, y))
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_macro_planet(
+        backend_name: String,
+        cuda_addr: String,
+        config: MacroPlanetConfig,
+        bot_count: usize,
+        aoi_radius: usize,
+    ) -> Self {
+        let grid_w = config.face_size_virtual();
+        let grid_h = grid_w;
+        let grid_d = config.depth.clamp(16, 64);
+        let chunks_x = chunks_for_dim(grid_w);
+        let chunks_y = chunks_for_dim(grid_h);
+        let mr = MacroPlanetRuntime::new(config);
+        let shrines: Vec<ShrineEntity> = mr
+            .build_macro_shrines()
+            .into_iter()
+            .map(|(id, name, face, x, y, z)| ShrineEntity {
+                id,
+                name,
+                face,
+                x,
+                y,
+                z,
+                progress: 0.0,
+                owner: 0,
+            })
+            .collect();
+        let volume = VolumeField::new_biome_3d(16, 16, 4, 0, config.seed);
+        let init_epoch = volume.evolution_epoch_name();
+        let eco = EcosystemState::new(16, 16);
+        let use_cuda = backend_name == "cuda-rpc";
+        let r_core = config.r_core as f32;
+
+        let mut gs = Self {
+            grid_w,
+            grid_h,
+            grid_d,
+            biome_id: 0,
+            world_seed: config.seed,
+            chunks_x,
+            chunks_y,
+            aoi_radius,
+            entity_aoi_radius: 220.0,
+            persistent_world: false,
+            match_elapsed_offset_secs: 0,
+            persistent_players: HashMap::new(),
+            brick_raw_cache: HashMap::new(),
+            subbrick_raw_cache: HashMap::new(),
+            hazard_layers: vec![vec![1u8; 16 * 16]; 4],
+            volume,
+            planet_runtime: None,
+            macro_planet_runtime: Some(mr),
+            planet_r_core: r_core,
+            eco,
+            sim_mode: "neural".to_string(),
+            backend_name,
+            ecosystem_on: false,
+            neural_bots_on: false,
+            physics_native: true,
+            bot_infer_ms: 0.0,
+            acoustic_ms: 0.0,
+            world_sparse_pct: 100.0,
+            bot_rpc: if use_cuda { Some(CudaRpcClient::new(cuda_addr)) } else { None },
+            sim_tick: 0,
+            match_start_instant: Instant::now(),
+            celebration_started: None,
+            match_phase: MATCH_PHASE_ACTIVE,
+            match_time_left_s: MATCH_DURATION_SECS,
+            mvp_name: String::new(),
+            mvp_score: 0,
+            next_id: 1,
+            next_event_id: 1,
+            score_west: 0,
+            score_east: 0,
+            relic_x: (grid_w as f32) * 0.50,
+            relic_y: (grid_h as f32) * 0.50,
+            relic_carrier: None,
+            shrines,
+            players: HashMap::new(),
+            projectiles: Vec::new(),
+            rafts: Vec::new(),
+            events: VecDeque::with_capacity(48),
+            bot_brains: Vec::new(),
+            kill_feed: VecDeque::with_capacity(8),
+            speech_bubbles: VecDeque::with_capacity(6),
+            pending_chat: None,
+            bot_overrides: HashMap::new(),
+            recent_actuators: VecDeque::with_capacity(32),
+            actuator_pulses: Vec::with_capacity(32),
+            time_domes: Vec::with_capacity(4),
+            system2_slm_active: false,
+            peers: HashMap::new(),
+            weather_kind: WEATHER_CLEAR,
+            day_time: 0.25,
+            time_scale: 1.0,
+            evo_speed: 1.0,
+            world_day: 1,
+            last_epoch_name: init_epoch,
+            tunnels_carved: 0,
+            tunnel_mass_displaced: 0,
+            last_combo_tick: [0; 10],
+            last_squad_dome_tick: [0, 0],
+            tactical_events: VecDeque::with_capacity(16),
+            pending_cryo_bridges: VecDeque::with_capacity(16),
+            pending_basalt_quenches: VecDeque::with_capacity(16),
+            neural_3d_vertical: false,
+            wind_x: 0.65,
+            wind_y: 0.35,
+            infer_ms_last: 0.0,
+            eco_infer_ms: 0.0,
+            infer_window: VecDeque::with_capacity(100),
+            proj_active_pct: 0.0,
+            mass_error: 0,
+            energy_error: 0,
+            aoi_chunks_sent_last: 0,
+            bytes_sent_window: 0,
+            bytes_window_start: Instant::now(),
+            wire_kbps: 0.0,
+            rt_handle: tokio::runtime::Handle::current(),
+            ws_bridge: None,
+            tps_window_start: Instant::now(),
+            tps_window_ticks: 0,
+            measured_tps: 30.0,
+        };
+
+        let capped_bots = bot_count.min(64);
+        let squad_size = if capped_bots >= 24 { 4usize } else { 3usize };
+        let mut team_squad_counts = [0usize; 2];
+        for i in 0..capped_bots {
+            let team = (i % 2) as u8;
+            let class_id = ((i / 2) % 5) as u8;
+            let squad_id = if class_id == CLASS_EMBERSTALKER {
+                0u8
+            } else {
+                let idx = team_squad_counts[team as usize];
+                team_squad_counts[team as usize] += 1;
+                ((idx / squad_size) + 1).min(8) as u8
+            };
+            let role_tag = match class_id {
+                CLASS_STRIDER => "Strider",
+                CLASS_SKYWING => "Skywing",
+                CLASS_TIDEKIN => "Tidekin",
+                CLASS_EMBERSTALKER => "Stalker",
+                _ => "Terramole",
+            };
+            let prefix = if team == 0 { "Frost" } else { "Ember" };
+            let name = if squad_id == 0 {
+                format!("{}-{}-Solo{}", prefix, role_tag, i / 2 + 1)
+            } else {
+                let sq_code = match squad_id {
+                    1 => "A",
+                    2 => "B",
+                    3 => "C",
+                    4 => "D",
+                    5 => "E",
+                    6 => "F",
+                    _ => "G",
+                };
+                format!("{}-{}-{}{}", prefix, role_tag, sq_code, i / 2 + 1)
+            };
+            let (bf, bx, by, bz) = gs
+                .macro_planet_runtime
+                .as_ref()
+                .unwrap()
+                .spawn_point_for_bot(i, capped_bots, class_id, (i as u32) + 1);
+            let pid = gs.spawn_player_on_face(name, team, class_id, true, Some(bf));
+            if let Some(p) = gs.players.get_mut(&pid) {
+                p.face = bf;
+                p.x = bx;
+                p.y = by;
+                p.z = bz;
+                p.squad_id = squad_id;
+            }
+        }
+        gs
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1576,6 +1828,7 @@ impl GameState {
             hazard_layers: vec![vec![1u8; 16 * 16]; 4],
             volume,
             planet_runtime: Some(pr),
+            macro_planet_runtime: None,
             planet_r_core: r_core,
             eco,
             sim_mode: "neural".to_string(),
@@ -1733,6 +1986,7 @@ impl GameState {
             hazard_layers: vec![vec![1u8; grid_w * grid_h]; grid_d],
             volume,
             planet_runtime: None,
+            macro_planet_runtime: None,
             planet_r_core: 0.0,
             eco,
             sim_mode: "neural".to_string(),
@@ -2302,16 +2556,31 @@ impl GameState {
         let id = self.next_id;
         self.next_id += 1;
         let cls = class_id % 5;
-        let (face, x, y, mut z) = if let Some(ref pr) = self.planet_runtime {
+        let (face, x, y, mut z, init_ax, init_ay) = if let Some(ref mr) = self.macro_planet_runtime {
+            if !is_bot {
+                mr.human_spawn_point()
+            } else {
+                let (bf, bx, by, bz) = mr.spawn_point_for_bot(id as usize, 60, cls, id);
+                (
+                    preferred_face.unwrap_or(bf),
+                    bx,
+                    by,
+                    bz,
+                    if team % 2 == 0 { 1.0 } else { -1.0 },
+                    0.0,
+                )
+            }
+        } else if let Some(ref pr) = self.planet_runtime {
             let f = preferred_face.unwrap_or(if is_bot {
                 (id as usize % FACE_COUNT) as u8
             } else {
                 0
             });
-            pr.spawn_point_for_entity(f, cls, id)
+            let (pf, px, py, pz) = pr.spawn_point_for_entity(f, cls, id);
+            (pf, px, py, pz, if team % 2 == 0 { 1.0 } else { -1.0 }, 0.0)
         } else {
             let (sx, sy, sz) = self.spawn_point(team % 2, id);
-            (0u8, sx, sy, sz)
+            (0u8, sx, sy, sz, if team % 2 == 0 { 1.0 } else { -1.0 }, 0.0)
         };
         if cls == CLASS_SKYWING && !self.is_planet_mode() {
             // Skywings launch slightly aloft for immediate 3D flight!
@@ -2337,8 +2606,8 @@ impl GameState {
                 vy: 0.0,
                 vz: 0.0,
                 desired_vz: 0.0,
-                aim_x: if team % 2 == 0 { 1.0 } else { -1.0 },
-                aim_y: 0.0,
+                aim_x: init_ax,
+                aim_y: init_ay,
                 hp: mhp,
                 max_hp: mhp,
                 mana: mmp,
@@ -2928,27 +3197,30 @@ impl GameState {
                         if !self.is_planet_mode() {
                             self.record_terrain_engineering_candidates(pid, team, tx as f32, ty as f32, pl, -0.95, 0.0);
                         }
-                        self.face_volume_mut(p_face).apply_frost_3d(tx, ty, pl, 5, 2.2);
+                        if let Some((vf, lx, ly)) = self.volume_at_mut(p_face, tx as f32, ty as f32) {
+                            vf.apply_frost_3d(lx as i32, ly as i32, pl, 5, 2.2);
+                        }
                     }
                     self.push_event(2, px, py, 0, team, "ICE BRIDGE!".into());
                 }
                 CLASS_SKYWING => self.push_event(2, px, py, 0, team, "OIL BARRAGE!".into()),
                 CLASS_TIDEKIN => self.push_event(2, px, py, 0, team, "HYDRO SURGE!".into()),
                 CLASS_EMBERSTALKER => {
-                    self.face_volume_mut(p_face).apply_physical_actuator(px, py, pl, 0.25, 0.0, 0.35, 0.85, 4.5);
+                    if let Some((vf, lx, ly)) = self.volume_at_mut(p_face, px, py) {
+                        vf.apply_physical_actuator(lx, ly, pl, 0.25, 0.0, 0.35, 0.85, 4.5);
+                    }
                     self.push_event(2, px, py, 0, team, "SMOKE AMBUSH!".into());
                 }
                 _ => {
                     // CLASS_BURROWER (Terramole): Conservative Subterranean Bore
                     let max_z_b = (self.grid_d as f32 - 1.5).max(1.0);
-                    let moved = self.face_volume_mut(p_face).carve_tunnel_3d(
-                        (px + ax * 1.6).clamp(3.0, gw - 4.0),
-                        (py + ay * 1.6).clamp(3.0, gh - 4.0),
-                        (pz + 0.7).clamp(1.0, max_z_b),
-                        ax,
-                        ay,
-                        2.6,
-                    );
+                    let bx = (px + ax * 1.6).clamp(3.0, gw - 4.0);
+                    let by = (py + ay * 1.6).clamp(3.0, gh - 4.0);
+                    let moved = if let Some((vf, lx, ly)) = self.volume_at_mut(p_face, bx, by) {
+                        vf.carve_tunnel_3d(lx, ly, (pz + 0.7).clamp(1.0, max_z_b), ax, ay, 2.6)
+                    } else {
+                        0
+                    };
                     if moved > 0 {
                         self.tunnels_carved = self.tunnels_carved.saturating_add(1);
                         self.tunnel_mass_displaced = self.tunnel_mass_displaced.saturating_add(moved as u64);
@@ -2962,7 +3234,11 @@ impl GameState {
             let pl = (pz.round() as usize).clamp(0, self.grid_d - 1);
             match cls {
                 CLASS_STRIDER => {
-                    self.face_volume_mut(p_face).layers[pl].apply_glacial_nova(px.clamp(4.0, gw - 5.0) as i32, py.clamp(4.0, gh - 5.0) as i32, 11);
+                    let gx_c = px.clamp(4.0, gw - 5.0);
+                    let gy_c = py.clamp(4.0, gh - 5.0);
+                    if let Some((vf, lx, ly)) = self.volume_at_mut(p_face, gx_c, gy_c) {
+                        vf.layers[pl].apply_glacial_nova(lx as i32, ly as i32, 11);
+                    }
                     let targets: Vec<u32> = self
                         .players
                         .values()
@@ -2980,7 +3256,12 @@ impl GameState {
                 CLASS_SKYWING => {
                     let tx = (px + ax * 16.0).clamp(6.0, gw - 7.0);
                     let ty = (py + ay * 16.0).clamp(6.0, gh - 7.0);
-                    self.face_volume_mut(p_face).layers[pl].apply_meteor_impact(tx as i32, ty as i32, 8);
+                    if let Some((vf, lx, ly)) = self.volume_at_mut(p_face, tx, ty) {
+                        vf.layers[pl].apply_meteor_impact(lx as i32, ly as i32, 8);
+                    }
+                    if let Some(ref mut mr) = self.macro_planet_runtime {
+                        mr.enqueue_climate_injection_virtual(p_face, tx, ty, 0.70, 0.95);
+                    }
                     let targets: Vec<u32> = self
                         .players
                         .values()
@@ -2999,17 +3280,24 @@ impl GameState {
                     self.push_event(2, tx, ty, 0, team, "METEOR STORM!".into());
                 }
                 CLASS_TIDEKIN => {
-                    let cx = (px + ax * 10.0).clamp(5.0, gw - 6.0) as i32;
-                    let cy = (py + ay * 10.0).clamp(5.0, gh - 6.0) as i32;
-                    let boiled = self.face_volume_mut(p_face).apply_steam_burst_3d(cx, cy, pl, 8);
+                    let cx = (px + ax * 10.0).clamp(5.0, gw - 6.0);
+                    let cy = (py + ay * 10.0).clamp(5.0, gh - 6.0);
+                    let boiled = if let Some((vf, lx, ly)) = self.volume_at_mut(p_face, cx, cy) {
+                        vf.apply_steam_burst_3d(lx as i32, ly as i32, pl, 8)
+                    } else {
+                        0
+                    };
                     for p in self.players.values_mut() {
                         if p.face == p_face && p.team == team && (p.x - px).hypot(p.y - py) <= 24.0 {
                             p.haste_until = tick + 150;
                             p.hp = (p.hp + 20).min(p.max_hp);
                         }
                     }
-                    let phys_p = self.face_volume(p_face).sample_entity_physics(px, py, pl);
-                    if phys_p.water_frac > 0.10 || boiled >= 4 {
+                    let water_frac = self
+                        .volume_at(p_face, px, py)
+                        .map(|(vf, lx, ly)| vf.sample_entity_physics(lx, ly, pl).water_frac)
+                        .unwrap_or(0.0);
+                    if water_frac > 0.10 || boiled >= 4 {
                         self.push_combo_callout(1, px, py, team, "SUBMERGED GEYSER!");
                     }
                     self.push_event(2, px, py, 0, team, "TIDAL SURGE!".into());
@@ -3018,10 +3306,12 @@ impl GameState {
                     // CLASS_EMBERSTALKER: Inferno Raid (oil + fire burst + smoke veil)
                     let tx = (px + ax * 10.0).clamp(5.0, gw - 6.0);
                     let ty = (py + ay * 10.0).clamp(5.0, gh - 6.0);
-                    {
-                        let vf = self.face_volume_mut(p_face);
-                        vf.layers[pl].apply_oil_splash(tx as i32, ty as i32, 6, 1.3);
-                        vf.layers[pl].apply_fire_bolt(tx as i32, ty as i32, 7, 2.2);
+                    if let Some((vf, lx, ly)) = self.volume_at_mut(p_face, tx, ty) {
+                        vf.layers[pl].apply_oil_splash(lx as i32, ly as i32, 6, 1.3);
+                        vf.layers[pl].apply_fire_bolt(lx as i32, ly as i32, 7, 2.2);
+                    }
+                    if let Some(ref mut mr) = self.macro_planet_runtime {
+                        mr.enqueue_climate_injection_virtual(p_face, tx, ty, 0.55, 0.70);
                     }
                     let targets: Vec<u32> = self
                         .players
@@ -3041,14 +3331,16 @@ impl GameState {
                     for step in 1..=3 {
                         let bx = (px + ax * (step as f32 * 2.2)).clamp(3.0, gw - 4.0);
                         let by = (py + ay * (step as f32 * 2.2)).clamp(3.0, gh - 4.0);
-                        total_moved = total_moved.saturating_add(self.face_volume_mut(p_face).carve_tunnel_3d(
-                            bx,
-                            by,
-                            (pz + 0.7).clamp(1.0, max_z_b),
-                            ax,
-                            ay,
-                            2.8,
-                        ));
+                        if let Some((vf, lx, ly)) = self.volume_at_mut(p_face, bx, by) {
+                            total_moved = total_moved.saturating_add(vf.carve_tunnel_3d(
+                                lx,
+                                ly,
+                                (pz + 0.7).clamp(1.0, max_z_b),
+                                ax,
+                                ay,
+                                2.8,
+                            ));
+                        }
                     }
                     if total_moved > 0 {
                         self.tunnels_carved = self.tunnels_carved.saturating_add(1);
@@ -3202,15 +3494,16 @@ impl GameState {
             let mut l = (pz.round() as usize).clamp(0, self.grid_d - 1);
             // Project airborne Skywing actuators downward onto terrain/water surface below when targeting open air
             if self.is_z16() && l > 1 {
-                let txi = (tx.round() as usize).min(self.grid_w - 1);
-                let tyi = (ty.round() as usize).min(self.grid_h - 1);
-                let tidx = tyi * self.grid_w + txi;
-                let vf = self.face_volume(p_face);
-                if vf.layers[l].cell_volume(tidx) < 25 {
-                    for z_scan in (1..l).rev() {
-                        if vf.layers[z_scan].cell_volume(tidx) >= 40 {
-                            l = z_scan;
-                            break;
+                if let Some((vf, lx, ly)) = self.volume_at(p_face, tx, ty) {
+                    let txi = (lx.round() as usize).min(vf.width.saturating_sub(1));
+                    let tyi = (ly.round() as usize).min(vf.height.saturating_sub(1));
+                    let tidx = tyi * vf.width + txi;
+                    if vf.layers[l].cell_volume(tidx) < 25 {
+                        for z_scan in (1..l).rev() {
+                            if vf.layers[z_scan].cell_volume(tidx) >= 40 {
+                                l = z_scan;
+                                break;
+                            }
                         }
                     }
                 }
@@ -3225,25 +3518,43 @@ impl GameState {
         let imp_s = imp * scale;
 
         // Pre-sample target & caster voxel physics for emergent cross-archetype combo & terrain-engineering detection
-        let txi_c = (tx.round() as usize).min(self.grid_w - 1);
-        let tyi_c = (ty.round() as usize).min(self.grid_h - 1);
-        let tidx_c = tyi_c * self.grid_w + txi_c;
         let pl_caster = (pz.round() as usize).clamp(0, self.grid_d - 1);
-        let (target_has_oil, target_has_water, caster_in_water) = {
-            let vf = self.face_volume(p_face);
-            (
-                vf.layers[layer].mass[SP_OIL][tidx_c] >= 40,
-                vf.layers[layer].mass[SP_WATER][tidx_c] >= 80,
-                vf.sample_entity_physics(px, py, pl_caster).water_frac > 0.10,
-            )
-        };
+        let (target_has_oil, target_has_water) = self
+            .volume_at(p_face, tx, ty)
+            .map(|(vf, lx, ly)| {
+                let txi_c = (lx.round() as usize).min(vf.width.saturating_sub(1));
+                let tyi_c = (ly.round() as usize).min(vf.height.saturating_sub(1));
+                let tidx_c = tyi_c * vf.width + txi_c;
+                (
+                    vf.layers[layer].mass[SP_OIL][tidx_c] >= 40,
+                    vf.layers[layer].mass[SP_WATER][tidx_c] >= 80,
+                )
+            })
+            .unwrap_or((false, false));
+        let caster_in_water = self
+            .volume_at(p_face, px, py)
+            .map(|(vf, lx, ly)| vf.sample_entity_physics(lx, ly, pl_caster).water_frac > 0.10)
+            .unwrap_or(false);
 
         if !self.is_planet_mode() {
             self.record_terrain_engineering_candidates(pid, team, tx, ty, layer, tf_s, sw_s);
         }
 
-        self.face_volume_mut(p_face)
-            .apply_physical_actuator(tx, ty, layer, tf_s, sw_s, so_s, ss_s, r);
+        if let Some((vf, lx, ly)) = self.volume_at_mut(p_face, tx, ty) {
+            vf.apply_physical_actuator(lx, ly, layer, tf_s, sw_s, so_s, ss_s, r);
+        }
+        // Wave 34A: Massive local heat/smoke actuators upscale directly into PlanetaryClimateNet (op=13)!
+        if tf_s > 0.65 || (tf_s > 0.45 && ss_s > 0.45) {
+            if let Some(ref mut mr) = self.macro_planet_runtime {
+                mr.enqueue_climate_injection_virtual(
+                    p_face,
+                    tx,
+                    ty,
+                    (tf_s * 0.45).clamp(0.1, 1.0),
+                    (ss_s * 0.50 + so_s * 0.35 + 0.15).clamp(0.1, 1.2),
+                );
+            }
+        }
 
         let tick = self.sim_tick;
         let surf_z = self.surf_layer() as f32;
@@ -3882,7 +4193,15 @@ impl GameState {
             self.relic_x = rx;
             self.relic_y = ry;
         }
-        let (sface, sx, sy, sz) = if let Some(ref pr) = self.planet_runtime {
+        let is_bot_p = self.players.get(&pid).map(|p| p.is_bot).unwrap_or(false);
+        let (sface, sx, sy, sz) = if let Some(ref mr) = self.macro_planet_runtime {
+            if !is_bot_p {
+                let (hf, hx, hy, hz, _, _) = mr.human_spawn_point();
+                (hf, hx, hy, hz)
+            } else {
+                mr.spawn_point_for_bot(pid as usize % 60, 60, class_id, self.sim_tick as u32 + pid)
+            }
+        } else if let Some(ref pr) = self.planet_runtime {
             pr.spawn_point_for_entity(prev_face, class_id, self.sim_tick as u32 + pid)
         } else {
             let (x, y, z) = self.spawn_point(team, self.sim_tick as u32 + pid);
@@ -3918,7 +4237,27 @@ impl GameState {
 
     fn reset_match(&mut self) {
         let (w, h, d) = (self.grid_w, self.grid_h, self.grid_d);
-        if self.is_planet_mode() {
+        if let Some(ref existing_mr) = self.macro_planet_runtime {
+            let cfg = existing_mr.config();
+            let mr = MacroPlanetRuntime::new(cfg);
+            self.shrines = mr
+                .build_macro_shrines()
+                .into_iter()
+                .map(|(id, name, face, x, y, z)| ShrineEntity {
+                    id,
+                    name,
+                    face,
+                    x,
+                    y,
+                    z,
+                    progress: 0.0,
+                    owner: 0,
+                })
+                .collect();
+            self.macro_planet_runtime = Some(mr);
+            self.mass_error = 0;
+            self.energy_error = 0;
+        } else if self.is_planet_mode() {
             let pr = PlanetRuntime::new(w, d, self.planet_r_core, self.world_seed);
             self.shrines = pr
                 .build_planetary_shrines()
@@ -3975,12 +4314,19 @@ impl GameState {
         self.weather_kind = WEATHER_CLEAR;
 
         let pids: Vec<u32> = self.players.keys().copied().collect();
-        for pid in pids {
-            let (team, cls, old_face) = {
+        for (idx_p, pid) in pids.into_iter().enumerate() {
+            let (team, cls, old_face, is_bot_p) = {
                 let p = &self.players[&pid];
-                (p.team, p.class_id, p.face)
+                (p.team, p.class_id, p.face, p.is_bot)
             };
-            let (sface, sx, sy, sz) = if let Some(ref pr) = self.planet_runtime {
+            let (sface, sx, sy, sz) = if let Some(ref mr) = self.macro_planet_runtime {
+                if !is_bot_p {
+                    let (hf, hx, hy, hz, _, _) = mr.human_spawn_point();
+                    (hf, hx, hy, hz)
+                } else {
+                    mr.spawn_point_for_bot(idx_p % 60, 60, cls, pid)
+                }
+            } else if let Some(ref pr) = self.planet_runtime {
                 pr.spawn_point_for_entity(old_face, cls, pid)
             } else {
                 let (x, y, z) = self.spawn_point(team, pid);
@@ -4042,6 +4388,9 @@ impl GameState {
             peer.pending_subbricks.clear();
             peer.planet_subbrick_shadow.clear();
             peer.pending_planet_subbricks.clear();
+            peer.macro_subbrick_shadow.clear();
+            peer.pending_macro_subbricks.clear();
+            peer.macro_synced_shards.clear();
         }
         self.brick_raw_cache.clear();
         self.subbrick_raw_cache.clear();
@@ -4105,6 +4454,9 @@ impl GameState {
             peer.pending_subbricks.clear();
             peer.planet_subbrick_shadow.clear();
             peer.pending_planet_subbricks.clear();
+            peer.macro_subbrick_shadow.clear();
+            peer.pending_macro_subbricks.clear();
+            peer.macro_synced_shards.clear();
         }
         self.brick_raw_cache.clear();
         self.subbrick_raw_cache.clear();
@@ -4246,15 +4598,23 @@ impl GameState {
             // 2. Choose movement vector:
             //    - ~45% of bots act as global geodesic explorers / seam-crossers so bots stream
             //      continuously across all 12 cube seams (including polar seams!).
-            //    - Remaining bots contest their face's planetary shrine and engage nearby enemies.
-            let is_roamer = (b.id % 5 == 0) || (b.class_id == CLASS_SKYWING) || (b.class_id == CLASS_EMBERSTALKER);
+            //    - Remaining bots contest their face's planetary shrine (or nearest local shrine in macro mode)
+            //      and engage nearby enemies.
+            let is_macro = self.is_macro_planet_mode();
+            let engage_r = if is_macro { 96.0 } else { nf * 0.45 };
+            let is_roamer = if is_macro {
+                // Keep 2/3 local bots battling around the Hero Shard shrines & Sky-Island while 1/3 roam the globe!
+                (b.id % 3 == 0) && (b.class_id == CLASS_SKYWING || b.class_id == CLASS_EMBERSTALKER || b.id % 6 == 0)
+            } else {
+                (b.id % 5 == 0) || (b.class_id == CLASS_SKYWING) || (b.class_id == CLASS_EMBERSTALKER)
+            };
             let (mut mx, mut my) = if is_roamer {
                 // Smoothly rotating geodesic heading around the cube sphere
                 let phase = ((tick / 90) as f32) * 0.65 + (b.id as f32) * 1.13;
                 let dir_x = phase.cos();
                 let dir_y = phase.sin();
                 (dir_x, dir_y)
-            } else if let Some((ed, ex, ey, _)) = nearest_enemy.filter(|(d, _, _, _)| *d < nf * 0.45) {
+            } else if let Some((ed, ex, ey, _)) = nearest_enemy.filter(|(d, _, _, _)| *d < engage_r) {
                 let dx = ex - b.x;
                 let dy = ey - b.y;
                 if ed > 7.5 {
@@ -4263,7 +4623,16 @@ impl GameState {
                     // Strafe around target
                     (-dy / ed.max(1e-3), dx / ed.max(1e-3))
                 }
-            } else if let Some(&(_, sx, sy, _, _)) = shrine_snaps.iter().find(|s| s.0 == b.face) {
+            } else if let Some((_, sx, sy, _, _)) = shrine_snaps
+                .iter()
+                .copied()
+                .filter(|s| s.0 == b.face)
+                .min_by(|a, c| {
+                    let da = (a.1 - b.x).hypot(a.2 - b.y);
+                    let dc = (c.1 - b.x).hypot(c.2 - b.y);
+                    da.partial_cmp(&dc).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            {
                 let dx = sx - b.x;
                 let dy = sy - b.y;
                 let d = dx.hypot(dy);
@@ -6413,6 +6782,14 @@ impl GameState {
 
             let mut eff_vx = vx + kb_vx;
             let mut eff_vy = vy + kb_vy;
+            // Apply live Coriolis wind drift from PlanetaryClimateNet onto flying Skywings in macro-planet mode
+            if class_id == CLASS_SKYWING {
+                if let Some(ref mr) = self.macro_planet_runtime {
+                    let (wu, wv, _, _) = mr.sample_local_climate(face, x, y);
+                    eff_vx += wu * 0.45;
+                    eff_vy += wv * 0.45;
+                }
+            }
             kb_vx *= 0.82;
             kb_vy *= 0.82;
             if kb_vx.abs() < 0.05 { kb_vx = 0.0; }
@@ -6438,18 +6815,28 @@ impl GameState {
             }
 
             // Smooth archetype radial altitude `z` tracking curved terrain / ocean / Sky-Ring
-            let surf_z = self
-                .planet_runtime
-                .as_ref()
-                .map(|pr| pr.find_surface_z(face, x, y))
-                .unwrap_or(gd * 0.5);
+            let surf_z = if let Some(ref mr) = self.macro_planet_runtime {
+                mr.find_surface_z(face, x, y)
+            } else if let Some(ref pr) = self.planet_runtime {
+                pr.find_surface_z(face, x, y)
+            } else {
+                gd * 0.5
+            };
             let target_z = match class_id % 5 {
                 CLASS_SKYWING => {
-                    let sky_alt = (gd - 6.0).max(surf_z + 4.0).min(gd - 1.5);
+                    let sky_alt = if self.is_macro_planet_mode() {
+                        (gd * 0.80).max(surf_z + 10.0).min(gd - 1.5)
+                    } else {
+                        (gd - 6.0).max(surf_z + 4.0).min(gd - 1.5)
+                    };
                     sky_alt + 1.5 * ((tick as f32) * 0.04 + (pid as f32)).sin()
                 }
                 CLASS_TIDEKIN => {
-                    let z_sea = (15.0 * (gd / 32.0)).clamp(3.0, gd - 4.0);
+                    let z_sea = if let Some(ref mr) = self.macro_planet_runtime {
+                        (mr.config().z_sea as f32 * (gd / 64.0)).clamp(3.0, gd - 4.0)
+                    } else {
+                        (15.0 * (gd / 32.0)).clamp(3.0, gd - 4.0)
+                    };
                     surf_z.max(z_sea + 0.4)
                 }
                 CLASS_BURROWER => (surf_z - 1.0).max(4.5),
@@ -6504,9 +6891,9 @@ impl GameState {
             let pl = (pr.z.round() as usize).clamp(0, self.grid_d - 1);
 
             let mut hit = self
-                .face_volume(pr.face)
-                .sample_solid_density_3d(pr.x, pr.y, pr.z)
-                >= 0.65;
+                .volume_at(pr.face, pr.x, pr.y)
+                .map(|(vf, lx, ly)| vf.sample_solid_density_3d(lx, ly, pr.z) >= 0.65)
+                .unwrap_or(false);
             let mut hit_pid = None;
             if !hit {
                 for p in self.players.values() {
@@ -6528,13 +6915,14 @@ impl GameState {
             }
 
             if hit || pr.ttl <= 1 {
-                let cx = (pr.x.round() as i32).clamp(2, (face_size as i32) - 3);
-                let cy = (pr.y.round() as i32).clamp(2, (face_size as i32) - 3);
-                let vf = self.face_volume_mut(pr.face);
-                match pr.element {
-                    0 => vf.apply_fire_3d(cx, cy, pl, 3, 1.3 * pr.power),
-                    1 => vf.apply_frost_3d(cx, cy, pl, 4, 1.5 * pr.power),
-                    _ => vf.apply_oil_3d(cx, cy, pl, 3, 1.2 * pr.power),
+                if let Some((vf, lx, ly)) = self.volume_at_mut(pr.face, pr.x, pr.y) {
+                    let cx = (lx.round() as i32).clamp(2, (vf.width as i32) - 3);
+                    let cy = (ly.round() as i32).clamp(2, (vf.height as i32) - 3);
+                    match pr.element {
+                        0 => vf.apply_fire_3d(cx, cy, pl, 3, 1.3 * pr.power),
+                        1 => vf.apply_frost_3d(cx, cy, pl, 4, 1.5 * pr.power),
+                        _ => vf.apply_oil_3d(cx, cy, pl, 3, 1.2 * pr.power),
+                    }
                 }
                 if let Some(vid) = hit_pid {
                     proj_hits.push((pr.owner, vid, pr.element, pr.power, pr.face, pr.x, pr.y));
@@ -6548,6 +6936,8 @@ impl GameState {
 
         if let Some(ref mut pr) = self.planet_runtime {
             pr.seam_crossings_total = pr.seam_crossings_total.saturating_add(new_seam_crossings);
+        } else if let Some(ref mut mr) = self.macro_planet_runtime {
+            mr.seam_crossings_total = mr.seam_crossings_total.saturating_add(new_seam_crossings);
         }
 
         for (owner, vid, elem, pwr, _face, _hx, _hy) in proj_hits {
@@ -6792,11 +7182,13 @@ impl GameState {
                 let pl = (p.z.round() as usize).clamp(if is_z16 { 0 } else { surf_l }, self.grid_d - 1);
                 let mut status = 0u8;
                 if self.physics_native || is_planet {
-                    let phys = self.face_volume(p.face).sample_entity_physics(p.x, p.y, pl);
-                    if phys.temp_c > 120.0 { status |= STATUS_BURNING; }
-                    if phys.temp_c < -15.0 { status |= STATUS_CHILLED; }
-                    if phys.water_frac > 0.18 && phys.ice_frac < 0.30 { status |= STATUS_WET; }
-                    if phys.oil_frac > 0.12 { status |= STATUS_OILED; }
+                    if let Some((vf, lx, ly)) = self.volume_at(p.face, p.x, p.y) {
+                        let phys = vf.sample_entity_physics(lx, ly, pl);
+                        if phys.temp_c > 120.0 { status |= STATUS_BURNING; }
+                        if phys.temp_c < -15.0 { status |= STATUS_CHILLED; }
+                        if phys.water_frac > 0.18 && phys.ice_frac < 0.30 { status |= STATUS_WET; }
+                        if phys.oil_frac > 0.12 { status |= STATUS_OILED; }
+                    }
                 } else {
                     let hz = self.sample_hazard(p.x, p.y, pl);
                     if (hz & (1 << 2)) != 0 { status |= STATUS_BURNING; }
@@ -6905,32 +7297,77 @@ impl GameState {
             .unwrap_or(self.infer_ms_last);
 
         let bot_cnt = self.players.values().filter(|p| p.is_bot).count() as u16;
-        let (planet_mode, planet_r_core, sun_dir, seam_mass_crossed, active_sky_cores, field_tick_snap, mass_err_snap, energy_err_snap, total_chunks_snap) =
-            if let Some(ref pr) = self.planet_runtime {
-                (
-                    true,
-                    pr.planet.r_core,
-                    pr.planet.sun_dir,
-                    pr.planet.total_seam_mass_crossed.max(0) as u64,
-                    pr.active_sky_cores(),
-                    pr.planet.tick,
-                    pr.planet.global_mass_error(),
-                    pr.planet.global_energy_error(),
-                    (FACE_COUNT * pr.chunks_xy() * pr.chunks_xy() * (pr.subbricks_z() as usize)) as u16,
-                )
-            } else {
-                (
-                    false,
-                    0.0,
-                    [0.0, 0.0, 0.0],
-                    0,
-                    0,
-                    self.volume.tick,
-                    self.mass_error,
-                    self.energy_error,
-                    (self.chunks_x * self.chunks_y * self.grid_d) as u16,
-                )
-            };
+        let (
+            planet_mode,
+            macro_planet,
+            planet_r_core,
+            planet_shards_per_axis,
+            planet_seed,
+            climate_infer_ms,
+            active_hydrated_shards,
+            sun_dir,
+            seam_mass_crossed,
+            active_sky_cores,
+            field_tick_snap,
+            mass_err_snap,
+            energy_err_snap,
+            total_chunks_snap,
+        ) = if let Some(ref mr) = self.macro_planet_runtime {
+            let cfg = mr.config();
+            let hydrated = mr.planet.shards.len().min(u16::MAX as usize) as u16;
+            let per_shard_sb =
+                (mr.shard_chunks_xy() as usize) * (mr.shard_chunks_xy() as usize) * (mr.subbricks_z() as usize);
+            (
+                true,
+                true,
+                cfg.r_core as f32,
+                cfg.shards_per_face_axis,
+                cfg.seed,
+                mr.climate_infer_ms,
+                hydrated,
+                mr.sun_dir_f32(),
+                mr.planet.total_seam_mass_crossed.max(0) as u64,
+                mr.active_sky_cores(),
+                mr.planet.tick,
+                mr.planet.global_mass_error(),
+                mr.planet.global_energy_error(),
+                (per_shard_sb * (hydrated as usize).max(1)).min(u16::MAX as usize) as u16,
+            )
+        } else if let Some(ref pr) = self.planet_runtime {
+            (
+                true,
+                false,
+                pr.planet.r_core,
+                0u8,
+                self.world_seed,
+                0.0f32,
+                0u16,
+                pr.planet.sun_dir,
+                pr.planet.total_seam_mass_crossed.max(0) as u64,
+                pr.active_sky_cores(),
+                pr.planet.tick,
+                pr.planet.global_mass_error(),
+                pr.planet.global_energy_error(),
+                (FACE_COUNT * pr.chunks_xy() * pr.chunks_xy() * (pr.subbricks_z() as usize)) as u16,
+            )
+        } else {
+            (
+                false,
+                false,
+                0.0,
+                0u8,
+                self.world_seed,
+                0.0f32,
+                0u16,
+                [0.0, 0.0, 0.0],
+                0,
+                0,
+                self.volume.tick,
+                self.mass_error,
+                self.energy_error,
+                (self.chunks_x * self.chunks_y * self.grid_d) as u16,
+            )
+        };
         let telemetry = TelemetrySnap {
             mode: self.sim_mode.clone(),
             backend: self.backend_name.clone(),
@@ -6970,6 +7407,15 @@ impl GameState {
             sun_dir,
             seam_mass_crossed,
             active_sky_cores,
+            macro_planet,
+            planet_shards_per_axis,
+            planet_seed,
+            climate_infer_ms,
+            active_hydrated_shards,
+            local_wind_u: self.wind_x,
+            local_wind_v: self.wind_y,
+            local_temp_c: 15.0,
+            local_cloud_cover: 0.0,
         };
         let match_secs = (self.match_elapsed_offset_secs + self.match_start_instant.elapsed().as_secs()) as u32;
         let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
@@ -7054,6 +7500,14 @@ impl GameState {
             } else {
                 projectiles.clone()
             };
+            let mut peer_telemetry = telemetry.clone();
+            if let Some(ref mr) = self.macro_planet_runtime {
+                let (wu, wv, tc, cc) = mr.sample_local_climate(my_face, my_x, my_y);
+                peer_telemetry.local_wind_u = wu;
+                peer_telemetry.local_wind_v = wv;
+                peer_telemetry.local_temp_c = tc;
+                peer_telemetry.local_cloud_cover = cc;
+            }
             let msg = ServerDatagram::EntitySnapshot {
                 sim_tick: tick,
                 match_time_secs: match_secs,
@@ -7066,7 +7520,7 @@ impl GameState {
                 bodies: bodies.clone(),
                 shrines: shrines.clone(),
                 events: events.clone(),
-                telemetry: telemetry.clone(),
+                telemetry: peer_telemetry,
                 bot_brains: self.bot_brains.clone(),
                 kill_feed: kill_feed.clone(),
                 speech_bubbles: speech_bubbles.clone(),
@@ -7242,6 +7696,9 @@ impl GameState {
             peer.pending_subbricks.clear();
             peer.planet_subbrick_shadow.clear();
             peer.pending_planet_subbricks.clear();
+            peer.macro_subbrick_shadow.clear();
+            peer.pending_macro_subbricks.clear();
+            peer.macro_synced_shards.clear();
         }
         if let Some(ref ws) = self.ws_bridge {
             ws.queue_full_sync_all();
@@ -8009,6 +8466,150 @@ impl GameState {
         self.record_wire_bytes(total_peer_bytes / peer_count);
     }
 
+    /// Wave 34A: Stream `PlanetMacroClimateFace` (all 6 faces on initial sync, 1–2 round-robin faces/tick
+    /// ongoing ~2 Hz full-globe refresh = ~20 KB/s) AND nearby hydrated `16×16×16` cubic shard sub-bricks
+    /// (`PlanetShardBrick3D` / `PlanetShardBrick3DDelta`, skipping empty sky & deep mantle!).
+    fn broadcast_macro_planet_chunks_10hz(&mut self, dirty_subbricks: &[ShardSubbrickKey]) {
+        if self.peers.is_empty() || self.macro_planet_runtime.is_none() {
+            return;
+        }
+        let rt_handle = self.rt_handle.clone();
+        const MAX_MACRO_BYTES_PER_PEER_TICK: u64 = 32 * 1024;
+        const NEAR_SHARD_STREAM_DIST_M: f32 = 192.0;
+
+        let peer_count = self.peers.len().max(1) as u64;
+        let mut total_peer_bytes = 0u64;
+        let mut total_peer_chunks = 0u64;
+
+        let mut mr = self.macro_planet_runtime.take().unwrap();
+        let rr_climate_pkts = mr.encode_next_climate_face_packets(2);
+
+        for (&pid, peer) in self.peers.iter_mut() {
+            let mut peer_b = 0u64;
+            let mut sent_cnt = 0u16;
+            let (my_face, my_x, my_y) = self
+                .players
+                .get(&pid)
+                .map(|p| (p.face, p.x, p.y))
+                .unwrap_or_else(|| {
+                    let (f, gx, gy, _, _, _) = mr.human_spawn_point();
+                    (f, gx, gy)
+                });
+            let (cur_shard, _, _) = mr.virtual_to_shard(my_face, my_x, my_y);
+
+            if peer.needs_full_sync || !peer.macro_synced_shards.contains(&cur_shard) {
+                let is_initial = peer.needs_full_sync;
+                peer.needs_full_sync = false;
+                if is_initial {
+                    peer.macro_subbrick_shadow.clear();
+                    peer.pending_macro_subbricks.clear();
+                    peer.macro_synced_shards.clear();
+                }
+
+                let mut batch = Vec::new();
+                if is_initial {
+                    for cp in mr.encode_all_climate_face_packets() {
+                        peer_b += cp.len() as u64;
+                        batch.push(cp);
+                    }
+                } else {
+                    for cp in &rr_climate_pkts {
+                        peer_b += cp.len() as u64;
+                        batch.push(cp.clone());
+                    }
+                }
+
+                let (full_pkts, empty_shadows, total_sb, skipped_sb) = mr
+                    .encode_nearby_hydrated_subbricks(
+                        my_face,
+                        my_x,
+                        my_y,
+                        NEAR_SHARD_STREAM_DIST_M,
+                    );
+                for (key, arc) in &empty_shadows {
+                    peer.macro_subbrick_shadow.insert(*key, arc.clone());
+                }
+                for (key, arc, pkt) in &full_pkts {
+                    if !is_initial && peer.macro_subbrick_shadow.contains_key(key) {
+                        continue;
+                    }
+                    peer.macro_subbrick_shadow.insert(*key, arc.clone());
+                    peer.macro_synced_shards.insert(key.0);
+                    peer_b += pkt.len() as u64;
+                    sent_cnt = sent_cnt.saturating_add(1);
+                    batch.push(pkt.clone());
+                }
+                peer.macro_synced_shards.insert(cur_shard);
+                let skip_pct = if total_sb > 0 {
+                    (skipped_sb as f32 * 100.0) / (total_sb as f32)
+                } else {
+                    0.0
+                };
+                log::info!(
+                    "Macro Planet shard sync ({:?}, hydrated={}): sent {} / {} sub-bricks, skipped {:.1}% sky/mantle (player {}, {:.1} KB)",
+                    cur_shard,
+                    mr.planet.shards.len(),
+                    full_pkts.len(),
+                    total_sb,
+                    skip_pct,
+                    pid,
+                    peer_b as f32 / 1024.0
+                );
+                Self::send_packets_batched(&rt_handle, peer.conn.clone(), batch);
+            } else {
+                let mut out_pkts = Vec::new();
+                for cp in &rr_climate_pkts {
+                    peer_b += cp.len() as u64;
+                    out_pkts.push(cp.clone());
+                }
+
+                for &k in dirty_subbricks {
+                    if k.0 == cur_shard || peer.macro_synced_shards.contains(&k.0) {
+                        peer.pending_macro_subbricks.insert(k);
+                    }
+                }
+                let mut pending: Vec<ShardSubbrickKey> =
+                    peer.pending_macro_subbricks.drain().collect();
+                pending.sort_by_key(|&(sk, bx, by, bz)| {
+                    let shard_prio = if sk == cur_shard { 0u8 } else { 1u8 };
+                    (shard_prio, bz, by, bx)
+                });
+                let mut budget_hit = false;
+                for (sk, bx, by, bz) in pending {
+                    if budget_hit {
+                        peer.pending_macro_subbricks.insert((sk, bx, by, bz));
+                        continue;
+                    }
+                    let prev_arc = peer.macro_subbrick_shadow.get(&(sk, bx, by, bz));
+                    let dz = if sk == cur_shard {
+                        DEFAULT_BRICK3D_DELTA_DEADZONE
+                    } else {
+                        5
+                    };
+                    if let Some((pkt, _is_delta, cur_arc)) =
+                        mr.encode_incremental_shard_subbrick(sk, bx, by, bz, prev_arc, dz)
+                    {
+                        peer_b += pkt.len() as u64;
+                        sent_cnt = sent_cnt.saturating_add(1);
+                        out_pkts.push(pkt);
+                        peer.macro_subbrick_shadow.insert((sk, bx, by, bz), cur_arc);
+                        if peer_b >= MAX_MACRO_BYTES_PER_PEER_TICK {
+                            budget_hit = true;
+                        }
+                    }
+                }
+                if !out_pkts.is_empty() {
+                    Self::send_packets_batched(&rt_handle, peer.conn.clone(), out_pkts);
+                }
+            }
+            total_peer_bytes += peer_b;
+            total_peer_chunks += sent_cnt as u64;
+        }
+        self.macro_planet_runtime = Some(mr);
+        self.aoi_chunks_sent_last = (total_peer_chunks / peer_count) as u16;
+        self.record_wire_bytes(total_peer_bytes / peer_count);
+    }
+
     fn record_wire_bytes(&mut self, bytes_per_client: u64) {
         self.bytes_sent_window += bytes_per_client;
         let secs = self.bytes_window_start.elapsed().as_secs_f32();
@@ -8048,13 +8649,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,ort=warn")).init();
     let args = Args::parse();
 
-    let effective_size = args.size.unwrap_or(if args.planet { 64 } else { 256 });
-    let effective_layers = args.layers.unwrap_or(if args.planet { 32 } else { 4 });
+    let effective_size = args.size.unwrap_or(if args.planet_macro {
+        256
+    } else if args.planet {
+        64
+    } else {
+        256
+    });
+    let effective_layers = args.layers.unwrap_or(if args.planet_macro {
+        64
+    } else if args.planet {
+        32
+    } else {
+        4
+    });
+    let effective_bots = if args.planet_macro && args.bots == 12 {
+        60
+    } else {
+        args.bots
+    };
 
     let server_cfg = make_quic_server_config()?;
     let endpoint = Endpoint::server(server_cfg, args.bind)?;
     let state = Arc::new(Mutex::new({
-        let mut gs = if args.planet {
+        let mut gs = if args.planet_macro {
+            let mut cfg = MacroPlanetConfig::default();
+            cfg.shard_size = (effective_size / CHUNK_SIZE).max(2) * CHUNK_SIZE;
+            cfg.depth = effective_layers.clamp(16, 64);
+            if args.seed != 1 {
+                cfg.seed = args.seed;
+            }
+            GameState::new_macro_planet(
+                args.backend.clone(),
+                args.cuda_addr.clone(),
+                cfg,
+                effective_bots,
+                args.aoi_radius,
+            )
+        } else if args.planet {
             GameState::new_planet(
                 args.backend.clone(),
                 args.cuda_addr.clone(),
@@ -8079,7 +8711,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         gs.entity_aoi_radius = args.entity_aoi_radius;
         gs.persistent_world = args.persistent_world;
-        if !args.planet {
+        if !args.planet && !args.planet_macro {
             if let Some(ref sf) = args.state_file {
                 if sf.exists() {
                     match persistence::load_world(sf) {
@@ -8125,7 +8757,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for p in gs.players.values().filter(|p| p.is_bot) {
             cls_cnt[(p.class_id as usize) % 5] += 1;
         }
-        let sc = gs.planet_runtime.as_ref().map(|pr| pr.active_sky_cores()).unwrap_or(0);
+        let sc = gs
+            .macro_planet_runtime
+            .as_ref()
+            .map(|mr| mr.active_sky_cores())
+            .or_else(|| gs.planet_runtime.as_ref().map(|pr| pr.active_sky_cores()))
+            .unwrap_or(0);
         (gs.grid_w, gs.grid_h, gs.grid_d, gs.biome_id, gs.world_seed, gs.chunks_x, gs.chunks_y, cls_cnt, sc)
     };
     if let Some(ref ws_addr) = args.ws_bind {
@@ -8139,7 +8776,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             grid_d
         );
     }
-    if args.planet {
+    if args.planet_macro {
+        let (r_surf, virt_vox, hero_shard, shards_per_axis) = {
+            let gs = state.lock().unwrap();
+            let mr = gs.macro_planet_runtime.as_ref().unwrap();
+            (
+                mr.config().surface_radius_m(),
+                mr.config().virtual_voxels(),
+                mr.hero_site.shard_key,
+                mr.config().shards_per_face_axis,
+            )
+        };
+        log::info!(
+            "Frostmarsh Wave 34A MACRO DUAL-SCALE PLANET QUIC Server listening on {} (R_surf={:.1}m, 6x{}x{}x{} = {} virtual voxels, {}x{} shards/face, hero={:?}, sky_cores={}, seed={}, backend={}, bots={} [Strider={} Skywing={} Tidekin={} Emberstalker={} Burrower={}])",
+            args.bind,
+            r_surf,
+            grid_w,
+            grid_h,
+            grid_d,
+            virt_vox,
+            shards_per_axis,
+            shards_per_axis,
+            hero_shard,
+            sky_cores,
+            world_seed,
+            args.backend,
+            bot_counts.iter().sum::<usize>(),
+            bot_counts[0],
+            bot_counts[1],
+            bot_counts[2],
+            bot_counts[3],
+            bot_counts[4],
+        );
+    } else if args.planet {
         log::info!(
             "Frostmarsh Wave 31A CUBED-SPHERE PLANET QUIC Server listening on {} (6x{}x{}x{} = {} voxels, r_core={:.1}, sky_cores={}, seed={}, backend={}, bots={} [Strider={} Skywing={} Tidekin={} Emberstalker={} Burrower={}])",
             args.bind,
@@ -8187,6 +8856,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_path = args.model.clone();
     let eco_path = args.ecosystem_model.clone();
     let planet_mode_flag = args.planet;
+    let macro_planet_flag = args.planet_macro;
 
     std::thread::spawn(move || {
         #[cfg(feature = "onnx")]
@@ -8198,6 +8868,205 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = (&model_path, &eco_path);
 
         let period = Duration::from_millis(100);
+        if macro_planet_flag {
+            loop {
+                let t_loop = Instant::now();
+                // 1. Lazily hydrate shards around human observers + prepare op=13 climate payload outside lock
+                let (climate_req_opt, drained_injections, hero_op11_prep) = {
+                    let mut gs = field_state.lock().unwrap();
+                    let observers: Vec<(u8, f32, f32)> = gs
+                        .players
+                        .values()
+                        .filter(|p| !p.is_bot)
+                        .map(|p| (p.face, p.x, p.y))
+                        .collect();
+                    let use_neural = gs.sim_mode == "neural" && cuda_rpc.is_some();
+                    if let Some(ref mut mr) = gs.macro_planet_runtime {
+                        let newly_hyd = mr.ensure_hydrated_around_observers(&observers);
+                        for k in newly_hyd {
+                            log::info!(
+                                "Macro Planet lazily hydrated shard {:?} (active_hydrated={})",
+                                k,
+                                mr.planet.shards.len()
+                            );
+                        }
+                        let should_clim = mr.should_step_climate_this_tick();
+                        let injections: Vec<ClimateInjection> = if should_clim {
+                            std::mem::take(&mut mr.pending_climate_injections)
+                        } else {
+                            Vec::new()
+                        };
+                        let clim_req = if should_clim && use_neural && mr.op13_backoff == 0 {
+                            let next_sun = macro_planet_runtime::macro_sun_dir_from_angle(
+                                (mr.sun_angle + mr.sun_speed_rad_per_tick).rem_euclid(std::f32::consts::TAU),
+                            );
+                            Some(encode_planet_op13_request(
+                                mr.config().seed,
+                                next_sun,
+                                1,
+                                &injections,
+                            ))
+                        } else {
+                            None
+                        };
+                        // Optional op=11 WorldModel3D-v8 sparse step on primary hero shard when cuda-rpc is active
+                        let op11_req = if use_neural {
+                            let hk = mr.hero_site.shard_key;
+                            mr.planet.shards.get(&hk).map(|vf| {
+                                let bin = vf.encode_batched_input_tensor();
+                                let dt_map = vec![1.0f32; vf.width * vf.height];
+                                (vf.depth, vf.height, vf.width, bin, dt_map, vf.world_laws)
+                            })
+                        } else {
+                            None
+                        };
+                        (clim_req, injections, op11_req)
+                    } else {
+                        (None, Vec::new(), None)
+                    }
+                };
+
+                // 2. Execute CUDA op=13 (PlanetaryClimateNet) & optional op=11 outside the GameState mutex!
+                let mut op13_outcome: Option<Result<PlanetClimateOp13Response, String>> = None;
+                if let (Some(rpc), Some(payload)) = (cuda_rpc.as_mut(), climate_req_opt) {
+                    op13_outcome = Some(rpc.step_planet_climate_raw(&payload));
+                }
+                let mut hero_op11_res: Option<(Vec<RawStepOutput>, Option<Vec<f32>>, f32, f32)> = None;
+                if let (Some(rpc), Some((gd, gh, gw, bin, dt_map, laws))) =
+                    (cuda_rpc.as_mut(), hero_op11_prep)
+                {
+                    let per = OUTPUT_CHANNELS * gw * gh;
+                    let horiz_len = gd * per;
+                    let z_len = gd.saturating_sub(1) * 5 * gw * gh;
+                    if let Ok((flat, gpu_ms, _used_v8)) =
+                        rpc.step_world_v8(gd, gh, gw, &bin, &dt_map, laws)
+                    {
+                        if flat.len() == horiz_len + z_len {
+                            let raws: Vec<RawStepOutput> = (0..gd)
+                                .map(|l| RawStepOutput {
+                                    width: gw,
+                                    height: gh,
+                                    data: flat[l * per..(l + 1) * per].to_vec(),
+                                })
+                                .collect();
+                            let zf = if z_len > 0 {
+                                Some(flat[horiz_len..].to_vec())
+                            } else {
+                                None
+                            };
+                            hero_op11_res = Some((raws, zf, gpu_ms, 0.25));
+                        }
+                    }
+                }
+
+                // 3. Apply macro-planet physics tick + exact border exchange + AMR climate + sub-brick streaming!
+                {
+                    let mut gs = field_state.lock().unwrap();
+                    let mut mr_opt = gs.macro_planet_runtime.take();
+                    if let Some(ref mut mr) = mr_opt {
+                        let outcome = mr.step_macro_tick(
+                            op13_outcome,
+                            &drained_injections,
+                            hero_op11_res,
+                        );
+                        let sim_tick_u32 = gs.sim_tick as u32;
+                        for (fi, _cid, cname, cx, cy, cz) in &outcome.newly_fracturing_cores {
+                            let msg = format!("SKY-ISLAND FRACTURING: {}!", cname);
+                            gs.push_event(5, *cx, *cy, 0, 2, msg.clone());
+                            gs.push_speech_bubble(SpeechBubbleSnap {
+                                speaker_id: 0,
+                                speaker_name: "SKY ALERT".into(),
+                                team: 2,
+                                x: *cx,
+                                y: *cy,
+                                z: *cz,
+                                snr_db: 24.0,
+                                symbol_id: 5,
+                                text: msg.clone(),
+                                tick: sim_tick_u32,
+                                face: *fi,
+                            });
+                            log::info!("MACRO PLANET STRUCTURAL: {} (face={})", msg, fi);
+                        }
+                        for (fi, _cid, cname, cx, cy, cz) in &outcome.newly_impacted_cores {
+                            let msg = format!("{} CRASHED INTO COASTAL BAY!", cname);
+                            gs.push_event(5, *cx, *cy, 0, 2, msg.clone());
+                            gs.push_speech_bubble(SpeechBubbleSnap {
+                                speaker_id: 0,
+                                speaker_name: "SKY ALERT".into(),
+                                team: 2,
+                                x: *cx,
+                                y: *cy,
+                                z: *cz,
+                                snr_db: 24.0,
+                                symbol_id: 5,
+                                text: msg.clone(),
+                                tick: sim_tick_u32,
+                                face: *fi,
+                            });
+                            log::info!(
+                                "MACRO PLANET IMPACT: {} (face={}, fallen={}, splashed={})",
+                                msg,
+                                fi,
+                                outcome.fallen_solid_mass,
+                                outcome.splashed_fluid_mass
+                            );
+                        }
+                        gs.backend_name = outcome.backend.clone();
+                        gs.infer_ms_last = outcome.infer_ms;
+                        if gs.infer_window.len() >= 100 {
+                            gs.infer_window.pop_front();
+                        }
+                        gs.infer_window.push_back(outcome.infer_ms);
+                        gs.world_sparse_pct = (outcome.active_frac * 100.0).clamp(0.0, 100.0);
+                        gs.neural_3d_vertical = outcome.neural_3d_vertical;
+                        gs.mass_error = outcome.global_mass_error;
+                        gs.energy_error = outcome.global_energy_error;
+                        let dirty_sb = outcome.dirty_subbricks;
+                        let log_tick = outcome.tick;
+                        let log_clim_ms = outcome.climate_infer_ms;
+                        let log_hyd = outcome.active_hydrated_shards;
+                        let log_seam_tick = outcome.seam_mass_crossed;
+                        let log_seam = mr.planet.total_seam_mass_crossed;
+                        let log_cores = mr.active_sky_cores();
+                        let log_cross = mr.seam_crossings_total;
+                        gs.macro_planet_runtime = mr_opt;
+                        gs.broadcast_macro_planet_chunks_10hz(&dirty_sb);
+
+                        if log_tick % 10 == 0 {
+                            let bot_cnt = gs.players.values().filter(|p| p.is_bot).count();
+                            log::info!(
+                                "macro_tick={} backend={} infer={:.2}ms climate={:.2}ms hydrated={} mass_err={} energy_err={} seam_mass={} (+{}) sky_cores={} bot_seams={} bots={} dirty_sb={} wire={:.1}KB/s peers={}",
+                                log_tick,
+                                gs.backend_name,
+                                gs.infer_ms_last,
+                                log_clim_ms,
+                                log_hyd,
+                                gs.mass_error,
+                                gs.energy_error,
+                                log_seam,
+                                log_seam_tick,
+                                log_cores,
+                                log_cross,
+                                bot_cnt,
+                                dirty_sb.len(),
+                                gs.wire_kbps,
+                                gs.peers.len()
+                            );
+                        }
+                    } else {
+                        gs.macro_planet_runtime = mr_opt;
+                    }
+                }
+
+                let elapsed = t_loop.elapsed();
+                if elapsed < period {
+                    std::thread::sleep(period - elapsed);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
         if planet_mode_flag {
             loop {
                 let t_loop = Instant::now();
@@ -8747,6 +9616,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pending_subbricks: HashSet::new(),
                         planet_subbrick_shadow: HashMap::new(),
                         pending_planet_subbricks: HashSet::new(),
+                        macro_subbrick_shadow: HashMap::new(),
+                        pending_macro_subbricks: HashSet::new(),
+                        macro_synced_shards: HashSet::new(),
                     },
                 );
                 (pid, gs.grid_w as u16, gs.grid_h as u16, gs.grid_d as u8)
@@ -8829,19 +9701,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .take(72)
                                     .collect();
                                 if !clean.is_empty() {
-                                    // Wave 28 / Wave 31A: Conservation-exact interactive structural collapse triggers!
+                                    // Wave 28 / Wave 31A / Wave 34A: Conservation-exact interactive structural & volcanic triggers!
                                     if clean.starts_with("/collapse_isle") || clean.starts_with("/shatter_core") {
-                                        let default_cid = if gs.is_planet_mode() { 0u8 } else { 1u8 };
-                                        let cid: u8 = clean
+                                        let explicit_cid: Option<u8> = clean
                                             .split_whitespace()
                                             .nth(1)
-                                            .and_then(|s| s.parse::<u8>().ok())
-                                            .unwrap_or(default_cid);
-                                        let collapsed_planet = gs
-                                            .planet_runtime
+                                            .and_then(|s| s.parse::<u8>().ok());
+                                        let (pface, px, py) = gs
+                                            .players
+                                            .get(&pid)
+                                            .map(|p| (p.face, p.x, p.y))
+                                            .unwrap_or((0, 0.0, 0.0));
+                                        let collapsed_macro = gs
+                                            .macro_planet_runtime
                                             .as_mut()
-                                            .and_then(|pr| pr.collapse_orbital_isle(cid));
-                                        if let Some((face, cname, cx, cy, cz)) = collapsed_planet {
+                                            .and_then(|mr| mr.collapse_nearest_isle(pface, px, py, explicit_cid));
+                                        let collapsed_planet = if collapsed_macro.is_none() {
+                                            let cid = explicit_cid.unwrap_or(0u8);
+                                            gs.planet_runtime
+                                                .as_mut()
+                                                .and_then(|pr| pr.collapse_orbital_isle(cid))
+                                        } else {
+                                            None
+                                        };
+                                        if let Some((face, cname, cx, cy, cz)) = collapsed_macro.or(collapsed_planet) {
                                             let msg = format!("ORBITAL SHOCK! {} CORE DESTABILIZED!", cname);
                                             let tick_u32 = gs.sim_tick as u32;
                                             gs.push_event(5, cx, cy, 0, 2, msg.clone());
@@ -8860,6 +9743,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             });
                                             log::info!("Planet ChatCommand {} -> {} (face={})", clean, msg, face);
                                         } else if !gs.is_planet_mode() {
+                                            let cid = explicit_cid.unwrap_or(1u8);
                                             if let Some((cname, cx, cy, _cz)) =
                                                 field_core::structural::fracture_buoyant_core(&mut gs.volume, cid)
                                             {
@@ -8867,6 +9751,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 gs.push_event(5, cx, cy, 0, 2, msg.clone());
                                                 log::info!("ChatCommand {} -> {}", clean, msg);
                                             }
+                                        }
+                                    } else if clean.starts_with("/erupt") {
+                                        let (pface, px, py, pz) = gs
+                                            .players
+                                            .get(&pid)
+                                            .map(|p| (p.face, p.x, p.y, p.z))
+                                            .unwrap_or((0, 0.0, 0.0, 26.0));
+                                        if let Some(ref mut mr) = gs.macro_planet_runtime {
+                                            let (ef, ex, ey, ez) = mr.trigger_eruption(pface, px, py, pz);
+                                            let msg = "VOLCANIC ERUPTION! ASH PLUME INJECTED INTO CLIMATE!".to_string();
+                                            let tick_u32 = gs.sim_tick as u32;
+                                            gs.push_event(5, ex, ey, 0, 2, msg.clone());
+                                            gs.push_speech_bubble(SpeechBubbleSnap {
+                                                speaker_id: 0,
+                                                speaker_name: "VOLCANIC ALERT".into(),
+                                                team: 2,
+                                                x: ex,
+                                                y: ey,
+                                                z: ez,
+                                                snr_db: 24.0,
+                                                symbol_id: 5,
+                                                text: msg.clone(),
+                                                tick: tick_u32,
+                                                face: ef,
+                                            });
+                                            log::info!("Macro Planet ChatCommand /erupt at face={} ({:.1}, {:.1}, {:.1})", ef, ex, ey, ez);
                                         }
                                     } else if clean.starts_with("/undercut_viaduct") && !gs.is_planet_mode() {
                                         let px = gs.grid_w as f32 * 0.44;
@@ -9871,5 +10781,336 @@ mod tests {
         }
         assert!(saw_any_update, "expected at least one incremental planet sub-brick update");
         assert!(saw_delta, "expected at least one PlanetFaceBrick3DDelta temporal delta packet");
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn test_wave34a_macro_planet_1_6B_shards_climate_exact_conservation() {
+        // 1. Verify canonical default MacroPlanetConfig = R_core=1280m, R_surf=1304m, 1.61B virtual voxels!
+        let default_cfg = MacroPlanetConfig::default();
+        assert_eq!(default_cfg.shards_per_face_axis, 8);
+        assert_eq!(default_cfg.shard_size, 256);
+        assert_eq!(default_cfg.depth, 64);
+        assert!((default_cfg.r_core - 1280.0).abs() < 1e-6);
+        assert!((default_cfg.surface_radius_m() - 1304.0).abs() < 1e-6);
+        assert_eq!(default_cfg.face_size_virtual(), 2048);
+        assert_eq!(default_cfg.virtual_voxels(), 1_610_612_736);
+
+        // Use a compact shard size (32×32×64, 8×8 shards/face => 256 virtual edge) so multi-tick
+        // stepping, lazy neighbor hydration, /erupt, /collapse_isle, and sub-brick delta round-trips
+        // execute thoroughly in <2s even in unoptimized debug test builds!
+        let cfg = MacroPlanetConfig {
+            shards_per_face_axis: 8,
+            shard_size: 32,
+            depth: 64,
+            r_core: 1280.0,
+            z_sea: 24,
+            climate_res: 64,
+            seed: 33_033,
+        };
+        let mut gs = GameState::new_macro_planet(
+            "refsim".to_string(),
+            "127.0.0.1:14440".to_string(),
+            cfg,
+            60,
+            4,
+        );
+        assert!(gs.is_macro_planet_mode());
+        assert!(gs.is_planet_mode());
+        assert_eq!(gs.grid_w, cfg.face_size_virtual());
+        assert_eq!(gs.grid_d, 64);
+
+        // 2. Verify Hero Shard hydrated + 60 5-archetype bots (40 local + 20 global) + 6 shrines + human beach spawn
+        let hero_key = gs.macro_planet_runtime.as_ref().unwrap().hero_site.shard_key;
+        assert_eq!(gs.macro_planet_runtime.as_ref().unwrap().planet.shards.len(), 1);
+        assert!(gs.macro_planet_runtime.as_ref().unwrap().planet.shards.contains_key(&hero_key));
+        assert_eq!(gs.macro_planet_runtime.as_ref().unwrap().planet.global_mass_error(), 0);
+        assert_eq!(gs.macro_planet_runtime.as_ref().unwrap().planet.global_energy_error(), 0);
+
+        let mut class_counts = [0usize; 5];
+        let mut local_hero_bots = 0usize;
+        let mut distinct_faces = HashSet::new();
+        for p in gs.players.values().filter(|p| p.is_bot) {
+            class_counts[(p.class_id as usize) % 5] += 1;
+            distinct_faces.insert(p.face);
+            let (sk, _, _) = gs
+                .macro_planet_runtime
+                .as_ref()
+                .unwrap()
+                .virtual_to_shard(p.face, p.x, p.y);
+            if sk == hero_key {
+                local_hero_bots += 1;
+            }
+        }
+        assert_eq!(class_counts, [12, 12, 12, 12, 12], "60 bots must cover all 5 archetypes evenly");
+        assert!(local_hero_bots >= 38, "expected ~40 local bots in hero shard, got {}", local_hero_bots);
+        assert!(distinct_faces.len() >= 4, "expected global explorer bots across multiple cube faces");
+        assert_eq!(gs.shrines.len(), 6, "must spawn 6 shrines (3 local + 3 global)");
+
+        // Spawn human player on sunlit coastal beach facing the bay & Floating Sky-Island
+        let human_pid = gs.spawn_player("Explorer".into(), 0, CLASS_WARDEN, false);
+        let (h_face, h_x, h_y, h_z) = {
+            let p = &gs.players[&human_pid];
+            (p.face, p.x, p.y, p.z)
+        };
+        assert_eq!(h_face, hero_key.face);
+        let (h_shard, _, _) = gs
+            .macro_planet_runtime
+            .as_ref()
+            .unwrap()
+            .virtual_to_shard(h_face, h_x, h_y);
+        assert_eq!(h_shard, hero_key, "human player must spawn inside Hero Spawn Shard");
+        assert!(h_z >= 20.0 && h_z < 60.0, "human spawn altitude must sit on coastal beach/meadow: z={}", h_z);
+
+        // Verify Hero Sky-Island BuoyantCore exists inside Hero Shard
+        let init_cores = gs.macro_planet_runtime.as_ref().unwrap().active_sky_cores();
+        assert!(init_cores >= 1, "Hero Shard must contain an intact Floating Sky-Island BuoyantCore");
+
+        // 3. Verify PlanetMacroClimateFace + PlanetShardBrick3D full encoding & skippable empty sky/mantle skipping!
+        let clim_pkts = gs
+            .macro_planet_runtime
+            .as_ref()
+            .unwrap()
+            .encode_all_climate_face_packets();
+        assert_eq!(clim_pkts.len(), 6);
+        for (fi, pkt_bytes) in clim_pkts.iter().enumerate() {
+            match decode_server_datagram(pkt_bytes).expect("decode PlanetMacroClimateFace") {
+                ServerDatagram::PlanetMacroClimateFace {
+                    face,
+                    grid_n,
+                    lz4_climate_rgba,
+                    ..
+                } => {
+                    assert_eq!(face as usize, fi);
+                    assert_eq!(grid_n, 64);
+                    let raw = lz4_flex::decompress_size_prepended(&lz4_climate_rgba)
+                        .expect("decompress PlanetMacroClimateFace");
+                    assert_eq!(raw.len(), 64 * 64 * 4);
+                }
+                other => panic!("unexpected datagram: {:?}", other),
+            }
+        }
+
+        let (full_pkts, _empty_shadows, total_sb, skipped_sb) = gs
+            .macro_planet_runtime
+            .as_mut()
+            .unwrap()
+            .encode_nearby_hydrated_subbricks(h_face, h_x, h_y, 192.0);
+        assert!(total_sb > 0 && !full_pkts.is_empty());
+        assert!(skipped_sb > 0, "must skip pure empty sky / uniform deep mantle sub-bricks");
+
+        let mut shadow_map: HashMap<ShardSubbrickKey, RawBrickArc> = HashMap::new();
+        for (key, raw_arc, wire_bytes) in &full_pkts {
+            shadow_map.insert(*key, raw_arc.clone());
+            match decode_server_datagram(wire_bytes).expect("decode PlanetShardBrick3D") {
+                ServerDatagram::PlanetShardBrick3D {
+                    face,
+                    sx,
+                    sy,
+                    bx,
+                    by,
+                    bz,
+                    total_depth,
+                    sub_depth,
+                    lz4_density_mat,
+                    lz4_albedo_thermal,
+                    ..
+                } => {
+                    assert_eq!((PlanetShardKey::new(face, sx, sy), bx, by, bz), *key);
+                    assert_eq!(total_depth, 64);
+                    assert_eq!(sub_depth, 16);
+                    let (dm, at) = decode_subbrick3d_lz4(&lz4_density_mat, &lz4_albedo_thermal)
+                        .expect("decompress PlanetShardBrick3D");
+                    assert_eq!(dm, raw_arc.0);
+                    assert_eq!(at, raw_arc.1);
+                }
+                other => panic!("unexpected datagram: {:?}", other),
+            }
+        }
+
+        // 4. Test lazy neighbor shard hydration near a shard border while preserving 0/0 conservation!
+        let s_f = cfg.shard_size as f32;
+        let edge_x = (hero_key.sx as f32 + 1.0) * s_f - 2.0;
+        let edge_y = (hero_key.sy as f32 + 0.5) * s_f;
+        let newly_hyd = gs
+            .macro_planet_runtime
+            .as_mut()
+            .unwrap()
+            .ensure_hydrated_around_observers(&[(hero_key.face, edge_x, edge_y)]);
+        assert!(!newly_hyd.is_empty(), "approaching shard border must lazily hydrate adjacent shard");
+        assert!(gs.macro_planet_runtime.as_ref().unwrap().planet.shards.len() >= 2);
+        assert_eq!(gs.macro_planet_runtime.as_ref().unwrap().planet.global_mass_error(), 0);
+        assert_eq!(gs.macro_planet_runtime.as_ref().unwrap().planet.global_energy_error(), 0);
+
+        // 5. Place several bots near cube-face seams & trigger /erupt + /collapse_isle!
+        let nf = cfg.face_size_virtual() as f32;
+        let bot_ids: Vec<u32> = gs
+            .players
+            .values()
+            .filter(|p| p.is_bot)
+            .map(|p| p.id)
+            .collect();
+        for (idx, &bid) in bot_ids.iter().take(12).enumerate() {
+            if let Some(p) = gs.players.get_mut(&bid) {
+                p.face = (idx % FACE_COUNT) as u8;
+                p.x = nf - 1.0;
+                p.y = nf * 0.5;
+                p.vx = 36.0;
+                p.vy = 2.0;
+                p.aim_x = 1.0;
+                p.aim_y = 0.0;
+            }
+        }
+
+        let ash_before: u64 = gs
+            .macro_planet_runtime
+            .as_ref()
+            .unwrap()
+            .climate_rgba_faces[h_face as usize]
+            .chunks_exact(4)
+            .map(|c| c[2] as u64)
+            .sum();
+
+        let _ = gs
+            .macro_planet_runtime
+            .as_mut()
+            .unwrap()
+            .trigger_eruption(h_face, h_x, h_y, h_z);
+        let collapsed = gs
+            .macro_planet_runtime
+            .as_mut()
+            .unwrap()
+            .collapse_nearest_isle(h_face, h_x, h_y, None);
+        assert!(collapsed.is_some(), "/collapse_isle must fracture Hero Shard Sky-Island BuoyantCore");
+
+        // 6. Step 6 macro-planet ticks (18 combat ticks + 6 field/climate/structural ticks)
+        //    and verify 0/0 conservation, ash plume rise, seam crossings, Sky-Island collapse, and deltas!
+        let mut all_dirty: Vec<ShardSubbrickKey> = Vec::new();
+        for step_i in 0..6 {
+            for _ in 0..3 {
+                gs.tick_combat_30hz();
+            }
+            if let Some(&sample_bid) = bot_ids.get(step_i % bot_ids.len()) {
+                if let Some(p) = gs.players.get_mut(&sample_bid) {
+                    p.mana = p.max_mana;
+                }
+                gs.apply_player_physical_actuator_3d(
+                    sample_bid,
+                    4.0,
+                    2.0,
+                    None,
+                    0.85,
+                    0.20,
+                    0.30,
+                    0.35,
+                    3.5,
+                    0.25,
+                );
+            }
+            let injections = {
+                let mr = gs.macro_planet_runtime.as_mut().unwrap();
+                std::mem::take(&mut mr.pending_climate_injections)
+            };
+            let outcome = gs
+                .macro_planet_runtime
+                .as_mut()
+                .unwrap()
+                .step_macro_tick(None, &injections, None);
+            assert_eq!(
+                outcome.global_mass_error, 0,
+                "macro tick {} global_mass_error must equal 0",
+                outcome.tick
+            );
+            assert_eq!(
+                outcome.global_energy_error, 0,
+                "macro tick {} global_energy_error must equal 0",
+                outcome.tick
+            );
+            all_dirty.extend(outcome.dirty_subbricks);
+        }
+
+        let mr = gs.macro_planet_runtime.as_mut().unwrap();
+        assert_eq!(mr.planet.global_mass_error(), 0);
+        assert_eq!(mr.planet.global_energy_error(), 0);
+        assert!(
+            mr.seam_crossings_total > 0,
+            "expected bots to cross cube-face seams in virtual [0, 2048) space"
+        );
+        assert!(
+            mr.active_sky_cores() < init_cores,
+            "expected active_sky_cores to drop after /collapse_isle ({} -> {})",
+            init_cores,
+            mr.active_sky_cores()
+        );
+        let ash_after: u64 = mr.climate_rgba_faces[h_face as usize]
+            .chunks_exact(4)
+            .map(|c| c[2] as u64)
+            .sum();
+        assert!(
+            ash_after > ash_before,
+            "expected /erupt + /collapse_isle to inject visible ash into PlanetMacroClimateFace ({} -> {})",
+            ash_before,
+            ash_after
+        );
+
+        // 7. Verify PlanetShardBrick3DDelta encoding & round-trip apply on dirty sub-bricks!
+        let mut saw_delta = false;
+        let mut saw_any = false;
+        for &(sk, bx, by, bz) in &all_dirty {
+            let prev = shadow_map.get(&(sk, bx, by, bz)).cloned();
+            if let Some((wire_bytes, is_delta, cur_arc)) = mr.encode_incremental_shard_subbrick(
+                sk,
+                bx,
+                by,
+                bz,
+                prev.as_ref(),
+                DEFAULT_BRICK3D_DELTA_DEADZONE,
+            ) {
+                saw_any = true;
+                match decode_server_datagram(&wire_bytes).expect("decode incremental shard sub-brick") {
+                    ServerDatagram::PlanetShardBrick3DDelta {
+                        face,
+                        sx,
+                        sy,
+                        bx: dbx,
+                        by: dby,
+                        bz: dbz,
+                        lz4_deltas,
+                        ..
+                    } => {
+                        assert!(is_delta);
+                        assert_eq!((PlanetShardKey::new(face, sx, sy), dbx, dby, dbz), (sk, bx, by, bz));
+                        let prev_arc = prev.expect("delta requires prev shadow");
+                        let mut dm_patch = prev_arc.0.clone();
+                        let mut at_patch = prev_arc.1.clone();
+                        let patched = apply_brick3d_delta(&mut dm_patch, &mut at_patch, &lz4_deltas)
+                            .expect("apply PlanetShardBrick3DDelta");
+                        assert!(patched > 0);
+                        saw_delta = true;
+                    }
+                    ServerDatagram::PlanetShardBrick3D {
+                        face,
+                        sx,
+                        sy,
+                        bx: fbx,
+                        by: fby,
+                        bz: fbz,
+                        lz4_density_mat,
+                        lz4_albedo_thermal,
+                        ..
+                    } => {
+                        assert_eq!((PlanetShardKey::new(face, sx, sy), fbx, fby, fbz), (sk, bx, by, bz));
+                        let (dm, at) = decode_subbrick3d_lz4(&lz4_density_mat, &lz4_albedo_thermal)
+                            .expect("decompress PlanetShardBrick3D");
+                        assert_eq!(dm, cur_arc.0);
+                        assert_eq!(at, cur_arc.1);
+                    }
+                    other => panic!("unexpected variant: {:?}", other),
+                }
+                shadow_map.insert((sk, bx, by, bz), cur_arc);
+            }
+        }
+        assert!(saw_any, "expected at least one incremental macro shard sub-brick update");
+        assert!(saw_delta, "expected at least one PlanetShardBrick3DDelta temporal delta packet");
     }
 }

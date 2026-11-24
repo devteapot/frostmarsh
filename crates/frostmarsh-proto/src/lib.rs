@@ -331,6 +331,31 @@ pub struct TelemetrySnap {
     /// Number of intact levitating Orbital Sky-Ring `BuoyantCore`s (out of 8).
     #[serde(default)]
     pub active_sky_cores: u8,
+    /// Wave 34: Dual-Scale Locally-Flat Macro Planet Mode (`R ≈ 1,304 m`, `6 × 2048² × 64` = `1.61B` virtual voxels).
+    #[serde(default)]
+    pub macro_planet: bool,
+    /// Shards per cube-face edge in macro planet mode (e.g. `8` => `8×8 = 64` shards/face = `384` total shards).
+    #[serde(default)]
+    pub planet_shards_per_axis: u8,
+    /// Procedural world seed shared by server & client for deterministic macro globe terrain alignment.
+    #[serde(default)]
+    pub planet_seed: u64,
+    /// Live `op=13` `PlanetaryClimateNet` GPU inference latency in ms on NVIDIA GB10.
+    #[serde(default)]
+    pub climate_infer_ms: f32,
+    /// Number of currently hydrated `256×256×64` `1 m` shards on the server.
+    #[serde(default)]
+    pub active_hydrated_shards: u16,
+    /// Live Coriolis macro wind vector `(u, v)` at the local player's position.
+    #[serde(default)]
+    pub local_wind_u: f32,
+    #[serde(default)]
+    pub local_wind_v: f32,
+    /// Live `PlanetaryClimateNet` surface temperature (°C) & cloud cover (`0..1`) at the local player.
+    #[serde(default)]
+    pub local_temp_c: f32,
+    #[serde(default)]
+    pub local_cloud_cover: f32,
 }
 
 /// Additive `16×16×D` 3D volumetric column brick payload (`density_mat` + `albedo_thermal` RGBA8, LZ4-compressed).
@@ -437,6 +462,41 @@ pub enum ServerDatagram {
     /// Wave 31: 10 Hz sparse temporal delta for one `16×16×sub_depth` cubic 3D sub-brick on planet `face ∈ 0..6`.
     PlanetFaceBrick3DDelta {
         face: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_deltas: Vec<u8>,
+    },
+    /// Wave 34: Live `PlanetaryClimateNet` (`op=13`) `64×64` global weather/cloud/ash/snow overlay for one cube face.
+    /// RGBA8 per cell: `R = temp_norm (240..320K)`, `G = cloud_storm`, `B = ash_plume`, `A = ice_snow`.
+    PlanetMacroClimateFace {
+        face: u8,
+        grid_n: u16,
+        tick: u64,
+        lz4_climate_rgba: Vec<u8>,
+    },
+    /// Wave 34: `16×16×sub_depth` cubic `1 m` sub-brick for a hydrated `256×256×64` macro-planet shard `(face, sx, sy)`.
+    PlanetShardBrick3D {
+        face: u8,
+        sx: u8,
+        sy: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_density_mat: Vec<u8>,
+        lz4_albedo_thermal: Vec<u8>,
+    },
+    /// Wave 34: Sparse temporal delta for a hydrated `256×256×64` macro-planet shard `(face, sx, sy)` sub-brick.
+    PlanetShardBrick3DDelta {
+        face: u8,
+        sx: u8,
+        sy: u8,
         bx: u16,
         by: u16,
         bz: u16,
@@ -832,6 +892,15 @@ mod tests {
                 sun_dir: [0.0, 0.0, 0.0],
                 seam_mass_crossed: 0,
                 active_sky_cores: 0,
+                macro_planet: false,
+                planet_shards_per_axis: 0,
+                planet_seed: 0,
+                climate_infer_ms: 0.0,
+                active_hydrated_shards: 0,
+                local_wind_u: 0.0,
+                local_wind_v: 0.0,
+                local_temp_c: 0.0,
+                local_cloud_cover: 0.0,
             },
             bot_brains: Vec::new(),
             kill_feed: Vec::new(),
@@ -1172,6 +1241,68 @@ mod tests {
                 assert_eq!(apply_brick3d_delta(&mut r_dm, &mut r_at, &lz4_deltas).expect("apply"), 1);
                 assert_eq!(r_dm, next_dm);
                 assert_eq!(r_at, next_at);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_wave34_macro_planet_shard_and_climate_roundtrip() {
+        let clim_raw = vec![128u8; 64 * 64 * 4];
+        let clim_pkt = ServerDatagram::PlanetMacroClimateFace {
+            face: 2,
+            grid_n: 64,
+            tick: 42,
+            lz4_climate_rgba: compress_aplus_cells(&clim_raw),
+        };
+        let wire = encode_server_datagram(&clim_pkt);
+        match decode_server_datagram(&wire).expect("decode PlanetMacroClimateFace") {
+            ServerDatagram::PlanetMacroClimateFace { face, grid_n, tick, lz4_climate_rgba } => {
+                assert_eq!((face, grid_n, tick), (2, 64, 42));
+                assert_eq!(decompress_aplus_cells(&lz4_climate_rgba).unwrap().len(), 64 * 64 * 4);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+
+        let voxels = CHUNK_SIZE * CHUNK_SIZE * 16;
+        let dm = vec![200u8; voxels * 4];
+        let at = vec![90u8; voxels * 4];
+        let (ldm, lat) = encode_subbrick3d_lz4(&dm, &at);
+        let shard_pkt = ServerDatagram::PlanetShardBrick3D {
+            face: 4,
+            sx: 3,
+            sy: 5,
+            bx: 1,
+            by: 2,
+            bz: 1,
+            total_depth: 64,
+            sub_depth: 16,
+            tick: 77,
+            lz4_density_mat: ldm,
+            lz4_albedo_thermal: lat,
+        };
+        let wire2 = encode_server_datagram(&shard_pkt);
+        match decode_server_datagram(&wire2).expect("decode PlanetShardBrick3D") {
+            ServerDatagram::PlanetShardBrick3D {
+                face,
+                sx,
+                sy,
+                bx,
+                by,
+                bz,
+                total_depth,
+                sub_depth,
+                tick,
+                lz4_density_mat,
+                lz4_albedo_thermal,
+            } => {
+                assert_eq!(
+                    (face, sx, sy, bx, by, bz, total_depth, sub_depth, tick),
+                    (4, 3, 5, 1, 2, 1, 64, 16, 77)
+                );
+                let (d2, a2) = decode_subbrick3d_lz4(&lz4_density_mat, &lz4_albedo_thermal).unwrap();
+                assert_eq!(d2, dm);
+                assert_eq!(a2, at);
             }
             other => panic!("unexpected variant: {:?}", other),
         }

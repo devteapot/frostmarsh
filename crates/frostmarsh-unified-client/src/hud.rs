@@ -9,6 +9,7 @@
 //! - World-Space Overhead HP Bars & Floating Damage/Combo Popups
 
 use crate::camera::CameraMatrices;
+use crate::macro_planet_world::{sphere_pos_f64_to_minimap_uv, virtual_grid_to_world_f64};
 use crate::mesh_gen::{
     archetype_color, archetype_is_solo, archetype_tag, CLASS_BURROWER, CLASS_EMBERSTALKER,
     CLASS_SKYWING, CLASS_STRIDER, CLASS_TIDEKIN,
@@ -18,6 +19,7 @@ use crate::planet_world::{face_grid_to_world_pos, PlanetWorld};
 use crate::world_bridge::LiveApproach4World;
 use crate::z16_world::Z16World;
 use bytemuck::{Pod, Zeroable};
+use field_core::planet_macro::{dot3_f64, normalize3_f64, world_f64_to_camera_rel_f32};
 use frostmarsh_proto::*;
 use glam::{Vec3, Vec4};
 
@@ -52,6 +54,8 @@ pub struct HudConfig<'a> {
     pub cave_enclosure: f32,
     pub show_squad_links: bool,
     pub camera_preset_label: &'static str,
+    /// Wave 34B: Exact `f64` camera eye in macro planet mode (`R = 1,304 m`) for jitter-free HUD projection.
+    pub macro_eye_f64: Option<[f64; 3]>,
 }
 
 pub struct HudBatch {
@@ -216,15 +220,44 @@ pub fn build_hud(
     let east_col = [1.0, 0.36, 0.28, 1.0];
     let gold_col = [1.0, 0.84, 0.28, 1.0];
 
-    let planet_mode = entities.map(|e| e.telemetry.planet_mode).unwrap_or(false);
+    let macro_planet = entities.map(|e| e.telemetry.macro_planet).unwrap_or(false);
+    let planet_mode = entities.map(|e| e.telemetry.planet_mode || e.telemetry.macro_planet).unwrap_or(false);
     let planet_r_core = entities
-        .map(|e| if e.telemetry.planet_r_core > 1.0 { e.telemetry.planet_r_core } else { 48.0 })
+        .map(|e| {
+            if e.telemetry.planet_r_core > 1.0 {
+                e.telemetry.planet_r_core
+            } else if e.telemetry.macro_planet {
+                1280.0
+            } else {
+                48.0
+            }
+        })
         .unwrap_or(48.0);
-    let planet_face_n = entities
-        .map(|e| (e.telemetry.grid_w as usize).max(16))
-        .unwrap_or(64);
+    let macro_face_virt = entities
+        .map(|e| {
+            let spa = if e.telemetry.planet_shards_per_axis > 0 {
+                e.telemetry.planet_shards_per_axis as usize
+            } else {
+                8usize
+            };
+            spa * 256
+        })
+        .unwrap_or(2048);
+    let planet_face_n = if macro_planet {
+        macro_face_virt
+    } else {
+        entities.map(|e| (e.telemetry.grid_w as usize).max(16)).unwrap_or(64)
+    };
     let planet_depth_d = entities
-        .map(|e| (e.telemetry.grid_d as usize).max(16))
+        .map(|e| {
+            if e.telemetry.grid_d >= 16 {
+                e.telemetry.grid_d as usize
+            } else if e.telemetry.macro_planet {
+                64
+            } else {
+                32
+            }
+        })
         .unwrap_or(32);
 
     // ------------------------------------------------------------------
@@ -234,7 +267,102 @@ pub fn build_hud(
     //    compact team-colored HP pips for distant players!
     // ------------------------------------------------------------------
     if let Some(ent) = entities {
-        if planet_mode {
+        if macro_planet {
+            // Wave 34B: Exact `f64` floating-origin world labels on the R = 1,304 m Macro Planet!
+            let eye_f64 = cfg.macro_eye_f64.unwrap_or([0.0, 0.0, planet_r_core as f64 + 32.0]);
+            let eye_r = (eye_f64[0] * eye_f64[0] + eye_f64[1] * eye_f64[1] + eye_f64[2] * eye_f64[2]).sqrt();
+            let eye_dir = normalize3_f64(eye_f64);
+            let is_orbital_far = eye_r > (planet_r_core as f64 + 24.0) + 450.0;
+            let z_surf_est = 24.5f64;
+
+            for p in &ent.players {
+                if p.hp <= 0 {
+                    continue;
+                }
+                let is_self = p.id == ent.your_player_id;
+                if is_orbital_far && !is_self {
+                    continue;
+                }
+                let wpos_f64 = virtual_grid_to_world_f64(
+                    p.face,
+                    p.x as f64,
+                    p.y as f64,
+                    (p.z as f64).max(z_surf_est) + 2.8,
+                    macro_face_virt,
+                    planet_r_core as f64,
+                );
+                if dot3_f64(normalize3_f64(wpos_f64), eye_dir) < 0.05 {
+                    continue;
+                }
+                let rel = Vec3::from_array(world_f64_to_camera_rel_f32(wpos_f64, eye_f64));
+                let dist = rel.length();
+                if !is_self && dist > 160.0 {
+                    continue;
+                }
+                if let Some((sx, sy)) = project_world(rel, mats, sw, sh) {
+                    let hp_frac = (p.hp as f32 / p.max_hp.max(1) as f32).clamp(0.0, 1.0);
+                    let bar_c = if is_self {
+                        [0.32, 0.96, 0.52, 0.96]
+                    } else if p.team == 0 {
+                        west_col
+                    } else {
+                        east_col
+                    };
+                    if is_self || dist < 64.0 {
+                        let bw = 54.0 * ui;
+                        let bh = 5.5 * ui;
+                        let bx = sx - bw * 0.5;
+                        let by = sy - bh;
+                        b.rect(
+                            bx - 1.2 * ui,
+                            by - 1.2 * ui,
+                            bw + 2.4 * ui,
+                            bh + 2.4 * ui,
+                            if is_self { gold_col } else { [0.05, 0.04, 0.12, 0.85] },
+                        );
+                        b.rect(bx, by, bw, bh, [0.16, 0.14, 0.24, 0.92]);
+                        b.rect(bx, by, bw * hp_frac, bh, bar_c);
+                        let short_name: String = p.name.chars().take(8).collect();
+                        let tag = format!("{} {}", archetype_tag(p.class_id), short_name);
+                        let sc = 1.25 * ui;
+                        let tw = HudBatch::text_width(&tag, sc);
+                        b.text_shadow(sx - tw * 0.5, by - 11.5 * ui, sc, if is_self { gold_col } else { text_hi }, &tag);
+                    } else {
+                        let pw = 16.0 * ui;
+                        let ph = 3.5 * ui;
+                        b.rect(sx - pw * 0.5, sy - ph, pw, ph, [0.12, 0.11, 0.20, 0.85]);
+                        b.rect(sx - pw * 0.5, sy - ph, pw * hp_frac, ph, bar_c);
+                    }
+                }
+            }
+
+            for s in &ent.shrines {
+                let wpos_f64 = virtual_grid_to_world_f64(
+                    s.face,
+                    s.x as f64,
+                    s.y as f64,
+                    z_surf_est + 12.0,
+                    macro_face_virt,
+                    planet_r_core as f64,
+                );
+                if dot3_f64(normalize3_f64(wpos_f64), eye_dir) < 0.08 {
+                    continue;
+                }
+                let rel = Vec3::from_array(world_f64_to_camera_rel_f32(wpos_f64, eye_f64));
+                if let Some((sx, sy)) = project_world(rel, mats, sw, sh) {
+                    let bw = 64.0 * ui;
+                    let bh = 4.5 * ui;
+                    let bx = sx - bw * 0.5;
+                    b.rect(bx - 1.0, sy - 1.0, bw + 2.0, bh + 2.0, [0.05, 0.04, 0.12, 0.82]);
+                    let p01 = (s.progress * 0.5 + 0.5).clamp(0.0, 1.0);
+                    b.rect(bx, sy, bw * (1.0 - p01), bh, west_col);
+                    b.rect(bx + bw * (1.0 - p01), sy, bw * p01, bh, east_col);
+                    let sc = 1.2 * ui;
+                    let tw = HudBatch::text_width(&s.name, sc);
+                    b.text_shadow(sx - tw * 0.5, sy - 10.5 * ui, sc, gold_col, &s.name);
+                }
+            }
+        } else if planet_mode {
             // Spherical front-hemisphere world labels for planetary mode (zero back-side bleed!)
             let cam_dist = mats.rel_eye.length();
             let is_orbital_far = cam_dist > planet_r_core * 2.4;
@@ -744,7 +872,18 @@ pub fn build_hud(
     if let Some(ent) = entities {
         // Shrines on minimap
         for s in &ent.shrines {
-            let (sx, sy) = if planet_mode {
+            let (sx, sy) = if macro_planet {
+                let wp = virtual_grid_to_world_f64(
+                    s.face,
+                    s.x as f64,
+                    s.y as f64,
+                    24.0,
+                    macro_face_virt,
+                    planet_r_core as f64,
+                );
+                let (u, v) = sphere_pos_f64_to_minimap_uv(wp);
+                (mm_x + u * mm_sz, mm_y + v * mm_sz)
+            } else if planet_mode {
                 let wp = face_grid_to_world_pos(s.face, s.x, s.y, 16.0, planet_face_n, planet_r_core);
                 let (u, v) = PlanetWorld::sphere_pos_to_minimap_uv(wp);
                 (mm_x + u * mm_sz, mm_y + v * mm_sz)
@@ -793,7 +932,17 @@ pub fn build_hud(
                     base_dot
                 };
                 let half = sz * 0.5;
-                let (ux, uy) = if planet_mode {
+                let (ux, uy) = if macro_planet {
+                    let wp = virtual_grid_to_world_f64(
+                        p.face,
+                        p.x as f64,
+                        p.y as f64,
+                        p.z as f64,
+                        macro_face_virt,
+                        planet_r_core as f64,
+                    );
+                    sphere_pos_f64_to_minimap_uv(wp)
+                } else if planet_mode {
                     let wp = face_grid_to_world_pos(p.face, p.x, p.y, p.z, planet_face_n, planet_r_core);
                     PlanetWorld::sphere_pos_to_minimap_uv(wp)
                 } else {
@@ -821,7 +970,9 @@ pub fn build_hud(
         }
     }
     let player_cnt = entities.map(|e| e.players.len()).unwrap_or(0);
-    let mm_lbl = if planet_mode {
+    let mm_lbl = if macro_planet {
+        format!("MACRO 6×{}²×{} ({}P)", macro_face_virt, planet_depth_d, player_cnt)
+    } else if planet_mode {
         format!("PLANET 6×{}²×{} ({}P)", planet_face_n, planet_depth_d, player_cnt)
     } else if cfg.z16_active {
         format!("3D-Z{} {}X{} ({}P)", gd_u, gw_u, gh_u, player_cnt)
@@ -1086,7 +1237,13 @@ pub fn build_hud(
         let sc = 1.40 * ui;
         if let Some(ent) = entities {
             let t = &ent.telemetry;
-            let l1 = if t.planet_mode {
+            let l1 = if t.macro_planet {
+                let r_disp = (planet_r_core + 24.0).round() as u32;
+                format!(
+                    "MACRO PLANET 6×{}²×{} (R={}M)",
+                    macro_face_virt, planet_depth_d, r_disp
+                )
+            } else if t.planet_mode {
                 format!(
                     "PLANET 6×{}²×{}  {} T:{}",
                     t.grid_w,
@@ -1105,7 +1262,14 @@ pub fn build_hud(
                     t.field_tick
                 )
             };
-            let l2 = if t.planet_mode {
+            let l2 = if t.macro_planet {
+                let wind_spd = t.local_wind_u.hypot(t.local_wind_v);
+                let cloud_pct = (t.local_cloud_cover * 100.0).clamp(0.0, 100.0);
+                format!(
+                    "CLIMATE:{:.2}MS  TEMP:{:.1}C  WIND:{:.1}  CLOUDS:{:.0}%",
+                    t.climate_infer_ms, t.local_temp_c, wind_spd, cloud_pct
+                )
+            } else if t.planet_mode {
                 format!(
                     "SEAM {}  SKY-CORES {}/8  CAM:{}",
                     t.seam_mass_crossed, t.active_sky_cores, cfg.camera_preset_label
@@ -1116,7 +1280,14 @@ pub fn build_hud(
                     t.infer_ms_last, t.eco_infer_ms, t.proj_active_pct
                 )
             };
-            let l3 = if t.planet_mode {
+            let l3 = if t.macro_planet {
+                let spa = (t.planet_shards_per_axis.max(1)) as usize;
+                let tot_shards = 6 * spa * spa;
+                format!(
+                    "SHARDS:{}/{}  SKY-CORES:{}  M_ERR:{} E_ERR:{}",
+                    t.active_hydrated_shards, tot_shards, t.active_sky_cores, t.mass_error, t.energy_error
+                )
+            } else if t.planet_mode {
                 format!(
                     "M_ERR:{} E_ERR:{} WORLD {:.2}MS",
                     t.mass_error, t.energy_error, t.infer_ms_last
@@ -1127,10 +1298,17 @@ pub fn build_hud(
                     t.mass_error, t.energy_error, t.aoi_chunks_sent, t.total_chunks
                 )
             };
-            let l4 = format!(
-                "FPS:{:.0} RTT:{:.0}MS WIRE:{:.0}KB/S {}",
-                cfg.fps, cfg.rtt_ms, t.wire_kbps, cfg.style_label
-            );
+            let l4 = if t.macro_planet {
+                format!(
+                    "FPS:{:.0} RTT:{:.0}MS WIRE:{:.0}KB/S CAM:{} [F5]",
+                    cfg.fps, cfg.rtt_ms, t.wire_kbps, cfg.camera_preset_label
+                )
+            } else {
+                format!(
+                    "FPS:{:.0} RTT:{:.0}MS WIRE:{:.0}KB/S {}",
+                    cfg.fps, cfg.rtt_ms, t.wire_kbps, cfg.style_label
+                )
+            };
             let l5 = if t.neural_bots_on {
                 format!("AI: NEURAL-Z SHARED LATENT ({:.2}MS, {} BOTS)", t.bot_infer_ms, t.active_bots)
             } else {
@@ -1283,7 +1461,9 @@ pub fn build_hud(
         } else {
             [0.36, 0.86, 1.00, 1.0]
         };
-        let alt_tag = if cfg.z16_active {
+        let alt_tag = if macro_planet {
+            format!("ALT:{:.0}M", (p.z - 24.0).max(0.0))
+        } else if cfg.z16_active {
             format!("Z:{:.1}M", p.z)
         } else if p.class_id == CLASS_SKYWING && p.z >= 1.35 {
             "AIR".to_string()
@@ -1349,7 +1529,9 @@ pub fn build_hud(
         let phys_native = entities.map(|e| e.telemetry.physics_native).unwrap_or(false);
 
         // Controls hint bar at bottom
-        let hint_bar = if cfg.z16_active {
+        let hint_bar = if macro_planet {
+            format!("F5 CAM:{}  WHEEL ZOOM  Q/Z ORBIT  F2 SKYWING  LMB/RMB/E/R", cfg.camera_preset_label)
+        } else if cfg.z16_active {
             if phys_native {
                 format!("1-3 MAT [/] R={:.1}  Y STYLE  G:SQD  F1-F3/F8/F10 ARCH  F4", cfg.focus_radius)
             } else {

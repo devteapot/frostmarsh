@@ -1291,6 +1291,7 @@ dependencies = [
  "bytes",
  "clap",
  "cpal",
+ "field-core",
  "frostmarsh-proto",
  "glam",
  "image",

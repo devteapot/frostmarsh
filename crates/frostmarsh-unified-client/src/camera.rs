@@ -1,6 +1,448 @@
 //! Rotatable MOBA Camera with Dynamic F5 Presets, Floating-Origin GPU Math & 2048px Texel-Snapped Shadow Frustum.
 
-use glam::{Mat4, Vec3};
+use glam::{DVec3, Mat4, Vec3};
+
+// =============================================================================
+// Wave 34B: Playable Locally-Flat Macro Planet Camera (R = 1,304 m, f64 Geodesic)
+//           4-Stage F5 Cycle: Ground3rdPerson -> SkywingFlight -> Stratosphere -> OrbitalGlobe
+// =============================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MacroPlanetCamMode {
+    Ground3rdPerson,
+    SkywingFlight,
+    Stratosphere,
+    OrbitalGlobe,
+}
+
+impl MacroPlanetCamMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Ground3rdPerson => Self::SkywingFlight,
+            Self::SkywingFlight => Self::Stratosphere,
+            Self::Stratosphere => Self::OrbitalGlobe,
+            Self::OrbitalGlobe => Self::Ground3rdPerson,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ground3rdPerson => "GROUND",
+            Self::SkywingFlight => "FLIGHT",
+            Self::Stratosphere => "STRATO",
+            Self::OrbitalGlobe => "ORBIT",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub struct MacroPlanetCameraMatrices {
+    /// Exact `f64` planet-centered eye position (meters).
+    pub eye_f64: [f64; 3],
+    /// Exact `f64` planet-centered look target (meters).
+    pub target_f64: [f64; 3],
+    /// Exact `f64` radial/camera up unit vector.
+    pub up_f64: [f64; 3],
+    /// Camera-relative view matrix (camera sits strictly at `Vec3::ZERO`!).
+    pub view: Mat4,
+    pub proj: Mat4,
+    /// Camera-relative view-projection matrix (`proj * view`, camera at `Vec3::ZERO`).
+    pub vp: Mat4,
+    pub inv_vp: Mat4,
+    pub focal_px: f32,
+}
+
+impl MacroPlanetCameraMatrices {
+    /// Convert to `CameraMatrices` (origin = `Vec3::ZERO`, `vp` is camera-relative) so `hud.rs`
+    /// can project `world_f64_to_camera_rel_f32(world_pos_f64, eye_f64)` with zero `f32` jitter!
+    pub fn to_hud_camera_matrices(&self) -> CameraMatrices {
+        let fwd_d = (DVec3::from_array(self.target_f64) - DVec3::from_array(self.eye_f64))
+            .normalize_or(DVec3::NEG_Z);
+        let fwd = Vec3::new(fwd_d.x as f32, fwd_d.y as f32, fwd_d.z as f32);
+        CameraMatrices {
+            origin: Vec3::ZERO,
+            rel_eye: Vec3::ZERO,
+            fwd,
+            view: self.view,
+            proj: self.proj,
+            vp: self.vp,
+            light_vp: Mat4::IDENTITY,
+            focal_px: self.focal_px,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MacroPlanetCamera {
+    pub mode: MacroPlanetCamMode,
+    pub orbit_yaw: f64,
+    pub orbit_pitch: f64,
+    /// Distance from hero (Ground/Flight/Strato) or from planet center (OrbitalGlobe, >= 1450m).
+    pub orbit_dist: f64,
+    pub smoothed_up: DVec3,
+    pub smoothed_fwd: DVec3,
+    pub eye_f64: DVec3,
+    pub target_f64: DVec3,
+    pub up_f64: DVec3,
+    pub initialized: bool,
+    pub fov_y_deg: f32,
+    pub near: f32,
+    pub far: f32,
+    pub exposure: f32,
+}
+
+impl MacroPlanetCamera {
+    pub fn new(r_surf: f64) -> Self {
+        let r = r_surf.max(100.0);
+        let eye = DVec3::new(0.0, 0.0, r + 6.0);
+        Self {
+            mode: MacroPlanetCamMode::Ground3rdPerson,
+            orbit_yaw: 0.0,
+            orbit_pitch: 0.22,
+            orbit_dist: 12.0,
+            smoothed_up: DVec3::Z,
+            smoothed_fwd: DVec3::X,
+            eye_f64: eye,
+            target_f64: DVec3::new(15.0, 0.0, r + 1.5),
+            up_f64: DVec3::Z,
+            initialized: false,
+            fov_y_deg: 56.0,
+            near: 0.25,
+            far: 2800.0,
+            exposure: 1.06,
+        }
+    }
+
+    pub fn tangent_move_basis_f64(&self, hero_up: DVec3) -> (DVec3, DVec3) {
+        let up = hero_up.normalize_or(DVec3::Y);
+        let raw_look = (self.target_f64 - self.eye_f64).normalize_or(self.smoothed_fwd);
+        let mut fwd = (raw_look - up * raw_look.dot(up)).normalize_or_zero();
+        if fwd.length_squared() < 0.15 {
+            fwd = (self.smoothed_fwd - up * self.smoothed_fwd.dot(up)).normalize_or_zero();
+        }
+        if fwd.length_squared() < 0.15 {
+            fwd = if up.y.abs() < 0.9 {
+                DVec3::Y.cross(up).normalize()
+            } else {
+                DVec3::X.cross(up).normalize()
+            };
+        }
+        let right = fwd.cross(up).normalize_or(DVec3::X);
+        (fwd, right)
+    }
+
+    pub fn drag_orbit(&mut self, dx: f32, dy: f32) {
+        self.orbit_yaw -= dx as f64 * 0.006;
+        self.orbit_pitch = (self.orbit_pitch + dy as f64 * 0.005).clamp(-1.32, 1.32);
+    }
+
+    /// Smooth continuous scroll-wheel zoom all the way from Ground (`6 m`) to Full Orbit (`4,600 m`)!
+    pub fn zoom(&mut self, delta: f32) {
+        let factor = (1.0 - (delta as f64) * 0.045).clamp(0.70, 1.45);
+        self.orbit_dist = (self.orbit_dist * factor).clamp(6.0, 4600.0);
+        self.mode = if self.orbit_dist < 36.0 {
+            MacroPlanetCamMode::Ground3rdPerson
+        } else if self.orbit_dist < 260.0 {
+            MacroPlanetCamMode::SkywingFlight
+        } else if self.orbit_dist < 1350.0 {
+            MacroPlanetCamMode::Stratosphere
+        } else {
+            MacroPlanetCamMode::OrbitalGlobe
+        };
+    }
+
+    /// Cycle through the 4 signature altitudes via `F5`: GROUND -> FLIGHT -> STRATO -> ORBIT.
+    pub fn cycle_mode(&mut self) {
+        self.mode = self.mode.next();
+        match self.mode {
+            MacroPlanetCamMode::Ground3rdPerson => {
+                self.orbit_dist = 12.0;
+                self.orbit_pitch = 0.22;
+                self.fov_y_deg = 56.0;
+                self.exposure = 1.06;
+            }
+            MacroPlanetCamMode::SkywingFlight => {
+                self.orbit_dist = 85.0;
+                self.orbit_pitch = 0.36;
+                self.fov_y_deg = 58.0;
+                self.exposure = 1.08;
+            }
+            MacroPlanetCamMode::Stratosphere => {
+                self.orbit_dist = 550.0;
+                self.orbit_pitch = 0.55;
+                self.fov_y_deg = 60.0;
+                self.exposure = 1.14;
+            }
+            MacroPlanetCamMode::OrbitalGlobe => {
+                self.orbit_dist = 3250.0;
+                self.orbit_pitch = 0.24;
+                self.fov_y_deg = 52.0;
+                self.exposure = 1.22;
+            }
+        }
+    }
+
+    /// Smooth `f64` geodesic follow & seamless Ground -> Flight -> Stratosphere -> Orbit transition.
+    pub fn update_follow(
+        &mut self,
+        hero_world_pos: DVec3,
+        hero_tangent_fwd: DVec3,
+        r_surf: f64,
+        dt: f32,
+    ) {
+        let hero_up = hero_world_pos.normalize_or(DVec3::Z);
+        let dt_c = (dt as f64).clamp(0.001, 0.1);
+        let alpha_up = if !self.initialized { 1.0 } else { 1.0 - (-8.0 * dt_c).exp() };
+        let alpha_pos = if !self.initialized { 1.0 } else { 1.0 - (-10.0 * dt_c).exp() };
+
+        // Geodesic slerp of radial UP across seams & poles
+        let dot_u = self.smoothed_up.dot(hero_up).clamp(-1.0, 1.0);
+        if !self.initialized {
+            self.smoothed_up = hero_up;
+        } else if dot_u < 0.99999 {
+            let omega = dot_u.acos();
+            let sin_o = omega.sin();
+            if sin_o > 1e-5 {
+                let w0 = ((1.0 - alpha_up) * omega).sin() / sin_o;
+                let w1 = (alpha_up * omega).sin() / sin_o;
+                self.smoothed_up = (self.smoothed_up * w0 + hero_up * w1).normalize_or(hero_up);
+            } else {
+                self.smoothed_up = self.smoothed_up.lerp(hero_up, alpha_up).normalize_or(hero_up);
+            }
+        } else {
+            self.smoothed_up = hero_up;
+        }
+
+        // Parallel-transport tangent forward perpendicular to `smoothed_up`
+        let proj_cur = (self.smoothed_fwd - self.smoothed_up * self.smoothed_fwd.dot(self.smoothed_up))
+            .normalize_or_zero();
+        let proj_tgt = (hero_tangent_fwd - self.smoothed_up * hero_tangent_fwd.dot(self.smoothed_up))
+            .normalize_or_zero();
+        let fallback_fwd = if self.smoothed_up.y.abs() < 0.9 {
+            DVec3::Y.cross(self.smoothed_up).normalize()
+        } else {
+            DVec3::X.cross(self.smoothed_up).normalize()
+        };
+        if !self.initialized {
+            self.smoothed_fwd = if proj_tgt.length_squared() > 0.25 { proj_tgt } else { fallback_fwd };
+        } else if proj_cur.length_squared() > 0.25 {
+            self.smoothed_fwd = proj_cur;
+        } else if proj_tgt.length_squared() > 0.25 {
+            self.smoothed_fwd = proj_tgt;
+        } else {
+            self.smoothed_fwd = fallback_fwd;
+        }
+
+        let tang_r = self.smoothed_fwd.cross(self.smoothed_up).normalize_or(DVec3::X);
+        let look_dir = (self.smoothed_fwd * self.orbit_yaw.cos()
+            + tang_r * self.orbit_yaw.sin())
+        .normalize_or(self.smoothed_fwd);
+
+        let (des_eye, des_tgt, des_up, fov, near, far, exp) = match self.mode {
+            MacroPlanetCamMode::Ground3rdPerson => {
+                // Classic over-the-shoulder 3rd-person (~12m behind, ~4.5m above hero) on 1m flat ground!
+                let back_d = self.orbit_dist.clamp(6.0, 35.0);
+                let up_h = (back_d * 0.36).clamp(3.0, 14.0);
+                let eye = hero_world_pos + self.smoothed_up * up_h - look_dir * back_d;
+                let tgt = hero_world_pos + look_dir * 32.0 + self.smoothed_up * 2.2;
+                (eye, tgt, self.smoothed_up, 56.0, 0.25, 2900.0, 1.06)
+            }
+            MacroPlanetCamMode::SkywingFlight => {
+                // Dramatic Skywing flight (~85m above hero) framing coastline, Sky-Island & curving horizon!
+                let alt = self.orbit_dist.clamp(36.0, 260.0);
+                let back_d = alt * 0.82;
+                let eye = hero_world_pos + self.smoothed_up * alt - look_dir * back_d;
+                let tgt = hero_world_pos + look_dir * (alt * 1.45) + self.smoothed_up * 8.0;
+                (eye, tgt, self.smoothed_up, 58.0, 0.8, 4600.0, 1.08)
+            }
+            MacroPlanetCamMode::Stratosphere => {
+                // High stratosphere (~550m above hero) where sky fades to starry space & limb bends vividly!
+                let alt = self.orbit_dist.clamp(260.0, 1349.0);
+                let eye_dir = (hero_up - look_dir * (alt * 0.42 / r_surf.max(100.0))).normalize();
+                let eye = eye_dir * (r_surf + alt);
+                let tgt_dir = (hero_up + look_dir * (alt * 0.65 / r_surf.max(100.0))).normalize();
+                let tgt = tgt_dir * r_surf;
+                (eye, tgt, eye_dir, 60.0, 4.0, 7200.0, 1.14)
+            }
+            MacroPlanetCamMode::OrbitalGlobe => {
+                // Full orbital space view (~3,250m from center) showing the entire R=1,304m planet & Coriolis storms!
+                let cp = self.orbit_pitch.cos();
+                let sp = self.orbit_pitch.sin();
+                let dir = DVec3::new(self.orbit_yaw.sin() * cp, sp, self.orbit_yaw.cos() * cp).normalize();
+                let dist = self.orbit_dist.clamp(2100.0, 4600.0);
+                let eye = dir * dist;
+                let up_ref = if dir.y.abs() > 0.96 { DVec3::NEG_Z } else { DVec3::Y };
+                (eye, DVec3::ZERO, up_ref, 52.0, 25.0, 11000.0, 1.22)
+            }
+        };
+
+        self.eye_f64 = self.eye_f64.lerp(des_eye, alpha_pos);
+        self.target_f64 = self.target_f64.lerp(des_tgt, alpha_pos);
+        self.up_f64 = self.up_f64.lerp(des_up, alpha_pos).normalize_or(des_up);
+        self.fov_y_deg = fov;
+        self.near = near;
+        self.far = far;
+        self.exposure = exp;
+        self.initialized = true;
+    }
+
+    pub fn compute_matrices(&self, rt_w: f32, rt_h: f32) -> MacroPlanetCameraMatrices {
+        let aspect = (rt_w / rt_h.max(1.0)).max(0.1);
+        let fwd_d = (self.target_f64 - self.eye_f64).normalize_or(DVec3::NEG_Z);
+        let up_d = self.up_f64.normalize_or(DVec3::Y);
+        let safe_up_d = if fwd_d.dot(up_d).abs() > 0.995 {
+            if up_d.y.abs() < 0.9 { DVec3::Y } else { DVec3::X }
+        } else {
+            up_d
+        };
+        let fwd = Vec3::new(fwd_d.x as f32, fwd_d.y as f32, fwd_d.z as f32).normalize_or(Vec3::NEG_Z);
+        let up = Vec3::new(safe_up_d.x as f32, safe_up_d.y as f32, safe_up_d.z as f32).normalize_or(Vec3::Y);
+
+        // Floating-origin camera-relative matrix: eye sits strictly at Vec3::ZERO!
+        let view = glam::camera::rh::view::look_at_mat4(Vec3::ZERO, fwd, up);
+        let fov_rad = self.fov_y_deg.to_radians();
+        let proj = glam::camera::rh::proj::directx::perspective(
+            fov_rad,
+            aspect,
+            self.near.max(0.1),
+            self.far.max(100.0),
+        );
+        let vp = proj * view;
+        let inv_vp = vp.inverse();
+        let focal_px = (rt_h * 0.5) / (fov_rad * 0.5).tan();
+        MacroPlanetCameraMatrices {
+            eye_f64: self.eye_f64.to_array(),
+            target_f64: self.target_f64.to_array(),
+            up_f64: safe_up_d.to_array(),
+            view,
+            proj,
+            vp,
+            inv_vp,
+            focal_px,
+        }
+    }
+
+    /// Headless Shot 1: Ground 3rd-Person Hero Shot on locally-flat 1m terrain framing hero, bots & Sky-Island!
+    pub fn ground_3rd_person_shot(hero_pos: DVec3, hero_fwd: DVec3, sky_island_dir: DVec3) -> Self {
+        let up = hero_pos.normalize_or(DVec3::Z);
+        let to_isl = (sky_island_dir - up * sky_island_dir.dot(up)).normalize_or_zero();
+        let mut fwd = if to_isl.length_squared() > 0.1 {
+            to_isl
+        } else {
+            (hero_fwd - up * hero_fwd.dot(up)).normalize_or_zero()
+        };
+        if fwd.length_squared() < 0.15 {
+            fwd = if up.y.abs() < 0.9 { DVec3::Y.cross(up).normalize() } else { DVec3::X.cross(up).normalize() };
+        }
+        let right = fwd.cross(up).normalize_or(DVec3::X);
+        let eye = hero_pos + up * 4.8 - fwd * 12.5 + right * 2.2;
+        let tgt = hero_pos + fwd * 42.0 + up * 4.5;
+        Self {
+            mode: MacroPlanetCamMode::Ground3rdPerson,
+            orbit_yaw: 0.0,
+            orbit_pitch: 0.22,
+            orbit_dist: 12.5,
+            smoothed_up: up,
+            smoothed_fwd: fwd,
+            eye_f64: eye,
+            target_f64: tgt,
+            up_f64: up,
+            initialized: true,
+            fov_y_deg: 56.0,
+            near: 0.25,
+            far: 2900.0,
+            exposure: 1.06,
+        }
+    }
+
+    /// Headless Shot 2: Skywing Flight Action Shot (~95m altitude) framing Sky-Island, coastline & curving horizon!
+    pub fn skywing_flight_shot(hero_pos: DVec3, hero_fwd: DVec3, sky_island_dir: DVec3, r_surf: f64) -> Self {
+        let up = hero_pos.normalize_or(DVec3::Z);
+        let to_isl = (sky_island_dir - up * sky_island_dir.dot(up)).normalize_or_zero();
+        let mut fwd = if to_isl.length_squared() > 0.1 {
+            to_isl
+        } else {
+            (hero_fwd - up * hero_fwd.dot(up)).normalize_or_zero()
+        };
+        if fwd.length_squared() < 0.15 {
+            fwd = if up.y.abs() < 0.9 { DVec3::Y.cross(up).normalize() } else { DVec3::X.cross(up).normalize() };
+        }
+        let right = fwd.cross(up).normalize_or(DVec3::X);
+        let flight_dir = (up - fwd * (44.0 / r_surf.max(100.0)) - right * (58.0 / r_surf.max(100.0))).normalize();
+        let eye = flight_dir * (r_surf + 95.0);
+        let tgt = hero_pos + fwd * 68.0 + up * 22.0;
+        Self {
+            mode: MacroPlanetCamMode::SkywingFlight,
+            orbit_yaw: 0.0,
+            orbit_pitch: 0.36,
+            orbit_dist: 95.0,
+            smoothed_up: flight_dir,
+            smoothed_fwd: fwd,
+            eye_f64: eye,
+            target_f64: tgt,
+            up_f64: flight_dir,
+            initialized: true,
+            fov_y_deg: 58.0,
+            near: 0.8,
+            far: 4600.0,
+            exposure: 1.08,
+        }
+    }
+
+    /// Headless Shot 3: Stratosphere (~550m altitude) — curving planetary limb fading into cosmic starfield!
+    pub fn stratosphere_shot(hero_pos: DVec3, hero_fwd: DVec3, r_surf: f64) -> Self {
+        let up = hero_pos.normalize_or(DVec3::Z);
+        let mut fwd = (hero_fwd - up * hero_fwd.dot(up)).normalize_or_zero();
+        if fwd.length_squared() < 0.15 {
+            fwd = if up.y.abs() < 0.9 { DVec3::Y.cross(up).normalize() } else { DVec3::X.cross(up).normalize() };
+        }
+        let right = fwd.cross(up).normalize_or(DVec3::X);
+        let strat_dir = (up - fwd * (240.0 / r_surf.max(100.0)) - right * (120.0 / r_surf.max(100.0))).normalize();
+        let eye = strat_dir * (r_surf + 550.0);
+        let tgt = (up + fwd * (390.0 / r_surf.max(100.0))).normalize() * r_surf;
+        Self {
+            mode: MacroPlanetCamMode::Stratosphere,
+            orbit_yaw: 0.0,
+            orbit_pitch: 0.55,
+            orbit_dist: 550.0,
+            smoothed_up: strat_dir,
+            smoothed_fwd: fwd,
+            eye_f64: eye,
+            target_f64: tgt,
+            up_f64: strat_dir,
+            initialized: true,
+            fov_y_deg: 60.0,
+            near: 4.0,
+            far: 7200.0,
+            exposure: 1.14,
+        }
+    }
+
+    /// Headless Shot 4: Full Orbital Globe (~3,250m) framing spinning R=1,304m planet, Coriolis storms & Terminator!
+    pub fn orbital_globe_shot(sun_dir: DVec3, _r_surf: f64) -> Self {
+        let sun = sun_dir.normalize_or(DVec3::new(-0.72, 0.36, 0.59).normalize());
+        let perp = DVec3::Y.cross(sun).normalize_or(DVec3::Z);
+        let cam_dir = (sun * 0.24 + perp * 0.91 + DVec3::Y * 0.26).normalize();
+        let dist = 3250.0;
+        Self {
+            mode: MacroPlanetCamMode::OrbitalGlobe,
+            orbit_yaw: cam_dir.x.atan2(cam_dir.z),
+            orbit_pitch: cam_dir.y.asin(),
+            orbit_dist: dist,
+            smoothed_up: DVec3::Y,
+            smoothed_fwd: -cam_dir,
+            eye_f64: cam_dir * dist,
+            target_f64: DVec3::ZERO,
+            up_f64: DVec3::Y,
+            initialized: true,
+            fov_y_deg: 52.0,
+            near: 25.0,
+            far: 11000.0,
+            exposure: 1.24,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PlanetCamMode {

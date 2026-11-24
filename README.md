@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Waves 31-32 Live Multiplayer 6-Face Cubed-Sphere Planet — WorldModel3D-v8 CUDA FP16 (op=12), 60 Geodesic Bots Crossing All 12 Seams, Orbital Sky-Ring Buoyant Cores, Sweeping Solar Terminator & 228 FPS 1080p / 128 FPS 4K Metal](models/unified_iter32_live_planet/unified_live_1080p_hud.png)
+![Frostmarsh Waves 34-35 Live Playable Locally-Flat R=1,304m Dual-Scale Planet — 1.61B Virtual Voxels, Live op=13 PlanetaryClimateNet Coriolis Storms (5.4ms GB10), WorldModel3D-v8 1m Shards, 60 Bots & 219-248 FPS Metal](models/unified_iter34_macro_planet/unified_orbit_4view.png)
 
 ---
 
@@ -145,11 +145,16 @@
 - **Iteration 33 — Locally-Flat `R = 1,300 m` Dual-Scale Planet (`1.61B` Virtual Voxels) & Purpose-Built `PlanetaryClimateNet` (`169 Hz` Coriolis/Hadley/Storms):**
   - **Purpose-Built `PlanetaryClimateNet` (`ml/planetary_climate.py`, `ml/train_planetary_climate.py`, `planetary_climate_v1.pt`, [PLANETARY_CLIMATE_METRICS.json](models/PLANETARY_CLIMATE_METRICS.json), [planetary_climate_viz.png](models/planetary_climate_viz.png), `286.7K` params):** `C4/SO(2)` gauge-equivariant 6-face cubed-sphere neural climate operator (`6×64²×4 = 98,304` macro cells) with strictly antisymmetric moisture/ash flux conservation and zero hardcoded Coriolis equations. On held-out unseen planets: **`0.9972` 1-step `R²`** (`T=1.0000`, `W=0.9837`, `M=0.9997`, `P=0.9999`, `Ash=0.9998`), **`0.9695` 20-step autoregressive `R²`**, exact **Northern (`+0.0276` CCW) vs Southern (`-0.0272` CW) Coriolis storm polarity (`0.9974` correlation)**, `200`-tick (`2.5`-day) rollout stability (`0` NaNs, moisture drift `1.19e-7`, ash drift `6.86e-8`, `+23.86 K` Day-Night land split), verified **AMR Macro↔Micro coupling** (`[6, 64, 256, 256]` world-law downscale + `7.6%` cross-seam volcanic ash plume causing `-2.81 K` downwind radiative cooling), running live on **NVIDIA GB10 FP16 in `5.90 ms` (`169.4 Hz`, `117.6 MB` VRAM)**!
   - **Locally-Flat `R = 1,304 m` Dual-Scale Planetary Core & Metal Scale-Transition Proof (`crates/field-core/src/planet_macro.rs`, `crates/frostmarsh-3d-sandbox/src/bin/planet_horizon_demo.rs`, [PLANET_HORIZON_METRICS.json](models/PLANET_HORIZON_METRICS.json), `32/32` `field-core` tests, `0` warnings):** Tiles all 6 faces into **`6 × 8×8 = 384` on-demand `256×256×64` `1 m` shards (`1,610,612,736` = `1.61B` virtual voxels, `8.19 km` circumference, `0.96 m` horizon drop over `50 m` — 100% locally flat on foot!)** with verified `1,536`-edge cross-shard/cross-face exact involution (`det == +1`), `1.36e-7 m` `f64` floating-origin precision (even at `6,371 km` Earth scale!), `93.8 ms` shard hydration, and bit-exact `0 / 0` conservation across rotated cube-face shard seams + climate coupling. Renders seamless **Flat Ground (`2.5 m`) → Skywing Flight (`120 m`) → Stratosphere (`600 m`) → Full Orbit (`3,300 m`)** on Apple M4 Pro Metal (`730.8K` tris) at **`315.0 FPS` Ground / `379.1 FPS` Orbital @ 1080p (`95.6–134.8 FPS` @ 4K)**!
+- **Iterations 34–35 — Live Playable Locally-Flat `R = 1,304 m` Planet (`--planet-macro`, Live `op=13` `PlanetaryClimateNet` + `WorldModel3D-v8` + `219–248 FPS` Floating-Origin Metal Client):**
+  - **Live `op=13` (`OP_PLANET_CLIMATE_STEP`) + `frostmarsh-server --planet-macro` (`ml/gpu_infer_daemon.py`, `crates/frostmarsh-server/src/macro_planet_runtime.rs`, `19/19` server + `5/5` proto tests, `0` warnings):** Runs **`PlanetaryClimateNet` (`op=13`, `5.4–6.4 ms` CUDA FP16)** alongside **`WorldModel3D-v8` (`op=11`)** live on NVIDIA GB10 (`backend=cuda-fp16-macro-climate+v8`, **`mass_err == 0 && energy_err == 0`**), streaming live `64×64` Coriolis storm/cloud/ash/temp overlays (`PlanetMacroClimateFace`) + on-demand `16×16×16` cubic `1 m` shard sub-bricks (`PlanetShardBrick3D` / `Delta`, skipping **`41.9–42.9%`** sky/mantle cubes, **`100.3 KB/s`** steady-state QUIC wire!), 60 live 5-archetype bots, 6 planetary shrines, and `/collapse_isle` + `/erupt` AMR volcanic ash-plume upscale commands!
+  - **Live Dual-Scale Floating-Origin Spherical Clipmap inside `frostmarsh-unified-client` (`macro_planet_world.rs`, `macro_planet_live.wgsl`, `8/8` client tests, `0` warnings):** Spawns you directly in **3rd-person `Ground` mode** behind your hero on locally-flat `1 m` Nordic terrain with camera-relative 6-DOF `WASD`, `Q/Z`/`←/→` turning, `LMB/RMB/E/R` live beams, continuous ground-to-orbit scroll zoom, and **`F5`** cycling **Ground (`1 m` Flat) ↔ Skywing Flight ↔ Stratosphere ↔ Full Orbital Globe** with live `PlanetaryClimateNet` storm clouds — verified LIVE over QUIC on Apple M4 Pro Metal (`419.3K` tris + 60 bots + HUD) at **`218.6 FPS` Ground / `248.1 FPS` Orbital @ 1080p (`74.0–97.4 FPS` @ 4K)**!
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
 | World Scale & Mode | Render Mode | Resolution | p50 Frame Time | FPS |
 |---|---|---|---:|---:|
+| **`6×2048²×64` Live Macro Planet (`1.61B` vox, `R=1,304m`, `op=13+11`)** | **Floating-Origin Dual-Scale `1 m` Ground + 60 Bots + HUD** | **1920×1080** | **`4.58 ms`** | **218.6 FPS** |
+| **`6×2048²×64` Live Macro Planet (`1.61B` vox, `R=1,304m`, `op=13+11`)** | **Floating-Origin Orbital + Live Coriolis Climate + HUD** | **1920×1080 / 4K** | **`4.03 / 10.27 ms`** | **248.1 / 97.4 FPS** |
 | **`6×64²×32` Live Cubed-Sphere Planet (`786K` vox, 60P, `op=12` v8)** | **Curved 6-Face Spherical Metal (`155K` tris) + 60 Bots + HUD** | **1920×1080** | **`4.38 ms`** | **228.4 FPS** |
 | **`6×64²×32` Live Cubed-Sphere Planet (`786K` vox, 60P, `op=12` v8)** | **Curved 6-Face Spherical Metal (`155K` tris) + 60 Bots + HUD** | **3840×2160 (4K)** | **`7.83 ms`** | **127.6 FPS** |
 | **`256×256×64` (4.19M vox Sky-Isles & Abyss, 60P)** | **Cubic `16³` Surface-Nets (`410K` tris) + Clean 3D** | **1920×1080** | **`9.09 ms`** | **110.0 FPS** |
@@ -167,6 +172,10 @@
 ---
 
 ## Visual Showcase
+
+| Live Playable `R=1,304 m` Macro Planet (`219 FPS` Ground 3rd-Person, `op=13` Climate `5.4ms`) | Live Skywing Flight (`1.61B` Virtual Vox, Floating Sky-Island, Pine Continent & Horizon) |
+|---|---|
+| ![Live Playable Macro Planet Ground 3rd-Person with HUD](models/unified_iter34_macro_planet/unified_live_1080p_hud.png) | ![Live Macro Planet Skywing Flight over Continent and Sky-Island](models/unified_iter34_macro_planet/unified_closeup_action_1080p.png) |
 
 | Dual-Scale `R=1,300 m` Planet (`1.61B` Virtual Vox, Ground Flat → Orbit, `315–379 FPS` Metal) | Purpose-Built `PlanetaryClimateNet` (`169 Hz` GB10 FP16, `0.997` R², Coriolis & AMR Plumes) |
 |---|---|

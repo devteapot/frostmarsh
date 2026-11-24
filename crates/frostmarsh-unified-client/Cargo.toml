@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 frostmarsh-proto = { path = "../frostmarsh-proto" }
+field-core = { path = "../field-core" }
 wgpu = "30.0.2"
 winit = "0.30"
 glam = "0.33"

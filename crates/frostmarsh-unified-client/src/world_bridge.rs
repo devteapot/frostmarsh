@@ -2760,6 +2760,15 @@ mod tests {
                 sun_dir: [0.0, 1.0, 0.0],
                 seam_mass_crossed: 0,
                 active_sky_cores: 0,
+                macro_planet: false,
+                planet_shards_per_axis: 0,
+                planet_seed: 0,
+                climate_infer_ms: 0.0,
+                active_hydrated_shards: 0,
+                local_wind_u: 0.0,
+                local_wind_v: 0.0,
+                local_temp_c: 0.0,
+                local_cloud_cover: 0.0,
             },
             bot_brains,
             kill_feed: Vec::new(),
@@ -2905,6 +2914,7 @@ mod tests {
                     cave_enclosure: 0.0,
                     show_squad_links: true,
                     camera_preset_label: "TACTICAL",
+                    macro_eye_f64: None,
                 },
             );
             assert!(!hud_batch.vertices.is_empty());

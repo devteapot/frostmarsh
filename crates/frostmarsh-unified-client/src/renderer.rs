@@ -9,8 +9,9 @@
 //!   5. Stage B 1-Tap Blit (`blit_pass.wgsl` -> native output)
 //!   6. Native-Res GPU 2D Action-MMO HUD + Live 256×256 Tactical Minimap (`hud_pass.wgsl`)
 
-use crate::camera::{CameraMatrices, MobaCamera, PlanetCameraMatrices};
+use crate::camera::{CameraMatrices, MacroPlanetCameraMatrices, MobaCamera, PlanetCameraMatrices};
 use crate::hud::{HudBatch, HudVertex};
+use crate::macro_planet_world::{MacroPlanetVertex, MacroPlanetWorld, MACRO_CLIMATE_RES};
 use crate::mesh_gen::{MeshInstance, MeshSlice, MeshVertex, StaticMeshBank, MESH_KIND_COUNT};
 use crate::neural_style::{build_neural_style_weights, NUM_Z16_STYLES};
 pub use crate::neural_style::z16_style_label;
@@ -20,6 +21,7 @@ use crate::surfel_gen::{SplatPlacement, SplatProto, SplatRef, SurfelProtoBank};
 use crate::world_bridge::{AssembledFrame, VolSplat};
 use crate::z16_world::{SurfaceVertex, Z16World, OCC_BRICK_SIZE, SN_BRICK_SIZE};
 use bytemuck::{Pod, Zeroable};
+use field_core::planet_macro::world_f64_to_camera_rel_f32;
 use frostmarsh_proto::{WEATHER_BLIZZARD, WEATHER_EMBER, WEATHER_SQUALL};
 use glam::Vec3;
 use std::borrow::Cow;
@@ -102,6 +104,19 @@ struct PlanetUniforms {
     sun_dir: [f32; 4],    // xyz, r_ocean
     planet_cfg: [f32; 4], // r_core, r_surf_atmo, r_atmo_outer, exposure
     viewport: [f32; 4],   // width, height, 1/width, 1/height
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MacroPlanetUniforms {
+    view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    cam_pos: [f32; 4],        // xyz = planet-centered camera pos, w = sim_time
+    model_offset: [f32; 4],   // xyz = (mesh_origin_f64 - cam_pos_f64) as f32, w = r_ocean
+    sun_dir: [f32; 4],        // xyz = normalized sun dir, w = r_cloud_shell
+    planet_cfg: [f32; 4],     // r_core, r_surf_atmo, r_atmo_outer, exposure
+    viewport: [f32; 4],       // width, height, 1/width, 1/height
+    climate_params: [f32; 4], // local_wind_u, local_wind_v, local_cloud_cover, has_live_climate
 }
 
 const STYLE_PARAMS_STRIDE: u64 = 256;
@@ -428,6 +443,56 @@ pub struct Approach4Renderer {
     planet_ent_fx_vcap: usize,
     planet_ent_fx_ibuf: wgpu::Buffer,
     planet_ent_fx_icap: usize,
+
+    // Wave 34B: Live Locally-Flat R=1,304m Dual-Scale Macro Planet + PlanetaryClimateNet Metal Pipelines
+    pipe_macro_starfield: wgpu::RenderPipeline,
+    pipe_macro_solid: wgpu::RenderPipeline,
+    pipe_macro_ocean: wgpu::RenderPipeline,
+    pipe_macro_translucent: wgpu::RenderPipeline,
+    pipe_macro_resolve: wgpu::RenderPipeline,
+    macro_climate_tex: wgpu::Texture,
+    macro_uni_near_buf: wgpu::Buffer,
+    macro_uni_near_bg: wgpu::BindGroup,
+    macro_uni_global_buf: wgpu::Buffer,
+    macro_uni_global_bg: wgpu::BindGroup,
+    macro_t_vbuf: wgpu::Buffer,
+    macro_t_vcap: usize,
+    macro_t_ibuf: wgpu::Buffer,
+    macro_t_icap: usize,
+    macro_t_icount: u32,
+    macro_o_vbuf: wgpu::Buffer,
+    macro_o_vcap: usize,
+    macro_o_ibuf: wgpu::Buffer,
+    macro_o_icap: usize,
+    macro_o_icount: u32,
+    macro_sky_vbuf: wgpu::Buffer,
+    macro_sky_vcap: usize,
+    macro_sky_ibuf: wgpu::Buffer,
+    macro_sky_icap: usize,
+    macro_sky_icount: u32,
+    near_t_vbuf: wgpu::Buffer,
+    near_t_vcap: usize,
+    near_t_ibuf: wgpu::Buffer,
+    near_t_icap: usize,
+    near_t_icount: u32,
+    near_o_vbuf: wgpu::Buffer,
+    near_o_vcap: usize,
+    near_o_ibuf: wgpu::Buffer,
+    near_o_icap: usize,
+    near_o_icount: u32,
+    near_g_vbuf: wgpu::Buffer,
+    near_g_vcap: usize,
+    near_g_ibuf: wgpu::Buffer,
+    near_g_icap: usize,
+    near_g_icount: u32,
+    macro_ent_solid_vbuf: wgpu::Buffer,
+    macro_ent_solid_vcap: usize,
+    macro_ent_solid_ibuf: wgpu::Buffer,
+    macro_ent_solid_icap: usize,
+    macro_ent_fx_vbuf: wgpu::Buffer,
+    macro_ent_fx_vcap: usize,
+    macro_ent_fx_ibuf: wgpu::Buffer,
+    macro_ent_fx_icap: usize,
 }
 
 fn make_planet_hdr_targets(
@@ -1718,6 +1783,296 @@ impl Approach4Renderer {
         let planet_ent_fx_vbuf = mk_buf(planet_ent_fx_vcap * pv_stride, wgpu::BufferUsages::VERTEX);
         let planet_ent_fx_ibuf = mk_buf(planet_ent_fx_icap * 4, wgpu::BufferUsages::INDEX);
 
+        // Wave 34B: Live Dual-Scale Macro Planet + PlanetaryClimateNet 6-Layer Array Texture Pipelines
+        let macro_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("macro_planet_live_wgsl"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                "../assets/shaders/macro_planet_live.wgsl"
+            ))),
+        });
+        let macro_climate_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("macro_planet_climate_6x64"),
+            size: wgpu::Extent3d {
+                width: MACRO_CLIMATE_RES as u32,
+                height: MACRO_CLIMATE_RES as u32,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let macro_climate_view = macro_climate_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let macro_climate_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("macro_climate_samp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let macro_uni_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("macro_uni_bgl"),
+            entries: &[
+                ubuf_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let macro_uni_near_buf = mk_ubuf(std::mem::size_of::<MacroPlanetUniforms>());
+        let macro_uni_global_buf = mk_ubuf(std::mem::size_of::<MacroPlanetUniforms>());
+        let macro_uni_near_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("macro_uni_near_bg"),
+            layout: &macro_uni_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: macro_uni_near_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&macro_climate_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&macro_climate_samp) },
+            ],
+        });
+        let macro_uni_global_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("macro_uni_global_bg"),
+            layout: &macro_uni_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: macro_uni_global_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&macro_climate_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&macro_climate_samp) },
+            ],
+        });
+        let macro_hdr_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("macro_hdr_pl"),
+            bind_group_layouts: &[Some(&macro_uni_bgl)],
+            immediate_size: 0,
+        });
+        let macro_res_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("macro_res_pl"),
+            bind_group_layouts: &[Some(&macro_uni_bgl), Some(&planet_resolve_bgl)],
+            immediate_size: 0,
+        });
+
+        let pipe_macro_starfield = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_macro_starfield"),
+            layout: Some(&macro_hdr_pl),
+            vertex: wgpu::VertexState {
+                module: &macro_mod,
+                entry_point: Some("vs_fullscreen"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &macro_mod,
+                entry_point: Some("fs_starfield"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let pipe_macro_solid = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_macro_solid"),
+            layout: Some(&macro_hdr_pl),
+            vertex: wgpu::VertexState {
+                module: &macro_mod,
+                entry_point: Some("vs_macro_planet"),
+                buffers: &[Some(MacroPlanetVertex::desc())],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &macro_mod,
+                entry_point: Some("fs_macro_solid"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let pipe_macro_ocean = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_macro_ocean"),
+            layout: Some(&macro_hdr_pl),
+            vertex: wgpu::VertexState {
+                module: &macro_mod,
+                entry_point: Some("vs_macro_planet"),
+                buffers: &[Some(MacroPlanetVertex::desc())],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &macro_mod,
+                entry_point: Some("fs_macro_ocean"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let pipe_macro_translucent = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_macro_translucent"),
+            layout: Some(&macro_hdr_pl),
+            vertex: wgpu::VertexState {
+                module: &macro_mod,
+                entry_point: Some("vs_macro_planet"),
+                buffers: &[Some(MacroPlanetVertex::desc())],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &macro_mod,
+                entry_point: Some("fs_macro_translucent"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let pipe_macro_resolve = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_macro_resolve"),
+            layout: Some(&macro_res_pl),
+            vertex: wgpu::VertexState {
+                module: &macro_mod,
+                entry_point: Some("vs_fullscreen"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &macro_mod,
+                entry_point: Some("fs_macro_atmosphere_resolve"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: out_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let mv_stride = std::mem::size_of::<MacroPlanetVertex>();
+        let macro_t_vcap = 16_384;
+        let macro_t_icap = 65_536;
+        let macro_o_vcap = 16_384;
+        let macro_o_icap = 65_536;
+        let macro_sky_vcap = 8_192;
+        let macro_sky_icap = 16_384;
+        let near_t_vcap = 16_384;
+        let near_t_icap = 65_536;
+        let near_o_vcap = 8_192;
+        let near_o_icap = 32_768;
+        let near_g_vcap = 2_048;
+        let near_g_icap = 4_096;
+        let macro_ent_solid_vcap = 16_384;
+        let macro_ent_solid_icap = 32_768;
+        let macro_ent_fx_vcap = 16_384;
+        let macro_ent_fx_icap = 32_768;
+
+        let macro_t_vbuf = mk_buf(macro_t_vcap * mv_stride, wgpu::BufferUsages::VERTEX);
+        let macro_t_ibuf = mk_buf(macro_t_icap * 4, wgpu::BufferUsages::INDEX);
+        let macro_o_vbuf = mk_buf(macro_o_vcap * mv_stride, wgpu::BufferUsages::VERTEX);
+        let macro_o_ibuf = mk_buf(macro_o_icap * 4, wgpu::BufferUsages::INDEX);
+        let macro_sky_vbuf = mk_buf(macro_sky_vcap * mv_stride, wgpu::BufferUsages::VERTEX);
+        let macro_sky_ibuf = mk_buf(macro_sky_icap * 4, wgpu::BufferUsages::INDEX);
+        let near_t_vbuf = mk_buf(near_t_vcap * mv_stride, wgpu::BufferUsages::VERTEX);
+        let near_t_ibuf = mk_buf(near_t_icap * 4, wgpu::BufferUsages::INDEX);
+        let near_o_vbuf = mk_buf(near_o_vcap * mv_stride, wgpu::BufferUsages::VERTEX);
+        let near_o_ibuf = mk_buf(near_o_icap * 4, wgpu::BufferUsages::INDEX);
+        let near_g_vbuf = mk_buf(near_g_vcap * mv_stride, wgpu::BufferUsages::VERTEX);
+        let near_g_ibuf = mk_buf(near_g_icap * 4, wgpu::BufferUsages::INDEX);
+        let macro_ent_solid_vbuf = mk_buf(macro_ent_solid_vcap * mv_stride, wgpu::BufferUsages::VERTEX);
+        let macro_ent_solid_ibuf = mk_buf(macro_ent_solid_icap * 4, wgpu::BufferUsages::INDEX);
+        let macro_ent_fx_vbuf = mk_buf(macro_ent_fx_vcap * mv_stride, wgpu::BufferUsages::VERTEX);
+        let macro_ent_fx_ibuf = mk_buf(macro_ent_fx_icap * 4, wgpu::BufferUsages::INDEX);
+
         Ok(Self {
             adapter_name,
             adapter_backend,
@@ -1847,6 +2202,54 @@ impl Approach4Renderer {
             planet_ent_fx_vcap,
             planet_ent_fx_ibuf,
             planet_ent_fx_icap,
+            pipe_macro_starfield,
+            pipe_macro_solid,
+            pipe_macro_ocean,
+            pipe_macro_translucent,
+            pipe_macro_resolve,
+            macro_climate_tex,
+            macro_uni_near_buf,
+            macro_uni_near_bg,
+            macro_uni_global_buf,
+            macro_uni_global_bg,
+            macro_t_vbuf,
+            macro_t_vcap,
+            macro_t_ibuf,
+            macro_t_icap,
+            macro_t_icount: 0,
+            macro_o_vbuf,
+            macro_o_vcap,
+            macro_o_ibuf,
+            macro_o_icap,
+            macro_o_icount: 0,
+            macro_sky_vbuf,
+            macro_sky_vcap,
+            macro_sky_ibuf,
+            macro_sky_icap,
+            macro_sky_icount: 0,
+            near_t_vbuf,
+            near_t_vcap,
+            near_t_ibuf,
+            near_t_icap,
+            near_t_icount: 0,
+            near_o_vbuf,
+            near_o_vcap,
+            near_o_ibuf,
+            near_o_icap,
+            near_o_icount: 0,
+            near_g_vbuf,
+            near_g_vcap,
+            near_g_ibuf,
+            near_g_icap,
+            near_g_icount: 0,
+            macro_ent_solid_vbuf,
+            macro_ent_solid_vcap,
+            macro_ent_solid_ibuf,
+            macro_ent_solid_icap,
+            macro_ent_fx_vbuf,
+            macro_ent_fx_vcap,
+            macro_ent_fx_ibuf,
+            macro_ent_fx_icap,
         })
     }
 
@@ -3329,6 +3732,465 @@ impl Approach4Renderer {
                 exposure,
                 (warmup + i) as f32 * 0.016,
                 planet,
+                hud,
+            );
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p50 = samples[samples.len() / 2];
+        let p99 = samples[((samples.len() as f64) * 0.99).floor().min((samples.len() - 1) as f64) as usize];
+        let mean = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
+        (p50, p99, mean)
+    }
+
+    // =========================================================================
+    // Wave 34B: Live Dual-Scale Locally-Flat R=1,304m Macro Planet Metal Path
+    // =========================================================================
+
+    fn upload_macro_mesh_pair(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        verts: &[MacroPlanetVertex],
+        indices: &[u32],
+        vbuf: &mut wgpu::Buffer,
+        vcap: &mut usize,
+        ibuf: &mut wgpu::Buffer,
+        icap: &mut usize,
+    ) -> u32 {
+        if verts.len() > *vcap {
+            *vcap = (verts.len() * 3 / 2).max(1024);
+            *vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("macro_planet_vbuf"),
+                size: (*vcap * std::mem::size_of::<MacroPlanetVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if indices.len() > *icap {
+            *icap = (indices.len() * 3 / 2).max(1024);
+            *ibuf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("macro_planet_ibuf"),
+                size: (*icap * 4) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !verts.is_empty() {
+            queue.write_buffer(vbuf, 0, bytemuck::cast_slice(verts));
+        }
+        if !indices.is_empty() {
+            queue.write_buffer(ibuf, 0, bytemuck::cast_slice(indices));
+        }
+        indices.len() as u32
+    }
+
+    /// Upload dirty Layer A macro globe, Layer B hydrated `1 m` shards, Sky-Islands, and live
+    /// `6`-layer `64×64` RGBA8 `PlanetaryClimateNet` climate texture slices!
+    pub fn upload_macro_planet_world(&mut self, world: &mut MacroPlanetWorld) {
+        if world.macro_gpu_dirty {
+            self.macro_t_icount = Self::upload_macro_mesh_pair(
+                &self.device,
+                &self.queue,
+                &world.macro_terrain_verts,
+                &world.macro_terrain_indices,
+                &mut self.macro_t_vbuf,
+                &mut self.macro_t_vcap,
+                &mut self.macro_t_ibuf,
+                &mut self.macro_t_icap,
+            );
+            self.macro_o_icount = Self::upload_macro_mesh_pair(
+                &self.device,
+                &self.queue,
+                &world.macro_ocean_verts,
+                &world.macro_ocean_indices,
+                &mut self.macro_o_vbuf,
+                &mut self.macro_o_vcap,
+                &mut self.macro_o_ibuf,
+                &mut self.macro_o_icap,
+            );
+            self.macro_sky_icount = Self::upload_macro_mesh_pair(
+                &self.device,
+                &self.queue,
+                &world.macro_sky_verts,
+                &world.macro_sky_indices,
+                &mut self.macro_sky_vbuf,
+                &mut self.macro_sky_vcap,
+                &mut self.macro_sky_ibuf,
+                &mut self.macro_sky_icap,
+            );
+            world.macro_gpu_dirty = false;
+        }
+        if world.near_gpu_dirty {
+            self.near_t_icount = Self::upload_macro_mesh_pair(
+                &self.device,
+                &self.queue,
+                &world.near_terrain_verts,
+                &world.near_terrain_indices,
+                &mut self.near_t_vbuf,
+                &mut self.near_t_vcap,
+                &mut self.near_t_ibuf,
+                &mut self.near_t_icap,
+            );
+            self.near_o_icount = Self::upload_macro_mesh_pair(
+                &self.device,
+                &self.queue,
+                &world.near_ocean_verts,
+                &world.near_ocean_indices,
+                &mut self.near_o_vbuf,
+                &mut self.near_o_vcap,
+                &mut self.near_o_ibuf,
+                &mut self.near_o_icap,
+            );
+            self.near_g_icount = Self::upload_macro_mesh_pair(
+                &self.device,
+                &self.queue,
+                &world.near_gas_verts,
+                &world.near_gas_indices,
+                &mut self.near_g_vbuf,
+                &mut self.near_g_vcap,
+                &mut self.near_g_ibuf,
+                &mut self.near_g_icap,
+            );
+            world.near_gpu_dirty = false;
+        }
+        let res = world.climate_res as u32;
+        for f in 0..6usize {
+            if world.climate_dirty_faces[f] && world.climate_faces[f].len() == (res * res * 4) as usize {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.macro_climate_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: f as u32 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &world.climate_faces[f],
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(res * 4),
+                        rows_per_image: Some(res),
+                    },
+                    wgpu::Extent3d {
+                        width: res,
+                        height: res,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                world.climate_dirty_faces[f] = false;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_macro_planet_into(
+        &mut self,
+        dst_view: &wgpu::TextureView,
+        out_w: u32,
+        out_h: u32,
+        cam_mats: &MacroPlanetCameraMatrices,
+        sun_dir: [f32; 3],
+        exposure: f32,
+        sim_time: f32,
+        local_climate: [f32; 3], // wind_u, wind_v, cloud_cover
+        world: &MacroPlanetWorld,
+        hud: Option<&HudBatch>,
+    ) {
+        let w = out_w.max(1);
+        let h = out_h.max(1);
+        if self.planet_hdr_w != w || self.planet_hdr_h != h {
+            let (hv, dv, bg) = make_planet_hdr_targets(&self.device, &self.planet_resolve_bgl, w, h);
+            self.planet_hdr_w = w;
+            self.planet_hdr_h = h;
+            self.planet_hdr_view = hv;
+            self.planet_depth_view = dv;
+            self.planet_resolve_bg = bg;
+        }
+
+        let ent_solid_icount = Self::upload_macro_mesh_pair(
+            &self.device,
+            &self.queue,
+            &world.dynamic_solid_verts,
+            &world.dynamic_solid_indices,
+            &mut self.macro_ent_solid_vbuf,
+            &mut self.macro_ent_solid_vcap,
+            &mut self.macro_ent_solid_ibuf,
+            &mut self.macro_ent_solid_icap,
+        );
+        let ent_fx_icount = Self::upload_macro_mesh_pair(
+            &self.device,
+            &self.queue,
+            &world.dynamic_fx_verts,
+            &world.dynamic_fx_indices,
+            &mut self.macro_ent_fx_vbuf,
+            &mut self.macro_ent_fx_vcap,
+            &mut self.macro_ent_fx_ibuf,
+            &mut self.macro_ent_fx_icap,
+        );
+
+        let hud_vert_count = if let Some(hb) = hud {
+            if hb.vertices.len() > self.hud_vcap {
+                self.hud_vcap = (hb.vertices.len() * 2).max(1024);
+                self.hud_vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (self.hud_vcap * std::mem::size_of::<HudVertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if !hb.vertices.is_empty() {
+                self.queue.write_buffer(&self.hud_vbuf, 0, bytemuck::cast_slice(&hb.vertices));
+            }
+            hb.vertices.len() as u32
+        } else {
+            0
+        };
+
+        let sun = Vec3::from_array(sun_dir).normalize_or(Vec3::new(-0.72, 0.36, 0.59).normalize());
+        let r_core = world.r_core as f32;
+        let r_ocean = world.r_ocean() as f32;
+        let r_surf_atmo = world.r_surf() as f32;
+        let r_atmo_outer = r_surf_atmo + 216.0;
+        let r_cloud_shell = r_surf_atmo + 138.0;
+
+        let near_off = world_f64_to_camera_rel_f32(world.origin_f64, cam_mats.eye_f64);
+        let global_off = world_f64_to_camera_rel_f32([0.0, 0.0, 0.0], cam_mats.eye_f64);
+        let has_clim = if world.has_live_climate() { 1.0f32 } else { 0.85f32 };
+
+        let make_uni = |offset: [f32; 3]| MacroPlanetUniforms {
+            view_proj: cam_mats.vp.to_cols_array_2d(),
+            inv_view_proj: cam_mats.inv_vp.to_cols_array_2d(),
+            cam_pos: [
+                cam_mats.eye_f64[0] as f32,
+                cam_mats.eye_f64[1] as f32,
+                cam_mats.eye_f64[2] as f32,
+                sim_time,
+            ],
+            model_offset: [offset[0], offset[1], offset[2], r_ocean],
+            sun_dir: [sun.x, sun.y, sun.z, r_cloud_shell],
+            planet_cfg: [r_core, r_surf_atmo, r_atmo_outer, exposure],
+            viewport: [w as f32, h as f32, 1.0 / w as f32, 1.0 / h as f32],
+            climate_params: [local_climate[0], local_climate[1], local_climate[2], has_clim],
+        };
+
+        self.queue.write_buffer(&self.macro_uni_near_buf, 0, bytemuck::bytes_of(&make_uni(near_off)));
+        self.queue.write_buffer(&self.macro_uni_global_buf, 0, bytemuck::bytes_of(&make_uni(global_off)));
+
+        let hud_u = HudUniforms {
+            screen_size: [w as f32, h as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.queue.write_buffer(&self.hud_ubuf, 0, bytemuck::bytes_of(&hud_u));
+        let hud_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.hud_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.hud_ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.minimap_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.minimap_samp) },
+            ],
+        });
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+
+        // PASS 1 (HDR + Depth): Starfield + Layer B Near 1m Shards + Layer A Macro Globe + Sky-Islands + Ocean + Layer C Entities & Beams
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("macro_planet_hdr_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.planet_hdr_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.planet_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            // 1A: Cosmic Starfield & Live Sun Disc
+            rp.set_pipeline(&self.pipe_macro_starfield);
+            rp.set_bind_group(0, &self.macro_uni_global_bg, &[]);
+            rp.draw(0..3, 0..1);
+
+            // 1B: Layer B — Live Hydrated 1m Shards + Nordic Pines + Boulders + Live Sky-Island Voxels (floating-origin near_off!)
+            rp.set_pipeline(&self.pipe_macro_solid);
+            if self.near_t_icount > 0 {
+                rp.set_bind_group(0, &self.macro_uni_near_bg, &[]);
+                rp.set_vertex_buffer(0, self.near_t_vbuf.slice(..));
+                rp.set_index_buffer(self.near_t_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..self.near_t_icount, 0, 0..1);
+            }
+
+            // 1C: Layer A — Full 6-Face R=1,304m Macro Globe + 12 Floating Sky-Islands (inset-clipped!)
+            rp.set_bind_group(0, &self.macro_uni_global_bg, &[]);
+            if self.macro_t_icount > 0 {
+                rp.set_vertex_buffer(0, self.macro_t_vbuf.slice(..));
+                rp.set_index_buffer(self.macro_t_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..self.macro_t_icount, 0, 0..1);
+            }
+            if self.macro_sky_icount > 0 {
+                rp.set_vertex_buffer(0, self.macro_sky_vbuf.slice(..));
+                rp.set_index_buffer(self.macro_sky_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..self.macro_sky_icount, 0, 0..1);
+            }
+
+            // 1D: Layer C — Live 60 3D Heroes, Shrines & Solid Projectiles (floating-origin near_off!)
+            if ent_solid_icount > 0 {
+                rp.set_bind_group(0, &self.macro_uni_near_bg, &[]);
+                rp.set_vertex_buffer(0, self.macro_ent_solid_vbuf.slice(..));
+                rp.set_index_buffer(self.macro_ent_solid_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..ent_solid_icount, 0, 0..1);
+            }
+
+            // 1E: Fresnel Sapphire Ocean (Near 1m Bays + Macro Globe Ocean Shell)
+            rp.set_pipeline(&self.pipe_macro_ocean);
+            if self.near_o_icount > 0 {
+                rp.set_bind_group(0, &self.macro_uni_near_bg, &[]);
+                rp.set_vertex_buffer(0, self.near_o_vbuf.slice(..));
+                rp.set_index_buffer(self.near_o_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..self.near_o_icount, 0, 0..1);
+            }
+            if self.macro_o_icount > 0 {
+                rp.set_bind_group(0, &self.macro_uni_global_bg, &[]);
+                rp.set_vertex_buffer(0, self.macro_o_vbuf.slice(..));
+                rp.set_index_buffer(self.macro_o_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..self.macro_o_icount, 0, 0..1);
+            }
+
+            // 1F: Translucent Steam/Volcanic Plumes + Curved Geodesic Actuator Beams + Shrine Light Pillars + Aura Rings
+            if self.near_g_icount > 0 || ent_fx_icount > 0 {
+                rp.set_pipeline(&self.pipe_macro_translucent);
+                rp.set_bind_group(0, &self.macro_uni_near_bg, &[]);
+                if self.near_g_icount > 0 {
+                    rp.set_vertex_buffer(0, self.near_g_vbuf.slice(..));
+                    rp.set_index_buffer(self.near_g_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..self.near_g_icount, 0, 0..1);
+                }
+                if ent_fx_icount > 0 {
+                    rp.set_vertex_buffer(0, self.macro_ent_fx_vbuf.slice(..));
+                    rp.set_index_buffer(self.macro_ent_fx_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..ent_fx_icount, 0, 0..1);
+                }
+            }
+        }
+
+        // PASS 2 (`dst_view`): Seamless Ground-to-Orbit Rayleigh+Mie Atmosphere + Live Coriolis Cloud/Ash Deck + ACES + HUD!
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("macro_planet_resolve_and_hud_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dst_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.pipe_macro_resolve);
+            rp.set_bind_group(0, &self.macro_uni_global_bg, &[]);
+            rp.set_bind_group(1, &self.planet_resolve_bg, &[]);
+            rp.draw(0..3, 0..1);
+
+            if hud_vert_count > 0 {
+                rp.set_pipeline(&self.pipe_hud);
+                rp.set_bind_group(0, &hud_bg, &[]);
+                rp.set_vertex_buffer(0, self.hud_vbuf.slice(..));
+                rp.draw(0..hud_vert_count, 0..1);
+            }
+        }
+
+        self.queue.submit(Some(enc.finish()));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_macro_planet_to_rgba(
+        &mut self,
+        w: u32,
+        h: u32,
+        cam_mats: &MacroPlanetCameraMatrices,
+        sun_dir: [f32; 3],
+        exposure: f32,
+        sim_time: f32,
+        local_climate: [f32; 3],
+        world: &MacroPlanetWorld,
+        hud: Option<&HudBatch>,
+    ) -> (Vec<u8>, f64) {
+        let (tex, view) = self.create_output_texture(w, h);
+        let t0 = Instant::now();
+        self.render_macro_planet_into(
+            &view,
+            w,
+            h,
+            cam_mats,
+            sun_dir,
+            exposure,
+            sim_time,
+            local_climate,
+            world,
+            hud,
+        );
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let gpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let rgba = self.readback_rgba(&tex, w, h);
+        (rgba, gpu_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn benchmark_macro_planet_gpu(
+        &mut self,
+        w: u32,
+        h: u32,
+        cam_mats: &MacroPlanetCameraMatrices,
+        sun_dir: [f32; 3],
+        exposure: f32,
+        local_climate: [f32; 3],
+        world: &MacroPlanetWorld,
+        hud: Option<&HudBatch>,
+        warmup: usize,
+        iters: usize,
+    ) -> (f64, f64, f64) {
+        let (_tex, view) = self.create_output_texture(w, h);
+        for i in 0..warmup {
+            self.render_macro_planet_into(
+                &view,
+                w,
+                h,
+                cam_mats,
+                sun_dir,
+                exposure,
+                i as f32 * 0.016,
+                local_climate,
+                world,
+                hud,
+            );
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        let mut samples = Vec::with_capacity(iters);
+        for i in 0..iters {
+            let t0 = Instant::now();
+            self.render_macro_planet_into(
+                &view,
+                w,
+                h,
+                cam_mats,
+                sun_dir,
+                exposure,
+                (warmup + i) as f32 * 0.016,
+                local_climate,
+                world,
                 hud,
             );
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());

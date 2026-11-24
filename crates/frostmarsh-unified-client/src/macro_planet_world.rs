@@ -395,6 +395,15 @@ impl MacroShardData {
                         sea_ice_hits += solid as f32 / 255.0;
                     }
                     if solid >= 96 && !found_solid {
+                        // Skip sparse vegetation canopy / trunk voxels floating above the procedural ground
+                        // so 3D sculpted pines stand cleanly on smooth meadows instead of bulging the ground mesh!
+                        let is_veg_spike = (z as f64) > proc_surf_z + 0.55
+                            && therm < 0.25
+                            && rough >= 0.66
+                            && (ag >= ar * 0.90 || (ar >= ab * 1.15 && ar < 0.45));
+                        if is_veg_spike {
+                            continue;
+                        }
                         found_solid = true;
                         solid_z = z;
                         solid_fill = (solid as f64 / 255.0).clamp(0.18, 1.0);
@@ -576,8 +585,8 @@ impl MacroPlanetWorld {
         let climate_faces = Self::init_procedural_climate_faces(MACRO_CLIMATE_RES, sd);
         let sky_islands = MacroSkyIsland::default_archipelago(sd);
 
-        // 112 quads/face in release (150k tris, >320 FPS on M4 Pro Metal), 64 in debug tests for fast test execution
-        let macro_sub = if cfg!(debug_assertions) { 64 } else { 112 };
+        // 160 quads/face in release (307k tris, razor-sharp orbital coastlines & >180 FPS on M4 Pro Metal), 64 in debug tests
+        let macro_sub = if cfg!(debug_assertions) { 64 } else { 160 };
 
         Self {
             r_core: rc,
@@ -1167,6 +1176,17 @@ impl MacroPlanetWorld {
                         }
                     }
 
+                    let xm = ix.saturating_sub(1);
+                    let xp = (ix + 1).min(bf.sub);
+                    let ym = iy.saturating_sub(1);
+                    let yp = (iy + 1).min(bf.sub);
+                    let nb_avg = 0.25
+                        * (bf.surf_z[iy * stride + xm]
+                            + bf.surf_z[iy * stride + xp]
+                            + bf.surf_z[ym * stride + ix]
+                            + bf.surf_z[yp * stride + ix]);
+                    let ao_m = (1.0 - ((nb_avg - bf.surf_z[vi]).max(0.0) * 0.14) as f32).clamp(0.58, 1.0);
+
                     let pos = scale_f64(dir, r_core + bf.surf_z[vi] + r_offset);
                     self.macro_terrain_verts.push(MacroPlanetVertex {
                         pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32],
@@ -1183,7 +1203,7 @@ impl MacroPlanetWorld {
                             bf.emissives[vi][2],
                             MAT_MACRO_TERRAIN,
                         ],
-                        water_ice: [bf.water_depth[vi], bf.ice_frac[vi], 1.0, 0.0],
+                        water_ice: [bf.water_depth[vi], bf.ice_frac[vi], 1.0, ao_m],
                     });
 
                     let o_pos = scale_f64(dir, r_core + z_sea_surf + r_offset * 0.5);
@@ -1325,6 +1345,32 @@ impl MacroPlanetWorld {
             }
         }
 
+        // Spike-suppressing 3x3 bilateral/outlier clamp: eliminates single-voxel grey cones from
+        // isolated transient surface voxels while preserving real hills, cliffs, coastlines & craters!
+        let mut smooth_sz = grid_sz.clone();
+        for vy in 1..cells {
+            for vx in 1..cells {
+                let vi = vy * stride + vx;
+                let c = grid_sz[vi];
+                let n0 = grid_sz[vy * stride + (vx - 1)];
+                let n1 = grid_sz[vy * stride + (vx + 1)];
+                let n2 = grid_sz[(vy - 1) * stride + vx];
+                let n3 = grid_sz[(vy + 1) * stride + vx];
+                let nb_avg = 0.25 * (n0 + n1 + n2 + n3);
+                let nb_max = n0.max(n1).max(n2).max(n3);
+                let nb_min = n0.min(n1).min(n2).min(n3);
+                if c > nb_max + 0.65 {
+                    smooth_sz[vi] = nb_avg + 0.35 * (nb_max - nb_avg);
+                } else if c < nb_min - 1.15 {
+                    smooth_sz[vi] = nb_avg + 0.55 * (c - nb_avg);
+                } else {
+                    smooth_sz[vi] = c * 0.72 + nb_avg * 0.28;
+                }
+                grid_pos[vi] = scale_f64(grid_dir[vi], r_core + smooth_sz[vi]);
+            }
+        }
+        grid_sz = smooth_sz;
+
         for vy in 0..=cells {
             for vx in 0..=cells {
                 let vi = vy * stride + vx;
@@ -1339,12 +1385,29 @@ impl MacroPlanetWorld {
                     n = scale_f64(n, -1.0);
                 }
 
+                // Fast valley ambient occlusion & mountain concavity shadow (`water_ice.w`)
+                let xm2 = vx.saturating_sub(3);
+                let xp2 = (vx + 3).min(cells);
+                let ym2 = vy.saturating_sub(3);
+                let yp2 = (vy + 3).min(cells);
+                let ring_avg = 0.125
+                    * (grid_sz[vy * stride + xm]
+                        + grid_sz[vy * stride + xp]
+                        + grid_sz[ym * stride + vx]
+                        + grid_sz[yp * stride + vx]
+                        + grid_sz[vy * stride + xm2]
+                        + grid_sz[vy * stride + xp2]
+                        + grid_sz[ym2 * stride + vx]
+                        + grid_sz[yp2 * stride + vx]);
+                let cavity = (ring_avg - grid_sz[vi]).max(0.0) as f32;
+                let ao_shadow = (1.0 - cavity * 0.15).clamp(0.46, 1.0);
+
                 terrain_verts.push(MacroPlanetVertex {
                     pos: world_f64_to_camera_rel_f32(grid_pos[vi], origin_f64),
                     normal: [n[0] as f32, n[1] as f32, n[2] as f32],
                     color: [grid_col[vi][0], grid_col[vi][1], grid_col[vi][2], grid_rough[vi]],
                     emissive_mat: [grid_em[vi][0], grid_em[vi][1], grid_em[vi][2], MAT_MACRO_TERRAIN],
-                    water_ice: [grid_wd[vi], grid_ice[vi], 0.0, 0.0],
+                    water_ice: [grid_wd[vi], grid_ice[vi], 0.0, ao_shadow],
                 });
 
                 let ocean_pos = scale_f64(grid_dir[vi], r_core + z_sea_surf);
@@ -1353,7 +1416,7 @@ impl MacroPlanetWorld {
                     normal: [grid_dir[vi][0] as f32, grid_dir[vi][1] as f32, grid_dir[vi][2] as f32],
                     color: [0.04, 0.24, 0.54, 0.08],
                     emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_OCEAN],
-                    water_ice: [grid_wd[vi], grid_ice[vi], 0.0, 0.0],
+                    water_ice: [grid_wd[vi], grid_ice[vi], 0.0, 1.0],
                 });
             }
         }
@@ -1404,7 +1467,7 @@ impl MacroPlanetWorld {
         emit_skirt((0..=cells).map(|vy| (0, vy)).collect(), true);
         emit_skirt((0..=cells).map(|vy| (cells, vy)).collect(), false);
 
-        // Sculpted 3D Nordic pine clusters & coastal granite boulders on forested/coastal voxels!
+        // Rich Nordic Biome Flora, Grounded Shadows, Coastal Crags, Wildflowers & Frontier Landmarks!
         let prop_step = if step == 1 { 5usize } else { 8usize };
         for ly in (3..s - 3).step_by(prop_step) {
             for lx in (3..s - 3).step_by(prop_step) {
@@ -1416,17 +1479,33 @@ impl MacroPlanetWorld {
                 let jy = (ly + ((h / 7) % 3)).min(s - 2);
                 let cc = sh.column_cache[jy * s + jx];
                 let sz = cc.surf_z;
+                let (u, v) = face_virtual_uv_f64((gx_base + jx) as f64 + 0.5, (gy_base + jy) as f64 + 0.5, n_virt);
+                let dir = face_uv_to_sphere_dir_f64(face, u, v);
+
+                // Weathered coastal timber pier pilings in shallow sunlit turquoise water!
+                if cc.water_depth > 0.12 && cc.water_depth < 0.72 && (h % 200) < 3 {
+                    let piling_base = scale_f64(dir, r_core + sz);
+                    push_timber_piling(
+                        &mut terrain_verts,
+                        &mut terrain_indices,
+                        piling_base,
+                        dir,
+                        origin_f64,
+                        cc.water_depth as f64 + 1.15,
+                    );
+                    continue;
+                }
                 if sz <= z_sea_surf + 0.15 {
                     continue;
                 }
-                let (u, v) = face_virtual_uv_f64((gx_base + jx) as f64 + 0.5, (gy_base + jy) as f64 + 0.5, n_virt);
-                let dir = face_uv_to_sphere_dir_f64(face, u, v);
                 let pos = scale_f64(dir, r_core + sz);
+                let is_snowy = (cc.albedo[2] > 0.72 && cc.albedo[0] > 0.62) || sz > 31.2;
 
-                if sz > z_sea_surf + 2.45 && sz < 35.5 && (cc.has_wood || cc.has_plant) && (h % 100) < 24 {
-                    let tree_h = 5.4 + ((h % 37) as f64 / 37.0) * 4.4;
-                    let tree_r = 1.55 + ((h % 19) as f64 / 19.0) * 0.95;
+                if sz > z_sea_surf + 2.15 && sz < 36.2 && (cc.has_wood || cc.has_plant) && (h % 100) < 26 {
+                    let tree_h = 5.2 + ((h % 37) as f64 / 37.0) * 5.2;
+                    let tree_r = 1.55 + ((h % 19) as f64 / 19.0) * 1.10;
                     let tint = ((h % 11) as f32) / 11.0;
+                    let snow_cap = if is_snowy { 0.85 } else if sz > 29.2 { 0.35 } else { 0.0 };
                     push_pine_tree(
                         &mut terrain_verts,
                         &mut terrain_indices,
@@ -1436,18 +1515,85 @@ impl MacroPlanetWorld {
                         tree_h,
                         tree_r,
                         tint,
+                        snow_cap,
                     );
-                } else if sz < z_sea_surf + 3.4 && (h % 100) < 9 {
-                    let r_b = 0.85 + ((h % 13) as f64 / 13.0) * 1.15;
+                    push_contact_shadow_disc_f64(
+                        &mut gas_verts,
+                        &mut gas_indices,
+                        add_f64(pos, scale_f64(dir, 0.12)),
+                        dir,
+                        tree_r * 1.35,
+                        8,
+                        origin_f64,
+                        0.32,
+                    );
+                } else if sz < z_sea_surf + 4.2 && (h % 100) < 10 {
+                    // Natural mossy granite boulder outcrop cluster + grounded contact shadow
+                    let r_b = 0.85 + ((h % 13) as f64 / 13.0) * 1.25;
                     push_boulder(
                         &mut terrain_verts,
                         &mut terrain_indices,
                         pos,
                         dir,
                         origin_f64,
-                        r_b * 1.2,
-                        r_b * 0.9,
-                        r_b * 0.65,
+                        r_b * 1.25,
+                        r_b * 0.92,
+                        r_b * 0.68,
+                    );
+                    let (t1, t2) = tangent_basis_f64(dir);
+                    let ang_s = (h as f64) * 1.1;
+                    let side_p = add_f64(
+                        pos,
+                        add_f64(scale_f64(t1, ang_s.cos() * r_b * 0.95), scale_f64(t2, ang_s.sin() * r_b * 0.95)),
+                    );
+                    push_boulder(
+                        &mut terrain_verts,
+                        &mut terrain_indices,
+                        side_p,
+                        dir,
+                        origin_f64,
+                        r_b * 0.68,
+                        r_b * 0.56,
+                        r_b * 0.44,
+                    );
+                    push_contact_shadow_disc_f64(
+                        &mut gas_verts,
+                        &mut gas_indices,
+                        add_f64(pos, scale_f64(dir, 0.10)),
+                        dir,
+                        r_b * 1.55,
+                        8,
+                        origin_f64,
+                        0.28,
+                    );
+                } else if sz > z_sea_surf + 1.6 && sz < 31.0 && !is_snowy && (h % 100) < 14 {
+                    // Lush meadow fern & coastal wildflower tuft!
+                    push_wildflower_tuft(
+                        &mut terrain_verts,
+                        &mut terrain_indices,
+                        pos,
+                        dir,
+                        origin_f64,
+                        h,
+                    );
+                } else if sz > z_sea_surf + 1.3 && sz < z_sea_surf + 6.8 && (h % 500) == 17 {
+                    // Warm glowing Nordic frontier waystone lantern along the coastal trail!
+                    push_waystone_lantern(
+                        &mut terrain_verts,
+                        &mut terrain_indices,
+                        pos,
+                        dir,
+                        origin_f64,
+                    );
+                    push_contact_shadow_disc_f64(
+                        &mut gas_verts,
+                        &mut gas_indices,
+                        add_f64(pos, scale_f64(dir, 0.10)),
+                        dir,
+                        1.4,
+                        8,
+                        origin_f64,
+                        0.30,
                     );
                 }
             }
@@ -1970,9 +2116,20 @@ impl MacroPlanetWorld {
                 [team_col[0], team_col[1], team_col[2], if is_self { 0.84 } else { 0.62 }],
                 [team_col[0] * 1.4, team_col[1] * 1.4, team_col[2] * 1.4, MAT_MACRO_BEAM],
             );
+            // Soft grounded contact shadow disc beneath every hero!
+            push_contact_shadow_disc_f64(
+                &mut self.dynamic_fx_verts,
+                &mut self.dynamic_fx_indices,
+                add_f64(base_pos, scale_f64(up, 0.14)),
+                up,
+                if is_self { 1.65 } else { 1.30 },
+                10,
+                origin,
+                0.36,
+            );
         }
 
-        // 2. Planetary Shrines with tall vertical light pillars visible from Skywing altitude & Orbit!
+        // 2. Sculpted Runic Stone Temple Shrines with 4 carved monolith pillars, warm braziers & atmospheric rune beacon!
         for s in &ent.shrines {
             let (base_pos, up, right, fwd) =
                 self.entity_world_frame_f64(s.face, s.x, s.y, 0.0, 1.0, 0.0);
@@ -1984,73 +2141,129 @@ impl MacroPlanetWorld {
                 [1.00, 0.86, 0.34]
             };
 
+            push_contact_shadow_disc_f64(
+                &mut self.dynamic_fx_verts,
+                &mut self.dynamic_fx_indices,
+                add_f64(base_pos, scale_f64(up, 0.14)),
+                up,
+                5.4,
+                14,
+                origin,
+                0.36,
+            );
+            // 2-tier stepped Nordic granite temple plinth
             push_oriented_box_f64(
                 &mut self.dynamic_solid_verts,
                 &mut self.dynamic_solid_indices,
-                add_f64(base_pos, scale_f64(up, 0.8)),
+                add_f64(base_pos, scale_f64(up, 0.45)),
                 right,
                 up,
                 fwd,
-                [3.4, 1.6, 3.4],
+                [5.8, 0.9, 5.8],
                 origin,
-                [0.34, 0.38, 0.48, 0.45],
-                [0.08, 0.10, 0.14, MAT_MACRO_ENTITY],
+                [0.28, 0.31, 0.38, 0.72],
+                [0.02, 0.03, 0.04, MAT_MACRO_ENTITY],
             );
+            push_oriented_box_f64(
+                &mut self.dynamic_solid_verts,
+                &mut self.dynamic_solid_indices,
+                add_f64(base_pos, scale_f64(up, 1.25)),
+                right,
+                up,
+                fwd,
+                [3.8, 0.85, 3.8],
+                origin,
+                [0.34, 0.37, 0.45, 0.62],
+                [0.05, 0.06, 0.09, MAT_MACRO_ENTITY],
+            );
+            // 4 carved flanking runic monolith pillars + glowing warm corner braziers
+            for &(sx_o, sy_o) in &[(-2.15f64, -2.15f64), (2.15, -2.15), (2.15, 2.15), (-2.15, 2.15)] {
+                let p_off = add_f64(scale_f64(right, sx_o), scale_f64(fwd, sy_o));
+                let pil_base = add_f64(base_pos, p_off);
+                push_oriented_box_f64(
+                    &mut self.dynamic_solid_verts,
+                    &mut self.dynamic_solid_indices,
+                    add_f64(pil_base, scale_f64(up, 2.9)),
+                    right,
+                    up,
+                    fwd,
+                    [0.72, 4.2, 0.72],
+                    origin,
+                    [0.30, 0.34, 0.41, 0.68],
+                    [shrine_col[0] * 0.14, shrine_col[1] * 0.14, shrine_col[2] * 0.14, MAT_MACRO_ENTITY],
+                );
+                // Warm ember brazier crowning each corner monolith
+                push_oriented_box_f64(
+                    &mut self.dynamic_solid_verts,
+                    &mut self.dynamic_solid_indices,
+                    add_f64(pil_base, scale_f64(up, 5.25)),
+                    right,
+                    up,
+                    fwd,
+                    [0.52, 0.52, 0.52],
+                    origin,
+                    [1.0, 0.72, 0.28, 0.15],
+                    [2.4, 1.15, 0.28, MAT_MACRO_BEAM],
+                );
+            }
+            // Central faceted runic spire
             push_oriented_pyramid_f64(
                 &mut self.dynamic_solid_verts,
                 &mut self.dynamic_solid_indices,
-                add_f64(base_pos, scale_f64(up, 1.6)),
+                add_f64(base_pos, scale_f64(up, 1.65)),
                 right,
                 up,
                 fwd,
-                1.45,
-                6.8,
+                1.35,
+                6.2,
                 origin,
-                [shrine_col[0], shrine_col[1], shrine_col[2], 0.16],
-                [shrine_col[0] * 1.8, shrine_col[1] * 1.8, shrine_col[2] * 1.8, MAT_MACRO_ENTITY],
+                [shrine_col[0], shrine_col[1], shrine_col[2], 0.18],
+                [shrine_col[0] * 1.45, shrine_col[1] * 1.45, shrine_col[2] * 1.45, MAT_MACRO_ENTITY],
             );
+            // Rotating levitating crystal prism above the spire
             let spin = (sim_time * 1.6 + s.id as f32) as f64;
             let r_rot = add_f64(scale_f64(right, spin.cos()), scale_f64(fwd, spin.sin()));
             let f_rot = add_f64(scale_f64(right, -spin.sin()), scale_f64(fwd, spin.cos()));
+            let bob_z = 9.0 + ((sim_time * 2.5 + s.id as f32).sin() * 0.45) as f64;
             push_oriented_box_f64(
                 &mut self.dynamic_solid_verts,
                 &mut self.dynamic_solid_indices,
-                add_f64(base_pos, scale_f64(up, 9.2 + ((sim_time * 2.5 + s.id as f32).sin() * 0.45) as f64)),
+                add_f64(base_pos, scale_f64(up, bob_z)),
                 r_rot,
                 up,
                 f_rot,
-                [1.3, 1.8, 1.3],
+                [1.15, 1.75, 1.15],
                 origin,
                 [shrine_col[0], shrine_col[1], shrine_col[2], 0.12],
-                [shrine_col[0] * 2.4, shrine_col[1] * 2.4, shrine_col[2] * 2.4, MAT_MACRO_ENTITY],
+                [shrine_col[0] * 2.2, shrine_col[1] * 2.2, shrine_col[2] * 2.2, MAT_MACRO_CRYSTAL],
             );
             push_spherical_ring_f64(
                 &mut self.dynamic_fx_verts,
                 &mut self.dynamic_fx_indices,
-                add_f64(base_pos, scale_f64(up, 0.32)),
+                add_f64(base_pos, scale_f64(up, 0.28)),
                 up,
                 right,
                 fwd,
-                3.6,
-                4.8,
+                4.2,
+                5.2,
                 20,
                 origin,
-                [shrine_col[0], shrine_col[1], shrine_col[2], 0.78],
-                [shrine_col[0] * 1.8, shrine_col[1] * 1.8, shrine_col[2] * 1.8, MAT_MACRO_BEAM],
+                [shrine_col[0], shrine_col[1], shrine_col[2], 0.65],
+                [shrine_col[0] * 1.6, shrine_col[1] * 1.6, shrine_col[2] * 1.6, MAT_MACRO_BEAM],
             );
-            // Tall glowing orbital light pillar (68 m tall -> visible from Ground, Flight, Strato & Orbit!)
+            // Subtle atmospheric orbital rune beam (slender & translucent so it frames landmarks cleanly!)
             push_radial_pillar_f64(
                 &mut self.dynamic_fx_verts,
                 &mut self.dynamic_fx_indices,
-                add_f64(base_pos, scale_f64(up, 2.0)),
+                add_f64(base_pos, scale_f64(up, 2.2)),
                 up,
                 right,
                 fwd,
-                1.35,
-                68.0,
+                0.78,
+                56.0,
                 origin,
-                [shrine_col[0], shrine_col[1], shrine_col[2], 0.44],
-                [shrine_col[0] * 2.6, shrine_col[1] * 2.6, shrine_col[2] * 2.6, MAT_MACRO_BEAM],
+                [shrine_col[0], shrine_col[1], shrine_col[2], 0.22],
+                [shrine_col[0] * 1.9, shrine_col[1] * 1.9, shrine_col[2] * 1.9, MAT_MACRO_BEAM],
             );
         }
 
@@ -2230,6 +2443,7 @@ fn push_pine_tree(
     height_m: f64,
     radius_m: f64,
     tint_var: f32,
+    snow_cap: f32,
 ) {
     let (t1, t2) = tangent_basis_f64(up_dir);
     let mut emit_cone = |z0: f64,
@@ -2239,12 +2453,13 @@ fn push_pine_tree(
                          segs: usize,
                          col_bot: [f32; 3],
                          col_top: [f32; 3],
-                         rough: f32| {
+                         rough: f32,
+                         ang_off: f64| {
         let base_idx = verts.len() as u32;
         for s in 0..=segs {
-            let ang = (s as f64 / segs as f64) * std::f64::consts::TAU;
+            let ang = (s as f64 / segs as f64) * std::f64::consts::TAU + ang_off;
             let rad_dir = add_f64(scale_f64(t1, ang.cos()), scale_f64(t2, ang.sin()));
-            let n_dir = normalize3_f64(add_f64(scale_f64(rad_dir, 0.85), scale_f64(up_dir, 0.52)));
+            let n_dir = normalize3_f64(add_f64(scale_f64(rad_dir, 0.84), scale_f64(up_dir, 0.54)));
             let n_f32 = [n_dir[0] as f32, n_dir[1] as f32, n_dir[2] as f32];
             let p0 = add_f64(add_f64(base_world, scale_f64(up_dir, z0)), scale_f64(rad_dir, r0));
             let p1 = add_f64(add_f64(base_world, scale_f64(up_dir, z1)), scale_f64(rad_dir, r1));
@@ -2253,14 +2468,14 @@ fn push_pine_tree(
                 normal: n_f32,
                 color: [col_bot[0], col_bot[1], col_bot[2], rough],
                 emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
-                water_ice: [0.0; 4],
+                water_ice: [0.0, 0.0, 0.0, 0.72],
             });
             verts.push(MacroPlanetVertex {
                 pos: world_f64_to_camera_rel_f32(p1, origin_f64),
                 normal: n_f32,
                 color: [col_top[0], col_top[1], col_top[2], rough],
                 emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
-                water_ice: [0.0; 4],
+                water_ice: [0.0, 0.0, 0.0, 1.0],
             });
         }
         for s in 0..segs {
@@ -2269,13 +2484,24 @@ fn push_pine_tree(
         }
     };
 
-    emit_cone(-0.4, height_m * 0.34, radius_m * 0.24, radius_m * 0.14, 4, [0.18, 0.11, 0.06], [0.24, 0.15, 0.09], 0.90);
-    let g0 = [0.038 + 0.018 * tint_var, 0.16 + 0.05 * tint_var, 0.065];
-    let g1 = [0.065 + 0.025 * tint_var, 0.27 + 0.07 * tint_var, 0.095];
-    let g2 = [0.095 + 0.030 * tint_var, 0.34 + 0.06 * tint_var, 0.115];
-    emit_cone(height_m * 0.22, height_m * 0.60, radius_m * 1.05, radius_m * 0.20, 5, g0, g1, 0.88);
-    emit_cone(height_m * 0.45, height_m * 0.82, radius_m * 0.82, radius_m * 0.14, 5, g0, g1, 0.88);
-    emit_cone(height_m * 0.68, height_m * 1.04, radius_m * 0.54, 0.04, 5, g1, g2, 0.86);
+    emit_cone(-0.45, height_m * 0.34, radius_m * 0.25, radius_m * 0.13, 5, [0.16, 0.10, 0.055], [0.23, 0.14, 0.085], 0.90, 0.0);
+    let mix_snow = |c: [f32; 3], w: f32| -> [f32; 3] {
+        let s = (w * snow_cap).clamp(0.0, 0.92);
+        [
+            c[0] * (1.0 - s) + 0.86 * s,
+            c[1] * (1.0 - s) + 0.91 * s,
+            c[2] * (1.0 - s) + 0.96 * s,
+        ]
+    };
+    let g0 = [0.028 + 0.016 * tint_var, 0.12 + 0.045 * tint_var, 0.052 + 0.015 * tint_var];
+    let g1 = [0.048 + 0.022 * tint_var, 0.21 + 0.065 * tint_var, 0.075 + 0.020 * tint_var];
+    let g2 = [0.075 + 0.030 * tint_var, 0.29 + 0.065 * tint_var, 0.098 + 0.020 * tint_var];
+    let r_fol = 0.88 - snow_cap * 0.30;
+    // 4 staggered irregular Nordic spruce tiers (with optional frosted alpine snow tips!)
+    emit_cone(height_m * 0.19, height_m * 0.48, radius_m * 1.12, radius_m * 0.24, 6, g0, mix_snow(g1, 0.25), r_fol, 0.0);
+    emit_cone(height_m * 0.37, height_m * 0.67, radius_m * 0.92, radius_m * 0.18, 6, g0, mix_snow(g1, 0.50), r_fol, 0.52);
+    emit_cone(height_m * 0.56, height_m * 0.86, radius_m * 0.68, radius_m * 0.12, 6, mix_snow(g1, 0.25), mix_snow(g2, 0.78), r_fol, 1.04);
+    emit_cone(height_m * 0.74, height_m * 1.06, radius_m * 0.44, 0.04, 5, mix_snow(g1, 0.45), mix_snow(g2, 0.95), r_fol, 1.56);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2369,24 +2595,27 @@ fn push_sky_island(
     let eval_bot = |t: f64, ang: f64| -> ([f64; 3], [f32; 3], [f32; 3], f32, f32) {
         let rad = isl.organic_radius_m(ang) * t;
         let d = dir_at_offset(rad * ang.cos(), rad * ang.sin());
-        let crag = 1.65 * (ang * 6.0 - isl.phase).sin() * t * (1.0 - t)
-            + 0.85 * (ang * 11.0 + isl.phase * 1.7).cos() * t * (1.0 - t);
-        let z_f = isl.z_bot + (isl.z_top - isl.z_bot) * t.powf(0.58) + crag;
+        // Deep dramatic sculpted inverted basalt stalactite mountain spire (instead of thin saucer!)
+        let keel_bot = (isl.z_top - 22.5).max(z_sea + 9.0);
+        let crag = 2.85 * (ang * 5.0 - isl.phase).sin() * t * (1.0 - t * 0.8)
+            + 1.65 * (ang * 9.0 + isl.phase * 1.7).cos() * t * (1.0 - t)
+            + 0.95 * (ang * 13.0 - isl.phase * 0.6).sin() * t;
+        let z_f = keel_bot + (isl.z_top - keel_bot) * t.powf(0.68) + crag;
         let pos = scale_f64(d, r_core + z_f);
-        let core_glow = (1.0 - (t / 0.44).clamp(0.0, 1.0)).powf(1.65) as f32;
-        let vein = ((ang * 5.0 + isl.phase).sin().abs().powf(8.0) as f32)
-            * ((1.0 - t as f32).clamp(0.0, 1.0))
-            * 0.65;
-        let glow = (core_glow + vein * 0.42).clamp(0.0, 1.0);
-        let rock_dark = 0.11 + 0.08 * (t as f32);
+        let core_glow = (1.0 - (t / 0.48).clamp(0.0, 1.0)).powf(1.55) as f32;
+        let vein = ((ang * 5.0 + isl.phase).sin().abs().powf(7.0) as f32)
+            * ((1.0 - t as f32 * 0.85).clamp(0.0, 1.0))
+            * 0.78;
+        let glow = (core_glow + vein * 0.52).clamp(0.0, 1.0);
+        let rock_dark = 0.11 + 0.10 * (t as f32);
         let col = [
-            rock_dark + 0.20 * glow,
-            rock_dark * 1.06 + 0.66 * glow,
-            rock_dark * 1.22 + 0.82 * glow,
+            rock_dark + 0.18 * glow,
+            rock_dark * 1.08 + 0.68 * glow,
+            rock_dark * 1.24 + 0.86 * glow,
         ];
-        let em = [0.32 * glow, 1.85 * glow, 3.35 * glow];
-        let mk = if glow > 0.35 { MAT_MACRO_CRYSTAL } else { MAT_MACRO_PROP };
-        (pos, col, em, 0.76 - 0.50 * glow, mk)
+        let em = [0.34 * glow, 1.95 * glow, 3.55 * glow];
+        let mk = if glow > 0.34 { MAT_MACRO_CRYSTAL } else { MAT_MACRO_PROP };
+        (pos, col, em, 0.76 - 0.52 * glow, mk)
     };
 
     for is_top in [true, false] {
@@ -2434,10 +2663,10 @@ fn push_sky_island(
     }
 
     if add_sky_pines {
-        for pi in 0..10usize {
+        for pi in 0..12usize {
             let f_i = pi as f64;
             let ang = f_i * 2.39996 + isl.phase;
-            let t_r = ((f_i + 0.5) / 10.0).sqrt() * 0.70;
+            let t_r = 0.24 + ((f_i + 0.5) / 12.0).sqrt() * 0.52;
             let (p_top, _, _, _, _) = eval_top(t_r, ang);
             let up_d = normalize3_f64(p_top);
             push_pine_tree(
@@ -2446,11 +2675,72 @@ fn push_sky_island(
                 p_top,
                 up_d,
                 origin_f64,
-                5.2 + (pi % 4) as f64 * 1.2,
-                1.7 + (pi % 3) as f64 * 0.4,
+                5.4 + (pi % 4) as f64 * 1.4,
+                1.7 + (pi % 3) as f64 * 0.45,
                 (pi % 5) as f32 * 0.2,
+                if pi % 3 == 0 { 0.45 } else { 0.15 },
             );
         }
+        // Ancient Nordic Runic Stone Monolith Ring & glowing crystal obelisk crowning the Sky-Island summit!
+        let (summit_p, _, _, _, _) = eval_top(0.0, 0.0);
+        let s_up = normalize3_f64(summit_p);
+        let (st1, st2) = tangent_basis_f64(s_up);
+        let ring_r = (isl.radius_m * 0.26).clamp(5.0, 9.5);
+        for mi in 0..5usize {
+            let a = (mi as f64 / 5.0) * std::f64::consts::TAU + isl.phase;
+            let m_dir = add_f64(scale_f64(st1, a.cos()), scale_f64(st2, a.sin()));
+            let m_side = normalize3_f64(cross_f64(s_up, m_dir));
+            let m_base = add_f64(summit_p, scale_f64(m_dir, ring_r));
+            let mh = 5.2 + (mi % 2) as f64 * 1.6;
+            push_oriented_box_f64(
+                verts,
+                indices,
+                add_f64(m_base, scale_f64(s_up, mh * 0.5 - 0.5)),
+                m_side,
+                s_up,
+                m_dir,
+                [1.15, mh, 0.85],
+                origin_f64,
+                [0.28, 0.31, 0.38, 0.66],
+                [0.06, 0.26, 0.42, MAT_MACRO_PROP],
+            );
+        }
+        push_oriented_pyramid_f64(
+            verts,
+            indices,
+            add_f64(summit_p, scale_f64(s_up, 0.2)),
+            st1,
+            s_up,
+            st2,
+            1.65,
+            8.2,
+            origin_f64,
+            [0.24, 0.84, 1.0, 0.14],
+            [0.32, 1.75, 3.10, MAT_MACRO_CRYSTAL],
+        );
+    }
+
+    // 5 orbiting levitating obsidian & crystal shards suspended around the deep Sky-Island keel!
+    let keel_z = (isl.z_top - 16.5).max(z_sea + 12.0);
+    for ki in 0..5usize {
+        let a = (ki as f64 / 5.0) * std::f64::consts::TAU + isl.phase * 1.3;
+        let orb_r = isl.radius_m * (0.72 + (ki % 2) as f64 * 0.22);
+        let d_k = dir_at_offset(orb_r * a.cos(), orb_r * a.sin());
+        let k_z = keel_z + ((ki % 3) as f64 - 1.0) * 3.8;
+        let k_pos = scale_f64(d_k, r_core + k_z);
+        let (kt1, kt2) = tangent_basis_f64(d_k);
+        push_oriented_box_f64(
+            verts,
+            indices,
+            k_pos,
+            kt1,
+            d_k,
+            kt2,
+            [2.4, 4.8, 2.2],
+            origin_f64,
+            [0.18, 0.22, 0.29, 0.55],
+            [0.14, 0.82, 1.45, MAT_MACRO_CRYSTAL],
+        );
     }
 
     if let Some(wf_ang) = waterfall_az {
@@ -2679,6 +2969,191 @@ fn push_radial_pillar_f64(
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
+}
+
+/// Soft grounded contact shadow disc (alpha-blended via `fs_macro_translucent`, `mat_kind = 4.0`).
+#[allow(clippy::too_many_arguments)]
+fn push_contact_shadow_disc_f64(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    center: [f64; 3],
+    up: [f64; 3],
+    radius: f64,
+    segs: usize,
+    origin_f64: [f64; 3],
+    alpha: f32,
+) {
+    let (t1, t2) = tangent_basis_f64(up);
+    let base = verts.len() as u32;
+    let n_f = [up[0] as f32, up[1] as f32, up[2] as f32];
+    let c_col = [0.02, 0.03, 0.06, alpha];
+    let e_col = [0.02, 0.03, 0.06, 0.0];
+    let mat = [0.0, 0.0, 0.0, MAT_MACRO_ENTITY];
+    verts.push(MacroPlanetVertex {
+        pos: world_f64_to_camera_rel_f32(center, origin_f64),
+        normal: n_f,
+        color: c_col,
+        emissive_mat: mat,
+        water_ice: [0.0; 4],
+    });
+    for i in 0..=segs {
+        let ang = (i as f64 / segs as f64) * std::f64::consts::TAU;
+        let p = add_f64(
+            center,
+            add_f64(scale_f64(t1, ang.cos() * radius), scale_f64(t2, ang.sin() * radius)),
+        );
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(p, origin_f64),
+            normal: n_f,
+            color: e_col,
+            emissive_mat: mat,
+            water_ice: [0.0; 4],
+        });
+    }
+    for i in 0..segs {
+        let i1 = base + 1 + i as u32;
+        let i2 = base + 2 + i as u32;
+        indices.extend_from_slice(&[base, i1, i2, base, i2, i1]);
+    }
+}
+
+/// Lush meadow fern & Nordic wildflower accent tuft (golden buttercups, heather violet, arctic white).
+fn push_wildflower_tuft(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    base_world: [f64; 3],
+    up_dir: [f64; 3],
+    origin_f64: [f64; 3],
+    hash: usize,
+) {
+    let (t1, t2) = tangent_basis_f64(up_dir);
+    let flower_col = match hash % 4 {
+        0 => [0.95, 0.78, 0.22], // Golden buttercup
+        1 => [0.76, 0.44, 0.92], // Nordic heather
+        2 => [0.92, 0.96, 1.00], // Arctic daisy
+        _ => [0.22, 0.48, 0.16], // Lush fern frond
+    };
+    let h = 0.55 + ((hash % 9) as f64 / 9.0) * 0.45;
+    let r = 0.55 + ((hash % 7) as f64 / 7.0) * 0.42;
+    let base = verts.len() as u32;
+    for bi in 0..3usize {
+        let ang = (bi as f64 / 3.0) * std::f64::consts::PI + (hash as f64) * 0.37;
+        let axis = add_f64(scale_f64(t1, ang.cos()), scale_f64(t2, ang.sin()));
+        let n = normalize3_f64(cross_f64(up_dir, axis));
+        let n_f = [n[0] as f32, n[1] as f32, n[2] as f32];
+        let p0 = sub_f64(base_world, scale_f64(axis, r));
+        let p1 = add_f64(base_world, scale_f64(axis, r));
+        let p2 = add_f64(base_world, scale_f64(up_dir, h));
+        let idx = base + (bi * 3) as u32;
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(p0, origin_f64),
+            normal: n_f,
+            color: [0.06, 0.22, 0.08, 0.88],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 0.85],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(p1, origin_f64),
+            normal: n_f,
+            color: [0.06, 0.22, 0.08, 0.88],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 0.85],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(p2, origin_f64),
+            normal: [up_dir[0] as f32, up_dir[1] as f32, up_dir[2] as f32],
+            color: [flower_col[0], flower_col[1], flower_col[2], 0.82],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 1.0],
+        });
+        indices.extend_from_slice(&[idx, idx + 1, idx + 2, idx, idx + 2, idx + 1]);
+    }
+}
+
+/// Warm glowing Nordic stone waystone lantern along coastal frontier ridges.
+fn push_waystone_lantern(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    base_world: [f64; 3],
+    up_dir: [f64; 3],
+    origin_f64: [f64; 3],
+) {
+    let (t1, t2) = tangent_basis_f64(up_dir);
+    // Carved stone base plinth + vertical post
+    push_oriented_box_f64(
+        verts,
+        indices,
+        add_f64(base_world, scale_f64(up_dir, 0.35)),
+        t1,
+        up_dir,
+        t2,
+        [1.05, 0.70, 1.05],
+        origin_f64,
+        [0.30, 0.32, 0.37, 0.76],
+        [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+    );
+    push_oriented_box_f64(
+        verts,
+        indices,
+        add_f64(base_world, scale_f64(up_dir, 1.75)),
+        t1,
+        up_dir,
+        t2,
+        [0.46, 2.25, 0.46],
+        origin_f64,
+        [0.24, 0.16, 0.10, 0.84],
+        [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+    );
+    // Glowing amber hearth lantern housing
+    push_oriented_box_f64(
+        verts,
+        indices,
+        add_f64(base_world, scale_f64(up_dir, 3.15)),
+        t1,
+        up_dir,
+        t2,
+        [0.64, 0.68, 0.64],
+        origin_f64,
+        [1.00, 0.78, 0.36, 0.16],
+        [2.60, 1.35, 0.32, MAT_MACRO_BEAM],
+    );
+    push_oriented_pyramid_f64(
+        verts,
+        indices,
+        add_f64(base_world, scale_f64(up_dir, 3.50)),
+        t1,
+        up_dir,
+        t2,
+        0.52,
+        0.48,
+        origin_f64,
+        [0.22, 0.24, 0.28, 0.72],
+        [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+    );
+}
+
+/// Weathered timber dock piling jutting out of shallow turquoise coastal surf.
+fn push_timber_piling(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    base_world: [f64; 3],
+    up_dir: [f64; 3],
+    origin_f64: [f64; 3],
+    height_m: f64,
+) {
+    let (t1, t2) = tangent_basis_f64(up_dir);
+    push_oriented_box_f64(
+        verts,
+        indices,
+        add_f64(base_world, scale_f64(up_dir, height_m * 0.5)),
+        t1,
+        up_dir,
+        t2,
+        [0.42, height_m, 0.42],
+        origin_f64,
+        [0.26, 0.18, 0.11, 0.88],
+        [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+    );
 }
 
 // =============================================================================

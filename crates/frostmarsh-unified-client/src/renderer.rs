@@ -3950,7 +3950,7 @@ impl Approach4Renderer {
         let r_ocean = world.r_ocean() as f32;
         let r_surf_atmo = world.r_surf() as f32;
         let r_atmo_outer = r_surf_atmo + 216.0;
-        let r_cloud_shell = r_surf_atmo + 138.0;
+        let r_cloud_shell = r_surf_atmo + 96.0;
 
         let near_off = world_f64_to_camera_rel_f32(world.origin_f64, cam_mats.eye_f64);
         let global_off = world_f64_to_camera_rel_f32([0.0, 0.0, 0.0], cam_mats.eye_f64);

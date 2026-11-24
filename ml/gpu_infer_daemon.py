@@ -968,8 +968,13 @@ class _PlanetClimateAdapter:
             mean_temp_k = float(temp_k.mean().item())
 
             r_u8 = ((temp_k - 240.0) / 80.0).clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
-            cloud_col = st32[:, 1:, self._ch_cloud].clamp(min=0.0).sum(dim=1)
-            g_u8 = (cloud_col / 0.65).clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+            # Crisp Earth-like cloud optical depth (~30-45% global cover): condensed cloud liquid (L1..3)
+            # + upper-level storm anvil cirrus (L2..3) + only supersaturated cyclone/ITCZ vapor peaks (>0.50).
+            cloud_liq = st32[:, 1:, self._ch_cloud].clamp(min=0.0).sum(dim=1)
+            cirrus_ice = (st32[:, 2:, self._ch_ice].clamp(min=0.0).sum(dim=1) - 0.14).clamp(min=0.0)
+            storm_vapor = (st32[:, 1:3, 1].clamp(min=0.0).sum(dim=1) - 0.52).clamp(min=0.0)
+            cloud_col = cloud_liq * 1.15 + cirrus_ice * 0.70 + storm_vapor * 0.45
+            g_u8 = (cloud_col / 0.58).clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
             ash_col = st32[:, :, self._ch_ash].clamp(min=0.0).sum(dim=1)
             b_u8 = (ash_col / 0.80).clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
             ice_surf = st32[:, 0, self._ch_ice].clamp(min=0.0) + 0.5 * st32[:, 1, self._ch_ice].clamp(min=0.0)

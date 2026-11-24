@@ -7,10 +7,37 @@ use quinn::{ClientConfig, Connection, Endpoint};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum PlanetBrickUpdate {
+    FullSubBrick {
+        face: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        density_mat: Vec<u8>,
+        albedo_thermal: Vec<u8>,
+    },
+    DeltaSubBrick {
+        face: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        patches: Vec<(u16, [u8; 4], [u8; 4])>,
+    },
+}
 
 static CURRENT_WORLD_LAW_PRESET: AtomicU8 = AtomicU8::new(0);
 
@@ -118,6 +145,12 @@ pub struct LiveWorldState {
     pub has_z16_bricks: bool,
     pub bricks_3d_rx: u64,
     pub bricks_3d_delta_rx: u64,
+    /// Wave 31B: Live 6-face planetary mode state & incoming brick queue
+    pub planet_mode: bool,
+    pub planet_r_core: f32,
+    pub planet_brick_queue: Vec<PlanetBrickUpdate>,
+    pub received_planet_brick_keys: HashSet<(u8, u16, u16, u16)>,
+    pub planet_bricks_rx: u64,
     pub latest_field_tick: u64,
     pub entities: Option<LiveEntityState>,
     pub chunks_rx: u64,
@@ -158,6 +191,11 @@ impl LiveWorldState {
             has_z16_bricks: d >= 16,
             bricks_3d_rx: 0,
             bricks_3d_delta_rx: 0,
+            planet_mode: false,
+            planet_r_core: 48.0,
+            planet_brick_queue: Vec::new(),
+            received_planet_brick_keys: HashSet::new(),
+            planet_bricks_rx: 0,
             latest_field_tick: 0,
             entities: None,
             chunks_rx: 0,
@@ -208,6 +246,95 @@ impl LiveWorldState {
 
     pub fn received_z16_count(&self) -> usize {
         self.received_z16_bricks.iter().filter(|&&b| b).count()
+    }
+
+    pub fn received_planet_brick_count(&self) -> usize {
+        self.received_planet_brick_keys.len()
+    }
+
+    pub fn take_planet_brick_updates(&mut self) -> Vec<PlanetBrickUpdate> {
+        std::mem::take(&mut self.planet_brick_queue)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_planet_face_brick3d(
+        &mut self,
+        raw_len: u64,
+        face: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_density_mat: &[u8],
+        lz4_albedo_thermal: &[u8],
+    ) {
+        if face >= 6 || total_depth == 0 || sub_depth == 0 {
+            return;
+        }
+        let Some((dm_raw, at_raw)) = decode_subbrick3d_lz4(lz4_density_mat, lz4_albedo_thermal) else {
+            return;
+        };
+        let expected = CHUNK_SIZE * CHUNK_SIZE * (sub_depth as usize) * 4;
+        if dm_raw.len() != expected || at_raw.len() != expected {
+            return;
+        }
+        self.planet_mode = true;
+        self.bytes_rx += raw_len;
+        self.bricks_3d_rx += 1;
+        self.planet_bricks_rx += 1;
+        self.latest_field_tick = self.latest_field_tick.max(tick);
+        self.received_planet_brick_keys.insert((face, bx, by, bz));
+        self.planet_brick_queue.push(PlanetBrickUpdate::FullSubBrick {
+            face,
+            bx,
+            by,
+            bz,
+            total_depth,
+            sub_depth,
+            tick,
+            density_mat: dm_raw,
+            albedo_thermal: at_raw,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_planet_face_brick3d_delta(
+        &mut self,
+        raw_len: u64,
+        face: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_deltas: &[u8],
+    ) {
+        if face >= 6 || total_depth == 0 || sub_depth == 0 {
+            return;
+        }
+        let Ok(patches) = decode_brick3d_delta_voxels(lz4_deltas) else {
+            return;
+        };
+        self.planet_mode = true;
+        self.bytes_rx += raw_len;
+        self.bricks_3d_rx += 1;
+        self.bricks_3d_delta_rx += 1;
+        self.planet_bricks_rx += 1;
+        self.latest_field_tick = self.latest_field_tick.max(tick);
+        self.received_planet_brick_keys.insert((face, bx, by, bz));
+        self.planet_brick_queue.push(PlanetBrickUpdate::DeltaSubBrick {
+            face,
+            bx,
+            by,
+            bz,
+            total_depth,
+            sub_depth,
+            tick,
+            patches,
+        });
     }
 
     pub fn take_dirty_z16_bricks(&mut self) -> Vec<(usize, usize)> {
@@ -683,6 +810,12 @@ impl QuicClientHandle {
                               world_law_preset: u8| {
             st.world_law_preset = world_law_preset;
             CURRENT_WORLD_LAW_PRESET.store(world_law_preset, Ordering::Relaxed);
+            if telemetry.planet_mode {
+                st.planet_mode = true;
+                if telemetry.planet_r_core > 1.0 {
+                    st.planet_r_core = telemetry.planet_r_core;
+                }
+            }
             st.resize_if_needed(
                 telemetry.grid_w as usize,
                 telemetry.grid_h as usize,
@@ -854,6 +987,54 @@ impl QuicClientHandle {
                                         &lz4_deltas,
                                     );
                                 }
+                                ServerDatagram::PlanetFaceBrick3D {
+                                    face,
+                                    bx,
+                                    by,
+                                    bz,
+                                    total_depth,
+                                    sub_depth,
+                                    tick,
+                                    lz4_density_mat,
+                                    lz4_albedo_thermal,
+                                } => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    st.apply_planet_face_brick3d(
+                                        raw_len,
+                                        face,
+                                        bx,
+                                        by,
+                                        bz,
+                                        total_depth,
+                                        sub_depth,
+                                        tick,
+                                        &lz4_density_mat,
+                                        &lz4_albedo_thermal,
+                                    );
+                                }
+                                ServerDatagram::PlanetFaceBrick3DDelta {
+                                    face,
+                                    bx,
+                                    by,
+                                    bz,
+                                    total_depth,
+                                    sub_depth,
+                                    tick,
+                                    lz4_deltas,
+                                } => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    st.apply_planet_face_brick3d_delta(
+                                        raw_len,
+                                        face,
+                                        bx,
+                                        by,
+                                        bz,
+                                        total_depth,
+                                        sub_depth,
+                                        tick,
+                                        &lz4_deltas,
+                                    );
+                                }
                             }
                         }
                     } else if let Some(ServerReliable::Welcome {
@@ -1002,6 +1183,54 @@ impl QuicClientHandle {
                             &lz4_deltas,
                         );
                     }
+                    ServerDatagram::PlanetFaceBrick3D {
+                        face,
+                        bx,
+                        by,
+                        bz,
+                        total_depth,
+                        sub_depth,
+                        tick,
+                        lz4_density_mat,
+                        lz4_albedo_thermal,
+                    } => {
+                        let mut st = st_dg.lock().unwrap();
+                        st.apply_planet_face_brick3d(
+                            raw_len,
+                            face,
+                            bx,
+                            by,
+                            bz,
+                            total_depth,
+                            sub_depth,
+                            tick,
+                            &lz4_density_mat,
+                            &lz4_albedo_thermal,
+                        );
+                    }
+                    ServerDatagram::PlanetFaceBrick3DDelta {
+                        face,
+                        bx,
+                        by,
+                        bz,
+                        total_depth,
+                        sub_depth,
+                        tick,
+                        lz4_deltas,
+                    } => {
+                        let mut st = st_dg.lock().unwrap();
+                        st.apply_planet_face_brick3d_delta(
+                            raw_len,
+                            face,
+                            bx,
+                            by,
+                            bz,
+                            total_depth,
+                            sub_depth,
+                            tick,
+                            &lz4_deltas,
+                        );
+                    }
                 }
             }
         });
@@ -1041,16 +1270,27 @@ impl QuicClientHandle {
         let start = Instant::now();
         let mut last_req = Instant::now();
         loop {
-            let (rc, tot, has_ent) = {
+            let (rc, tot, has_ent, is_planet) = {
                 let st = self.state.lock().unwrap();
-                let rc = if st.depth >= 16 {
-                    st.received_z16_count()
+                let is_planet = st.planet_mode
+                    || st.received_planet_brick_count() > 0
+                    || st.entities.as_ref().is_some_and(|e| e.telemetry.planet_mode);
+                if is_planet {
+                    (st.received_planet_brick_count(), 96usize, st.entities.is_some(), true)
                 } else {
-                    st.received_surf_count()
-                };
-                (rc, st.total_surf_chunks(), st.entities.is_some())
+                    let rc = if st.depth >= 16 {
+                        st.received_z16_count()
+                    } else {
+                        st.received_surf_count()
+                    };
+                    (rc, st.total_surf_chunks(), st.entities.is_some(), false)
+                }
             };
-            let target = ((tot as f32) * min_frac).ceil() as usize;
+            let target = if is_planet {
+                48usize
+            } else {
+                ((tot as f32) * min_frac).ceil() as usize
+            };
             if rc >= target && has_ent {
                 return (rc, tot, true);
             }

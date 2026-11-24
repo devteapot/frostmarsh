@@ -14,16 +14,22 @@
 //!   under-bridge rivers, cliff-drop gravity, destructible Layer 2 timber skybridges, and +25% High-Ground damage!
 
 mod persistence;
+mod planet_runtime;
 mod ws_bridge;
 
 use bytes::Bytes;
 use clap::Parser;
+use field_core::planet::{FACE_COUNT, face_uv_to_sphere_dir};
 use field_core::{
     biome_name, EntityVoxelPhysics, Field, INPUT_CHANNELS, NUM_BIOMES, NUM_WORLD_LAW_PRESETS,
     OUTPUT_CHANNELS, RawStepOutput, SP_ICE, SP_OIL, SP_PLANT, SP_ROCK, SP_STEAM, SP_WATER,
     SP_WOOD, VolumeField, WorldLaws,
 };
 use frostmarsh_proto::*;
+use planet_runtime::{
+    OP_PLANET_V8_STEP, PLANET_FLAG_FP16_IO, PLANET_FLAG_USE_SPARSE, PlanetOp12Response,
+    PlanetRuntime, decode_planet_op12_response, encode_planet_op12_request,
+};
 #[cfg(feature = "onnx")]
 use ort::environment::Environment;
 #[cfg(feature = "onnx")]
@@ -56,12 +62,18 @@ struct Args {
     model: PathBuf,
     #[arg(long, default_value = "models/ecosystem_model.onnx")]
     ecosystem_model: PathBuf,
-    /// Horizontal square grid dimension (128, 256, or 512)
-    #[arg(long, default_value_t = 256)]
-    size: usize,
-    /// Number of physically coupled 3D vertical strata (1..=64; 16..=64 enables isotropic 3D volumetric biomes, 64 = 3-strata vertical world!)
-    #[arg(long, default_value_t = 4)]
-    layers: usize,
+    /// Horizontal square grid dimension (default: 256 flat, 64 in --planet mode; accepts --size or --grid-size)
+    #[arg(long, alias = "grid-size")]
+    size: Option<usize>,
+    /// Number of physically coupled 3D vertical strata (default: 4 flat, 32 in --planet mode; 1..=64)
+    #[arg(long)]
+    layers: Option<usize>,
+    /// Enable Wave 31A 6-Face Cubed-Sphere Planetary Mode
+    #[arg(long, default_value_t = false)]
+    planet: bool,
+    /// Inner core radius in voxel units for --planet mode (default: 48.0)
+    #[arg(long, default_value_t = 48.0)]
+    planet_r_core: f32,
     /// 3D Biome preset (0=Nordic Viaduct, 1=Volcanic Caldera, 2=Sinkhole Caverns, 3=Glacier Gorge, 4=Geothermal Mist Basin, 5=Sky-Isles & Abyss)
     #[arg(long, default_value_t = 0)]
     biome: u8,
@@ -304,6 +316,61 @@ impl CudaRpcClient {
             &dt_payload,
         )?;
         Ok((flat, gpu_ms, false))
+    }
+
+    /// Wave 31A: Send pre-encoded `op=12` (`OP_PLANET_V8_STEP`) binary payload to GPU daemon
+    /// and decode `(infer_ms, active_frac, horiz[6], zflux[6])`.
+    fn step_planet_v8_raw(
+        &mut self,
+        n_face: usize,
+        l_depth: usize,
+        fp16_io: bool,
+        payload: &[u8],
+    ) -> Result<PlanetOp12Response, String> {
+        self.seq = self.seq.wrapping_add(1);
+        let seq = self.seq;
+        let payload_bytes = payload.len() as u32;
+        let mut hdr = [0u8; 16];
+        hdr[0] = OP_PLANET_V8_STEP;
+        hdr[1] = (l_depth.min(255) as u8).max(1);
+        hdr[2..4].copy_from_slice(&(INPUT_CHANNELS as u16).to_le_bytes());
+        hdr[4..6].copy_from_slice(&(n_face as u16).to_le_bytes());
+        hdr[6..8].copy_from_slice(&(n_face as u16).to_le_bytes());
+        hdr[8..12].copy_from_slice(&payload_bytes.to_le_bytes());
+        hdr[12..16].copy_from_slice(&seq.to_le_bytes());
+
+        let res: Result<PlanetOp12Response, (Option<u8>, String)> = (|| {
+            let s = self
+                .ensure_connected()
+                .map_err(|e| (None, e.to_string()))?;
+            s.write_all(&hdr).map_err(|e| (None, e.to_string()))?;
+            s.write_all(payload).map_err(|e| (None, e.to_string()))?;
+
+            let mut rhdr = [0u8; 16];
+            s.read_exact(&mut rhdr).map_err(|e| (None, e.to_string()))?;
+            let status = rhdr[0];
+            if status != 0 {
+                return Err((
+                    Some(status),
+                    format!("CUDA daemon op=12 returned error status {}", status),
+                ));
+            }
+            let rlen = u32::from_le_bytes(rhdr[8..12].try_into().unwrap()) as usize;
+            let mut rbuf = vec![0u8; rlen];
+            s.read_exact(&mut rbuf).map_err(|e| (None, e.to_string()))?;
+            decode_planet_op12_response(&rbuf, n_face, l_depth, fp16_io)
+                .map_err(|e| (None, e))
+        })();
+
+        match res {
+            Ok(ok) => Ok(ok),
+            Err((status, msg)) => {
+                if status != Some(1) {
+                    self.stream = None;
+                }
+                Err(msg)
+            }
+        }
     }
 
     fn call_json(
@@ -863,6 +930,7 @@ struct PlayerEntity {
     class_id: u8,
     squad_id: u8, // 0 = Solo Raider (Emberstalker) / Human, 1..=8 = Squad Alpha/Bravo/Charlie/...
     is_bot: bool,
+    face: u8,
     x: f32,
     y: f32,
     z: f32,
@@ -958,6 +1026,7 @@ struct ProjectileEntity {
     owner: u32,
     team: u8,
     element: u8,
+    face: u8,
     x: f32,
     y: f32,
     z: f32,
@@ -984,6 +1053,7 @@ struct RaftEntity {
 struct ShrineEntity {
     id: u8,
     name: String,
+    face: u8,
     x: f32,
     y: f32,
     z: f32,
@@ -1203,11 +1273,14 @@ struct ClientPeer {
     pending_bricks: HashSet<(u16, u16)>,
     subbrick_shadow: HashMap<(u16, u16, u16), RawBrickArc>,
     pending_subbricks: HashSet<(u16, u16, u16)>,
+    planet_subbrick_shadow: HashMap<(u8, u16, u16, u16), RawBrickArc>,
+    pending_planet_subbricks: HashSet<(u8, u16, u16, u16)>,
 }
 
 #[derive(Clone, Debug)]
 struct PendingChat {
     text: String,
+    face: u8,
     x: f32,
     y: f32,
     layer: f32,
@@ -1246,6 +1319,8 @@ struct GameState {
     brick_raw_cache: HashMap<(u16, u16), RawBrickArc>,
     subbrick_raw_cache: HashMap<(u16, u16, u16), (u8, RawBrickArc)>,
     volume: VolumeField,
+    planet_runtime: Option<PlanetRuntime>,
+    planet_r_core: f32,
     eco: EcosystemState,
     sim_mode: String,
     backend_name: String,
@@ -1410,17 +1485,212 @@ impl GameState {
         let hf = h as f32;
         if d >= 48 {
             vec![
-                ShrineEntity { id: 0, name: "ABYSSAL HEART".into(), x: wf * 0.50, y: hf * 0.64, z: 6.0, progress: -0.35, owner: 0 },
-                ShrineEntity { id: 1, name: "CENTRAL VIADUCT".into(), x: wf * 0.50, y: hf * 0.50, z: 30.0, progress: 0.0, owner: 0 },
-                ShrineEntity { id: 2, name: "SKY CITADEL".into(), x: wf * 0.50, y: hf * 0.45, z: 50.0, progress: 0.35, owner: 0 },
+                ShrineEntity { id: 0, name: "ABYSSAL HEART".into(), face: 0, x: wf * 0.50, y: hf * 0.64, z: 6.0, progress: -0.35, owner: 0 },
+                ShrineEntity { id: 1, name: "CENTRAL VIADUCT".into(), face: 0, x: wf * 0.50, y: hf * 0.50, z: 30.0, progress: 0.0, owner: 0 },
+                ShrineEntity { id: 2, name: "SKY CITADEL".into(), face: 0, x: wf * 0.50, y: hf * 0.45, z: 50.0, progress: 0.35, owner: 0 },
             ]
         } else {
             vec![
-                ShrineEntity { id: 0, name: "NORTH GLACIER".into(), x: wf * 0.50, y: hf * 0.18, z: 0.0, progress: -0.35, owner: 0 },
-                ShrineEntity { id: 1, name: "CENTRAL SPIRE".into(), x: wf * 0.50, y: hf * 0.50, z: 0.0, progress: 0.0, owner: 0 },
-                ShrineEntity { id: 2, name: "SOUTH CALDERA".into(), x: wf * 0.50, y: hf * 0.82, z: 0.0, progress: 0.35, owner: 0 },
+                ShrineEntity { id: 0, name: "NORTH GLACIER".into(), face: 0, x: wf * 0.50, y: hf * 0.18, z: 0.0, progress: -0.35, owner: 0 },
+                ShrineEntity { id: 1, name: "CENTRAL SPIRE".into(), face: 0, x: wf * 0.50, y: hf * 0.50, z: 0.0, progress: 0.0, owner: 0 },
+                ShrineEntity { id: 2, name: "SOUTH CALDERA".into(), face: 0, x: wf * 0.50, y: hf * 0.82, z: 0.0, progress: 0.35, owner: 0 },
             ]
         }
+    }
+
+    #[inline]
+    fn is_planet_mode(&self) -> bool {
+        self.planet_runtime.is_some()
+    }
+
+    #[inline]
+    fn face_volume(&self, face: u8) -> &VolumeField {
+        if let Some(ref pr) = self.planet_runtime {
+            &pr.planet.faces[(face as usize) % FACE_COUNT]
+        } else {
+            &self.volume
+        }
+    }
+
+    #[inline]
+    fn face_volume_mut(&mut self, face: u8) -> &mut VolumeField {
+        if let Some(ref mut pr) = self.planet_runtime {
+            &mut pr.planet.faces[(face as usize) % FACE_COUNT]
+        } else {
+            &mut self.volume
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_planet(
+        backend_name: String,
+        cuda_addr: String,
+        face_size: usize,
+        depth: usize,
+        r_core: f32,
+        seed: u64,
+        bot_count: usize,
+        aoi_radius: usize,
+    ) -> Self {
+        let grid_w = (face_size / CHUNK_SIZE).max(2) * CHUNK_SIZE;
+        let grid_h = grid_w;
+        let grid_d = depth.clamp(16, 64);
+        let chunks_x = chunks_for_dim(grid_w);
+        let chunks_y = chunks_for_dim(grid_h);
+        let pr = PlanetRuntime::new(grid_w, grid_d, r_core, seed);
+        let shrines: Vec<ShrineEntity> = pr
+            .build_planetary_shrines()
+            .into_iter()
+            .map(|(id, name, face, x, y, z)| ShrineEntity {
+                id,
+                name,
+                face,
+                x,
+                y,
+                z,
+                progress: 0.0,
+                owner: 0,
+            })
+            .collect();
+        // Tiny flat placeholder volume so flat-only fields stay valid with minimal memory footprint
+        let volume = VolumeField::new_biome_3d(16, 16, 4, 0, seed);
+        let init_epoch = volume.evolution_epoch_name();
+        let eco = EcosystemState::new(16, 16);
+        let use_cuda = backend_name == "cuda-rpc";
+
+        let mut gs = Self {
+            grid_w,
+            grid_h,
+            grid_d,
+            biome_id: 0,
+            world_seed: seed,
+            chunks_x,
+            chunks_y,
+            aoi_radius,
+            entity_aoi_radius: 110.0,
+            persistent_world: false,
+            match_elapsed_offset_secs: 0,
+            persistent_players: HashMap::new(),
+            brick_raw_cache: HashMap::new(),
+            subbrick_raw_cache: HashMap::new(),
+            hazard_layers: vec![vec![1u8; 16 * 16]; 4],
+            volume,
+            planet_runtime: Some(pr),
+            planet_r_core: r_core,
+            eco,
+            sim_mode: "neural".to_string(),
+            backend_name,
+            ecosystem_on: false,
+            neural_bots_on: false,
+            physics_native: true,
+            bot_infer_ms: 0.0,
+            acoustic_ms: 0.0,
+            world_sparse_pct: 100.0,
+            bot_rpc: if use_cuda { Some(CudaRpcClient::new(cuda_addr)) } else { None },
+            sim_tick: 0,
+            match_start_instant: Instant::now(),
+            celebration_started: None,
+            match_phase: MATCH_PHASE_ACTIVE,
+            match_time_left_s: MATCH_DURATION_SECS,
+            mvp_name: String::new(),
+            mvp_score: 0,
+            next_id: 1,
+            next_event_id: 1,
+            score_west: 0,
+            score_east: 0,
+            relic_x: (grid_w as f32) * 0.50,
+            relic_y: (grid_h as f32) * 0.50,
+            relic_carrier: None,
+            shrines,
+            players: HashMap::new(),
+            projectiles: Vec::new(),
+            rafts: Vec::new(),
+            events: VecDeque::with_capacity(48),
+            bot_brains: Vec::new(),
+            kill_feed: VecDeque::with_capacity(8),
+            speech_bubbles: VecDeque::with_capacity(6),
+            pending_chat: None,
+            bot_overrides: HashMap::new(),
+            recent_actuators: VecDeque::with_capacity(32),
+            actuator_pulses: Vec::with_capacity(32),
+            time_domes: Vec::with_capacity(4),
+            system2_slm_active: false,
+            peers: HashMap::new(),
+            weather_kind: WEATHER_CLEAR,
+            day_time: 0.25,
+            time_scale: 1.0,
+            evo_speed: 1.0,
+            world_day: 1,
+            last_epoch_name: init_epoch,
+            tunnels_carved: 0,
+            tunnel_mass_displaced: 0,
+            last_combo_tick: [0; 10],
+            last_squad_dome_tick: [0, 0],
+            tactical_events: VecDeque::with_capacity(16),
+            pending_cryo_bridges: VecDeque::with_capacity(16),
+            pending_basalt_quenches: VecDeque::with_capacity(16),
+            neural_3d_vertical: false,
+            wind_x: 0.65,
+            wind_y: 0.35,
+            infer_ms_last: 0.0,
+            eco_infer_ms: 0.0,
+            infer_window: VecDeque::with_capacity(100),
+            proj_active_pct: 0.0,
+            mass_error: 0,
+            energy_error: 0,
+            aoi_chunks_sent_last: 0,
+            bytes_sent_window: 0,
+            bytes_window_start: Instant::now(),
+            wire_kbps: 0.0,
+            rt_handle: tokio::runtime::Handle::current(),
+            ws_bridge: None,
+            tps_window_start: Instant::now(),
+            tps_window_ticks: 0,
+            measured_tps: 30.0,
+        };
+
+        let capped_bots = bot_count.min(64);
+        let squad_size = if capped_bots >= 24 { 4usize } else { 3usize };
+        let mut team_squad_counts = [0usize; 2];
+        for i in 0..capped_bots {
+            let team = (i % 2) as u8;
+            let class_id = ((i / 2) % 5) as u8;
+            let target_face = (i % FACE_COUNT) as u8;
+            let squad_id = if class_id == CLASS_EMBERSTALKER {
+                0u8
+            } else {
+                let idx = team_squad_counts[team as usize];
+                team_squad_counts[team as usize] += 1;
+                ((idx / squad_size) + 1).min(8) as u8
+            };
+            let role_tag = match class_id {
+                CLASS_STRIDER => "Strider",
+                CLASS_SKYWING => "Skywing",
+                CLASS_TIDEKIN => "Tidekin",
+                CLASS_EMBERSTALKER => "Stalker",
+                _ => "Terramole",
+            };
+            let prefix = if team == 0 { "Frost" } else { "Ember" };
+            let name = if squad_id == 0 {
+                format!("{}-{}-Solo{}", prefix, role_tag, i / 2 + 1)
+            } else {
+                let sq_code = match squad_id {
+                    1 => "A",
+                    2 => "B",
+                    3 => "C",
+                    4 => "D",
+                    5 => "E",
+                    6 => "F",
+                    _ => "G",
+                };
+                format!("{}-{}-{}{}", prefix, role_tag, sq_code, i / 2 + 1)
+            };
+            let pid = gs.spawn_player_on_face(name, team, class_id, true, Some(target_face));
+            if let Some(p) = gs.players.get_mut(&pid) {
+                p.squad_id = squad_id;
+            }
+        }
+        gs
     }
 
     fn new(
@@ -1462,6 +1732,8 @@ impl GameState {
             subbrick_raw_cache: HashMap::new(),
             hazard_layers: vec![vec![1u8; grid_w * grid_h]; grid_d],
             volume,
+            planet_runtime: None,
+            planet_r_core: 0.0,
             eco,
             sim_mode: "neural".to_string(),
             backend_name,
@@ -1816,6 +2088,7 @@ impl GameState {
                     symbol_id,
                     text: text.chars().take(64).collect(),
                     tick: tick_now as u32,
+                    face: self.players.get(&speaker_id).map(|p| p.face).unwrap_or(0),
                 });
             }
         }
@@ -1921,6 +2194,7 @@ impl GameState {
                         symbol_id: elem.unwrap_or(0) + 1,
                         text: format!("COPY! MOVING ON ORDER"),
                         tick: tick_now as u32,
+                        face: chat.face,
                     });
                     replies += 1;
                 }
@@ -2014,11 +2288,32 @@ impl GameState {
     }
 
     fn spawn_player(&mut self, name: String, team: u8, class_id: u8, is_bot: bool) -> u32 {
+        self.spawn_player_on_face(name, team, class_id, is_bot, None)
+    }
+
+    fn spawn_player_on_face(
+        &mut self,
+        name: String,
+        team: u8,
+        class_id: u8,
+        is_bot: bool,
+        preferred_face: Option<u8>,
+    ) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         let cls = class_id % 5;
-        let (x, y, mut z) = self.spawn_point(team % 2, id);
-        if cls == CLASS_SKYWING {
+        let (face, x, y, mut z) = if let Some(ref pr) = self.planet_runtime {
+            let f = preferred_face.unwrap_or(if is_bot {
+                (id as usize % FACE_COUNT) as u8
+            } else {
+                0
+            });
+            pr.spawn_point_for_entity(f, cls, id)
+        } else {
+            let (sx, sy, sz) = self.spawn_point(team % 2, id);
+            (0u8, sx, sy, sz)
+        };
+        if cls == CLASS_SKYWING && !self.is_planet_mode() {
             // Skywings launch slightly aloft for immediate 3D flight!
             let sky_ceil = (self.grid_d as f32 - if self.grid_d >= 48 { 3.0 } else { 2.0 }).max(1.5);
             let boost = if self.grid_d >= 48 { 3.5 } else if self.is_z16() { 2.5 } else { 0.8 };
@@ -2034,6 +2329,7 @@ impl GameState {
                 class_id: cls,
                 squad_id: 0,
                 is_bot,
+                face,
                 x,
                 y,
                 z,
@@ -2408,7 +2704,7 @@ impl GameState {
         let gw = self.grid_w as f32;
         let gh = self.grid_h as f32;
         let mut melee_hit_check = None;
-        let mut spawn_projs: Vec<(u8, u8, f32, f32, f32, f32, f32, f32, f32, f32, u16)> = Vec::new();
+        let mut spawn_projs: Vec<(u8, u8, u8, f32, f32, f32, f32, f32, f32, f32, f32, u16)> = Vec::new();
         let mut carve_pos = None;
         let mut ability_e_fx = None;
         let mut ult_r_fx = None;
@@ -2478,7 +2774,7 @@ impl GameState {
                     CLASS_EMBERSTALKER => 30,
                     _ => 24,
                 };
-                melee_hit_check = Some((p.team, p.class_id, p.x, p.y, p.z, p.aim_x, p.aim_y, dmg + (p.level as i16) * 3, tick <= p.burrow_ambush_until));
+                melee_hit_check = Some((p.face, p.team, p.class_id, p.x, p.y, p.z, p.aim_x, p.aim_y, dmg + (p.level as i16) * 3, tick <= p.burrow_ambush_until));
             }
 
             let bolt_cd_ticks = match p.class_id {
@@ -2494,6 +2790,7 @@ impl GameState {
                 let pwr = 1.0 + (p.level as f32 - 1.0) * 0.12;
                 let vz = if self.grid_d < 16 && p.z >= 1.6 { -0.65 } else { 0.0 }; // High-ground bolts arc gently downward on L=4!
                 spawn_projs.push((
+                    p.face,
                     p.team,
                     inp.bolt_element % 3,
                     p.x + p.aim_x * 1.5,
@@ -2523,16 +2820,16 @@ impl GameState {
                 match cls {
                     CLASS_STRIDER => {
                         p.shield_until = tick + 90;
-                        ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
+                        ability_e_fx = Some((p.face, cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
                     }
                     CLASS_SKYWING => {
                         for ang_off in [-0.24f32, 0.0, 0.24] {
                             let (ca, sa) = (ang_off.cos(), ang_off.sin());
                             let vx = (p.aim_x * ca - p.aim_y * sa) * 48.0;
                             let vy = (p.aim_x * sa + p.aim_y * ca) * 48.0;
-                            spawn_projs.push((p.team, 2, p.x + p.aim_x * 1.5, p.y + p.aim_y * 1.5, p.z, vx, vy, -0.4, 1.3, 1.2, 26));
+                            spawn_projs.push((p.face, p.team, 2, p.x + p.aim_x * 1.5, p.y + p.aim_y * 1.5, p.z, vx, vy, -0.4, 1.3, 1.2, 26));
                         }
-                        ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
+                        ability_e_fx = Some((p.face, cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
                     }
                     CLASS_TIDEKIN => {
                         p.haste_until = tick + 90;
@@ -2541,20 +2838,20 @@ impl GameState {
                             (p.y + p.aim_y * 3.2).clamp(3.0, gh - 4.0) as i32,
                             p.team,
                         ));
-                        ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
+                        ability_e_fx = Some((p.face, cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
                     }
                     CLASS_EMBERSTALKER => {
                         // CLASS_EMBERSTALKER: Smoke Veil + fast Oil/Fire Ambush!
                         p.haste_until = tick + 90;
-                        spawn_projs.push((p.team, 2, p.x + p.aim_x * 1.4, p.y + p.aim_y * 1.4, p.z, p.aim_x * 52.0, p.aim_y * 52.0, 0.0, 1.2, 1.1, 22));
-                        spawn_projs.push((p.team, 0, p.x + p.aim_x * 1.0, p.y + p.aim_y * 1.0, p.z, p.aim_x * 58.0, p.aim_y * 58.0, 0.0, 1.1, 1.2, 24));
-                        ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
+                        spawn_projs.push((p.face, p.team, 2, p.x + p.aim_x * 1.4, p.y + p.aim_y * 1.4, p.z, p.aim_x * 52.0, p.aim_y * 52.0, 0.0, 1.2, 1.1, 22));
+                        spawn_projs.push((p.face, p.team, 0, p.x + p.aim_x * 1.0, p.y + p.aim_y * 1.0, p.z, p.aim_x * 58.0, p.aim_y * 58.0, 0.0, 1.1, 1.2, 24));
+                        ability_e_fx = Some((p.face, cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
                     }
                     _ => {
                         // CLASS_BURROWER (Terramole): Subterranean Tunnel Bore + Haste!
                         p.haste_until = tick + 75;
                         p.burrow_ambush_until = tick + 120;
-                        ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
+                        ability_e_fx = Some((p.face, cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
                     }
                 }
             }
@@ -2571,17 +2868,17 @@ impl GameState {
                 if p.class_id == CLASS_BURROWER {
                     p.burrow_ambush_until = tick + 150;
                 }
-                ult_r_fx = Some((p.class_id, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
+                ult_r_fx = Some((p.face, p.class_id, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
             }
         }
 
-        if let Some((team, cls, px, py, pz, ax, ay, dmg, burrow_ambush)) = melee_hit_check {
+        if let Some((p_face, team, cls, px, py, pz, ax, ay, dmg, burrow_ambush)) = melee_hit_check {
             let z_tol = if self.is_z16() { 2.2 } else { 0.75 };
             let targets: Vec<u32> = self
                 .players
                 .values()
                 .filter(|t| {
-                    if t.id == pid || t.team == team || tick < t.dash_until || (t.z - pz).abs() > z_tol {
+                    if t.id == pid || t.team == team || t.face != p_face || tick < t.dash_until || (t.z - pz).abs() > z_tol {
                         return false;
                     }
                     let rx = t.x - px;
@@ -2600,7 +2897,7 @@ impl GameState {
             }
         }
 
-        for (team, elem, px, py, pz, vx, vy, vz, rad, pwr, ttl) in spawn_projs {
+        for (face, team, elem, px, py, pz, vx, vy, vz, rad, pwr, ttl) in spawn_projs {
             let id = self.next_id;
             self.next_id += 1;
             self.projectiles.push(ProjectileEntity {
@@ -2608,6 +2905,7 @@ impl GameState {
                 owner: pid,
                 team,
                 element: elem,
+                face,
                 x: px,
                 y: py,
                 z: pz,
@@ -2620,30 +2918,33 @@ impl GameState {
             });
         }
 
-        if let Some((cls, team, px, py, pz, ax, ay)) = ability_e_fx {
+        if let Some((p_face, cls, team, px, py, pz, ax, ay)) = ability_e_fx {
             let pl = (pz.round() as usize).clamp(0, self.grid_d - 1);
             match cls {
                 CLASS_STRIDER => {
                     for step in 1..=3 {
                         let tx = (px + ax * (step as f32 * 4.5)).clamp(3.0, gw - 4.0) as i32;
                         let ty = (py + ay * (step as f32 * 4.5)).clamp(3.0, gh - 4.0) as i32;
-                        self.record_terrain_engineering_candidates(pid, team, tx as f32, ty as f32, pl, -0.95, 0.0);
-                        self.volume.apply_frost_3d(tx, ty, pl, 5, 2.2);
+                        if !self.is_planet_mode() {
+                            self.record_terrain_engineering_candidates(pid, team, tx as f32, ty as f32, pl, -0.95, 0.0);
+                        }
+                        self.face_volume_mut(p_face).apply_frost_3d(tx, ty, pl, 5, 2.2);
                     }
                     self.push_event(2, px, py, 0, team, "ICE BRIDGE!".into());
                 }
                 CLASS_SKYWING => self.push_event(2, px, py, 0, team, "OIL BARRAGE!".into()),
                 CLASS_TIDEKIN => self.push_event(2, px, py, 0, team, "HYDRO SURGE!".into()),
                 CLASS_EMBERSTALKER => {
-                    self.volume.apply_physical_actuator(px, py, pl, 0.25, 0.0, 0.35, 0.85, 4.5);
+                    self.face_volume_mut(p_face).apply_physical_actuator(px, py, pl, 0.25, 0.0, 0.35, 0.85, 4.5);
                     self.push_event(2, px, py, 0, team, "SMOKE AMBUSH!".into());
                 }
                 _ => {
                     // CLASS_BURROWER (Terramole): Conservative Subterranean Bore
-                    let moved = self.volume.carve_tunnel_3d(
+                    let max_z_b = (self.grid_d as f32 - 1.5).max(1.0);
+                    let moved = self.face_volume_mut(p_face).carve_tunnel_3d(
                         (px + ax * 1.6).clamp(3.0, gw - 4.0),
                         (py + ay * 1.6).clamp(3.0, gh - 4.0),
-                        (pz + 0.7).clamp(1.0, (self.grid_d as f32 - 1.5).max(1.0)),
+                        (pz + 0.7).clamp(1.0, max_z_b),
                         ax,
                         ay,
                         2.6,
@@ -2657,15 +2958,15 @@ impl GameState {
             }
         }
 
-        if let Some((cls, team, px, py, pz, ax, ay)) = ult_r_fx {
+        if let Some((p_face, cls, team, px, py, pz, ax, ay)) = ult_r_fx {
             let pl = (pz.round() as usize).clamp(0, self.grid_d - 1);
             match cls {
                 CLASS_STRIDER => {
-                    self.volume.layers[pl].apply_glacial_nova(px.clamp(4.0, gw - 5.0) as i32, py.clamp(4.0, gh - 5.0) as i32, 11);
+                    self.face_volume_mut(p_face).layers[pl].apply_glacial_nova(px.clamp(4.0, gw - 5.0) as i32, py.clamp(4.0, gh - 5.0) as i32, 11);
                     let targets: Vec<u32> = self
                         .players
                         .values()
-                        .filter(|t| t.team != team && (t.x - px).hypot(t.y - py) <= 13.0)
+                        .filter(|t| t.face == p_face && t.team != team && (t.x - px).hypot(t.y - py) <= 13.0)
                         .map(|t| t.id)
                         .collect();
                     for tid in targets {
@@ -2679,17 +2980,19 @@ impl GameState {
                 CLASS_SKYWING => {
                     let tx = (px + ax * 16.0).clamp(6.0, gw - 7.0);
                     let ty = (py + ay * 16.0).clamp(6.0, gh - 7.0);
-                    self.volume.layers[pl].apply_meteor_impact(tx as i32, ty as i32, 8);
+                    self.face_volume_mut(p_face).layers[pl].apply_meteor_impact(tx as i32, ty as i32, 8);
                     let targets: Vec<u32> = self
                         .players
                         .values()
-                        .filter(|t| t.team != team && (t.x - tx).hypot(t.y - ty) <= 11.5)
+                        .filter(|t| t.face == p_face && t.team != team && (t.x - tx).hypot(t.y - ty) <= 11.5)
                         .map(|t| t.id)
                         .collect();
                     for tid in targets {
                         self.apply_damage(Some(pid), tid, 42, "METEOR", 0);
                     }
-                    self.eco.inject_fear_pulse(tx, ty, 24.0, 1.2);
+                    if !self.is_planet_mode() {
+                        self.eco.inject_fear_pulse(tx, ty, 24.0, 1.2);
+                    }
                     if pz >= self.surf_layer() as f32 + 1.5 {
                         self.push_combo_callout(0, tx, ty, team, "AERIAL OIL-IGNITION!");
                     }
@@ -2698,14 +3001,14 @@ impl GameState {
                 CLASS_TIDEKIN => {
                     let cx = (px + ax * 10.0).clamp(5.0, gw - 6.0) as i32;
                     let cy = (py + ay * 10.0).clamp(5.0, gh - 6.0) as i32;
-                    let boiled = self.volume.apply_steam_burst_3d(cx, cy, pl, 8);
+                    let boiled = self.face_volume_mut(p_face).apply_steam_burst_3d(cx, cy, pl, 8);
                     for p in self.players.values_mut() {
-                        if p.team == team && (p.x - px).hypot(p.y - py) <= 24.0 {
+                        if p.face == p_face && p.team == team && (p.x - px).hypot(p.y - py) <= 24.0 {
                             p.haste_until = tick + 150;
                             p.hp = (p.hp + 20).min(p.max_hp);
                         }
                     }
-                    let phys_p = self.volume.sample_entity_physics(px, py, pl);
+                    let phys_p = self.face_volume(p_face).sample_entity_physics(px, py, pl);
                     if phys_p.water_frac > 0.10 || boiled >= 4 {
                         self.push_combo_callout(1, px, py, team, "SUBMERGED GEYSER!");
                     }
@@ -2715,12 +3018,15 @@ impl GameState {
                     // CLASS_EMBERSTALKER: Inferno Raid (oil + fire burst + smoke veil)
                     let tx = (px + ax * 10.0).clamp(5.0, gw - 6.0);
                     let ty = (py + ay * 10.0).clamp(5.0, gh - 6.0);
-                    self.volume.layers[pl].apply_oil_splash(tx as i32, ty as i32, 6, 1.3);
-                    self.volume.layers[pl].apply_fire_bolt(tx as i32, ty as i32, 7, 2.2);
+                    {
+                        let vf = self.face_volume_mut(p_face);
+                        vf.layers[pl].apply_oil_splash(tx as i32, ty as i32, 6, 1.3);
+                        vf.layers[pl].apply_fire_bolt(tx as i32, ty as i32, 7, 2.2);
+                    }
                     let targets: Vec<u32> = self
                         .players
                         .values()
-                        .filter(|t| t.team != team && (t.x - tx).hypot(t.y - ty) <= 10.0)
+                        .filter(|t| t.face == p_face && t.team != team && (t.x - tx).hypot(t.y - ty) <= 10.0)
                         .map(|t| t.id)
                         .collect();
                     for tid in targets {
@@ -2730,14 +3036,15 @@ impl GameState {
                 }
                 _ => {
                     // CLASS_BURROWER (Terramole): Seismic Breach (3-step tunnel bore + shockwave!)
+                    let max_z_b = (self.grid_d as f32 - 1.5).max(1.0);
                     let mut total_moved = 0u32;
                     for step in 1..=3 {
                         let bx = (px + ax * (step as f32 * 2.2)).clamp(3.0, gw - 4.0);
                         let by = (py + ay * (step as f32 * 2.2)).clamp(3.0, gh - 4.0);
-                        total_moved = total_moved.saturating_add(self.volume.carve_tunnel_3d(
+                        total_moved = total_moved.saturating_add(self.face_volume_mut(p_face).carve_tunnel_3d(
                             bx,
                             by,
-                            (pz + 0.7).clamp(1.0, (self.grid_d as f32 - 1.5).max(1.0)),
+                            (pz + 0.7).clamp(1.0, max_z_b),
                             ax,
                             ay,
                             2.8,
@@ -2753,7 +3060,7 @@ impl GameState {
                     let targets: Vec<u32> = self
                         .players
                         .values()
-                        .filter(|t| t.team != team && (t.x - tx).hypot(t.y - ty) <= 11.0)
+                        .filter(|t| t.face == p_face && t.team != team && (t.x - tx).hypot(t.y - ty) <= 11.0)
                         .map(|t| t.id)
                         .collect();
                     for tid in targets {
@@ -2765,23 +3072,25 @@ impl GameState {
             }
         }
 
-        if let Some((cx, cy, team)) = carve_pos {
-            let sl = self.surf_layer();
-            if let Some(raft) = self.volume.layers[sl].carve_ice_raft(cx, cy, 4) {
-                let id = self.next_id;
-                self.next_id += 1;
-                self.rafts.push(RaftEntity {
-                    id,
-                    x: raft.center_x,
-                    y: raft.center_y,
-                    z: sl as f32,
-                    vx: 0.0,
-                    vy: 3.4,
-                    vz: 0.0,
-                    radius: raft.radius,
-                    ttl: 720,
-                });
-                self.push_event(2, raft.center_x, raft.center_y, 0, team, "RAFT CARVED!".into());
+        if !self.is_planet_mode() {
+            if let Some((cx, cy, team)) = carve_pos {
+                let sl = self.surf_layer();
+                if let Some(raft) = self.volume.layers[sl].carve_ice_raft(cx, cy, 4) {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    self.rafts.push(RaftEntity {
+                        id,
+                        x: raft.center_x,
+                        y: raft.center_y,
+                        z: sl as f32,
+                        vx: 0.0,
+                        vy: 3.4,
+                        vz: 0.0,
+                        radius: raft.radius,
+                        ttl: 720,
+                    });
+                    self.push_event(2, raft.center_x, raft.center_y, 0, team, "RAFT CARVED!".into());
+                }
             }
         }
     }
@@ -2846,7 +3155,7 @@ impl GameState {
 
         let mana_cost = (tf.abs() * 4.5 + (sw + so + ss) * 4.0 + imp * 7.5) * (0.65 + r * 0.08);
         let sim_tick_now = self.sim_tick;
-        let (px, py, pz, team, class_id, burrow_ambush_until, scale) = {
+        let (p_face, px, py, pz, team, class_id, burrow_ambush_until, scale) = {
             let Some(p) = self.players.get_mut(&pid) else {
                 return;
             };
@@ -2871,7 +3180,7 @@ impl GameState {
                 p.aim_x = dx / dlen;
                 p.aim_y = dy / dlen;
             }
-            (p.x, p.y, p.z, p.team, p.class_id, p.burrow_ambush_until, sc)
+            (p.face, p.x, p.y, p.z, p.team, p.class_id, p.burrow_ambush_until, sc)
         };
         if scale < 0.05 {
             return;
@@ -2896,9 +3205,10 @@ impl GameState {
                 let txi = (tx.round() as usize).min(self.grid_w - 1);
                 let tyi = (ty.round() as usize).min(self.grid_h - 1);
                 let tidx = tyi * self.grid_w + txi;
-                if self.volume.layers[l].cell_volume(tidx) < 25 {
+                let vf = self.face_volume(p_face);
+                if vf.layers[l].cell_volume(tidx) < 25 {
                     for z_scan in (1..l).rev() {
-                        if self.volume.layers[z_scan].cell_volume(tidx) >= 40 {
+                        if vf.layers[z_scan].cell_volume(tidx) >= 40 {
                             l = z_scan;
                             break;
                         }
@@ -2918,14 +3228,21 @@ impl GameState {
         let txi_c = (tx.round() as usize).min(self.grid_w - 1);
         let tyi_c = (ty.round() as usize).min(self.grid_h - 1);
         let tidx_c = tyi_c * self.grid_w + txi_c;
-        let target_has_oil = self.volume.layers[layer].mass[SP_OIL][tidx_c] >= 40;
-        let target_has_water = self.volume.layers[layer].mass[SP_WATER][tidx_c] >= 80;
         let pl_caster = (pz.round() as usize).clamp(0, self.grid_d - 1);
-        let caster_in_water = self.volume.sample_entity_physics(px, py, pl_caster).water_frac > 0.10;
+        let (target_has_oil, target_has_water, caster_in_water) = {
+            let vf = self.face_volume(p_face);
+            (
+                vf.layers[layer].mass[SP_OIL][tidx_c] >= 40,
+                vf.layers[layer].mass[SP_WATER][tidx_c] >= 80,
+                vf.sample_entity_physics(px, py, pl_caster).water_frac > 0.10,
+            )
+        };
 
-        self.record_terrain_engineering_candidates(pid, team, tx, ty, layer, tf_s, sw_s);
+        if !self.is_planet_mode() {
+            self.record_terrain_engineering_candidates(pid, team, tx, ty, layer, tf_s, sw_s);
+        }
 
-        self.volume
+        self.face_volume_mut(p_face)
             .apply_physical_actuator(tx, ty, layer, tf_s, sw_s, so_s, ss_s, r);
 
         let tick = self.sim_tick;
@@ -2964,6 +3281,7 @@ impl GameState {
                     focus_radius: r,
                     impulse: imp_s,
                     team,
+                    face: p_face,
                 },
             ));
             if self.actuator_pulses.len() > 48 {
@@ -2972,7 +3290,7 @@ impl GameState {
             }
         }
 
-        if tf_s.abs() > 0.45 || imp_s > 0.35 {
+        if !self.is_planet_mode() && (tf_s.abs() > 0.45 || imp_s > 0.35) {
             self.eco.inject_fear_pulse(tx, ty, (r * 3.0).clamp(10.0, 24.0), 0.75 * scale);
         }
 
@@ -2982,7 +3300,7 @@ impl GameState {
             let shock_z_tol = if self.is_z16() { 2.6 } else { 1.1 };
             let mut shock_hits: Vec<(u32, i16)> = Vec::new();
             for t in self.players.values_mut() {
-                if t.id == pid || tick < t.dash_until || (t.z - z1_beam).abs() > shock_z_tol {
+                if t.id == pid || t.face != p_face || tick < t.dash_until || (t.z - z1_beam).abs() > shock_z_tol {
                     continue;
                 }
                 let rx = t.x - tx;
@@ -3393,6 +3711,7 @@ impl GameState {
                         focus_radius: 7.5,
                         impulse: 0.0,
                         team,
+                        face: 0,
                     },
                 ));
                 if enemy_near {
@@ -3551,10 +3870,10 @@ impl GameState {
     }
 
     fn respawn_player(&mut self, pid: u32) {
-        let Some((team, carrying, rx, ry)) = self
+        let Some((team, class_id, prev_face, carrying, rx, ry)) = self
             .players
             .get(&pid)
-            .map(|p| (p.team, p.carrying_relic, p.x, p.y))
+            .map(|p| (p.team, p.class_id, p.face, p.carrying_relic, p.x, p.y))
         else {
             return;
         };
@@ -3563,9 +3882,15 @@ impl GameState {
             self.relic_x = rx;
             self.relic_y = ry;
         }
-        let (sx, sy, sz) = self.spawn_point(team, self.sim_tick as u32 + pid);
+        let (sface, sx, sy, sz) = if let Some(ref pr) = self.planet_runtime {
+            pr.spawn_point_for_entity(prev_face, class_id, self.sim_tick as u32 + pid)
+        } else {
+            let (x, y, z) = self.spawn_point(team, self.sim_tick as u32 + pid);
+            (0u8, x, y, z)
+        };
         if let Some(p) = self.players.get_mut(&pid) {
             p.carrying_relic = false;
+            p.face = sface;
             p.x = sx;
             p.y = sy;
             p.z = sz;
@@ -3593,18 +3918,39 @@ impl GameState {
 
     fn reset_match(&mut self) {
         let (w, h, d) = (self.grid_w, self.grid_h, self.grid_d);
-        self.volume = VolumeField::new_biome_3d(w, h, d, self.biome_id, self.world_seed);
-        self.last_epoch_name = self.volume.evolution_epoch_name();
+        if self.is_planet_mode() {
+            let pr = PlanetRuntime::new(w, d, self.planet_r_core, self.world_seed);
+            self.shrines = pr
+                .build_planetary_shrines()
+                .into_iter()
+                .map(|(id, name, face, x, y, z)| ShrineEntity {
+                    id,
+                    name,
+                    face,
+                    x,
+                    y,
+                    z,
+                    progress: 0.0,
+                    owner: 0,
+                })
+                .collect();
+            self.planet_runtime = Some(pr);
+            self.mass_error = 0;
+            self.energy_error = 0;
+        } else {
+            self.volume = VolumeField::new_biome_3d(w, h, d, self.biome_id, self.world_seed);
+            self.last_epoch_name = self.volume.evolution_epoch_name();
+            self.eco.reset();
+            self.refresh_hazard_grids();
+            self.shrines = GameState::build_shrines(w, h, d);
+            self.snap_shrines_z();
+        }
         self.tunnels_carved = 0;
         self.tunnel_mass_displaced = 0;
         self.last_combo_tick = [0; 10];
         self.tactical_events.clear();
         self.pending_cryo_bridges.clear();
         self.pending_basalt_quenches.clear();
-        self.eco.reset();
-        self.refresh_hazard_grids();
-        self.shrines = GameState::build_shrines(w, h, d);
-        self.snap_shrines_z();
         self.score_west = 0;
         self.score_east = 0;
         self.match_phase = MATCH_PHASE_ACTIVE;
@@ -3630,10 +3976,19 @@ impl GameState {
 
         let pids: Vec<u32> = self.players.keys().copied().collect();
         for pid in pids {
-            let team = self.players[&pid].team;
-            let (sx, sy, sz) = self.spawn_point(team, pid);
+            let (team, cls, old_face) = {
+                let p = &self.players[&pid];
+                (p.team, p.class_id, p.face)
+            };
+            let (sface, sx, sy, sz) = if let Some(ref pr) = self.planet_runtime {
+                pr.spawn_point_for_entity(old_face, cls, pid)
+            } else {
+                let (x, y, z) = self.spawn_point(team, pid);
+                (0u8, x, y, z)
+            };
             if let Some(p) = self.players.get_mut(&pid) {
                 let (mhp, mmp, mst, _) = PlayerEntity::class_stats(p.class_id, 1);
+                p.face = sface;
                 p.x = sx;
                 p.y = sy;
                 p.z = sz;
@@ -3685,6 +4040,8 @@ impl GameState {
             peer.pending_bricks.clear();
             peer.subbrick_shadow.clear();
             peer.pending_subbricks.clear();
+            peer.planet_subbrick_shadow.clear();
+            peer.pending_planet_subbricks.clear();
         }
         self.brick_raw_cache.clear();
         self.subbrick_raw_cache.clear();
@@ -3746,6 +4103,8 @@ impl GameState {
             peer.pending_bricks.clear();
             peer.subbrick_shadow.clear();
             peer.pending_subbricks.clear();
+            peer.planet_subbrick_shadow.clear();
+            peer.pending_planet_subbricks.clear();
         }
         self.brick_raw_cache.clear();
         self.subbrick_raw_cache.clear();
@@ -3814,11 +4173,215 @@ impl GameState {
     }
 
     fn step_bots(&mut self) {
+        if self.is_planet_mode() {
+            self.step_bots_planetary();
+            return;
+        }
         if self.neural_bots_on && self.step_bots_neural_z() {
             return;
         }
         self.bot_brains.clear();
         self.step_bots_scripted();
+    }
+
+    /// Wave 31A: Live 60-Bot Planetary AI across all 6 cubed-sphere faces!
+    /// - Skirmishes with nearby enemies on the same face (diagonal 3D actuators, projectiles, melee)
+    /// - Contests the 6 planetary shrines (1 per face)
+    /// - Continuously roams & pushes across all 12 cube seams (`+u, -u, +v, -v`) into neighboring faces
+    /// - Emits live planetary speech callouts (`SpeechBubbleSnap` with `face`)
+    fn step_bots_planetary(&mut self) {
+        let tick = self.sim_tick;
+        let nf = self.grid_w as f32;
+        let gd = self.grid_d as f32;
+
+        #[derive(Clone, Copy)]
+        struct PBotSnap {
+            id: u32,
+            team: u8,
+            class_id: u8,
+            face: u8,
+            x: f32,
+            y: f32,
+            z: f32,
+        }
+
+        let snaps: Vec<PBotSnap> = self
+            .players
+            .values()
+            .map(|p| PBotSnap {
+                id: p.id,
+                team: p.team,
+                class_id: p.class_id,
+                face: p.face,
+                x: p.x,
+                y: p.y,
+                z: p.z,
+            })
+            .collect();
+        let bot_snaps: Vec<PBotSnap> = snaps
+            .iter()
+            .copied()
+            .filter(|s| self.players.get(&s.id).map(|p| p.is_bot).unwrap_or(false))
+            .collect();
+
+        let shrine_snaps: Vec<(u8, f32, f32, f32, i8)> = self
+            .shrines
+            .iter()
+            .map(|s| (s.face, s.x, s.y, s.z, s.owner))
+            .collect();
+
+        for b in bot_snaps {
+            // 1. Find nearest enemy on the same cube face
+            let mut nearest_enemy: Option<(f32, f32, f32, f32)> = None;
+            for o in &snaps {
+                if o.id == b.id || o.team == b.team || o.face != b.face {
+                    continue;
+                }
+                let d = (o.x - b.x).hypot(o.y - b.y);
+                if nearest_enemy.map(|(bd, _, _, _)| d < bd).unwrap_or(true) {
+                    nearest_enemy = Some((d, o.x, o.y, o.z));
+                }
+            }
+
+            // 2. Choose movement vector:
+            //    - ~45% of bots act as global geodesic explorers / seam-crossers so bots stream
+            //      continuously across all 12 cube seams (including polar seams!).
+            //    - Remaining bots contest their face's planetary shrine and engage nearby enemies.
+            let is_roamer = (b.id % 5 == 0) || (b.class_id == CLASS_SKYWING) || (b.class_id == CLASS_EMBERSTALKER);
+            let (mut mx, mut my) = if is_roamer {
+                // Smoothly rotating geodesic heading around the cube sphere
+                let phase = ((tick / 90) as f32) * 0.65 + (b.id as f32) * 1.13;
+                let dir_x = phase.cos();
+                let dir_y = phase.sin();
+                (dir_x, dir_y)
+            } else if let Some((ed, ex, ey, _)) = nearest_enemy.filter(|(d, _, _, _)| *d < nf * 0.45) {
+                let dx = ex - b.x;
+                let dy = ey - b.y;
+                if ed > 7.5 {
+                    (dx / ed.max(1e-3), dy / ed.max(1e-3))
+                } else {
+                    // Strafe around target
+                    (-dy / ed.max(1e-3), dx / ed.max(1e-3))
+                }
+            } else if let Some(&(_, sx, sy, _, _)) = shrine_snaps.iter().find(|s| s.0 == b.face) {
+                let dx = sx - b.x;
+                let dy = sy - b.y;
+                let d = dx.hypot(dy);
+                if d > 5.0 {
+                    (dx / d, dy / d)
+                } else {
+                    let ang = (tick as f32) * 0.05 + (b.id as f32);
+                    (ang.cos(), ang.sin())
+                }
+            } else {
+                (1.0, 0.0)
+            };
+
+            let mlen = mx.hypot(my);
+            if mlen > 1e-4 {
+                mx /= mlen;
+                my /= mlen;
+            } else {
+                mx = 1.0;
+                my = 0.0;
+            }
+
+            let (ax, ay, target_z, edist) = if let Some((ed, ex, ey, ez)) = nearest_enemy {
+                let dx = ex - b.x;
+                let dy = ey - b.y;
+                let d = dx.hypot(dy).max(1e-3);
+                (dx / d, dy / d, ez, ed)
+            } else {
+                let tz = if b.class_id == CLASS_SKYWING {
+                    (gd * 0.50).clamp(6.0, gd - 4.0)
+                } else {
+                    b.z
+                };
+                (mx, my, tz, 28.0)
+            };
+
+            let elem = match b.class_id % 5 {
+                CLASS_STRIDER => 1u8,      // Frost
+                CLASS_SKYWING => 0u8,      // Fire
+                CLASS_TIDEKIN => 1u8,      // Frost/Water
+                CLASS_EMBERSTALKER => 2u8, // Oil
+                _ => 0u8,                  // Burrower Fire/Seismic
+            };
+
+            let inp = ClientInputDatagram {
+                seq: tick as u32,
+                move_x: mx,
+                move_y: my,
+                aim_x: ax,
+                aim_y: ay,
+                dash: (tick + b.id as u64 * 11) % 72 == 0,
+                melee: edist < 5.5,
+                cast_bolt: edist < 28.0 && (tick + b.id as u64 * 7) % 21 == 0,
+                bolt_element: elem,
+                carve_ice: false,
+                cast_ability_e: edist < 20.0 && (tick + b.id as u64 * 17) % 135 == 0,
+                cast_ultimate_r: edist < 18.0 && (tick + b.id as u64 * 29) % 330 == 0,
+                client_time_ms: 0,
+            };
+            self.apply_input(b.id, &inp);
+
+            // Fire conservative 3D diagonal elemental actuator beams (`ActuatorPulseSnap` with `face`)
+            if (tick + b.id as u64 * 13) % 24 == 0 && edist < 34.0 {
+                let reach = edist.clamp(4.0, 14.0);
+                let (tf, sw, so, ss, imp) = match b.class_id % 5 {
+                    CLASS_STRIDER => (-0.85, 0.25, 0.0, 0.0, 0.20),
+                    CLASS_SKYWING => (0.90, 0.0, 0.35, 0.20, 0.15),
+                    CLASS_TIDEKIN => (-0.30, 0.85, 0.0, 0.30, 0.25),
+                    CLASS_EMBERSTALKER => (0.70, 0.0, 0.70, 0.55, 0.20),
+                    _ => (0.45, 0.0, 0.20, 0.45, 0.50),
+                };
+                self.apply_player_physical_actuator_3d(
+                    b.id,
+                    ax * reach,
+                    ay * reach,
+                    Some(target_z),
+                    tf,
+                    sw,
+                    so,
+                    ss,
+                    3.2,
+                    imp,
+                );
+            }
+        }
+
+        // Occasional planetary speech callout across the 6 faces (~every 3s)
+        if tick % 90 == 0 {
+            if let Some(speaker) = self
+                .players
+                .values()
+                .filter(|p| p.is_bot)
+                .nth(((tick / 90) as usize) % self.players.len().max(1))
+                .cloned()
+            {
+                let fname = field_core::planet::face_name(speaker.face as usize);
+                let line = match speaker.class_id % 5 {
+                    CLASS_SKYWING => format!("ORBITAL PASS OVER {} SKY-RING!", fname),
+                    CLASS_TIDEKIN => format!("RIDING {} CURVED OCEAN CURRENT!", fname),
+                    CLASS_BURROWER => format!("TUNNELING {} MANTLE CRUST!", fname),
+                    CLASS_EMBERSTALKER => format!("STALKING {} TERMINATOR EDGE!", fname),
+                    _ => format!("HOLDING {} PLANETARY SHRINE!", fname),
+                };
+                self.push_speech_bubble(SpeechBubbleSnap {
+                    speaker_id: speaker.id,
+                    speaker_name: speaker.name,
+                    team: speaker.team,
+                    x: speaker.x,
+                    y: speaker.y,
+                    z: speaker.z,
+                    snr_db: 18.0,
+                    symbol_id: (speaker.class_id % 5) + 1,
+                    text: line,
+                    tick: tick as u32,
+                    face: speaker.face,
+                });
+            }
+        }
     }
 
     /// Batched Shared-Latent Neural Bots (`op=5` inspect with `4x4` Z_world saliency, graceful fallback to `op=4`):
@@ -4882,6 +5445,10 @@ impl GameState {
     }
 
     fn tick_combat_30hz(&mut self) {
+        if self.is_planet_mode() {
+            self.tick_combat_planetary_30hz();
+            return;
+        }
         self.sim_tick += 1;
         let tick = self.sim_tick;
         let dt = 1.0 / 30.0f32;
@@ -5795,6 +6362,243 @@ impl GameState {
         }
     }
 
+    /// Wave 31A: 30 Hz Planetary Combat, Geodesic 12-Edge Locomotion & 6-Face Shrines!
+    fn tick_combat_planetary_30hz(&mut self) {
+        self.sim_tick += 1;
+        let tick = self.sim_tick;
+        let dt = 1.0 / 30.0f32;
+        let face_size = self.grid_w;
+        let gd = self.grid_d as f32;
+
+        self.day_time += (dt / 240.0) * self.time_scale;
+        while self.day_time >= 1.0 {
+            self.day_time -= 1.0;
+            self.world_day = self.world_day.saturating_add(1);
+        }
+
+        while let Some(&(exp, _)) = self.events.front() {
+            if tick > exp {
+                self.events.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.speech_bubbles.retain(|(exp, _)| tick <= *exp);
+        self.bot_overrides.retain(|_, ov| tick <= ov.expires_tick);
+        self.recent_actuators
+            .retain(|&(_, _, _, _, _, exp)| tick <= exp);
+        self.actuator_pulses.retain(|(exp, _, _)| tick <= *exp);
+        self.time_domes.retain(|d| tick <= d.expires_tick);
+
+        let elapsed_s =
+            (self.match_elapsed_offset_secs + self.match_start_instant.elapsed().as_secs()) as u16;
+        self.match_time_left_s = if self.persistent_world {
+            MATCH_DURATION_SECS
+        } else {
+            MATCH_DURATION_SECS.saturating_sub(elapsed_s)
+        };
+
+        if tick % 3 == 0 {
+            self.step_bots_planetary();
+        }
+
+        // 1. Move all players & 60 bots seamlessly across all 12 cubed-sphere seams!
+        let pids: Vec<u32> = self.players.keys().copied().collect();
+        let mut new_seam_crossings = 0u64;
+        for pid in pids {
+            let (mut face, mut x, mut y, mut z, mut vx, mut vy, mut aim_x, mut aim_y, class_id, mut kb_vx, mut kb_vy) = {
+                let p = &self.players[&pid];
+                (p.face, p.x, p.y, p.z, p.vx, p.vy, p.aim_x, p.aim_y, p.class_id, p.kb_vx, p.kb_vy)
+            };
+
+            let mut eff_vx = vx + kb_vx;
+            let mut eff_vy = vy + kb_vy;
+            kb_vx *= 0.82;
+            kb_vy *= 0.82;
+            if kb_vx.abs() < 0.05 { kb_vx = 0.0; }
+            if kb_vy.abs() < 0.05 { kb_vy = 0.0; }
+
+            let crossings = PlanetRuntime::step_entity_on_sphere(
+                &mut face,
+                &mut x,
+                &mut y,
+                z,
+                &mut eff_vx,
+                &mut eff_vy,
+                &mut aim_x,
+                &mut aim_y,
+                face_size,
+                dt,
+            );
+            if crossings > 0 {
+                new_seam_crossings += crossings as u64;
+                // Preserve rotated velocity components on the new face
+                vx = eff_vx;
+                vy = eff_vy;
+            }
+
+            // Smooth archetype radial altitude `z` tracking curved terrain / ocean / Sky-Ring
+            let surf_z = self
+                .planet_runtime
+                .as_ref()
+                .map(|pr| pr.find_surface_z(face, x, y))
+                .unwrap_or(gd * 0.5);
+            let target_z = match class_id % 5 {
+                CLASS_SKYWING => {
+                    let sky_alt = (gd - 6.0).max(surf_z + 4.0).min(gd - 1.5);
+                    sky_alt + 1.5 * ((tick as f32) * 0.04 + (pid as f32)).sin()
+                }
+                CLASS_TIDEKIN => {
+                    let z_sea = (15.0 * (gd / 32.0)).clamp(3.0, gd - 4.0);
+                    surf_z.max(z_sea + 0.4)
+                }
+                CLASS_BURROWER => (surf_z - 1.0).max(4.5),
+                _ => surf_z,
+            };
+            let dz = target_z - z;
+            let vz = (dz * 3.2).clamp(-8.0, 8.0);
+            z = (z + vz * dt).clamp(1.0, gd - 1.2);
+
+            if let Some(p) = self.players.get_mut(&pid) {
+                p.face = face;
+                p.x = x;
+                p.y = y;
+                p.z = z;
+                p.vx = vx;
+                p.vy = vy;
+                p.vz = vz;
+                p.aim_x = aim_x;
+                p.aim_y = aim_y;
+                p.kb_vx = kb_vx;
+                p.kb_vy = kb_vy;
+                p.airborne = class_id == CLASS_SKYWING && z > surf_z + 2.0;
+                p.mana = (p.mana + 11.0 * dt).min(p.max_mana);
+                p.stamina = (p.stamina + 18.0 * dt).min(p.max_stamina);
+                if tick % 25 == 0 && p.hp < p.max_hp {
+                    p.hp = (p.hp + 2).min(p.max_hp);
+                }
+            }
+        }
+
+        // 2. Advance projectiles seamlessly across all 12 cubed-sphere seams!
+        let old_proj = std::mem::take(&mut self.projectiles);
+        let mut next_proj = Vec::with_capacity(old_proj.len());
+        let mut proj_hits: Vec<(u32, u32, u8, f32, u8, f32, f32)> = Vec::new();
+        for mut pr in old_proj {
+            let mut dummy_ax = pr.vx;
+            let mut dummy_ay = pr.vy;
+            let crossings = PlanetRuntime::step_entity_on_sphere(
+                &mut pr.face,
+                &mut pr.x,
+                &mut pr.y,
+                pr.z,
+                &mut pr.vx,
+                &mut pr.vy,
+                &mut dummy_ax,
+                &mut dummy_ay,
+                face_size,
+                dt,
+            );
+            new_seam_crossings += crossings as u64;
+            pr.z = (pr.z + pr.vz * dt).clamp(1.0, gd - 1.0);
+            let pl = (pr.z.round() as usize).clamp(0, self.grid_d - 1);
+
+            let mut hit = self
+                .face_volume(pr.face)
+                .sample_solid_density_3d(pr.x, pr.y, pr.z)
+                >= 0.65;
+            let mut hit_pid = None;
+            if !hit {
+                for p in self.players.values() {
+                    if p.id == pr.owner
+                        || p.team == pr.team
+                        || p.face != pr.face
+                        || tick < p.dash_until
+                    {
+                        continue;
+                    }
+                    if (p.x - pr.x).powi(2) + (p.y - pr.y).powi(2) <= (2.2 + pr.radius).powi(2)
+                        && (p.z - pr.z).abs() <= 3.0
+                    {
+                        hit = true;
+                        hit_pid = Some(p.id);
+                        break;
+                    }
+                }
+            }
+
+            if hit || pr.ttl <= 1 {
+                let cx = (pr.x.round() as i32).clamp(2, (face_size as i32) - 3);
+                let cy = (pr.y.round() as i32).clamp(2, (face_size as i32) - 3);
+                let vf = self.face_volume_mut(pr.face);
+                match pr.element {
+                    0 => vf.apply_fire_3d(cx, cy, pl, 3, 1.3 * pr.power),
+                    1 => vf.apply_frost_3d(cx, cy, pl, 4, 1.5 * pr.power),
+                    _ => vf.apply_oil_3d(cx, cy, pl, 3, 1.2 * pr.power),
+                }
+                if let Some(vid) = hit_pid {
+                    proj_hits.push((pr.owner, vid, pr.element, pr.power, pr.face, pr.x, pr.y));
+                }
+            } else {
+                pr.ttl = pr.ttl.saturating_sub(1);
+                next_proj.push(pr);
+            }
+        }
+        self.projectiles = next_proj;
+
+        if let Some(ref mut pr) = self.planet_runtime {
+            pr.seam_crossings_total = pr.seam_crossings_total.saturating_add(new_seam_crossings);
+        }
+
+        for (owner, vid, elem, pwr, _face, _hx, _hy) in proj_hits {
+            let base_dmg = match elem {
+                0 => 19.0,
+                1 => 15.0,
+                _ => 9.0,
+            };
+            let dmg = (base_dmg * pwr).round().max(1.0) as i16;
+            self.apply_damage(Some(owner), vid, dmg, "", elem);
+        }
+
+        // 3. Contest the 6 Planetary Shrines (1 per cube face)
+        let player_pos: Vec<(u32, u8, u8, f32, f32)> = self
+            .players
+            .values()
+            .map(|p| (p.id, p.team, p.face, p.x, p.y))
+            .collect();
+        let mut shrine_events = Vec::new();
+        for s in &mut self.shrines {
+            let (mut w_cnt, mut e_cnt) = (0i32, 0i32);
+            for &(_, team, pface, px, py) in &player_pos {
+                if pface == s.face && (px - s.x).hypot(py - s.y) <= 14.0 {
+                    if team == 0 { w_cnt += 1; } else { e_cnt += 1; }
+                }
+            }
+            let net = (e_cnt - w_cnt) as f32;
+            if net != 0.0 {
+                s.progress = (s.progress + net * 0.009).clamp(-1.0, 1.0);
+            }
+            let prev = s.owner;
+            if s.progress <= -0.95 && s.owner != -1 {
+                s.owner = -1;
+                shrine_events.push((s.x, s.y, 0u8, format!("WEST CAP: {}", s.name)));
+            } else if s.progress >= 0.95 && s.owner != 1 {
+                s.owner = 1;
+                shrine_events.push((s.x, s.y, 1u8, format!("EAST CAP: {}", s.name)));
+            } else if prev != 0 && s.progress.abs() < 0.2 {
+                s.owner = 0;
+            }
+        }
+        for (sx, sy, team, lbl) in shrine_events {
+            if team == 0 {
+                self.score_west = self.score_west.saturating_add(25);
+            } else {
+                self.score_east = self.score_east.saturating_add(25);
+            }
+            self.push_event(3, sx, sy, 25, team, lbl);
+        }
+    }
+
     fn process_ws_commands(&mut self) {
         let Some(ws) = self.ws_bridge.clone() else {
             return;
@@ -5980,14 +6784,15 @@ impl GameState {
         let tick = self.sim_tick;
         let surf_l = self.surf_layer();
         let is_z16 = self.is_z16();
+        let is_planet = self.is_planet_mode();
         let players: Vec<PlayerSnap> = self
             .players
             .values()
             .map(|p| {
                 let pl = (p.z.round() as usize).clamp(if is_z16 { 0 } else { surf_l }, self.grid_d - 1);
                 let mut status = 0u8;
-                if self.physics_native {
-                    let phys = self.volume.sample_entity_physics(p.x, p.y, pl);
+                if self.physics_native || is_planet {
+                    let phys = self.face_volume(p.face).sample_entity_physics(p.x, p.y, pl);
                     if phys.temp_c > 120.0 { status |= STATUS_BURNING; }
                     if phys.temp_c < -15.0 { status |= STATUS_CHILLED; }
                     if phys.water_frac > 0.18 && phys.ice_frac < 0.30 { status |= STATUS_WET; }
@@ -6035,6 +6840,7 @@ impl GameState {
                     ult_r_cd_frac: (p.ult_r_cd.saturating_sub(tick) as f32 / 360.0).clamp(0.0, 1.0),
                     ack_input_seq: p.ack_input_seq,
                     score: p.score,
+                    face: p.face,
                 }
             })
             .collect();
@@ -6042,7 +6848,7 @@ impl GameState {
             .projectiles
             .iter()
             .map(|pr| {
-                let dscale = self.sample_time_dome_scale(pr.x, pr.y);
+                let dscale = if is_planet { 1.0 } else { self.sample_time_dome_scale(pr.x, pr.y) };
                 ProjectileSnap {
                     id: pr.id,
                     element: pr.element,
@@ -6053,6 +6859,7 @@ impl GameState {
                     vy: pr.vy * dscale,
                     vz: pr.vz * dscale,
                     radius: pr.radius,
+                    face: pr.face,
                 }
             })
             .collect();
@@ -6077,7 +6884,15 @@ impl GameState {
         let shrines: Vec<ShrineSnap> = self
             .shrines
             .iter()
-            .map(|s| ShrineSnap { id: s.id, name: s.name.clone(), x: s.x, y: s.y, progress: s.progress, owner: s.owner })
+            .map(|s| ShrineSnap {
+                id: s.id,
+                name: s.name.clone(),
+                x: s.x,
+                y: s.y,
+                progress: s.progress,
+                owner: s.owner,
+                face: s.face,
+            })
             .collect();
         let events: Vec<CombatEvent> = self.events.iter().rev().take(10).map(|(_, e)| e.clone()).collect();
 
@@ -6090,6 +6905,32 @@ impl GameState {
             .unwrap_or(self.infer_ms_last);
 
         let bot_cnt = self.players.values().filter(|p| p.is_bot).count() as u16;
+        let (planet_mode, planet_r_core, sun_dir, seam_mass_crossed, active_sky_cores, field_tick_snap, mass_err_snap, energy_err_snap, total_chunks_snap) =
+            if let Some(ref pr) = self.planet_runtime {
+                (
+                    true,
+                    pr.planet.r_core,
+                    pr.planet.sun_dir,
+                    pr.planet.total_seam_mass_crossed.max(0) as u64,
+                    pr.active_sky_cores(),
+                    pr.planet.tick,
+                    pr.planet.global_mass_error(),
+                    pr.planet.global_energy_error(),
+                    (FACE_COUNT * pr.chunks_xy() * pr.chunks_xy() * (pr.subbricks_z() as usize)) as u16,
+                )
+            } else {
+                (
+                    false,
+                    0.0,
+                    [0.0, 0.0, 0.0],
+                    0,
+                    0,
+                    self.volume.tick,
+                    self.mass_error,
+                    self.energy_error,
+                    (self.chunks_x * self.chunks_y * self.grid_d) as u16,
+                )
+            };
         let telemetry = TelemetrySnap {
             mode: self.sim_mode.clone(),
             backend: self.backend_name.clone(),
@@ -6097,16 +6938,16 @@ impl GameState {
             grid_w: self.grid_w as u16,
             grid_h: self.grid_h as u16,
             grid_d: self.grid_d as u8,
-            field_tick: self.volume.tick,
+            field_tick: field_tick_snap,
             infer_ms_last: self.infer_ms_last,
             infer_ms_p99: p99,
             eco_infer_ms: self.eco_infer_ms,
             proj_active_pct: self.proj_active_pct,
-            mass_error: self.mass_error,
-            energy_error: self.energy_error,
+            mass_error: mass_err_snap,
+            energy_error: energy_err_snap,
             wire_kbps: self.wire_kbps,
             aoi_chunks_sent: self.aoi_chunks_sent_last,
-            total_chunks: (self.chunks_x * self.chunks_y * self.grid_d) as u16,
+            total_chunks: total_chunks_snap,
             active_bots: bot_cnt,
             neural_bots_on: self.neural_bots_on,
             bot_infer_ms: self.bot_infer_ms,
@@ -6124,6 +6965,11 @@ impl GameState {
             neural_3d_vertical: self.neural_3d_vertical,
             active_time_domes: time_domes.len().min(255) as u8,
             system2_slm_active: self.system2_slm_active,
+            planet_mode,
+            planet_r_core,
+            sun_dir,
+            seam_mass_crossed,
+            active_sky_cores,
         };
         let match_secs = (self.match_elapsed_offset_secs + self.match_start_instant.elapsed().as_secs()) as u32;
         let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
@@ -6148,21 +6994,54 @@ impl GameState {
         };
         let mut dead = Vec::new();
         let mut total_bytes = 0u64;
+        let nf_snap = self.grid_w.max(1) as f32;
         for (&pid, peer) in &self.peers {
-            let (echo, my_x, my_y) = self
+            let (echo, my_face, my_x, my_y) = self
                 .players
                 .get(&pid)
-                .map(|p| (p.echo_client_time_ms, p.x, p.y))
-                .unwrap_or((0, self.grid_w as f32 * 0.5, self.grid_h as f32 * 0.5));
-            let peer_players = select_aoi_players(
-                &players,
-                pid,
-                my_x,
-                my_y,
-                entity_aoi_r,
-                MAX_SNAPSHOT_PLAYERS,
-            );
-            let peer_projectiles: Vec<ProjectileSnap> = if proj_r2.is_finite() {
+                .map(|p| (p.echo_client_time_ms, p.face, p.x, p.y))
+                .unwrap_or((0, 0, self.grid_w as f32 * 0.5, self.grid_h as f32 * 0.5));
+            let peer_players = if is_planet {
+                // On a spherical planet, include self + closest entities across ALL 6 faces by 3D angular distance
+                // (up to 64 so orbital camera sees all 60 planetary bots cleanly!)
+                let my_dir = face_uv_to_sphere_dir(
+                    my_face as usize,
+                    (my_x / nf_snap) * 2.0 - 1.0,
+                    (my_y / nf_snap) * 2.0 - 1.0,
+                );
+                let mut out = Vec::with_capacity(players.len().min(64));
+                let mut others: Vec<(f32, usize)> = Vec::with_capacity(players.len());
+                for (idx, p) in players.iter().enumerate() {
+                    if p.id == pid {
+                        out.push(p.clone());
+                    } else {
+                        let d = face_uv_to_sphere_dir(
+                            p.face as usize,
+                            (p.x / nf_snap) * 2.0 - 1.0,
+                            (p.y / nf_snap) * 2.0 - 1.0,
+                        );
+                        let dot = (my_dir[0] * d[0] + my_dir[1] * d[1] + my_dir[2] * d[2]).clamp(-1.0, 1.0);
+                        others.push((1.0 - dot, idx));
+                    }
+                }
+                others.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                for &(_, idx) in others.iter().take(64usize.saturating_sub(out.len())) {
+                    out.push(players[idx].clone());
+                }
+                out
+            } else {
+                select_aoi_players(
+                    &players,
+                    pid,
+                    my_x,
+                    my_y,
+                    entity_aoi_r,
+                    MAX_SNAPSHOT_PLAYERS,
+                )
+            };
+            let peer_projectiles: Vec<ProjectileSnap> = if is_planet {
+                projectiles.clone()
+            } else if proj_r2.is_finite() {
                 projectiles
                     .iter()
                     .filter(|pr| {
@@ -6361,6 +7240,8 @@ impl GameState {
             peer.pending_bricks.clear();
             peer.subbrick_shadow.clear();
             peer.pending_subbricks.clear();
+            peer.planet_subbrick_shadow.clear();
+            peer.pending_planet_subbricks.clear();
         }
         if let Some(ref ws) = self.ws_bridge {
             ws.queue_full_sync_all();
@@ -7020,6 +7901,114 @@ impl GameState {
         self.record_wire_bytes(total_peer_bytes / peer_count);
     }
 
+    /// Wave 31A: Stream `PlanetFaceBrick3D` (full initial sync across all 6 faces, skipping pure
+    /// empty orbital space & uniform inner core) and `PlanetFaceBrick3DDelta` (10 Hz dirty temporal
+    /// compression) over QUIC without stalling datagram buffers!
+    fn broadcast_planet_chunks_10hz(&mut self, dirty_subbricks: &[(u8, u16, u16, u16)]) {
+        if self.peers.is_empty() || self.planet_runtime.is_none() {
+            return;
+        }
+        let rt_handle = self.rt_handle.clone();
+        let any_full = self.peers.values().any(|p| p.needs_full_sync);
+
+        let (full_pkts, empty_shadows, total_sb, skipped_sb) = if any_full {
+            self.planet_runtime
+                .as_mut()
+                .unwrap()
+                .encode_full_planet_subbricks()
+        } else {
+            (Vec::new(), Vec::new(), 0, 0)
+        };
+
+        const MAX_PLANET_BYTES_PER_PEER_TICK: u64 = 24 * 1024;
+        let peer_count = self.peers.len().max(1) as u64;
+        let mut total_peer_bytes = 0u64;
+        let mut total_peer_chunks = 0u64;
+
+        let mut pr = self.planet_runtime.take().unwrap();
+        for (&pid, peer) in self.peers.iter_mut() {
+            let mut peer_b = 0u64;
+            let mut sent_cnt = 0u16;
+            if peer.needs_full_sync {
+                peer.needs_full_sync = false;
+                peer.planet_subbrick_shadow.clear();
+                peer.pending_planet_subbricks.clear();
+                for (key, arc) in &empty_shadows {
+                    peer.planet_subbrick_shadow.insert(*key, arc.clone());
+                }
+                let mut batch = Vec::with_capacity(full_pkts.len());
+                for (key, arc, pkt) in &full_pkts {
+                    peer.planet_subbrick_shadow.insert(*key, arc.clone());
+                    peer_b += pkt.len() as u64;
+                    sent_cnt = sent_cnt.saturating_add(1);
+                    batch.push(pkt.clone());
+                }
+                let skip_pct = if total_sb > 0 {
+                    (skipped_sb as f32 * 100.0) / (total_sb as f32)
+                } else {
+                    0.0
+                };
+                log::info!(
+                    "Full Planet sync (6x{}x{}x{}): sent {} / {} sub-bricks, skipped {:.1}% space/core (player {}, {:.1} KB)",
+                    pr.face_size(),
+                    pr.face_size(),
+                    pr.depth(),
+                    full_pkts.len(),
+                    total_sb,
+                    skip_pct,
+                    pid,
+                    peer_b as f32 / 1024.0
+                );
+                Self::send_packets_batched(&rt_handle, peer.conn.clone(), batch);
+            } else {
+                for &k in dirty_subbricks {
+                    peer.pending_planet_subbricks.insert(k);
+                }
+                let mut pending: Vec<(u8, u16, u16, u16)> =
+                    peer.pending_planet_subbricks.drain().collect();
+                let my_face = self.players.get(&pid).map(|p| p.face).unwrap_or(0);
+                // Prioritize sub-bricks on the player's current face first, then round-robin others
+                pending.sort_by_key(|&(f, bx, by, bz)| {
+                    let face_prio = if f == my_face { 0u8 } else { 1u8 + f };
+                    (face_prio, bz, by, bx)
+                });
+                let mut out_pkts = Vec::new();
+                let mut budget_hit = false;
+                for (f, bx, by, bz) in pending {
+                    if budget_hit {
+                        peer.pending_planet_subbricks.insert((f, bx, by, bz));
+                        continue;
+                    }
+                    let prev_arc = peer.planet_subbrick_shadow.get(&(f, bx, by, bz));
+                    let dz = if f == my_face {
+                        DEFAULT_BRICK3D_DELTA_DEADZONE
+                    } else {
+                        5
+                    };
+                    if let Some((pkt, _is_delta, cur_arc)) =
+                        pr.encode_incremental_subbrick(f, bx, by, bz, prev_arc, dz)
+                    {
+                        peer_b += pkt.len() as u64;
+                        sent_cnt = sent_cnt.saturating_add(1);
+                        out_pkts.push(pkt);
+                        peer.planet_subbrick_shadow.insert((f, bx, by, bz), cur_arc);
+                        if peer_b >= MAX_PLANET_BYTES_PER_PEER_TICK {
+                            budget_hit = true;
+                        }
+                    }
+                }
+                if !out_pkts.is_empty() {
+                    Self::send_packets_batched(&rt_handle, peer.conn.clone(), out_pkts);
+                }
+            }
+            total_peer_bytes += peer_b;
+            total_peer_chunks += sent_cnt as u64;
+        }
+        self.planet_runtime = Some(pr);
+        self.aoi_chunks_sent_last = (total_peer_chunks / peer_count) as u16;
+        self.record_wire_bytes(total_peer_bytes / peer_count);
+    }
+
     fn record_wire_bytes(&mut self, bytes_per_client: u64) {
         self.bytes_sent_window += bytes_per_client;
         let secs = self.bytes_window_start.elapsed().as_secs_f32();
@@ -7059,66 +8048,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,ort=warn")).init();
     let args = Args::parse();
 
+    let effective_size = args.size.unwrap_or(if args.planet { 64 } else { 256 });
+    let effective_layers = args.layers.unwrap_or(if args.planet { 32 } else { 4 });
+
     let server_cfg = make_quic_server_config()?;
     let endpoint = Endpoint::server(server_cfg, args.bind)?;
     let state = Arc::new(Mutex::new({
-        let mut gs = GameState::new(
-            args.backend.clone(),
-            args.cuda_addr.clone(),
-            args.size,
-            args.layers,
-            args.biome,
-            args.seed,
-            args.bots,
-            args.aoi_radius,
-        );
+        let mut gs = if args.planet {
+            GameState::new_planet(
+                args.backend.clone(),
+                args.cuda_addr.clone(),
+                effective_size,
+                effective_layers,
+                args.planet_r_core,
+                args.seed,
+                args.bots,
+                args.aoi_radius,
+            )
+        } else {
+            GameState::new(
+                args.backend.clone(),
+                args.cuda_addr.clone(),
+                effective_size,
+                effective_layers,
+                args.biome,
+                args.seed,
+                args.bots,
+                args.aoi_radius,
+            )
+        };
         gs.entity_aoi_radius = args.entity_aoi_radius;
         gs.persistent_world = args.persistent_world;
-        if let Some(ref sf) = args.state_file {
-            if sf.exists() {
-                match persistence::load_world(sf) {
-                    Ok(payload) => match gs.restore_from_persistence(payload) {
-                        Ok(()) => {
-                            log::info!(
-                                "Restored persistent world from {} (tick={}, {}x{}x{}, biome={}, players={}, mass_err={}, energy_err={})",
-                                sf.display(),
-                                gs.volume.tick,
-                                gs.grid_w,
-                                gs.grid_h,
-                                gs.grid_d,
-                                biome_name(gs.biome_id),
-                                gs.persistent_players.len(),
-                                gs.volume.mass_error(),
-                                gs.volume.energy_error()
-                            );
-                        }
+        if !args.planet {
+            if let Some(ref sf) = args.state_file {
+                if sf.exists() {
+                    match persistence::load_world(sf) {
+                        Ok(payload) => match gs.restore_from_persistence(payload) {
+                            Ok(()) => {
+                                log::info!(
+                                    "Restored persistent world from {} (tick={}, {}x{}x{}, biome={}, players={}, mass_err={}, energy_err={})",
+                                    sf.display(),
+                                    gs.volume.tick,
+                                    gs.grid_w,
+                                    gs.grid_h,
+                                    gs.grid_d,
+                                    biome_name(gs.biome_id),
+                                    gs.persistent_players.len(),
+                                    gs.volume.mass_error(),
+                                    gs.volume.energy_error()
+                                );
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Failed to apply persisted world from {}: {} (starting fresh)",
+                                    sf.display(),
+                                    e
+                                );
+                            }
+                        },
                         Err(e) => {
                             log::error!(
-                                "Failed to apply persisted world from {}: {} (starting fresh)",
+                                "Failed to load persisted world from {}: {} (starting fresh)",
                                 sf.display(),
                                 e
                             );
                         }
-                    },
-                    Err(e) => {
-                        log::error!(
-                            "Failed to load persisted world from {}: {} (starting fresh)",
-                            sf.display(),
-                            e
-                        );
                     }
                 }
             }
         }
         gs
     }));
-    let (grid_w, grid_h, grid_d, biome_id, world_seed, chunks_x, chunks_y, bot_counts) = {
+    let (grid_w, grid_h, grid_d, biome_id, world_seed, chunks_x, chunks_y, bot_counts, sky_cores) = {
         let gs = state.lock().unwrap();
         let mut cls_cnt = [0usize; 5];
         for p in gs.players.values().filter(|p| p.is_bot) {
             cls_cnt[(p.class_id as usize) % 5] += 1;
         }
-        (gs.grid_w, gs.grid_h, gs.grid_d, gs.biome_id, gs.world_seed, gs.chunks_x, gs.chunks_y, cls_cnt)
+        let sc = gs.planet_runtime.as_ref().map(|pr| pr.active_sky_cores()).unwrap_or(0);
+        (gs.grid_w, gs.grid_h, gs.grid_d, gs.biome_id, gs.world_seed, gs.chunks_x, gs.chunks_y, cls_cnt, sc)
     };
     if let Some(ref ws_addr) = args.ws_bind {
         let bridge = ws_bridge::WsBridge::start(ws_addr, chunks_x, chunks_y).await?;
@@ -7131,25 +8139,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             grid_d
         );
     }
-    log::info!(
-        "Frostmarsh v3 3D VOLUMETRIC QUIC Server listening on {} ({}x{}x{} = {} voxels, biome={} [{}], seed={}, backend={}, bots={} [Strider={} Skywing={} Tidekin={} Emberstalker={} Burrower={}], aoi_r={})",
-        args.bind,
-        grid_w,
-        grid_h,
-        grid_d,
-        grid_w * grid_h * grid_d,
-        biome_id,
-        biome_name(biome_id),
-        world_seed,
-        args.backend,
-        bot_counts.iter().sum::<usize>(),
-        bot_counts[0],
-        bot_counts[1],
-        bot_counts[2],
-        bot_counts[3],
-        bot_counts[4],
-        args.aoi_radius
-    );
+    if args.planet {
+        log::info!(
+            "Frostmarsh Wave 31A CUBED-SPHERE PLANET QUIC Server listening on {} (6x{}x{}x{} = {} voxels, r_core={:.1}, sky_cores={}, seed={}, backend={}, bots={} [Strider={} Skywing={} Tidekin={} Emberstalker={} Burrower={}])",
+            args.bind,
+            grid_w,
+            grid_h,
+            grid_d,
+            FACE_COUNT * grid_w * grid_h * grid_d,
+            args.planet_r_core,
+            sky_cores,
+            world_seed,
+            args.backend,
+            bot_counts.iter().sum::<usize>(),
+            bot_counts[0],
+            bot_counts[1],
+            bot_counts[2],
+            bot_counts[3],
+            bot_counts[4],
+        );
+    } else {
+        log::info!(
+            "Frostmarsh v3 3D VOLUMETRIC QUIC Server listening on {} ({}x{}x{} = {} voxels, biome={} [{}], seed={}, backend={}, bots={} [Strider={} Skywing={} Tidekin={} Emberstalker={} Burrower={}], aoi_r={})",
+            args.bind,
+            grid_w,
+            grid_h,
+            grid_d,
+            grid_w * grid_h * grid_d,
+            biome_id,
+            biome_name(biome_id),
+            world_seed,
+            args.backend,
+            bot_counts.iter().sum::<usize>(),
+            bot_counts[0],
+            bot_counts[1],
+            bot_counts[2],
+            bot_counts[3],
+            bot_counts[4],
+            args.aoi_radius
+        );
+    }
 
     // 10 Hz Batched 3D Neural World + Vertical Gravity/Buoyancy + Ecosystem Thread
     let field_state = state.clone();
@@ -7157,6 +8186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cuda_addr = args.cuda_addr.clone();
     let model_path = args.model.clone();
     let eco_path = args.ecosystem_model.clone();
+    let planet_mode_flag = args.planet;
 
     std::thread::spawn(move || {
         #[cfg(feature = "onnx")]
@@ -7168,6 +8198,148 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = (&model_path, &eco_path);
 
         let period = Duration::from_millis(100);
+        if planet_mode_flag {
+            loop {
+                let t_loop = Instant::now();
+                // 1. Snapshot op=12 request payload under the lock (so TCP RPC never blocks 30 Hz combat!)
+                let rpc_prep = {
+                    let gs = field_state.lock().unwrap();
+                    let use_neural = gs.sim_mode == "neural" && cuda_rpc.is_some();
+                    if use_neural {
+                        gs.planet_runtime.as_ref().and_then(|pr| {
+                            if pr.op12_backoff == 0 {
+                                let next_sun = planet_runtime::sun_dir_from_angle(
+                                    (pr.sun_angle + pr.sun_speed_rad_per_tick).rem_euclid(std::f32::consts::TAU),
+                                );
+                                let flags = PLANET_FLAG_USE_SPARSE | PLANET_FLAG_FP16_IO;
+                                let payload = encode_planet_op12_request(&pr.planet, next_sun, flags);
+                                Some((pr.face_size(), pr.depth(), true, payload))
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                };
+
+                // 2. Execute CUDA op=12 outside the mutex (zero lock contention!)
+                let mut rpc_outcome: Option<Result<PlanetOp12Response, String>> = None;
+                if let (Some(rpc), Some((nf, ld, fp16, payload))) = (cuda_rpc.as_mut(), rpc_prep) {
+                    rpc_outcome = Some(rpc.step_planet_v8_raw(nf, ld, fp16, &payload));
+                }
+
+                // 3. Apply neural or RefSim step + 12-edge conservation + terminator + structural + stream sub-bricks
+                {
+                    let mut gs = field_state.lock().unwrap();
+                    let use_neural = gs.sim_mode == "neural" && cuda_rpc.is_some();
+                    let mut pr_opt = gs.planet_runtime.take();
+                    if let Some(ref mut pr) = pr_opt {
+                        let outcome = pr.step_planet_neural_or_refsim(use_neural, |_planet, _sun, _flags| {
+                            rpc_outcome
+                                .take()
+                                .unwrap_or_else(|| Err("op=12 skipped".to_string()))
+                        });
+                        let sim_tick_u32 = gs.sim_tick as u32;
+                        for (fi, _cid, cname, cx, cy, cz) in &outcome.newly_fracturing_cores {
+                            let msg = format!("ORBITAL CORE FRACTURING: {}!", cname);
+                            gs.push_event(5, *cx, *cy, 0, 2, msg.clone());
+                            gs.push_speech_bubble(SpeechBubbleSnap {
+                                speaker_id: 0,
+                                speaker_name: "ORBITAL ALERT".into(),
+                                team: 2,
+                                x: *cx,
+                                y: *cy,
+                                z: *cz,
+                                snr_db: 24.0,
+                                symbol_id: 5,
+                                text: msg.clone(),
+                                tick: sim_tick_u32,
+                                face: *fi,
+                            });
+                            log::info!("PLANET STRUCTURAL: {} (face={})", msg, fi);
+                        }
+                        for (fi, _cid, cname, cx, cy, cz) in &outcome.newly_impacted_cores {
+                            let msg = format!("{} CRASHED ONTO PLANET SURFACE!", cname);
+                            gs.push_event(5, *cx, *cy, 0, 2, msg.clone());
+                            gs.push_speech_bubble(SpeechBubbleSnap {
+                                speaker_id: 0,
+                                speaker_name: "ORBITAL ALERT".into(),
+                                team: 2,
+                                x: *cx,
+                                y: *cy,
+                                z: *cz,
+                                snr_db: 24.0,
+                                symbol_id: 5,
+                                text: msg.clone(),
+                                tick: sim_tick_u32,
+                                face: *fi,
+                            });
+                            log::info!(
+                                "PLANET STRUCTURAL IMPACT: {} (face={}, fallen={}, splashed={})",
+                                msg,
+                                fi,
+                                outcome.fallen_solid_mass,
+                                outcome.splashed_fluid_mass
+                            );
+                        }
+                        gs.backend_name = outcome.backend.clone();
+                        gs.infer_ms_last = outcome.infer_ms;
+                        if gs.infer_window.len() >= 100 {
+                            gs.infer_window.pop_front();
+                        }
+                        gs.infer_window.push_back(outcome.infer_ms);
+                        gs.world_sparse_pct = (outcome.active_frac * 100.0).clamp(0.0, 100.0);
+                        gs.neural_3d_vertical = outcome.neural_3d_vertical;
+                        gs.mass_error = outcome.global_mass_error;
+                        gs.energy_error = outcome.global_energy_error;
+                        let dirty_sb = outcome.dirty_subbricks;
+                        let log_tick = outcome.tick;
+                        let log_seam_tick = outcome.seam_mass_crossed;
+                        let log_seam = pr.planet.total_seam_mass_crossed;
+                        let log_cores = pr.active_sky_cores();
+                        let log_cross = pr.seam_crossings_total;
+                        let log_nf = pr.face_size();
+                        let log_ld = pr.depth();
+                        gs.planet_runtime = pr_opt;
+                        gs.broadcast_planet_chunks_10hz(&dirty_sb);
+
+                        if log_tick % 10 == 0 {
+                            let bot_cnt = gs.players.values().filter(|p| p.is_bot).count();
+                            log::info!(
+                                "planet_tick={} 6x{}x{}x{} backend={} infer={:.2}ms sparse={:.1}% mass_err={} energy_err={} seam_mass={} (+{}) sky_cores={} bot_seams={} bots={} dirty_sb={} wire={:.1}KB/s peers={}",
+                                log_tick,
+                                log_nf,
+                                log_nf,
+                                log_ld,
+                                gs.backend_name,
+                                gs.infer_ms_last,
+                                gs.world_sparse_pct,
+                                gs.mass_error,
+                                gs.energy_error,
+                                log_seam,
+                                log_seam_tick,
+                                log_cores,
+                                log_cross,
+                                bot_cnt,
+                                dirty_sb.len(),
+                                gs.wire_kbps,
+                                gs.peers.len()
+                            );
+                        }
+                    } else {
+                        gs.planet_runtime = pr_opt;
+                    }
+                }
+
+                let elapsed = t_loop.elapsed();
+                if elapsed < period {
+                    std::thread::sleep(period - elapsed);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
         let mut world_dt_backoff: u32 = 0;
         let mut world_3d_backoff: u32 = 0;
         loop {
@@ -7573,6 +8745,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pending_bricks: HashSet::new(),
                         subbrick_shadow: HashMap::new(),
                         pending_subbricks: HashSet::new(),
+                        planet_subbrick_shadow: HashMap::new(),
+                        pending_planet_subbricks: HashSet::new(),
                     },
                 );
                 (pid, gs.grid_w as u16, gs.grid_h as u16, gs.grid_d as u8)
@@ -7655,21 +8829,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .take(72)
                                     .collect();
                                 if !clean.is_empty() {
-                                    // Wave 28: Conservation-exact interactive structural collapse triggers!
+                                    // Wave 28 / Wave 31A: Conservation-exact interactive structural collapse triggers!
                                     if clean.starts_with("/collapse_isle") || clean.starts_with("/shatter_core") {
+                                        let default_cid = if gs.is_planet_mode() { 0u8 } else { 1u8 };
                                         let cid: u8 = clean
                                             .split_whitespace()
                                             .nth(1)
                                             .and_then(|s| s.parse::<u8>().ok())
-                                            .unwrap_or(1);
-                                        if let Some((cname, cx, cy, _cz)) =
-                                            field_core::structural::fracture_buoyant_core(&mut gs.volume, cid)
-                                        {
-                                            let msg = format!("THERMAL SHOCK! {} CORE DESTABILIZED!", cname);
+                                            .unwrap_or(default_cid);
+                                        let collapsed_planet = gs
+                                            .planet_runtime
+                                            .as_mut()
+                                            .and_then(|pr| pr.collapse_orbital_isle(cid));
+                                        if let Some((face, cname, cx, cy, cz)) = collapsed_planet {
+                                            let msg = format!("ORBITAL SHOCK! {} CORE DESTABILIZED!", cname);
+                                            let tick_u32 = gs.sim_tick as u32;
                                             gs.push_event(5, cx, cy, 0, 2, msg.clone());
-                                            log::info!("ChatCommand {} -> {}", clean, msg);
+                                            gs.push_speech_bubble(SpeechBubbleSnap {
+                                                speaker_id: 0,
+                                                speaker_name: "ORBITAL ALERT".into(),
+                                                team: 2,
+                                                x: cx,
+                                                y: cy,
+                                                z: cz,
+                                                snr_db: 24.0,
+                                                symbol_id: 5,
+                                                text: msg.clone(),
+                                                tick: tick_u32,
+                                                face,
+                                            });
+                                            log::info!("Planet ChatCommand {} -> {} (face={})", clean, msg, face);
+                                        } else if !gs.is_planet_mode() {
+                                            if let Some((cname, cx, cy, _cz)) =
+                                                field_core::structural::fracture_buoyant_core(&mut gs.volume, cid)
+                                            {
+                                                let msg = format!("THERMAL SHOCK! {} CORE DESTABILIZED!", cname);
+                                                gs.push_event(5, cx, cy, 0, 2, msg.clone());
+                                                log::info!("ChatCommand {} -> {}", clean, msg);
+                                            }
                                         }
-                                    } else if clean.starts_with("/undercut_viaduct") {
+                                    } else if clean.starts_with("/undercut_viaduct") && !gs.is_planet_mode() {
                                         let px = gs.grid_w as f32 * 0.44;
                                         let py = gs.grid_h as f32 * 0.50;
                                         let z_lo = ((20.0 * (gs.volume.depth as f32 / 64.0)).round() as usize).max(1);
@@ -7688,10 +8887,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         log::info!("ChatCommand {} -> {}", clean, msg);
                                     }
                                     let vol = volume.clamp(0.1, 1.0);
-                                    if let Some((px, py, pz, team)) = gs
+                                    if let Some((pface, px, py, pz, team)) = gs
                                         .players
                                         .get(&pid)
-                                        .map(|p| (p.x, p.y, p.z, p.team))
+                                        .map(|p| (p.face, p.x, p.y, p.z, p.team))
                                     {
                                         let tick_u32 = gs.sim_tick as u32;
                                         gs.push_speech_bubble(SpeechBubbleSnap {
@@ -7705,9 +8904,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             symbol_id: if vol >= 0.6 { 1 } else { 0 },
                                             text: format!("YOU: {}", clean),
                                             tick: tick_u32,
+                                            face: pface,
                                         });
                                         gs.pending_chat = Some(PendingChat {
                                             text: clean,
+                                            face: pface,
                                             x: px,
                                             y: py,
                                             layer: pz,
@@ -8222,6 +9423,7 @@ mod tests {
                 ult_r_cd_frac: 0.0,
                 ack_input_seq: 0,
                 score: 0,
+                face: 0,
             })
             .collect();
         let culled = select_aoi_players(&all_snaps, 1, 64.0, 64.0, 110.0, MAX_SNAPSHOT_PLAYERS);
@@ -8441,5 +9643,233 @@ mod tests {
         let st = gs.volume.step_3d(&raws);
         assert_eq!(st.mass_error, 0);
         assert_eq!(st.energy_error, 0);
+    }
+
+    #[tokio::test]
+    async fn test_wave31a_planet_mode_60bots_12edges_exact_conservation() {
+        let mut gs = GameState::new_planet(
+            "refsim".to_string(),
+            "127.0.0.1:14440".to_string(),
+            64,
+            32,
+            48.0,
+            42,
+            60,
+            4,
+        );
+        assert!(gs.is_planet_mode());
+        assert_eq!(gs.grid_w, 64);
+        assert_eq!(gs.grid_d, 32);
+
+        // 1. Verify 60 bots distributed across all 6 cube faces & all 5 archetypes + 6 shrines (1 per face)
+        let mut face_counts = [0usize; FACE_COUNT];
+        let mut class_counts = [0usize; 5];
+        for p in gs.players.values().filter(|p| p.is_bot) {
+            face_counts[(p.face as usize) % FACE_COUNT] += 1;
+            class_counts[(p.class_id as usize) % 5] += 1;
+        }
+        assert_eq!(face_counts, [10, 10, 10, 10, 10, 10], "60 bots must distribute evenly across all 6 faces");
+        assert_eq!(class_counts, [12, 12, 12, 12, 12], "60 bots must cover all 5 archetypes evenly");
+        assert_eq!(gs.shrines.len(), 6, "must spawn 6 planetary shrines (1 per face)");
+        for f in 0..6u8 {
+            assert!(
+                gs.shrines.iter().any(|s| s.face == f),
+                "missing planetary shrine on face {}",
+                f
+            );
+        }
+
+        // Verify initial Sky-Ring BuoyantCores exist and conservation baseline is bit-exact
+        let init_cores = gs.planet_runtime.as_ref().unwrap().active_sky_cores();
+        assert!(init_cores >= 4, "expected intact Orbital Sky-Ring BuoyantCores, got {}", init_cores);
+        assert_eq!(gs.planet_runtime.as_ref().unwrap().planet.global_mass_error(), 0);
+        assert_eq!(gs.planet_runtime.as_ref().unwrap().planet.global_energy_error(), 0);
+
+        // 2. Encode initial PlanetFaceBrick3D full-planet sub-bricks & verify round-trip + empty orbital space skipping
+        let (full_pkts, _empty_shadows, total_sb, _skipped_sb) = gs
+            .planet_runtime
+            .as_mut()
+            .unwrap()
+            .encode_full_planet_subbricks();
+        assert_eq!(total_sb, 6 * 4 * 4 * 2); // 6 faces * 4x4 * 2 sub-bricks (Z=32) = 192
+        assert!(!full_pkts.is_empty());
+
+        // Verify pure empty orbital space sub-bricks are skipped cleanly (e.g. Z=48 upper orbital band bz=2)
+        let mut pr_orb = PlanetRuntime::new(32, 48, 48.0, 42);
+        let (_orb_pkts, orb_empty, orb_total, orb_skipped) = pr_orb.encode_full_planet_subbricks();
+        assert!(
+            orb_skipped > 0 && !orb_empty.is_empty(),
+            "must skip pure empty orbital space sub-bricks (skipped {}/{})",
+            orb_skipped,
+            orb_total
+        );
+
+        let mut shadow_map: HashMap<(u8, u16, u16, u16), RawBrickArc> = HashMap::new();
+        for (key, raw_arc, wire_bytes) in &full_pkts {
+            shadow_map.insert(*key, raw_arc.clone());
+            let decoded = decode_server_datagram(wire_bytes).expect("decode PlanetFaceBrick3D");
+            match decoded {
+                ServerDatagram::PlanetFaceBrick3D {
+                    face,
+                    bx,
+                    by,
+                    bz,
+                    total_depth,
+                    sub_depth,
+                    lz4_density_mat,
+                    lz4_albedo_thermal,
+                    ..
+                } => {
+                    assert_eq!((face, bx, by, bz), *key);
+                    assert_eq!(total_depth, 32);
+                    assert_eq!(sub_depth, 16);
+                    let (dm, at) = decode_subbrick3d_lz4(&lz4_density_mat, &lz4_albedo_thermal)
+                        .expect("decompress PlanetFaceBrick3D");
+                    assert_eq!(dm, raw_arc.0);
+                    assert_eq!(at, raw_arc.1);
+                }
+                other => panic!("unexpected datagram variant: {:?}", other),
+            }
+        }
+
+        // 3. Place several bots near cube seams heading outward + trigger `/collapse_isle 0`
+        let bot_ids: Vec<u32> = gs.players.keys().copied().collect();
+        for (idx, &bid) in bot_ids.iter().take(12).enumerate() {
+            if let Some(p) = gs.players.get_mut(&bid) {
+                p.face = (idx % FACE_COUNT) as u8;
+                p.x = 62.5;
+                p.y = 32.0;
+                p.vx = 28.0;
+                p.vy = 4.0;
+                p.aim_x = 1.0;
+                p.aim_y = 0.0;
+            }
+        }
+        let collapsed = gs
+            .planet_runtime
+            .as_mut()
+            .unwrap()
+            .collapse_orbital_isle(0);
+        assert!(collapsed.is_some(), "/collapse_isle 0 must fracture an Orbital Sky-Ring core");
+
+        // 4. Step 10 planetary field ticks (with 3 combat ticks per field tick = 30 combat ticks)
+        //    including active bot locomotion across seams, elemental actuators, solar terminator sweep,
+        //    and Orbital Sky-Ring collapse!
+        let init_sun = gs.planet_runtime.as_ref().unwrap().planet.sun_dir;
+        let mut all_dirty: Vec<(u8, u16, u16, u16)> = Vec::new();
+        for step_i in 0..10 {
+            for _ in 0..3 {
+                gs.tick_combat_30hz();
+            }
+            // Also fire an explicit 3D actuator on a bot to guarantee active elemental forcing
+            if let Some(&sample_bid) = bot_ids.get(step_i % bot_ids.len()) {
+                if let Some(p) = gs.players.get_mut(&sample_bid) {
+                    p.mana = p.max_mana;
+                }
+                gs.apply_player_physical_actuator_3d(
+                    sample_bid,
+                    4.0,
+                    2.0,
+                    None,
+                    0.85,
+                    0.35,
+                    0.25,
+                    0.20,
+                    3.2,
+                    0.3,
+                );
+            }
+            let outcome = gs
+                .planet_runtime
+                .as_mut()
+                .unwrap()
+                .step_planet_neural_or_refsim(false, |_, _, _| Err("refsim test".into()));
+            assert_eq!(
+                outcome.global_mass_error, 0,
+                "tick {} global mass error must equal 0",
+                outcome.tick
+            );
+            assert_eq!(
+                outcome.global_energy_error, 0,
+                "tick {} global energy error must equal 0",
+                outcome.tick
+            );
+            all_dirty.extend(outcome.dirty_subbricks);
+        }
+
+        let pr = gs.planet_runtime.as_mut().unwrap();
+        assert_eq!(pr.planet.global_mass_error(), 0);
+        assert_eq!(pr.planet.global_energy_error(), 0);
+        assert!(
+            pr.planet.total_seam_mass_crossed > 0,
+            "expected positive cross-seam mass transfer across the 12 cube edges"
+        );
+        assert!(
+            pr.seam_crossings_total > 0,
+            "expected bots/projectiles to cross cube seams (got {})",
+            pr.seam_crossings_total
+        );
+        assert!(
+            (pr.planet.sun_dir[0] - init_sun[0]).abs() + (pr.planet.sun_dir[2] - init_sun[2]).abs() > 0.05,
+            "expected sweeping solar terminator sun_dir to advance"
+        );
+        assert!(
+            pr.active_sky_cores() < init_cores,
+            "expected active_sky_cores to drop after /collapse_isle 0 ({} -> {})",
+            init_cores,
+            pr.active_sky_cores()
+        );
+
+        // 5. Verify PlanetFaceBrick3DDelta encoding & round-trip apply on dirty sub-bricks
+        let mut saw_delta = false;
+        let mut saw_any_update = false;
+        for &(f, bx, by, bz) in &all_dirty {
+            let prev = shadow_map.get(&(f, bx, by, bz)).cloned();
+            if let Some((wire_bytes, is_delta, cur_arc)) =
+                pr.encode_incremental_subbrick(f, bx, by, bz, prev.as_ref(), DEFAULT_BRICK3D_DELTA_DEADZONE)
+            {
+                saw_any_update = true;
+                let decoded = decode_server_datagram(&wire_bytes).expect("decode incremental planet sub-brick");
+                match decoded {
+                    ServerDatagram::PlanetFaceBrick3DDelta {
+                        face,
+                        bx: dbx,
+                        by: dby,
+                        bz: dbz,
+                        lz4_deltas,
+                        ..
+                    } => {
+                        assert!(is_delta);
+                        assert_eq!((face, dbx, dby, dbz), (f, bx, by, bz));
+                        let prev_arc = prev.expect("delta requires prev shadow");
+                        let mut dm_patch = prev_arc.0.clone();
+                        let mut at_patch = prev_arc.1.clone();
+                        let patched = apply_brick3d_delta(&mut dm_patch, &mut at_patch, &lz4_deltas)
+                            .expect("apply PlanetFaceBrick3DDelta");
+                        assert!(patched > 0);
+                        saw_delta = true;
+                    }
+                    ServerDatagram::PlanetFaceBrick3D {
+                        face,
+                        bx: fbx,
+                        by: fby,
+                        bz: fbz,
+                        lz4_density_mat,
+                        lz4_albedo_thermal,
+                        ..
+                    } => {
+                        assert_eq!((face, fbx, fby, fbz), (f, bx, by, bz));
+                        let (dm, at) = decode_subbrick3d_lz4(&lz4_density_mat, &lz4_albedo_thermal)
+                            .expect("decompress PlanetFaceBrick3D fallback");
+                        assert_eq!(dm, cur_arc.0);
+                        assert_eq!(at, cur_arc.1);
+                    }
+                    other => panic!("unexpected variant: {:?}", other),
+                }
+                shadow_map.insert((f, bx, by, bz), cur_arc);
+            }
+        }
+        assert!(saw_any_update, "expected at least one incremental planet sub-brick update");
+        assert!(saw_delta, "expected at least one PlanetFaceBrick3DDelta temporal delta packet");
     }
 }

@@ -2697,6 +2697,7 @@ mod tests {
                 ult_r_cd_frac: 0.5,
                 ack_input_seq: 1,
                 score: (player_count - i) as u32 * 10,
+                face: 0,
             });
         }
         let bot_brains = vec![BotBrainSnap {
@@ -2754,6 +2755,11 @@ mod tests {
                 neural_3d_vertical: true,
                 active_time_domes: 0,
                 system2_slm_active: false,
+                planet_mode: false,
+                planet_r_core: 0.0,
+                sun_dir: [0.0, 1.0, 0.0],
+                seam_mass_crossed: 0,
+                active_sky_cores: 0,
             },
             bot_brains,
             kill_feed: Vec::new(),
@@ -2951,6 +2957,7 @@ mod tests {
             focus_radius: 3.5,
             impulse: 0.0,
             team: 0,
+            face: 0,
         });
         beam_ent.actuator_pulses.push(ActuatorPulseSnap {
             x0: 60.0,
@@ -2966,6 +2973,7 @@ mod tests {
             focus_radius: 3.5,
             impulse: 0.0,
             team: 1,
+            face: 0,
         });
         let beam_frame = assemble_live_frame(
             &world,

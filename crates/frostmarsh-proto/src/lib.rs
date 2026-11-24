@@ -143,6 +143,9 @@ pub struct PlayerSnap {
     pub ack_input_seq: u32,
     #[serde(default)]
     pub score: u32,
+    /// Cubed-sphere face index (`0..6`) when `telemetry.planet_mode == true` (`0` on flat worlds).
+    #[serde(default)]
+    pub face: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,6 +159,8 @@ pub struct ProjectileSnap {
     pub vy: f32,
     pub vz: f32,
     pub radius: f32,
+    #[serde(default)]
+    pub face: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -180,6 +185,8 @@ pub struct ShrineSnap {
     pub progress: f32,
     /// -1 = West, 0 = Neutral, 1 = East
     pub owner: i8,
+    #[serde(default)]
+    pub face: u8,
 }
 
 /// Recent combat / world event for floating damage popups, elemental combo callouts, & kill feed.
@@ -230,6 +237,8 @@ pub struct SpeechBubbleSnap {
     pub symbol_id: u8,
     pub text: String,
     pub tick: u32,
+    #[serde(default)]
+    pub face: u8,
 }
 
 /// Short-lived 3D volumetric physical actuator pulse (heat beam, cryo field, matter stream, or kinetic shockwave).
@@ -248,6 +257,8 @@ pub struct ActuatorPulseSnap {
     pub focus_radius: f32,
     pub impulse: f32,
     pub team: u8,
+    #[serde(default)]
+    pub face: u8,
 }
 
 /// Active spatial `WorldModelDT` time-dilation dome (`0.15x` Stasis Dome or `3.0x` Haste Zone).
@@ -305,6 +316,21 @@ pub struct TelemetrySnap {
     pub active_time_domes: u8,
     #[serde(default)]
     pub system2_slm_active: bool,
+    /// Wave 31: Live 6-Face Cubed-Sphere Planetary Mode (`true` when server launched with `--planet`).
+    #[serde(default)]
+    pub planet_mode: bool,
+    /// Inner core radius `r_core` in voxel units when `planet_mode == true` (e.g. `48.0`).
+    #[serde(default)]
+    pub planet_r_core: f32,
+    /// Normalized 3D world-space direction toward the sweeping planetary Sun (Day/Night Terminator).
+    #[serde(default)]
+    pub sun_dir: [f32; 3],
+    /// Cumulative exact conserved integer mass exchanged across all 12 cubed-sphere seams.
+    #[serde(default)]
+    pub seam_mass_crossed: u64,
+    /// Number of intact levitating Orbital Sky-Ring `BuoyantCore`s (out of 8).
+    #[serde(default)]
+    pub active_sky_cores: u8,
 }
 
 /// Additive `16×16×D` 3D volumetric column brick payload (`density_mat` + `albedo_thermal` RGBA8, LZ4-compressed).
@@ -388,6 +414,29 @@ pub enum ServerDatagram {
     },
     /// 10 Hz sparse temporal delta for a `16×16×sub_depth` cubic 3D sub-brick (`(u16 idx, dm[4], at[4])` × N, LZ4).
     VolumetricSubBrick3DDelta {
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_deltas: Vec<u8>,
+    },
+    /// Wave 31: 10 Hz LZ4-compressed `16×16×sub_depth` cubic 3D sub-brick for one of the 6 Cubed-Sphere planet faces (`face ∈ 0..6`).
+    PlanetFaceBrick3D {
+        face: u8,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_density_mat: Vec<u8>,
+        lz4_albedo_thermal: Vec<u8>,
+    },
+    /// Wave 31: 10 Hz sparse temporal delta for one `16×16×sub_depth` cubic 3D sub-brick on planet `face ∈ 0..6`.
+    PlanetFaceBrick3DDelta {
+        face: u8,
         bx: u16,
         by: u16,
         bz: u16,
@@ -778,6 +827,11 @@ mod tests {
                 neural_3d_vertical: false,
                 active_time_domes: 0,
                 system2_slm_active: false,
+                planet_mode: false,
+                planet_r_core: 0.0,
+                sun_dir: [0.0, 0.0, 0.0],
+                seam_mass_crossed: 0,
+                active_sky_cores: 0,
             },
             bot_brains: Vec::new(),
             kill_feed: Vec::new(),
@@ -1048,5 +1102,78 @@ mod tests {
         }
         assert_eq!(recon_dm, next_dm);
         assert_eq!(recon_at, next_at);
+    }
+
+    #[test]
+    fn test_planet_face_brick3d_and_telemetry_roundtrip() {
+        let sub_depth = 16u8;
+        let total_depth = 32u16;
+        let voxels = CHUNK_SIZE * CHUNK_SIZE * (sub_depth as usize);
+        let mut dm = vec![0u8; voxels * 4];
+        let mut at = vec![0u8; voxels * 4];
+        dm[0..4].copy_from_slice(&[255, 0, 0, 210]);
+        at[0..4].copy_from_slice(&[72, 130, 82, 0]);
+        let (lz4_dm, lz4_at) = encode_subbrick3d_lz4(&dm, &at);
+
+        let full = ServerDatagram::PlanetFaceBrick3D {
+            face: 4,
+            bx: 2,
+            by: 1,
+            bz: 1,
+            total_depth,
+            sub_depth,
+            tick: 55,
+            lz4_density_mat: lz4_dm,
+            lz4_albedo_thermal: lz4_at,
+        };
+        let wire = encode_server_datagram(&full);
+        match decode_server_datagram(&wire).expect("decode PlanetFaceBrick3D") {
+            ServerDatagram::PlanetFaceBrick3D {
+                face,
+                bx,
+                by,
+                bz,
+                total_depth: td,
+                sub_depth: sd,
+                tick,
+                lz4_density_mat,
+                lz4_albedo_thermal,
+            } => {
+                assert_eq!((face, bx, by, bz, td, sd, tick), (4, 2, 1, 1, 32, 16, 55));
+                let (dm2, at2) = decode_subbrick3d_lz4(&lz4_density_mat, &lz4_albedo_thermal)
+                    .expect("decode planet brick lz4");
+                assert_eq!(dm2, dm);
+                assert_eq!(at2, at);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+
+        let mut next_dm = dm.clone();
+        let mut next_at = at.clone();
+        next_dm[40..44].copy_from_slice(&[0, 220, 0, 20]);
+        next_at[40..44].copy_from_slice(&[20, 95, 195, 0]);
+        let lz4_deltas = encode_brick3d_delta(&dm, &at, &next_dm, &next_at, 4).expect("delta");
+        let delta = ServerDatagram::PlanetFaceBrick3DDelta {
+            face: 4,
+            bx: 2,
+            by: 1,
+            bz: 1,
+            total_depth,
+            sub_depth,
+            tick: 56,
+            lz4_deltas,
+        };
+        let wire_d = encode_server_datagram(&delta);
+        match decode_server_datagram(&wire_d).expect("decode PlanetFaceBrick3DDelta") {
+            ServerDatagram::PlanetFaceBrick3DDelta { face, tick, lz4_deltas, .. } => {
+                assert_eq!((face, tick), (4, 56));
+                let mut r_dm = dm.clone();
+                let mut r_at = at.clone();
+                assert_eq!(apply_brick3d_delta(&mut r_dm, &mut r_at, &lz4_deltas).expect("apply"), 1);
+                assert_eq!(r_dm, next_dm);
+                assert_eq!(r_at, next_at);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
     }
 }

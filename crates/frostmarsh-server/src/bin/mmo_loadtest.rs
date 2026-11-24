@@ -145,11 +145,14 @@ fn record_server_datagram(
 ) {
     m.bytes_rx += raw_len;
     match pkt {
-        ServerDatagram::VolumetricBrick3D(_) | ServerDatagram::VolumetricSubBrick3D { .. } => {
+        ServerDatagram::VolumetricBrick3D(_)
+        | ServerDatagram::VolumetricSubBrick3D { .. }
+        | ServerDatagram::PlanetFaceBrick3D { .. } => {
             m.bricks_full += 1;
         }
         ServerDatagram::VolumetricBrick3DDelta { .. }
-        | ServerDatagram::VolumetricSubBrick3DDelta { .. } => {
+        | ServerDatagram::VolumetricSubBrick3DDelta { .. }
+        | ServerDatagram::PlanetFaceBrick3DDelta { .. } => {
             m.bricks_delta += 1;
         }
         ServerDatagram::APlusChunk { .. } => {

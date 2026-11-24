@@ -14,6 +14,7 @@ use crate::mesh_gen::{
     CLASS_SKYWING, CLASS_STRIDER, CLASS_TIDEKIN,
 };
 use crate::net::LiveEntityState;
+use crate::planet_world::{face_grid_to_world_pos, PlanetWorld};
 use crate::world_bridge::LiveApproach4World;
 use crate::z16_world::Z16World;
 use bytemuck::{Pod, Zeroable};
@@ -215,6 +216,17 @@ pub fn build_hud(
     let east_col = [1.0, 0.36, 0.28, 1.0];
     let gold_col = [1.0, 0.84, 0.28, 1.0];
 
+    let planet_mode = entities.map(|e| e.telemetry.planet_mode).unwrap_or(false);
+    let planet_r_core = entities
+        .map(|e| if e.telemetry.planet_r_core > 1.0 { e.telemetry.planet_r_core } else { 48.0 })
+        .unwrap_or(48.0);
+    let planet_face_n = entities
+        .map(|e| (e.telemetry.grid_w as usize).max(16))
+        .unwrap_or(64);
+    let planet_depth_d = entities
+        .map(|e| (e.telemetry.grid_d as usize).max(16))
+        .unwrap_or(32);
+
     // ------------------------------------------------------------------
     // 1. WORLD-SPACE OVERHEAD HP BARS + FLOATING COMBAT POPUPS
     //    40–64 Player LOD: when players.len() > 16, render full nameplates
@@ -222,6 +234,95 @@ pub fn build_hud(
     //    compact team-colored HP pips for distant players!
     // ------------------------------------------------------------------
     if let Some(ent) = entities {
+        if planet_mode {
+            // Spherical front-hemisphere world labels for planetary mode (zero back-side bleed!)
+            let cam_dist = mats.rel_eye.length();
+            let is_orbital_far = cam_dist > planet_r_core * 2.4;
+            let z_surf_est = ((15.0 * (planet_depth_d as f32 / 32.0)).round()).max(8.0);
+
+            // Show nearby player pips/nameplates when in Tactical/Surface views, or local hero in Orbit
+            for p in &ent.players {
+                if p.hp <= 0 {
+                    continue;
+                }
+                let is_self = p.id == ent.your_player_id;
+                if is_orbital_far && !is_self {
+                    continue;
+                }
+                let wpos = face_grid_to_world_pos(
+                    p.face,
+                    p.x,
+                    p.y,
+                    p.z.max(z_surf_est) + 2.8,
+                    planet_face_n,
+                    planet_r_core,
+                );
+                // Front-hemisphere visibility check against camera
+                if wpos.normalize_or(Vec3::Y).dot(mats.rel_eye.normalize_or(Vec3::Z)) < 0.05 {
+                    continue;
+                }
+                let dist = wpos.distance(mats.rel_eye);
+                if !is_self && dist > 95.0 {
+                    continue;
+                }
+                if let Some((sx, sy)) = project_world(wpos, mats, sw, sh) {
+                    let hp_frac = (p.hp as f32 / p.max_hp.max(1) as f32).clamp(0.0, 1.0);
+                    let bar_c = if is_self {
+                        [0.32, 0.96, 0.52, 0.96]
+                    } else if p.team == 0 {
+                        west_col
+                    } else {
+                        east_col
+                    };
+                    if is_self || dist < 48.0 {
+                        let bw = 54.0 * ui;
+                        let bh = 5.5 * ui;
+                        let bx = sx - bw * 0.5;
+                        let by = sy - bh;
+                        b.rect(bx - 1.2 * ui, by - 1.2 * ui, bw + 2.4 * ui, bh + 2.4 * ui, if is_self { gold_col } else { [0.05, 0.04, 0.12, 0.85] });
+                        b.rect(bx, by, bw, bh, [0.16, 0.14, 0.24, 0.92]);
+                        b.rect(bx, by, bw * hp_frac, bh, bar_c);
+                        let short_name: String = p.name.chars().take(8).collect();
+                        let tag = format!("{} {}", archetype_tag(p.class_id), short_name);
+                        let sc = 1.25 * ui;
+                        let tw = HudBatch::text_width(&tag, sc);
+                        b.text_shadow(sx - tw * 0.5, by - 11.5 * ui, sc, if is_self { gold_col } else { text_hi }, &tag);
+                    } else {
+                        let pw = 16.0 * ui;
+                        let ph = 3.5 * ui;
+                        b.rect(sx - pw * 0.5, sy - ph, pw, ph, [0.12, 0.11, 0.20, 0.85]);
+                        b.rect(sx - pw * 0.5, sy - ph, pw * hp_frac, ph, bar_c);
+                    }
+                }
+            }
+
+            // Front-hemisphere Planetary Shrine Beacon labels
+            for s in &ent.shrines {
+                let wpos = face_grid_to_world_pos(
+                    s.face,
+                    s.x,
+                    s.y,
+                    z_surf_est + 8.5,
+                    planet_face_n,
+                    planet_r_core,
+                );
+                if wpos.normalize_or(Vec3::Y).dot(mats.rel_eye.normalize_or(Vec3::Z)) < 0.08 {
+                    continue;
+                }
+                if let Some((sx, sy)) = project_world(wpos, mats, sw, sh) {
+                    let bw = 64.0 * ui;
+                    let bh = 4.5 * ui;
+                    let bx = sx - bw * 0.5;
+                    b.rect(bx - 1.0, sy - 1.0, bw + 2.0, bh + 2.0, [0.05, 0.04, 0.12, 0.82]);
+                    let p01 = (s.progress * 0.5 + 0.5).clamp(0.0, 1.0);
+                    b.rect(bx, sy, bw * (1.0 - p01), bh, west_col);
+                    b.rect(bx + bw * (1.0 - p01), sy, bw * p01, bh, east_col);
+                    let sc = 1.2 * ui;
+                    let tw = HudBatch::text_width(&s.name, sc);
+                    b.text_shadow(sx - tw * 0.5, sy - 10.5 * ui, sc, gold_col, &s.name);
+                }
+            }
+        } else {
         let mut proj_players: Vec<(usize, f32, f32, f32, bool)> =
             Vec::with_capacity(ent.players.len());
         for (idx, p) in ent.players.iter().enumerate() {
@@ -517,6 +618,7 @@ pub fn build_hud(
                 b.text_shadow(cx + 9.0 * ui, cy + 22.0 * ui, msg_sc, text_hi, &msg_short);
             }
         }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -566,13 +668,18 @@ pub fn build_hud(
         let mw = HudBatch::text_width(&mid_str, msc);
         b.text_shadow(bx + (banner_w - mw) * 0.5, by + 9.0 * ui, msc, mid_col, &mid_str);
 
-        // 3 Shrine ownership pips
-        let pip_sz = 12.0 * ui;
-        let pip_gap = 18.0 * ui;
-        let total_pips_w = 3.0 * pip_sz + 2.0 * pip_gap;
+        // Shrine ownership pips (3 on flat arena, up to 6 on full spherical planet!)
+        let pip_count = if planet_mode {
+            ent.shrines.len().clamp(3, 6)
+        } else {
+            ent.shrines.len().clamp(1, 3)
+        };
+        let pip_sz = if pip_count > 3 { 10.5 * ui } else { 12.0 * ui };
+        let pip_gap = if pip_count > 3 { 11.0 * ui } else { 18.0 * ui };
+        let total_pips_w = pip_count as f32 * pip_sz + (pip_count.saturating_sub(1) as f32) * pip_gap;
         let px0 = bx + (banner_w - total_pips_w) * 0.5;
         let py0 = by + 32.0 * ui;
-        for (i, s) in ent.shrines.iter().take(3).enumerate() {
+        for (i, s) in ent.shrines.iter().take(pip_count).enumerate() {
             let px = px0 + i as f32 * (pip_sz + pip_gap);
             let col = if s.owner < 0 {
                 west_col
@@ -637,29 +744,36 @@ pub fn build_hud(
     if let Some(ent) = entities {
         // Shrines on minimap
         for s in &ent.shrines {
-            let sx = mm_x + (s.x / gw) * mm_sz;
-            let sy = mm_y + (s.y / gh) * mm_sz;
+            let (sx, sy) = if planet_mode {
+                let wp = face_grid_to_world_pos(s.face, s.x, s.y, 16.0, planet_face_n, planet_r_core);
+                let (u, v) = PlanetWorld::sphere_pos_to_minimap_uv(wp);
+                (mm_x + u * mm_sz, mm_y + v * mm_sz)
+            } else {
+                (mm_x + (s.x / gw) * mm_sz, mm_y + (s.y / gh) * mm_sz)
+            };
             let col = if s.owner < 0 { west_col } else if s.owner > 0 { east_col } else { gold_col };
             b.rect(sx - 4.0 * ui, sy - 4.0 * ui, 8.0 * ui, 8.0 * ui, col);
             b.rect_outline(sx - 4.0 * ui, sy - 4.0 * ui, 8.0 * ui, 8.0 * ui, 1.2 * ui, text_hi);
         }
         // Active Time-Dilation Domes on minimap
-        for d in &ent.time_domes {
-            let dx = mm_x + (d.x / gw) * mm_sz;
-            let dy = mm_y + (d.y / gh) * mm_sz;
-            let dr = ((d.radius / gw) * mm_sz).clamp(4.0 * ui, 28.0 * ui);
-            let dcol = if d.dt_scale < 0.8 {
-                [0.32, 0.94, 1.0, 0.92]
-            } else {
-                [1.0, 0.82, 0.26, 0.92]
-            };
-            b.rect(dx - dr, dy - dr, dr * 2.0, dr * 2.0, [dcol[0], dcol[1], dcol[2], 0.20]);
-            b.rect_outline(dx - dr, dy - dr, dr * 2.0, dr * 2.0, 1.4 * ui, dcol);
+        if !planet_mode {
+            for d in &ent.time_domes {
+                let dx = mm_x + (d.x / gw) * mm_sz;
+                let dy = mm_y + (d.y / gh) * mm_sz;
+                let dr = ((d.radius / gw) * mm_sz).clamp(4.0 * ui, 28.0 * ui);
+                let dcol = if d.dt_scale < 0.8 {
+                    [0.32, 0.94, 1.0, 0.92]
+                } else {
+                    [1.0, 0.82, 0.26, 0.92]
+                };
+                b.rect(dx - dr, dy - dr, dr * 2.0, dr * 2.0, [dcol[0], dcol[1], dcol[2], 0.20]);
+                b.rect_outline(dx - dr, dy - dr, dr * 2.0, dr * 2.0, 1.4 * ui, dcol);
+            }
+            // Relic star
+            let rx = mm_x + (ent.relic_x / gw) * mm_sz;
+            let ry = mm_y + (ent.relic_y / gh) * mm_sz;
+            b.rect(rx - 3.5 * ui, ry - 3.5 * ui, 7.0 * ui, 7.0 * ui, gold_col);
         }
-        // Relic star
-        let rx = mm_x + (ent.relic_x / gw) * mm_sz;
-        let ry = mm_y + (ent.relic_y / gh) * mm_sz;
-        b.rect(rx - 3.5 * ui, ry - 3.5 * ui, 7.0 * ui, 7.0 * ui, gold_col);
 
         // Heroes / Bots on minimap (scales cleanly up to 64 players; self & relic carrier drawn on top!)
         let crowded = ent.players.len() > 24;
@@ -679,10 +793,14 @@ pub fn build_hud(
                     base_dot
                 };
                 let half = sz * 0.5;
-                let px = (mm_x + (p.x / gw).clamp(0.0, 1.0) * mm_sz)
-                    .clamp(mm_x + half, mm_x + mm_sz - half);
-                let py = (mm_y + (p.y / gh).clamp(0.0, 1.0) * mm_sz)
-                    .clamp(mm_y + half, mm_y + mm_sz - half);
+                let (ux, uy) = if planet_mode {
+                    let wp = face_grid_to_world_pos(p.face, p.x, p.y, p.z, planet_face_n, planet_r_core);
+                    PlanetWorld::sphere_pos_to_minimap_uv(wp)
+                } else {
+                    ((p.x / gw).clamp(0.0, 1.0), (p.y / gh).clamp(0.0, 1.0))
+                };
+                let px = (mm_x + ux * mm_sz).clamp(mm_x + half, mm_x + mm_sz - half);
+                let py = (mm_y + uy * mm_sz).clamp(mm_y + half, mm_y + mm_sz - half);
                 let col = if is_self {
                     [0.35, 1.0, 0.55, 1.0]
                 } else if p.team == 0 {
@@ -703,12 +821,14 @@ pub fn build_hud(
         }
     }
     let player_cnt = entities.map(|e| e.players.len()).unwrap_or(0);
-    let mm_lbl = if cfg.z16_active {
+    let mm_lbl = if planet_mode {
+        format!("PLANET 6×{}²×{} ({}P)", planet_face_n, planet_depth_d, player_cnt)
+    } else if cfg.z16_active {
         format!("3D-Z{} {}X{} ({}P)", gd_u, gw_u, gh_u, player_cnt)
     } else {
         format!("REACH {}X{}X{} ({}P)", gw_u, gh_u, gd_u, player_cnt)
     };
-    b.text_shadow(mm_x + 4.0 * ui, mm_y + mm_sz + 5.0 * ui, 1.25 * ui, if cfg.z16_active { [0.38, 0.94, 1.0, 1.0] } else { text_dim }, &mm_lbl);
+    b.text_shadow(mm_x + 4.0 * ui, mm_y + mm_sz + 5.0 * ui, 1.20 * ui, if planet_mode || cfg.z16_active { [0.38, 0.94, 1.0, 1.0] } else { text_dim }, &mm_lbl);
 
     // ------------------------------------------------------------------
     // 3B. LIVE NEURAL-BRAIN INSPECTOR CARD (TOP-RIGHT BELOW MINIMAP)
@@ -966,23 +1086,47 @@ pub fn build_hud(
         let sc = 1.40 * ui;
         if let Some(ent) = entities {
             let t = &ent.telemetry;
-            let l1 = format!(
-                "{} {} {}X{}X{} T:{}",
-                t.mode.to_uppercase(),
-                t.backend.to_uppercase(),
-                t.grid_w,
-                t.grid_h,
-                t.grid_d,
-                t.field_tick
-            );
-            let l2 = format!(
-                "WORLD {:.2}MS ECO {:.2}MS PROJ {:.1}%",
-                t.infer_ms_last, t.eco_infer_ms, t.proj_active_pct
-            );
-            let l3 = format!(
-                "MASS_ERR:{} E_ERR:{} CHUNKS:{}/{}",
-                t.mass_error, t.energy_error, t.aoi_chunks_sent, t.total_chunks
-            );
+            let l1 = if t.planet_mode {
+                format!(
+                    "PLANET 6×{}²×{}  {} T:{}",
+                    t.grid_w,
+                    t.grid_d,
+                    t.backend.to_uppercase(),
+                    t.field_tick
+                )
+            } else {
+                format!(
+                    "{} {} {}X{}X{} T:{}",
+                    t.mode.to_uppercase(),
+                    t.backend.to_uppercase(),
+                    t.grid_w,
+                    t.grid_h,
+                    t.grid_d,
+                    t.field_tick
+                )
+            };
+            let l2 = if t.planet_mode {
+                format!(
+                    "SEAM {}  SKY-CORES {}/8  CAM:{}",
+                    t.seam_mass_crossed, t.active_sky_cores, cfg.camera_preset_label
+                )
+            } else {
+                format!(
+                    "WORLD {:.2}MS ECO {:.2}MS PROJ {:.1}%",
+                    t.infer_ms_last, t.eco_infer_ms, t.proj_active_pct
+                )
+            };
+            let l3 = if t.planet_mode {
+                format!(
+                    "M_ERR:{} E_ERR:{} WORLD {:.2}MS",
+                    t.mass_error, t.energy_error, t.infer_ms_last
+                )
+            } else {
+                format!(
+                    "MASS_ERR:{} E_ERR:{} CHUNKS:{}/{}",
+                    t.mass_error, t.energy_error, t.aoi_chunks_sent, t.total_chunks
+                )
+            };
             let l4 = format!(
                 "FPS:{:.0} RTT:{:.0}MS WIRE:{:.0}KB/S {}",
                 cfg.fps, cfg.rtt_ms, t.wire_kbps, cfg.style_label
@@ -1485,9 +1629,10 @@ pub fn build_hud(
             cursor_x = sqd_x;
         }
 
-        // Subtle [F5] Camera Preset indicator pill (`TACTICAL` / `ACTION` / `OVERVIEW`)
+        // Subtle [F5] Camera Preset indicator pill (`ORBITAL`/`TACTICAL`/`SURFACE` or `TACTICAL`/`ACTION`/`OVERVIEW`)
         let cam_col = match cfg.camera_preset_label {
-            "ACTION" => [1.00, 0.78, 0.28, 1.0],
+            "ORBITAL" => [0.42, 0.88, 1.00, 1.0],
+            "SURFACE" | "ACTION" => [1.00, 0.78, 0.28, 1.0],
             "OVERVIEW" => [0.64, 0.84, 1.00, 1.0],
             _ => [0.76, 0.86, 0.98, 1.0],
         };
@@ -1889,6 +2034,9 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
         '<' => [0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010],
         '|' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
         '@' => [0b01110, 0b10001, 0b10111, 0b10101, 0b10110, 0b10000, 0b01110],
+        '×' => [0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b00000],
+        '²' => [0b01100, 0b10010, 0b00100, 0b01000, 0b11110, 0b00000, 0b00000],
+        '^' => [0b00100, 0b01010, 0b10001, 0b00000, 0b00000, 0b00000, 0b00000],
         _ => [0; 7],
     }
 }

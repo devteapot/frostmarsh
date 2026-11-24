@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Waves 26-27 Live 4.19M-Voxel Z=64 3-Strata Sky-Isles & Abyss — Floating Sky-Islands, 28m Plunging Waterfalls, Surface Viaduct, Abyssal Magma Caverns, 16x16x16 Cubic Bricks & 104-110 FPS Metal](models/unified_iter27_z64_sky_abyss/unified_live_1080p_hud.png)
+![Frostmarsh Waves 31-32 Live Multiplayer 6-Face Cubed-Sphere Planet — WorldModel3D-v8 CUDA FP16 (op=12), 60 Geodesic Bots Crossing All 12 Seams, Orbital Sky-Ring Buoyant Cores, Sweeping Solar Terminator & 228 FPS 1080p / 128 FPS 4K Metal](models/unified_iter32_live_planet/unified_live_1080p_hud.png)
 
 ---
 
@@ -139,11 +139,16 @@
     - **3-Strata Micro-Planet (`6×128²×64`, `6.29M` vox, Core+Surface+Sky-Ring):** **`138.28 ms` (`7.2 Hz`, `5.11×`, `93.3%` skip)**, `2.44 GB` VRAM, `359.9 KB/tick` halo.
     - **20-Tick Rotating Solar Terminator Rollout:** Sweeps `sun_dir` `144°` around the equator (`+38 K` day / `-45 K` night `θ_world[6,L,H,W]`), producing **`11.48×` Day Melt**, **`9.00×` Night Freeze**, **`+20.70 K`** day/night thermal split, and `0` NaNs.
   - **Exact 12-Edge Conservation `field-core::planet` & Curved Apple M4 Pro Metal Renderer (`crates/field-core/src/planet.rs`, `crates/frostmarsh-3d-sandbox/src/bin/planet_render.rs`, [PLANET_METAL_METRICS.json](models/PLANET_METAL_METRICS.json), `29/29` `field-core` tests, `0` warnings):** Couples 6 `VolumeField` faces using `BaseAnchorMode::RadialInnerShell` (no flat bedrock), exact antisymmetric 12-edge fluid/gas/heat exchange (`216,041` cross-seam mass crossed over 10 ticks with **`global_mass_error == 0 && global_energy_error == 0`**), sweeping solar terminator, and 6-DOF geodesic circumnavigation over both equator and poles. Renders `786K` active planetary voxels (`254.7K` curved triangles, Fresnel sapphire oceans, night-side volcanic magma rift, Rayleigh+Mie atmospheric limb glow & 8 Orbital Sky-Ring Islands with cyan Buoyant Crystal Cores) at **`434.2 FPS` @ 1080p (`2.30 ms`) / `143.2 FPS` @ 4K (`6.98 ms`)** on Apple M4 Pro Metal!
+- **Iterations 31–32 — Live Multiplayer Planetary Mode (`--planet`, `op=12` `cuda-fp16-planet-v8`, 60 Geodesic Bots Crossing All 12 Seams & `228 FPS` Curved Metal Client Over QUIC):**
+  - **Live 6-Face `WorldModel3D-v8` Planetary RPC (`op=12` in `ml/gpu_infer_daemon.py`, `0` Retraining) & `frostmarsh-server --planet` (`crates/frostmarsh-server/src/planet_runtime.rs`, `17/17` server + `4/4` proto tests, `0` warnings):** Streams `PlanetFaceBrick3D` / `PlanetFaceBrick3DDelta` `16×16×16` cubic sub-bricks across all 6 cubed-sphere faces (`6×64²×32 = 786,432` voxels, `r_core = 48.0`, `214–262 KB/s` steady-state wire) driven by live `WorldModel3D-v8` FP16 neural inference (`op=12`, `205.6–207.0 ms` on NVIDIA GB10 with live sweeping `sun_dir` Day/Night Terminator!), exact 12-edge antisymmetric conservation (`mass_err == 0 && energy_err == 0`, `24.2M+` seam mass crossed), 6 planetary shrines (1 per face), destructible Orbital Sky-Ring Buoyant Crystal Cores (`/collapse_isle [0..7]`), and **60 live 5-archetype neural bots** traversing seamlessly across all 12 rotated seams via `step_spherical_entity` (`24,107+` live bot seam crossings!).
+  - **Live Curved Spherical Metal Mode inside `frostmarsh-unified-client` (`planet_world.rs`, `planet_live.wgsl`, `7/7` client tests, `0` warnings):** Auto-detects planetary servers, incrementally meshes all 6 curved faces with analytical spherical normals, Fresnel sapphire curved oceans, blazing night-side volcanic rifts, glowing cyan-amethyst Orbital Sky-Ring Buoyant Crystal Cores, Rayleigh+Mie atmospheric limb glow, equirectangular live planet minimap, **6-DOF geodesic spherical camera** (`F5` cycles **Orbital Globe** ↔ **Low-Orbit Tactical** ↔ **Curved Surface Horizon** with slerp-smoothed `UP = normalize(pos)`), and all **60 live 3D heroes, 6 shrine beacon spires & curved geodesic elemental beams** oriented upright on the sphere — running live over QUIC on Apple M4 Pro Metal at **`228.4 FPS` @ 1080p (`4.38 ms` p50, `5.00 ms` p99)** and **`127.6 FPS` @ 4K (`7.83 ms` p50, `8.57 ms` p99)**!
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
 | World Scale & Mode | Render Mode | Resolution | p50 Frame Time | FPS |
 |---|---|---|---:|---:|
+| **`6×64²×32` Live Cubed-Sphere Planet (`786K` vox, 60P, `op=12` v8)** | **Curved 6-Face Spherical Metal (`155K` tris) + 60 Bots + HUD** | **1920×1080** | **`4.38 ms`** | **228.4 FPS** |
+| **`6×64²×32` Live Cubed-Sphere Planet (`786K` vox, 60P, `op=12` v8)** | **Curved 6-Face Spherical Metal (`155K` tris) + 60 Bots + HUD** | **3840×2160 (4K)** | **`7.83 ms`** | **127.6 FPS** |
 | **`256×256×64` (4.19M vox Sky-Isles & Abyss, 60P)** | **Cubic `16³` Surface-Nets (`410K` tris) + Clean 3D** | **1920×1080** | **`9.09 ms`** | **110.0 FPS** |
 | **`256×256×64` (4.19M vox Sky-Isles & Abyss, 60P)** | **Cubic `16³` Surface-Nets (`410K` tris) + Pixel-2xSS** | **1920×1080** | **`9.66 ms`** | **103.5 FPS** |
 | **`256×256×64` (4.19M vox Sky-Isles & Abyss, 60P)** | **Cubic `16³` Surface-Nets (`410K` tris) + Pixel-2xSS** | **3840×2160 (4K)** | **`9.65 ms`** | **103.6 FPS** |
@@ -159,6 +164,10 @@
 ---
 
 ## Visual Showcase
+
+| Live Multiplayer Planet 4-View (`228 FPS` 1080p / `128 FPS` 4K Metal, `op=12` v8, 60P) | Live 6-DOF Curved Surface Horizon Battle (Hovering Skywings & Geodesic Plasma Arc) |
+|---|---|
+| ![Live Multiplayer Planet 4-View Metal Showcase](models/unified_iter32_live_planet/unified_orbit_4view.png) | ![Live 6-DOF Curved Surface Horizon Action View](models/unified_iter32_live_planet/unified_closeup_action_1080p.png) |
 
 | Curved 6-Face Cubed-Sphere Planet (`434 FPS` 1080p / `143 FPS` 4K Metal, `mass_err=0`) | 6-Face `WorldModel3D-v8` Planet (`11.3 Hz` 3.15M Vox, Terminator & GB10 Scaling) |
 |---|---|

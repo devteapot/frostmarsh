@@ -14,6 +14,7 @@ Serves low-latency GPU inference on TCP_NODELAY and optional Unix domain socket:
   - op=9: WorldModelDT    ([L, 18, H, W] + [H, W] local_dt f32 -> [L, 17, H, W] + [L-1, 5, H, W] f32) spatial time-dilation domes!
   - op=10: ActuatorV3     ([N, 168]      f32 -> [N, 28]       f32) true 3D volumetric actuators (12 floats) + 16 (4x4) Z_world saliency!
   - op=11: WorldModelV8   ([L, 18, H, W] + [H, W] local_dt + [6] world_laws f32 -> [L, 17, H, W] + [L-1, 5, H, W] f32) live World-Law RPC!
+  - op=12: PlanetV8Step   (6-Face Cubed-Sphere `[6, L, 18, N, N]` f16/f32 + `sun_dir[3]` -> `(infer_ms, active_frac)` + `[6, L, 17, N, N]` + `[6, L-1, 5, N, N]` f16/f32)!
 """
 
 from __future__ import annotations
@@ -93,6 +94,13 @@ OP_WORLD_3D_STEP = 8
 OP_WORLD_DT_STEP = 9
 OP_ACTUATOR_V3 = 10
 OP_WORLD_V8_STEP = 11
+OP_PLANET_V8_STEP = 12
+
+PLANET_META_STRUCT = struct.Struct("<HHfffB")  # (N:u16, L:u16, sun_x:f32, sun_y:f32, sun_z:f32, flags:u8) = 17 bytes
+PLANET_META_SIZE = PLANET_META_STRUCT.size
+PLANET_RESP_META_STRUCT = struct.Struct("<ff")  # (infer_ms:f32, active_frac:f32) = 8 bytes
+PLANET_FLAG_USE_SPARSE = 1 << 0
+PLANET_FLAG_FP16_IO = 1 << 1
 
 Z_FLUX_CH = 5
 WORLD_LAWS_DIM = 6
@@ -295,7 +303,17 @@ class _CUDAGraphRunner:
         self._model = model
 
         if device.type == "cuda":
-            self._capture(model)
+            try:
+                self._capture(model)
+            except Exception as exc:
+                print(
+                    f"[gpu_infer_daemon] CUDA graph capture unavailable for op={op} {h}x{w} ({exc}); falling back to eager CUDA FP16.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.graph = None
+                self.static_out = None
+                self.static_latent = None
 
     def _run_model(self, model: torch.nn.Module, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         fn = _world_forward_with_latent if self.op == OP_WORLD_STEP else _eco_forward_with_latent
@@ -606,6 +624,164 @@ class _SparseWorldDTAdapter:
                 z_world = z_world.half()
         infer_us = int((time.perf_counter() - t0) * 1_000_000)
         return self.host_out_bytes, z_world, self.static_in_x, float(active_frac), infer_us
+
+
+class _PlanetV8Adapter:
+    """
+    Wave 31A: Lazy-initialized 6-Face Cubed-Sphere Planet RPC adapter for `op=12` (`OP_PLANET_V8_STEP`).
+    Wraps `CubedSpherePlanetSparseRunner` (`ml/cubed_sphere_planet.py`) over `WorldModel3DV8`
+    (`world_model_3d_v8.pt`, 164,622 params, 0 retraining) with:
+      - `brick_xy=16, brick_z=8, activity_eps=4e-3, sparse_threshold=0.65, max_bricks_per_batch=192`
+      - Exact 12-edge `HALO_XY=6` + 8-corner spherical halo exchange with tangent flow rotation
+      - Live 3D planetary world-law field (`make_all_faces_planetary_world_laws`) driven by incoming `sun_dir`
+      - Both FP16 (`flags & 2`) and FP32 (`flags & 2 == 0`) binary wire I/O!
+    """
+
+    def __init__(
+        self,
+        model_v8: torch.nn.Module,
+        n_face: int,
+        l_depth: int,
+        device: torch.device,
+        use_fp16: bool,
+        brick_xy: int = 16,
+        brick_z: int = 8,
+        activity_eps: float = 4e-3,
+        sparse_threshold: float = 0.65,
+        max_bricks_per_batch: int = 192,
+    ):
+        from cubed_sphere_planet import (  # noqa: E402
+            CubedSpherePlanetSparseRunner,
+            make_all_faces_planetary_world_laws,
+        )
+
+        self.n_face = int(n_face)
+        self.l_depth = int(l_depth)
+        self.device = device
+        self.use_fp16 = bool(use_fp16) and (device.type == "cuda")
+        self.compute_dtype = torch.float16 if self.use_fp16 else torch.float32
+        self.brick_xy = brick_xy if (self.n_face % brick_xy == 0) else math.gcd(self.n_face, brick_xy)
+        self.brick_z = brick_z if (self.l_depth % brick_z == 0) else math.gcd(self.l_depth, brick_z)
+        self.activity_eps = float(activity_eps)
+        self.sparse_threshold = float(sparse_threshold)
+        self._make_laws = make_all_faces_planetary_world_laws
+
+        self.runner = CubedSpherePlanetSparseRunner(
+            model_v8,
+            device=device,
+            use_fp16=self.use_fp16,
+            brick_xy=self.brick_xy,
+            brick_z=self.brick_z,
+            max_bricks_per_batch=max_bricks_per_batch,
+            bucket_size=32 if device.type == "cuda" else 1,
+        )
+        self.runner.allocate_caches(L=self.l_depth, N=self.n_face)
+        self.prev_x: torch.Tensor | None = None
+        self._cached_sun_dir: tuple[float, float, float] | None = None
+        self._cached_laws: torch.Tensor | None = None
+
+    def _get_planetary_laws(self, sun_dir: tuple[float, float, float]) -> torch.Tensor:
+        sx, sy, sz = sun_dir
+        norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+        if norm > 1e-6:
+            sun_u = (sx / norm, sy / norm, sz / norm)
+        else:
+            sun_u = (0.78, 0.24, 0.58)
+        if self._cached_laws is not None and self._cached_sun_dir is not None:
+            cs = self._cached_sun_dir
+            if (
+                abs(sun_u[0] - cs[0]) < 1e-4
+                and abs(sun_u[1] - cs[1]) < 1e-4
+                and abs(sun_u[2] - cs[2]) < 1e-4
+            ):
+                return self._cached_laws
+        laws = self._make_laws(
+            L=self.l_depth,
+            N=self.n_face,
+            sun_dir=sun_u,
+            device=self.device,
+            dtype=self.compute_dtype,
+        )
+        self._cached_sun_dir = sun_u
+        self._cached_laws = laws
+        return laws
+
+    def step_bytes(
+        self,
+        raw_tensor_bytes: bytes | memoryview,
+        sun_dir: tuple[float, float, float],
+        flags: int,
+    ) -> tuple[bytes, torch.Tensor, torch.Tensor, float, int]:
+        use_sparse = bool(flags & PLANET_FLAG_USE_SPARSE)
+        fp16_io = bool(flags & PLANET_FLAG_FP16_IO)
+        np_dtype = np.float16 if fp16_io else np.float32
+
+        arr = np.frombuffer(raw_tensor_bytes, dtype=np_dtype).reshape(
+            6, self.l_depth, 18, self.n_face, self.n_face
+        )
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            faces_x = torch.from_numpy(np.array(arr, copy=True)).to(
+                device=self.device, dtype=self.compute_dtype, non_blocking=(self.device.type == "cuda")
+            )
+            faces_laws = self._get_planetary_laws(sun_dir)
+
+            nz = self.l_depth // self.brick_z
+            ny = self.n_face // self.brick_xy
+            nx = self.n_face // self.brick_xy
+            total_bricks = max(1, 6 * nz * ny * nx)
+
+            if use_sparse:
+                # Identify pure empty orbital vacuum bricks via ch11 (log1p(total_mass/1000)) & ch16..17 forcing
+                occ = faces_x[:, :, 11].abs()
+                forcing = faces_x[:, :, 16:18].abs().amax(dim=2)
+                occ_b = occ.view(6, nz, self.brick_z, ny, self.brick_xy, nx, self.brick_xy).amax(dim=(2, 4, 6))
+                frc_b = forcing.view(6, nz, self.brick_z, ny, self.brick_xy, nx, self.brick_xy).amax(dim=(2, 4, 6))
+                non_empty_b = (occ_b > 1e-3) | (frc_b > 1e-3)
+
+                if self.prev_x is None or self.prev_x.shape != faces_x.shape:
+                    active_mask = non_empty_b
+                else:
+                    diff = (faces_x - self.prev_x).abs().amax(dim=2)
+                    diff_b = diff.view(6, nz, self.brick_z, ny, self.brick_xy, nx, self.brick_xy).amax(dim=(2, 4, 6))
+                    active_mask = ((diff_b > self.activity_eps) | (frc_b > 1e-3)) & non_empty_b
+                    if float(active_mask.sum().item()) / float(total_bricks) > self.sparse_threshold:
+                        active_mask = non_empty_b
+
+                # Clear cached outputs in completely empty vacuum bricks so stale fluxes never linger
+                empty_b = ~non_empty_b
+                if bool(empty_b.any().item()) and self.runner.cache_horiz is not None and self.runner.cache_z_flux_pad is not None:
+                    em_grid = empty_b.view(6, nz, 1, 1, ny, 1, nx, 1)
+                    self.runner.cache_horiz.view(
+                        6, nz, self.brick_z, self.runner._wm.out_ch, ny, self.brick_xy, nx, self.brick_xy
+                    ).masked_fill_(em_grid, 0.0)
+                    self.runner.cache_z_flux_pad.view(
+                        6, nz, self.brick_z, self.runner._wm.z_flux_ch, ny, self.brick_xy, nx, self.brick_xy
+                    ).masked_fill_(em_grid, 0.0)
+            else:
+                active_mask = torch.ones((6, nz, ny, nx), dtype=torch.bool, device=self.device)
+
+            active_frac = float(active_mask.sum().item()) / float(total_bricks)
+            horiz_t, zflux_t, z_world_t, _halo_ms = self.runner.step_sparse(
+                faces_x, faces_laws, active_mask
+            )
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            infer_s = time.perf_counter() - t0
+            infer_ms = float(infer_s * 1000.0)
+            infer_us = int(infer_s * 1_000_000.0)
+
+            self.prev_x = faces_x.clone()
+            out_torch_dtype = torch.float16 if fp16_io else torch.float32
+            horiz_np = horiz_t.to(dtype=out_torch_dtype).contiguous().cpu().numpy()
+            zflux_np = zflux_t.to(dtype=out_torch_dtype).contiguous().cpu().numpy()
+            z0 = z_world_t[0]
+            if self.use_fp16 and self.device.type == "cuda" and z0.dtype != torch.float16:
+                z0 = z0.half()
+            x0 = faces_x[0].float()
+
+        resp_bytes = PLANET_RESP_META_STRUCT.pack(infer_ms, active_frac) + horiz_np.tobytes() + zflux_np.tobytes()
+        return resp_bytes, z0, x0, active_frac, infer_us
 
 
 class _AsyncSystem2Bridge:
@@ -928,6 +1104,8 @@ class InferenceEngine:
         self._sparse_dt_runner_cls: Any = None
         self._sparse_dt_runners: dict[tuple[int, int, int], _SparseWorldDTAdapter] = {}
         self.world_model_v5_active: bool = False
+        self._planet_v8_model: Any = None
+        self._planet_v8_adapters: dict[tuple[int, int], _PlanetV8Adapter] = {}
         dt_candidate = world_v5_pt if (world_v5_pt is not None and world_v5_pt.exists()) else world_dt_pt
         if dt_candidate is not None and dt_candidate.exists():
             try:
@@ -1206,6 +1384,64 @@ class InferenceEngine:
             self.last_sparse_active_frac = active_frac
             out_copy = bytes(out_view)
         return memoryview(out_copy), infer_us
+
+    def _get_planet_v8_adapter(self, n_face: int, l_depth: int) -> _PlanetV8Adapter:
+        key = (int(n_face), int(l_depth))
+        adapter = self._planet_v8_adapters.get(key)
+        if adapter is None:
+            if self._planet_v8_model is None:
+                from world_model_3d_v8 import WorldModel3DV8  # noqa: E402
+                from cubed_sphere_planet import load_v8_model  # noqa: E402
+
+                if isinstance(self.world_model_dt, WorldModel3DV8):
+                    self._planet_v8_model = self.world_model_dt
+                else:
+                    cand = _SCRIPT_DIR / "world_model_3d_v8.pt"
+                    if not cand.exists():
+                        alt = _SCRIPT_DIR.parent / "models" / "checkpoints" / "world_model_3d_v8.pt"
+                        if alt.exists():
+                            cand = alt
+                    self._planet_v8_model = load_v8_model(cand, device=self.device)
+            adapter = _PlanetV8Adapter(
+                model_v8=self._planet_v8_model,
+                n_face=n_face,
+                l_depth=l_depth,
+                device=self.device,
+                use_fp16=self.use_fp16,
+                brick_xy=16,
+                brick_z=8,
+                activity_eps=4e-3,
+                sparse_threshold=0.65,
+                max_bricks_per_batch=192,
+            )
+            self._planet_v8_adapters[key] = adapter
+            print(
+                f"[gpu_infer_daemon] Activated PlanetV8Runner (op=12) for 6x{n_face}x{n_face}x{l_depth} "
+                f"(brick={adapter.brick_xy}x{adapter.brick_xy}x{adapter.brick_z}, max_bricks=192, fp16={self.use_fp16})",
+                flush=True,
+            )
+        return adapter
+
+    def infer_planet_v8_bytes(
+        self,
+        n_face: int,
+        l_depth: int,
+        sun_dir: tuple[float, float, float],
+        flags: int,
+        raw_tensor_bytes: bytes | memoryview,
+    ) -> tuple[bytes, int]:
+        with self.lock:
+            adapter = self._get_planet_v8_adapter(n_face, l_depth)
+            resp_bytes, z0, x0, active_frac, infer_us = adapter.step_bytes(
+                raw_tensor_bytes=raw_tensor_bytes,
+                sun_dir=sun_dir,
+                flags=flags,
+            )
+            self.last_z_world = z0
+            self.last_world_state = x0
+            self._invalidate_strata_pool_cache()
+            self.last_sparse_active_frac = active_frac
+        return resp_bytes, infer_us
 
     def _get_sparse_runner(self, h: int, w: int, batch: int) -> _SparseWorldAdapter | None:
         if not self.use_sparse_world or SparseWorldRunner is None:
@@ -2152,6 +2388,50 @@ class GPUInferDaemon:
                 if not _recv_exact(conn, hdr_view):
                     break
                 op, pad_batch, channels, height, width, payload_bytes, _seq = HEADER_STRUCT.unpack(hdr_buf)
+
+                if op == OP_PLANET_V8_STEP:
+                    if payload_bytes < PLANET_META_SIZE or payload_bytes > 512 * 1024 * 1024:
+                        if 0 < payload_bytes <= 512 * 1024 * 1024:
+                            _recv_exact(conn, memoryview(bytearray(payload_bytes)))
+                        self._send_error(conn, STATUS_BAD_REQUEST, height, width)
+                        continue
+                    meta_buf = bytearray(PLANET_META_SIZE)
+                    if not _recv_exact(conn, memoryview(meta_buf)):
+                        break
+                    n_face, l_depth, sun_x, sun_y, sun_z, flags = PLANET_META_STRUCT.unpack(meta_buf)
+                    elem_bytes = 2 if (flags & PLANET_FLAG_FP16_IO) else 4
+                    expected_tensor_bytes = 6 * int(l_depth) * 18 * int(n_face) * int(n_face) * elem_bytes
+                    rem_bytes = payload_bytes - PLANET_META_SIZE
+                    if n_face == 0 or l_depth < 2 or rem_bytes != expected_tensor_bytes:
+                        if rem_bytes > 0:
+                            _recv_exact(conn, memoryview(bytearray(rem_bytes)))
+                        self._send_error(conn, STATUS_BAD_REQUEST, n_face, l_depth)
+                        continue
+                    tensor_buf = bytearray(rem_bytes)
+                    if not _recv_exact(conn, memoryview(tensor_buf)):
+                        break
+                    try:
+                        out_bytes, infer_us = self.engine.infer_planet_v8_bytes(
+                            n_face=n_face,
+                            l_depth=l_depth,
+                            sun_dir=(sun_x, sun_y, sun_z),
+                            flags=flags,
+                            raw_tensor_bytes=memoryview(tensor_buf),
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[gpu_infer_daemon] PlanetV8 op=12 error (6x{n_face}x{n_face}x{l_depth}): {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        self._send_error(conn, STATUS_INTERNAL_ERROR, n_face, l_depth)
+                        continue
+                    resp_hdr = HEADER_STRUCT.pack(
+                        STATUS_OK, l_depth & 0xFF, 17, n_face, n_face, len(out_bytes), infer_us
+                    )
+                    conn.sendall(resp_hdr)
+                    conn.sendall(out_bytes)
+                    continue
 
                 if op == OP_WORLD_V8_STEP:
                     batch = max(1, int(pad_batch))

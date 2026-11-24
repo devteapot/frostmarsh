@@ -1,0 +1,52 @@
+{
+  "server": "spark-gb10:4433",
+  "gpu_adapter": "Apple M4 Pro",
+  "gpu_backend": "Metal",
+  "grid_w": 64,
+  "grid_h": 64,
+  "total_chunks": 192,
+  "parametric_build_ms": 2.18,
+  "sim_mode": "neural",
+  "backend": "cuda-fp16-planet-v8",
+  "field_tick": 480,
+  "world_infer_ms": 206.98273,
+  "eco_infer_ms": 0.0,
+  "proj_active_pct": 0.0,
+  "mass_error": 0,
+  "energy_error": 0,
+  "wire_kbps": 214.40482,
+  "aoi_chunks_sent": 192,
+  "active_bots": 60,
+  "weather_kind": 0,
+  "dirty_update_p50_ms": 4.8,
+  "dirty_update_p99_ms": 6.552,
+  "full_sync_build_ms": 8.683,
+  "visible_chunks": 6,
+  "terrain_triangles": 155322,
+  "mesh_instances": 67,
+  "surfel_draws": 0,
+  "volumetric_splats": 792,
+  "hud_vertices": 135228,
+  "gpu_benchmarks": [
+    {
+      "label": "1080p Curved Planet + 60 Bots + HUD",
+      "resolution": "1920x1080",
+      "art_resolution": "1920x1080",
+      "style": "PLANET-METAL",
+      "p50_ms": 4.379,
+      "p99_ms": 4.998,
+      "mean_ms": 4.251,
+      "fps_p50": 228.4
+    },
+    {
+      "label": "4K Curved Planet + 60 Bots + HUD",
+      "resolution": "3840x2160",
+      "art_resolution": "3840x2160",
+      "style": "PLANET-METAL",
+      "p50_ms": 7.834,
+      "p99_ms": 8.572,
+      "mean_ms": 7.931,
+      "fps_p50": 127.6
+    }
+  ]
+}

@@ -9,12 +9,13 @@
 //!   5. Stage B 1-Tap Blit (`blit_pass.wgsl` -> native output)
 //!   6. Native-Res GPU 2D Action-MMO HUD + Live 256×256 Tactical Minimap (`hud_pass.wgsl`)
 
-use crate::camera::{CameraMatrices, MobaCamera};
+use crate::camera::{CameraMatrices, MobaCamera, PlanetCameraMatrices};
 use crate::hud::{HudBatch, HudVertex};
 use crate::mesh_gen::{MeshInstance, MeshSlice, MeshVertex, StaticMeshBank, MESH_KIND_COUNT};
 use crate::neural_style::{build_neural_style_weights, NUM_Z16_STYLES};
 pub use crate::neural_style::z16_style_label;
 use crate::palette::{palette_resolve_64, palette_tex_bytes_at};
+use crate::planet_world::{PlanetVertex, PlanetWorld};
 use crate::surfel_gen::{SplatPlacement, SplatProto, SplatRef, SurfelProtoBank};
 use crate::world_bridge::{AssembledFrame, VolSplat};
 use crate::z16_world::{SurfaceVertex, Z16World, OCC_BRICK_SIZE, SN_BRICK_SIZE};
@@ -90,6 +91,17 @@ struct StyleComputeParams {
     vol_dims: [u32; 4],
     region_min: [u32; 4],
     region_size: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PlanetUniforms {
+    view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    cam_pos: [f32; 4],    // xyz, sim_time
+    sun_dir: [f32; 4],    // xyz, r_ocean
+    planet_cfg: [f32; 4], // r_core, r_surf_atmo, r_atmo_outer, exposure
+    viewport: [f32; 4],   // width, height, 1/width, 1/height
 }
 
 const STYLE_PARAMS_STRIDE: u64 = 256;
@@ -378,6 +390,94 @@ pub struct Approach4Renderer {
     art_color_view: wgpu::TextureView,
     smooth_atmo: Option<SmoothedAtmosphere>,
     last_render_sim_time: f32,
+
+    // Wave 31B: Live Curved 6-Face Spherical Planetary Metal Pipelines & Buffers
+    pipe_planet_starfield: wgpu::RenderPipeline,
+    pipe_planet_solid: wgpu::RenderPipeline,
+    pipe_planet_ocean: wgpu::RenderPipeline,
+    pipe_planet_translucent: wgpu::RenderPipeline,
+    pipe_planet_resolve: wgpu::RenderPipeline,
+    planet_resolve_bgl: wgpu::BindGroupLayout,
+    planet_uni_buf: wgpu::Buffer,
+    planet_uni_bg: wgpu::BindGroup,
+    planet_hdr_w: u32,
+    planet_hdr_h: u32,
+    planet_hdr_view: wgpu::TextureView,
+    planet_depth_view: wgpu::TextureView,
+    planet_resolve_bg: wgpu::BindGroup,
+    planet_terrain_vbuf: wgpu::Buffer,
+    planet_terrain_vcap: usize,
+    planet_terrain_ibuf: wgpu::Buffer,
+    planet_terrain_icap: usize,
+    planet_terrain_icount: u32,
+    planet_ocean_vbuf: wgpu::Buffer,
+    planet_ocean_vcap: usize,
+    planet_ocean_ibuf: wgpu::Buffer,
+    planet_ocean_icap: usize,
+    planet_ocean_icount: u32,
+    planet_gas_vbuf: wgpu::Buffer,
+    planet_gas_vcap: usize,
+    planet_gas_ibuf: wgpu::Buffer,
+    planet_gas_icap: usize,
+    planet_gas_icount: u32,
+    planet_ent_solid_vbuf: wgpu::Buffer,
+    planet_ent_solid_vcap: usize,
+    planet_ent_solid_ibuf: wgpu::Buffer,
+    planet_ent_solid_icap: usize,
+    planet_ent_fx_vbuf: wgpu::Buffer,
+    planet_ent_fx_vcap: usize,
+    planet_ent_fx_ibuf: wgpu::Buffer,
+    planet_ent_fx_icap: usize,
+}
+
+fn make_planet_hdr_targets(
+    device: &wgpu::Device,
+    resolve_bgl: &wgpu::BindGroupLayout,
+    w: u32,
+    h: u32,
+) -> (wgpu::TextureView, wgpu::TextureView, wgpu::BindGroup) {
+    let size = wgpu::Extent3d {
+        width: w.max(1),
+        height: h.max(1),
+        depth_or_array_layers: 1,
+    };
+    let hdr_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("planet_live_hdr"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("planet_live_depth"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let hdr_view = hdr_tex.create_view(&Default::default());
+    let depth_view = depth_tex.create_view(&Default::default());
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("planet_live_resolve_bg"),
+        layout: resolve_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&hdr_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&depth_view),
+            },
+        ],
+    });
+    (hdr_view, depth_view, bg)
 }
 
 fn make_2d_targets(
@@ -1367,6 +1467,257 @@ impl Approach4Renderer {
 
         let (ss_cv, ss_dv, art_cv) = make_2d_targets(&device, 1920, 1080, 960, 540);
 
+        // Wave 31B: Live Curved 6-Face Spherical Planetary Metal Pipelines (`planet_live.wgsl`)
+        let planet_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("planet_live_wgsl"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                "../assets/shaders/planet_live.wgsl"
+            ))),
+        });
+        let planet_uni_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("planet_uni_bgl"),
+            entries: &[ubuf_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT)],
+        });
+        let planet_resolve_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("planet_resolve_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let planet_uni_buf = mk_ubuf(std::mem::size_of::<PlanetUniforms>());
+        let planet_uni_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("planet_uni_bg"),
+            layout: &planet_uni_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: planet_uni_buf.as_entire_binding(),
+            }],
+        });
+        let planet_hdr_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("planet_hdr_pl"),
+            bind_group_layouts: &[Some(&planet_uni_bgl)],
+            immediate_size: 0,
+        });
+        let planet_res_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("planet_res_pl"),
+            bind_group_layouts: &[Some(&planet_uni_bgl), Some(&planet_resolve_bgl)],
+            immediate_size: 0,
+        });
+
+        let pipe_planet_starfield = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_planet_starfield"),
+            layout: Some(&planet_hdr_pl),
+            vertex: wgpu::VertexState {
+                module: &planet_mod,
+                entry_point: Some("vs_fullscreen"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &planet_mod,
+                entry_point: Some("fs_starfield"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let pipe_planet_solid = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_planet_solid"),
+            layout: Some(&planet_hdr_pl),
+            vertex: wgpu::VertexState {
+                module: &planet_mod,
+                entry_point: Some("vs_planet"),
+                buffers: &[Some(PlanetVertex::desc())],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &planet_mod,
+                entry_point: Some("fs_planet_solid"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let pipe_planet_ocean = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_planet_ocean"),
+            layout: Some(&planet_hdr_pl),
+            vertex: wgpu::VertexState {
+                module: &planet_mod,
+                entry_point: Some("vs_planet"),
+                buffers: &[Some(PlanetVertex::desc())],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &planet_mod,
+                entry_point: Some("fs_planet_ocean"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let pipe_planet_translucent = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_planet_translucent"),
+            layout: Some(&planet_hdr_pl),
+            vertex: wgpu::VertexState {
+                module: &planet_mod,
+                entry_point: Some("vs_planet"),
+                buffers: &[Some(PlanetVertex::desc())],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &planet_mod,
+                entry_point: Some("fs_planet_translucent"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let pipe_planet_resolve = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pipe_planet_resolve"),
+            layout: Some(&planet_res_pl),
+            vertex: wgpu::VertexState {
+                module: &planet_mod,
+                entry_point: Some("vs_fullscreen"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &planet_mod,
+                entry_point: Some("fs_atmosphere_resolve"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: out_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let (planet_hdr_view, planet_depth_view, planet_resolve_bg) =
+            make_planet_hdr_targets(&device, &planet_resolve_bgl, 1920, 1080);
+
+        let pv_stride = std::mem::size_of::<PlanetVertex>();
+        let planet_terrain_vcap = 16_384;
+        let planet_terrain_icap = 65_536;
+        let planet_ocean_vcap = 8_192;
+        let planet_ocean_icap = 32_768;
+        let planet_gas_vcap = 4_096;
+        let planet_gas_icap = 8_192;
+        let planet_ent_solid_vcap = 16_384;
+        let planet_ent_solid_icap = 32_768;
+        let planet_ent_fx_vcap = 16_384;
+        let planet_ent_fx_icap = 32_768;
+
+        let planet_terrain_vbuf = mk_buf(planet_terrain_vcap * pv_stride, wgpu::BufferUsages::VERTEX);
+        let planet_terrain_ibuf = mk_buf(planet_terrain_icap * 4, wgpu::BufferUsages::INDEX);
+        let planet_ocean_vbuf = mk_buf(planet_ocean_vcap * pv_stride, wgpu::BufferUsages::VERTEX);
+        let planet_ocean_ibuf = mk_buf(planet_ocean_icap * 4, wgpu::BufferUsages::INDEX);
+        let planet_gas_vbuf = mk_buf(planet_gas_vcap * pv_stride, wgpu::BufferUsages::VERTEX);
+        let planet_gas_ibuf = mk_buf(planet_gas_icap * 4, wgpu::BufferUsages::INDEX);
+        let planet_ent_solid_vbuf = mk_buf(planet_ent_solid_vcap * pv_stride, wgpu::BufferUsages::VERTEX);
+        let planet_ent_solid_ibuf = mk_buf(planet_ent_solid_icap * 4, wgpu::BufferUsages::INDEX);
+        let planet_ent_fx_vbuf = mk_buf(planet_ent_fx_vcap * pv_stride, wgpu::BufferUsages::VERTEX);
+        let planet_ent_fx_ibuf = mk_buf(planet_ent_fx_icap * 4, wgpu::BufferUsages::INDEX);
+
         Ok(Self {
             adapter_name,
             adapter_backend,
@@ -1460,6 +1811,42 @@ impl Approach4Renderer {
             art_color_view: art_cv,
             smooth_atmo: None,
             last_render_sim_time: 0.0,
+            pipe_planet_starfield,
+            pipe_planet_solid,
+            pipe_planet_ocean,
+            pipe_planet_translucent,
+            pipe_planet_resolve,
+            planet_resolve_bgl,
+            planet_uni_buf,
+            planet_uni_bg,
+            planet_hdr_w: 1920,
+            planet_hdr_h: 1080,
+            planet_hdr_view,
+            planet_depth_view,
+            planet_resolve_bg,
+            planet_terrain_vbuf,
+            planet_terrain_vcap,
+            planet_terrain_ibuf,
+            planet_terrain_icap,
+            planet_terrain_icount: 0,
+            planet_ocean_vbuf,
+            planet_ocean_vcap,
+            planet_ocean_ibuf,
+            planet_ocean_icap,
+            planet_ocean_icount: 0,
+            planet_gas_vbuf,
+            planet_gas_vcap,
+            planet_gas_ibuf,
+            planet_gas_icap,
+            planet_gas_icount: 0,
+            planet_ent_solid_vbuf,
+            planet_ent_solid_vcap,
+            planet_ent_solid_ibuf,
+            planet_ent_solid_icap,
+            planet_ent_fx_vbuf,
+            planet_ent_fx_vcap,
+            planet_ent_fx_ibuf,
+            planet_ent_fx_icap,
         })
     }
 
@@ -2589,6 +2976,361 @@ impl Approach4Renderer {
         for i in 0..iters {
             let t0 = Instant::now();
             self.render_into(&view, w, h, style, atmo, camera, mats, (warmup + i) as f32 * 0.016, frame, hud);
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p50 = samples[samples.len() / 2];
+        let p99 = samples[((samples.len() as f64) * 0.99).floor().min((samples.len() - 1) as f64) as usize];
+        let mean = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
+        (p50, p99, mean)
+    }
+
+    // =========================================================================
+    // Wave 31B: Live Curved 6-Face Spherical Planetary Metal Render Path
+    // =========================================================================
+
+    fn upload_planet_mesh_pair(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        verts: &[PlanetVertex],
+        indices: &[u32],
+        vbuf: &mut wgpu::Buffer,
+        vcap: &mut usize,
+        ibuf: &mut wgpu::Buffer,
+        icap: &mut usize,
+    ) -> u32 {
+        if verts.len() > *vcap {
+            *vcap = (verts.len() * 3 / 2).max(1024);
+            *vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("planet_vbuf"),
+                size: (*vcap * std::mem::size_of::<PlanetVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if indices.len() > *icap {
+            *icap = (indices.len() * 3 / 2).max(1024);
+            *ibuf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("planet_ibuf"),
+                size: (*icap * 4) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !verts.is_empty() {
+            queue.write_buffer(vbuf, 0, bytemuck::cast_slice(verts));
+        }
+        if !indices.is_empty() {
+            queue.write_buffer(ibuf, 0, bytemuck::cast_slice(indices));
+        }
+        indices.len() as u32
+    }
+
+    /// Upload combined 6-face planet terrain, ocean & gas meshes when dirty.
+    pub fn upload_planet_world(&mut self, planet: &mut PlanetWorld) {
+        if !planet.gpu_dirty {
+            return;
+        }
+        self.planet_terrain_icount = Self::upload_planet_mesh_pair(
+            &self.device,
+            &self.queue,
+            &planet.combined_terrain_verts,
+            &planet.combined_terrain_indices,
+            &mut self.planet_terrain_vbuf,
+            &mut self.planet_terrain_vcap,
+            &mut self.planet_terrain_ibuf,
+            &mut self.planet_terrain_icap,
+        );
+        self.planet_ocean_icount = Self::upload_planet_mesh_pair(
+            &self.device,
+            &self.queue,
+            &planet.combined_ocean_verts,
+            &planet.combined_ocean_indices,
+            &mut self.planet_ocean_vbuf,
+            &mut self.planet_ocean_vcap,
+            &mut self.planet_ocean_ibuf,
+            &mut self.planet_ocean_icap,
+        );
+        self.planet_gas_icount = Self::upload_planet_mesh_pair(
+            &self.device,
+            &self.queue,
+            &planet.combined_gas_verts,
+            &planet.combined_gas_indices,
+            &mut self.planet_gas_vbuf,
+            &mut self.planet_gas_vcap,
+            &mut self.planet_gas_ibuf,
+            &mut self.planet_gas_icap,
+        );
+        planet.gpu_dirty = false;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_planet_into(
+        &mut self,
+        dst_view: &wgpu::TextureView,
+        out_w: u32,
+        out_h: u32,
+        cam_mats: &PlanetCameraMatrices,
+        sun_dir: Vec3,
+        exposure: f32,
+        sim_time: f32,
+        planet: &PlanetWorld,
+        hud: Option<&HudBatch>,
+    ) {
+        let w = out_w.max(1);
+        let h = out_h.max(1);
+        if self.planet_hdr_w != w || self.planet_hdr_h != h {
+            let (hv, dv, bg) = make_planet_hdr_targets(&self.device, &self.planet_resolve_bgl, w, h);
+            self.planet_hdr_w = w;
+            self.planet_hdr_h = h;
+            self.planet_hdr_view = hv;
+            self.planet_depth_view = dv;
+            self.planet_resolve_bg = bg;
+        }
+
+        // Upload dynamic per-frame 3D heroes, shrines, beams & projectiles
+        let ent_solid_icount = Self::upload_planet_mesh_pair(
+            &self.device,
+            &self.queue,
+            &planet.dynamic_solid_verts,
+            &planet.dynamic_solid_indices,
+            &mut self.planet_ent_solid_vbuf,
+            &mut self.planet_ent_solid_vcap,
+            &mut self.planet_ent_solid_ibuf,
+            &mut self.planet_ent_solid_icap,
+        );
+        let ent_fx_icount = Self::upload_planet_mesh_pair(
+            &self.device,
+            &self.queue,
+            &planet.dynamic_fx_verts,
+            &planet.dynamic_fx_indices,
+            &mut self.planet_ent_fx_vbuf,
+            &mut self.planet_ent_fx_vcap,
+            &mut self.planet_ent_fx_ibuf,
+            &mut self.planet_ent_fx_icap,
+        );
+
+        let hud_vert_count = if let Some(hb) = hud {
+            if hb.vertices.len() > self.hud_vcap {
+                self.hud_vcap = (hb.vertices.len() * 2).max(1024);
+                self.hud_vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (self.hud_vcap * std::mem::size_of::<HudVertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if !hb.vertices.is_empty() {
+                self.queue.write_buffer(&self.hud_vbuf, 0, bytemuck::cast_slice(&hb.vertices));
+            }
+            hb.vertices.len() as u32
+        } else {
+            0
+        };
+
+        let sun = sun_dir.normalize_or(Vec3::new(-0.78, 0.28, 0.56).normalize());
+        let r_core = planet.r_core;
+        let d_f = planet.depth as f32;
+        let r_ocean = planet.r_ocean();
+        let r_surf_atmo = r_core + d_f * 0.48;
+        let r_atmo_outer = r_core + d_f * 1.15;
+
+        let uni = PlanetUniforms {
+            view_proj: cam_mats.vp.to_cols_array_2d(),
+            inv_view_proj: cam_mats.inv_vp.to_cols_array_2d(),
+            cam_pos: [cam_mats.eye.x, cam_mats.eye.y, cam_mats.eye.z, sim_time],
+            sun_dir: [sun.x, sun.y, sun.z, r_ocean],
+            planet_cfg: [r_core, r_surf_atmo, r_atmo_outer, exposure],
+            viewport: [w as f32, h as f32, 1.0 / w as f32, 1.0 / h as f32],
+        };
+        self.queue.write_buffer(&self.planet_uni_buf, 0, bytemuck::bytes_of(&uni));
+
+        let hud_u = HudUniforms {
+            screen_size: [w as f32, h as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.queue.write_buffer(&self.hud_ubuf, 0, bytemuck::bytes_of(&hud_u));
+        let hud_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.hud_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.hud_ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.minimap_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.minimap_samp) },
+            ],
+        });
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+
+        // PASS 1 (HDR + Depth): Cosmic Starfield + Curved 6-Face Planet + Ocean + Sky-Ring + 60 Live Heroes/Shrines/Beams
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("planet_live_hdr_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.planet_hdr_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.planet_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            // 1A: Cosmic Starfield & Live Sun Disc
+            rp.set_pipeline(&self.pipe_planet_starfield);
+            rp.set_bind_group(0, &self.planet_uni_bg, &[]);
+            rp.draw(0..3, 0..1);
+
+            // 1B: Curved 6-Face Planet Terrain + Polar Caps + Volcanic Rift + Orbital Sky-Ring Islands & Crystal Cores
+            if self.planet_terrain_icount > 0 {
+                rp.set_pipeline(&self.pipe_planet_solid);
+                rp.set_bind_group(0, &self.planet_uni_bg, &[]);
+                rp.set_vertex_buffer(0, self.planet_terrain_vbuf.slice(..));
+                rp.set_index_buffer(self.planet_terrain_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..self.planet_terrain_icount, 0, 0..1);
+            }
+
+            // 1C: Curved Specular/Fresnel Sapphire Ocean & Live Sea-Ice
+            if self.planet_ocean_icount > 0 {
+                rp.set_pipeline(&self.pipe_planet_ocean);
+                rp.set_bind_group(0, &self.planet_uni_bg, &[]);
+                rp.set_vertex_buffer(0, self.planet_ocean_vbuf.slice(..));
+                rp.set_index_buffer(self.planet_ocean_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..self.planet_ocean_icount, 0, 0..1);
+            }
+
+            // 1D: Live 3D Upright Heroes, Shrines & Solid Projectiles
+            if ent_solid_icount > 0 {
+                rp.set_pipeline(&self.pipe_planet_solid);
+                rp.set_bind_group(0, &self.planet_uni_bg, &[]);
+                rp.set_vertex_buffer(0, self.planet_ent_solid_vbuf.slice(..));
+                rp.set_index_buffer(self.planet_ent_solid_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..ent_solid_icount, 0, 0..1);
+            }
+
+            // 1E: Translucent Volumetric Steam/Smoke Plumes + Shrine Light Pillars + Hero Aura Rings + Elemental Beams
+            if self.planet_gas_icount > 0 || ent_fx_icount > 0 {
+                rp.set_pipeline(&self.pipe_planet_translucent);
+                rp.set_bind_group(0, &self.planet_uni_bg, &[]);
+                if self.planet_gas_icount > 0 {
+                    rp.set_vertex_buffer(0, self.planet_gas_vbuf.slice(..));
+                    rp.set_index_buffer(self.planet_gas_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..self.planet_gas_icount, 0, 0..1);
+                }
+                if ent_fx_icount > 0 {
+                    rp.set_vertex_buffer(0, self.planet_ent_fx_vbuf.slice(..));
+                    rp.set_index_buffer(self.planet_ent_fx_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..ent_fx_icount, 0, 0..1);
+                }
+            }
+        }
+
+        // PASS 2 (`dst_view`): Depth-Aware Physical Rayleigh + Mie Atmosphere Resolve + ACES Tonemap + Crisp HUD ON TOP!
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("planet_atmosphere_and_hud_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dst_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.pipe_planet_resolve);
+            rp.set_bind_group(0, &self.planet_uni_bg, &[]);
+            rp.set_bind_group(1, &self.planet_resolve_bg, &[]);
+            rp.draw(0..3, 0..1);
+
+            if hud_vert_count > 0 {
+                rp.set_pipeline(&self.pipe_hud);
+                rp.set_bind_group(0, &hud_bg, &[]);
+                rp.set_vertex_buffer(0, self.hud_vbuf.slice(..));
+                rp.draw(0..hud_vert_count, 0..1);
+            }
+        }
+
+        self.queue.submit(Some(enc.finish()));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_planet_to_rgba(
+        &mut self,
+        w: u32,
+        h: u32,
+        cam_mats: &PlanetCameraMatrices,
+        sun_dir: Vec3,
+        exposure: f32,
+        sim_time: f32,
+        planet: &PlanetWorld,
+        hud: Option<&HudBatch>,
+    ) -> (Vec<u8>, f64) {
+        let (tex, view) = self.create_output_texture(w, h);
+        let t0 = Instant::now();
+        self.render_planet_into(&view, w, h, cam_mats, sun_dir, exposure, sim_time, planet, hud);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let gpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let rgba = self.readback_rgba(&tex, w, h);
+        (rgba, gpu_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn benchmark_planet_gpu(
+        &mut self,
+        w: u32,
+        h: u32,
+        cam_mats: &PlanetCameraMatrices,
+        sun_dir: Vec3,
+        exposure: f32,
+        planet: &PlanetWorld,
+        hud: Option<&HudBatch>,
+        warmup: usize,
+        iters: usize,
+    ) -> (f64, f64, f64) {
+        let (_tex, view) = self.create_output_texture(w, h);
+        for i in 0..warmup {
+            self.render_planet_into(
+                &view,
+                w,
+                h,
+                cam_mats,
+                sun_dir,
+                exposure,
+                i as f32 * 0.016,
+                planet,
+                hud,
+            );
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        let mut samples = Vec::with_capacity(iters);
+        for i in 0..iters {
+            let t0 = Instant::now();
+            self.render_planet_into(
+                &view,
+                w,
+                h,
+                cam_mats,
+                sun_dir,
+                exposure,
+                (warmup + i) as f32 * 0.016,
+                planet,
+                hud,
+            );
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             samples.push(t0.elapsed().as_secs_f64() * 1000.0);
         }

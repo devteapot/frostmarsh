@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod sharding;
+
 pub const NUM_SPECIES: usize = 10;
 pub const NUM_MOBILE: usize = 4;
 pub const NUM_REACTIONS: usize = 7;

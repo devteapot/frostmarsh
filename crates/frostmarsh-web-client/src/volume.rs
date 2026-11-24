@@ -12,6 +12,59 @@ pub const MIN_SHOWCASE_DEPTH: usize = 16;
 pub const MAX_SHOWCASE_DEPTH: usize = 32;
 pub const BRICK_SIZE: usize = 8;
 pub const STREAM_BRICK_XY: usize = 16;
+pub const WS_DELTA_HEADER_BYTES: usize = 10;
+pub const WS_DELTA_RECORD_BYTES: usize = 10;
+pub const WS_DELTA_FLAG_RAW: u8 = 0;
+
+/// Parsed Wave 24A WebSocket `0x03` delta-brick binary frame view.
+#[derive(Clone, Copy, Debug)]
+pub struct WsBrick3dDeltaFrame<'a> {
+    pub bx: u16,
+    pub by: u16,
+    pub depth: u16,
+    pub count: u16,
+    pub flags: u8,
+    pub payload: &'a [u8],
+}
+
+/// Parse a Wave 24A `0x03` delta-brick binary frame:
+/// `[0x03, bx u16 LE, by u16 LE, depth u16 LE, count u16 LE, flags u8, records...]`.
+pub fn parse_ws_brick3d_delta_frame(frame: &[u8]) -> Result<WsBrick3dDeltaFrame<'_>, String> {
+    if frame.len() < WS_DELTA_HEADER_BYTES {
+        return Err(format!(
+            "0x03 delta frame too short: {} bytes (expected >= {})",
+            frame.len(),
+            WS_DELTA_HEADER_BYTES
+        ));
+    }
+    if frame[0] != 0x03 {
+        return Err(format!("Expected 0x03 frame tag, got 0x{:02X}", frame[0]));
+    }
+    let bx = u16::from_le_bytes([frame[1], frame[2]]);
+    let by = u16::from_le_bytes([frame[3], frame[4]]);
+    let depth = u16::from_le_bytes([frame[5], frame[6]]);
+    let count = u16::from_le_bytes([frame[7], frame[8]]);
+    let flags = frame[9];
+    if flags != WS_DELTA_FLAG_RAW {
+        return Err(format!("Unsupported 0x03 delta flags: {flags}"));
+    }
+    let expected = WS_DELTA_HEADER_BYTES + (count as usize) * WS_DELTA_RECORD_BYTES;
+    if frame.len() < expected {
+        return Err(format!(
+            "Truncated 0x03 delta frame: got {} bytes, expected {}",
+            frame.len(),
+            expected
+        ));
+    }
+    Ok(WsBrick3dDeltaFrame {
+        bx,
+        by,
+        depth,
+        count,
+        flags,
+        payload: &frame[WS_DELTA_HEADER_BYTES..expected],
+    })
+}
 
 /// Sub-region descriptor returned by [`WorldVolume3D::apply_brick3d_raw`] for incremental GPU uploads.
 #[derive(Clone, Copy, Debug)]
@@ -353,6 +406,31 @@ impl WorldVolume3D {
         }
     }
 
+    fn resize_depth_preserve(&mut self, brick_depth: usize) -> bool {
+        if brick_depth == self.depth {
+            return false;
+        }
+        let old_d = self.depth;
+        let copy_d = old_d.min(brick_depth);
+        let mut new_dm = vec![0u8; self.width * brick_depth * self.height * 4];
+        let mut new_at = vec![0u8; self.width * brick_depth * self.height * 4];
+        let row_bytes = self.width * 4;
+        for iz in 0..self.height {
+            for iy in 0..copy_d {
+                let src_off = (iz * old_d + iy) * row_bytes;
+                let dst_off = (iz * brick_depth + iy) * row_bytes;
+                new_dm[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&self.density_mat[src_off..src_off + row_bytes]);
+                new_at[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&self.albedo_thermal[src_off..src_off + row_bytes]);
+            }
+        }
+        self.depth = brick_depth;
+        self.density_mat = new_dm;
+        self.albedo_thermal = new_at;
+        true
+    }
+
     /// Incrementally patch one live `16×16×D` (`D = 16..=32`, up to `128`) brick `(bx, by)`
     /// from raw Z-major `[alt][dy][dx][4]` RGBA8 `density_rgba` and `albedo_rgba` slices.
     ///
@@ -397,28 +475,7 @@ impl WorldVolume3D {
             ));
         };
 
-        let mut resized_depth = false;
-        if brick_depth != self.depth {
-            let old_d = self.depth;
-            let copy_d = old_d.min(brick_depth);
-            let mut new_dm = vec![0u8; self.width * brick_depth * self.height * 4];
-            let mut new_at = vec![0u8; self.width * brick_depth * self.height * 4];
-            let row_bytes = self.width * 4;
-            for iz in 0..self.height {
-                for iy in 0..copy_d {
-                    let src_off = (iz * old_d + iy) * row_bytes;
-                    let dst_off = (iz * brick_depth + iy) * row_bytes;
-                    new_dm[dst_off..dst_off + row_bytes]
-                        .copy_from_slice(&self.density_mat[src_off..src_off + row_bytes]);
-                    new_at[dst_off..dst_off + row_bytes]
-                        .copy_from_slice(&self.albedo_thermal[src_off..src_off + row_bytes]);
-                }
-            }
-            self.depth = brick_depth;
-            self.density_mat = new_dm;
-            self.albedo_thermal = new_at;
-            resized_depth = true;
-        }
+        let resized_depth = self.resize_depth_preserve(brick_depth);
 
         let d = self.depth;
         let w = self.width;
@@ -445,6 +502,91 @@ impl WorldVolume3D {
             depth: d,
             resized_depth,
         })
+    }
+
+    /// Wave 24A: Apply a sparse `0x03` delta-brick payload (packed 10-byte `[idx u16 LE, density[4], albedo[4]]`
+    /// records) onto `16×16×D` brick `(bx, by)`, returning both the sub-region descriptor for GPU upload
+    /// and the number of patched voxels.
+    pub fn apply_brick3d_delta_with_patch(
+        &mut self,
+        bx: usize,
+        by: usize,
+        brick_depth: usize,
+        payload: &[u8],
+    ) -> Result<(BrickPatchResult, usize), String> {
+        if !(2..=128).contains(&brick_depth) {
+            return Err(format!("Unsupported delta brick depth: {brick_depth} (expected 2..=128)"));
+        }
+        let x0 = bx.saturating_mul(STREAM_BRICK_XY);
+        let z0 = by.saturating_mul(STREAM_BRICK_XY);
+        if x0 >= self.width || z0 >= self.height {
+            return Err(format!(
+                "Delta brick ({bx}, {by}) out of bounds for {}x{} volume",
+                self.width, self.height
+            ));
+        }
+        if payload.len() % WS_DELTA_RECORD_BYTES != 0 {
+            return Err(format!(
+                "Delta brick ({bx},{by}) payload length {} is not a multiple of {} bytes",
+                payload.len(),
+                WS_DELTA_RECORD_BYTES
+            ));
+        }
+
+        let cw = STREAM_BRICK_XY.min(self.width - x0);
+        let ch = STREAM_BRICK_XY.min(self.height - z0);
+        let resized_depth = self.resize_depth_preserve(brick_depth);
+
+        let d = self.depth;
+        let w = self.width;
+        let max_voxels = d * STREAM_BRICK_XY * STREAM_BRICK_XY;
+        let mut applied = 0usize;
+
+        for rec in payload.chunks_exact(WS_DELTA_RECORD_BYTES) {
+            let idx = u16::from_le_bytes([rec[0], rec[1]]) as usize;
+            if idx >= max_voxels {
+                return Err(format!(
+                    "Delta brick ({bx},{by}) voxel index {idx} out of range (max {max_voxels})"
+                ));
+            }
+            let dx = idx & 0x0F;
+            let dy = (idx >> 4) & 0x0F;
+            let alt = idx >> 8;
+            if dx < cw && dy < ch && alt < d {
+                let iz = z0 + dy;
+                let dst = ((iz * d + alt) * w + (x0 + dx)) * 4;
+                self.density_mat[dst..dst + 4].copy_from_slice(&rec[2..6]);
+                self.albedo_thermal[dst..dst + 4].copy_from_slice(&rec[6..10]);
+                applied += 1;
+            }
+        }
+
+        Ok((
+            BrickPatchResult {
+                bx,
+                by,
+                x0,
+                z0,
+                cw,
+                ch,
+                depth: d,
+                resized_depth,
+            },
+            applied,
+        ))
+    }
+
+    /// Wave 24A: Patch only the changed `(idx, density[4], albedo[4])` voxels inside `16×16×D`
+    /// brick `(bx, by)` from raw packed 10-byte `0x03` delta records. Returns number of applied voxels.
+    pub fn apply_brick3d_delta(
+        &mut self,
+        bx: usize,
+        by: usize,
+        brick_depth: usize,
+        payload: &[u8],
+    ) -> Result<usize, String> {
+        self.apply_brick3d_delta_with_patch(bx, by, brick_depth, payload)
+            .map(|(_, applied)| applied)
     }
 
     /// Pack a contiguous GPU sub-brick `[dz=0..ch][iy=0..depth][dx=0..cw][4]` ready for

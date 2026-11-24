@@ -1,0 +1,180 @@
+{
+  "wave": "24B",
+  "title": "MMO Phase 2B: Seamless 2x2 Multi-Region Ghost-Halo Sharding & Spatial World-Law Field",
+  "checkpoint": "/home/gooning/.t3/scratch/frostmarsh-ml/world_model_3d_v8.pt",
+  "world_model_params": 164622,
+  "parity": {
+    "grid_shape": [
+      16,
+      256,
+      256
+    ],
+    "shard_shape": [
+      16,
+      128,
+      128
+    ],
+    "halo_xy": 6,
+    "blend_width_m": 32,
+    "default_law_features_global_max_abs": 0.0,
+    "default_law_features_spatial_max_abs": 0.0,
+    "global_vs_uniform_spatial_max_abs_diff": 0.0,
+    "global_vs_uniform_spatial_max_rel_diff": 0.0,
+    "monolith_vs_2x2_sharded_fp32": {
+      "max_abs_diff_horiz": 7.62939453125e-06,
+      "max_abs_diff_horiz_mass_rxn": 1.9073486328125e-06,
+      "max_abs_diff_z_flux": 1.1920928955078125e-07,
+      "max_abs_diff_z_world_3d": 9.5367431640625e-07,
+      "max_rel_diff_horiz": 2.320924433485555e-07,
+      "max_rel_diff_z_flux": 1.4480530166962686e-07,
+      "max_rel_diff_z_world_3d": 1.591412230353101e-07,
+      "max_rel_diff_all": 2.320924433485555e-07,
+      "tensor_max_mag_horiz": 32.872222900390625,
+      "tensor_max_mag_z_flux": 0.8232384324073792,
+      "tensor_max_mag_z_world_3d": 5.992629051208496,
+      "seam_strip_max_abs_diff_horiz": 3.427267074584961e-06,
+      "seam_strip_max_abs_diff_z_flux": 8.940696716308594e-08,
+      "seam_strip_max_abs_diff_z_world_3d": 9.5367431640625e-07,
+      "passed_1e6_rel_gate": true
+    },
+    "monolith_vs_2x2_sharded_fp64_exact": {
+      "grid_shape": [
+        16,
+        64,
+        64
+      ],
+      "max_abs_diff_horiz": 2.220446049250313e-15,
+      "max_abs_diff_z_flux": 4.163336342344337e-17,
+      "max_abs_diff_z_world_3d": 6.661338147750939e-16,
+      "max_abs_diff_all": 2.220446049250313e-15,
+      "passed_1e13_algebraic_gate": true
+    },
+    "sparse_runner_spatial_laws_fp32": {
+      "grid_shape": [
+        16,
+        128,
+        128
+      ],
+      "active_brick_frac": 0.25,
+      "max_abs_diff_horiz": 3.814697265625e-06,
+      "max_abs_diff_z_flux": 1.7881393432617188e-07,
+      "max_abs_diff_z_world_3d": 9.5367431640625e-07,
+      "max_abs_diff_all": 3.814697265625e-06,
+      "max_rel_diff_all": 1.7881393432617188e-07,
+      "passed_1e6_rel_gate": true
+    }
+  },
+  "gpu_benchmark": {
+    "device": "NVIDIA GB10",
+    "dtype": "fp16",
+    "world_voxels": 4194304,
+    "world_shape": [
+      16,
+      512,
+      512
+    ],
+    "num_regions": 4,
+    "region_shape": [
+      16,
+      256,
+      256
+    ],
+    "halo_xy": 6,
+    "model_params": 164622,
+    "dense_4region": {
+      "p50_ms": 336.932,
+      "p95_ms": 408.831,
+      "mean_ms": 349.565,
+      "hz_p50": 2.97,
+      "peak_vram_mb": 1359.36,
+      "within_10hz_budget": false
+    },
+    "unified_sparse_brick_pool": {
+      "p50_ms": 125.598,
+      "p95_ms": 177.245,
+      "mean_ms": 132.974,
+      "hz_p50": 7.96,
+      "halo_sync_p50_ms": 0.192,
+      "peak_vram_mb": 1960.5,
+      "speedup_vs_dense": 2.68,
+      "within_10hz_budget": false,
+      "within_3gb_vram_budget": true,
+      "mmo_load": {
+        "total_bricks": 2048,
+        "total_active_bricks": 245,
+        "aggregate_active_pct": 11.96,
+        "per_region": {
+          "region_0_nw_hot": {
+            "active_bricks": 128,
+            "total_bricks": 512,
+            "active_pct": 25.0
+          },
+          "region_1_ne_med": {
+            "active_bricks": 51,
+            "total_bricks": 512,
+            "active_pct": 9.96
+          },
+          "region_2_sw_med": {
+            "active_bricks": 51,
+            "total_bricks": 512,
+            "active_pct": 9.96
+          },
+          "region_3_se_wild": {
+            "active_bricks": 15,
+            "total_bricks": 512,
+            "active_pct": 2.93
+          }
+        }
+      }
+    },
+    "unified_sparse_multirate_async": {
+      "p50_ms": 94.035,
+      "p95_ms": 157.211,
+      "mean_ms": 101.482,
+      "hz_p50": 10.63,
+      "peak_vram_mb": 1960.5,
+      "speedup_vs_dense": 3.58,
+      "within_10hz_budget": true,
+      "within_3gb_vram_budget": true,
+      "mmo_load": {
+        "total_bricks": 2048,
+        "total_active_bricks": 183,
+        "aggregate_active_pct": 8.94,
+        "per_region": {
+          "region_0_nw_hot": {
+            "active_bricks": 128,
+            "total_bricks": 512,
+            "active_pct": 25.0
+          },
+          "region_1_ne_med": {
+            "active_bricks": 26,
+            "total_bricks": 512,
+            "active_pct": 5.08
+          },
+          "region_2_sw_med": {
+            "active_bricks": 26,
+            "total_bricks": 512,
+            "active_pct": 5.08
+          },
+          "region_3_se_wild": {
+            "active_bricks": 3,
+            "total_bricks": 512,
+            "active_pct": 0.59
+          }
+        }
+      }
+    },
+    "halo_bandwidth": {
+      "halo_xy": 6,
+      "total_halo_voxels_exchanged_per_tick": 198912,
+      "raw_fp16_18ch_kb_per_tick": 6993.0,
+      "zlib_full_18ch_kb_per_tick": 163.19,
+      "zlib_delta_18ch_kb_per_tick": 196.32,
+      "raw_fp16_11ch_kb_per_tick": 4273.5,
+      "zlib_full_11ch_kb_per_tick": 102.26,
+      "zlib_delta_11ch_kb_per_tick": 91.74,
+      "zlib_delta_18ch_mb_per_sec_at_10hz": 1.917,
+      "zlib_delta_11ch_mb_per_sec_at_10hz": 0.896
+    }
+  }
+}

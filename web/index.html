@@ -850,6 +850,7 @@
       // Live Binary WebSocket Multiplayer Receiver
       // Frame 0x01: [u8=1, u16 bx (LE), u16 by (LE), u8 depth, u32 den_len (LE), density_bytes..., albedo_bytes...]
       // Frame 0x02: [u8=2, utf8_json_bytes...]
+      // Frame 0x03: [u8=3, u16 bx (LE), u16 by (LE), u16 depth (LE), u16 count (LE), u8 flags=0, 10-byte records...]
       const textDecoder = new TextDecoder("utf-8");
       let liveWs = null;
       let wsStateText = "Offline";
@@ -1021,6 +1022,9 @@
                 const jsonStr = textDecoder.decode(new Uint8Array(ev.data, 1));
                 app.apply_live_entities_json(jsonStr);
                 handleLiveEventsFromJson(jsonStr);
+              } else if (frameType === 0x03) {
+                // [u8=3, u16 bx, u16 by, u16 depth, u16 count, u8 flags=0, 10-byte voxel records...]
+                app.apply_ws_binary_frame(new Uint8Array(ev.data));
               }
             } catch (err) {
               console.warn("WS frame decode error:", err);
@@ -1201,8 +1205,9 @@
               ? `Capsule-3D (${s.grounded ? "Grounded" : "Airborne"} · Cutaway)`
               : "Free-Fly";
           if (liveWs && liveWs.readyState === WebSocket.OPEN) {
+            const deltaSuffix = s.live_delta_bricks_rx > 0 ? `, ${s.live_delta_bricks_rx}Δ` : "";
             const brkInfo = s.live_bricks_rx > 0
-              ? ` · ${s.live_bricks_rx} brk (${s.last_brick_ms.toFixed(2)}ms)`
+              ? ` · ${s.live_bricks_rx} brk (${s.last_brick_ms.toFixed(2)}ms${deltaSuffix})`
               : "";
             const beamInfo = s.live_beams > 0 ? `/${s.live_beams}B` : "";
             const statusSuffix = s.live_status && s.live_status !== "Offline" ? ` · ${s.live_status}` : "";

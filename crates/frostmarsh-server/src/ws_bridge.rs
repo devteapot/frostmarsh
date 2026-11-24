@@ -1,17 +1,20 @@
-//! Wave 12B: Pure-Rust Zero-Dependency RFC 6455 WebSocket Multiplayer Bridge.
+//! Wave 12B / Wave 24A: Pure-Rust Zero-Dependency RFC 6455 WebSocket Multiplayer Bridge.
 //!
-//! Streams exact Wave 12C WebGPU/WASM Browser Client (`web/index.html`) binary frames directly
-//! from the live authoritative `frostmarsh-server`:
-//! - Frame `0x01` (Volumetric 3D Brick):
+//! Streams exact Wave 12C / Wave 24A WebGPU/WASM Browser Client (`web/index.html`) binary frames
+//! directly from the live authoritative `frostmarsh-server`:
+//! - Frame `0x01` (Full Volumetric 3D Brick — initial sync & `>= 30%` massive mutations):
 //!   `[u8=1, u16_le bx, u16_le by, u8 depth, u32_le den_len, density_rgba..., albedo_rgba...]`
 //!   where `density_rgba` and `albedo_rgba` are raw Z-major `[z][dy][dx][rgba]` `16×16×depth`
 //!   bricks packed by `VolumeField::encode_3d_brick_16`.
 //! - Frame `0x02` (Live Entities & Telemetry JSON at ~15 Hz):
 //!   `[u8=2, utf8_json...]` matching `crates/frostmarsh-web-client/src/live_entities.rs`.
+//! - Frame `0x03` (Wave 24A Delta Volumetric 3D Brick — `< 30%` changed voxels with deadzone=5):
+//!   `[u8=3, u16_le bx, u16_le by, u16_le depth, u16_le count, u8 flags=0, records...]`
+//!   where each 10-byte record is `[u16_le voxel_idx, density_rgba[4], albedo_rgba[4]]`.
 //! - Inbound Client Text Frames (`0x01`, masked):
 //!   e.g. `{"type":"cycle_biome"}`, `{"type":"reset_world"}`, `{"type":"request_full_sync"}`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,8 +28,30 @@ const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const MAX_CLIENT_FRAME_BYTES: usize = 1024 * 1024;
 const PEER_QUEUE_CAPACITY: usize = 256;
 
-/// Default maximum number of initial full-sync bricks pushed per WS client per 10 Hz tick.
+/// Default maximum number of initial full-sync `0x01` bricks pushed per WS client per 10 Hz tick
+/// (center-outward: 64 viewport bricks in 0.8s, full 256-brick world in 3.2s without 50-client spikes).
 pub const WS_INITIAL_BRICKS_PER_TICK: usize = 16;
+
+/// Default per-channel visual deadzone for WS `0x03` delta-brick encoding (`5/255`).
+pub const WS_DELTA_DEADZONE: u8 = 5;
+
+/// Bricks with `< 30%` changed voxels use `0x03` delta frames; `>= 30%` fall back to `0x01` full frames.
+pub const WS_DELTA_MAX_CHANGE_PCT: usize = 30;
+
+/// Per-client steady-state WS incremental brick wire budget per 10 Hz tick (`20 KB/tick` = `200 KB/s`).
+pub const WS_MAX_DELTA_BYTES_PER_TICK: usize = 20 * 1024;
+
+/// `0x03` delta flags byte: `0` = raw packed 10-byte records `[idx u16 LE, density[4], albedo[4]]`.
+pub const WS_DELTA_FLAG_RAW: u8 = 0;
+
+/// Header size of `0x03` delta-brick binary payload (matches `0x01`'s 10-byte header).
+pub const WS_DELTA_HEADER_BYTES: usize = 10;
+
+/// Per-voxel record size in `flags = 0` `0x03` delta-brick binary payload.
+pub const WS_DELTA_RECORD_BYTES: usize = 10;
+
+/// Shared `(density_rgba, albedo_rgba)` raw `16×16×D` brick buffer matching server `brick_raw_cache`.
+pub type RawBrick = Arc<(Vec<u8>, Vec<u8>)>;
 
 // ---------------- Tiny Zero-Dependency SHA-1 (FIPS 180-4) & Base64 ----------------
 
@@ -187,6 +212,154 @@ pub fn encode_entities_payload(json: &str) -> Vec<u8> {
     out
 }
 
+/// Result of comparing a brick against a client's previously transmitted shadow brick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrickDeltaOutcome {
+    /// Zero voxels exceeded the deadzone — send 0 bytes!
+    Unchanged,
+    /// `< 30%` of voxels changed — ready-to-frame `0x03` delta payload (`10 + 10 * count` bytes).
+    Delta {
+        payload: Vec<u8>,
+        changed_voxels: usize,
+    },
+    /// `>= 30%` of voxels changed (or buffer geometry changed) — caller should send `0x01` full brick.
+    FullRequired,
+}
+
+/// Build Frostmarsh Wave 24A Frame `0x03` delta-brick payload:
+/// `[u8=3, u16_le bx, u16_le by, u16_le depth, u16_le count, u8 flags=0, records...]`
+/// where each 10-byte record is `[u16_le idx, density_rgba[4], albedo_rgba[4]]`.
+///
+/// - Suppresses any voxel whose max per-channel absolute diff across all 8 bytes is `<= deadzone`.
+/// - Returns `BrickDeltaOutcome::Unchanged` when 0 voxels changed (send 0 bytes).
+/// - Returns `BrickDeltaOutcome::FullRequired` when `>= 30%` of voxels changed or dimensions mismatch.
+pub fn encode_brick_delta_payload(
+    bx: u16,
+    by: u16,
+    depth: u16,
+    prev_density: &[u8],
+    prev_albedo: &[u8],
+    cur_density: &[u8],
+    cur_albedo: &[u8],
+    deadzone: u8,
+) -> BrickDeltaOutcome {
+    let byte_len = cur_density.len();
+    if byte_len == 0
+        || byte_len % 4 != 0
+        || prev_density.len() != byte_len
+        || prev_albedo.len() != byte_len
+        || cur_albedo.len() != byte_len
+    {
+        return BrickDeltaOutcome::FullRequired;
+    }
+    let total_voxels = byte_len / 4;
+    if total_voxels > u16::MAX as usize {
+        return BrickDeltaOutcome::FullRequired;
+    }
+
+    // Strictly < 30% changed uses 0x03 delta; >= 30% falls back to 0x01 full frame.
+    let max_delta_voxels = (total_voxels * WS_DELTA_MAX_CHANGE_PCT).saturating_sub(1) / 100;
+    let mut out: Vec<u8> = Vec::new();
+    let mut changed = 0usize;
+
+    for idx in 0..total_voxels {
+        let o = idx * 4;
+        let max_diff = cur_density[o]
+            .abs_diff(prev_density[o])
+            .max(cur_density[o + 1].abs_diff(prev_density[o + 1]))
+            .max(cur_density[o + 2].abs_diff(prev_density[o + 2]))
+            .max(cur_density[o + 3].abs_diff(prev_density[o + 3]))
+            .max(cur_albedo[o].abs_diff(prev_albedo[o]))
+            .max(cur_albedo[o + 1].abs_diff(prev_albedo[o + 1]))
+            .max(cur_albedo[o + 2].abs_diff(prev_albedo[o + 2]))
+            .max(cur_albedo[o + 3].abs_diff(prev_albedo[o + 3]));
+        if max_diff <= deadzone {
+            continue;
+        }
+        changed += 1;
+        if changed > max_delta_voxels {
+            return BrickDeltaOutcome::FullRequired;
+        }
+        if out.is_empty() {
+            out.reserve(WS_DELTA_HEADER_BYTES + 64 * WS_DELTA_RECORD_BYTES);
+            out.resize(WS_DELTA_HEADER_BYTES, 0);
+        }
+        out.extend_from_slice(&(idx as u16).to_le_bytes());
+        out.extend_from_slice(&cur_density[o..o + 4]);
+        out.extend_from_slice(&cur_albedo[o..o + 4]);
+    }
+
+    if changed == 0 {
+        return BrickDeltaOutcome::Unchanged;
+    }
+
+    out[0] = 0x03;
+    out[1..3].copy_from_slice(&bx.to_le_bytes());
+    out[3..5].copy_from_slice(&by.to_le_bytes());
+    out[5..7].copy_from_slice(&depth.to_le_bytes());
+    out[7..9].copy_from_slice(&(changed as u16).to_le_bytes());
+    out[9] = WS_DELTA_FLAG_RAW;
+
+    BrickDeltaOutcome::Delta {
+        payload: out,
+        changed_voxels: changed,
+    }
+}
+
+/// Decoded header & voxel patch list from a Wave 24A `0x03` delta-brick binary payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedBrickDelta {
+    pub bx: u16,
+    pub by: u16,
+    pub depth: u16,
+    pub flags: u8,
+    pub voxels: Vec<(u16, [u8; 4], [u8; 4])>,
+}
+
+/// Decode a Wave 24A `0x03` delta-brick binary payload back into its header and changed voxels.
+#[allow(dead_code)]
+pub fn decode_brick_delta_payload(payload: &[u8]) -> Result<DecodedBrickDelta, String> {
+    if payload.len() < WS_DELTA_HEADER_BYTES {
+        return Err(format!(
+            "0x03 delta payload too short: {} bytes",
+            payload.len()
+        ));
+    }
+    if payload[0] != 0x03 {
+        return Err(format!("Expected 0x03 delta tag, got 0x{:02X}", payload[0]));
+    }
+    let bx = u16::from_le_bytes([payload[1], payload[2]]);
+    let by = u16::from_le_bytes([payload[3], payload[4]]);
+    let depth = u16::from_le_bytes([payload[5], payload[6]]);
+    let count = u16::from_le_bytes([payload[7], payload[8]]) as usize;
+    let flags = payload[9];
+    if flags != WS_DELTA_FLAG_RAW {
+        return Err(format!("Unsupported 0x03 delta flags: {}", flags));
+    }
+    let expected = WS_DELTA_HEADER_BYTES + count * WS_DELTA_RECORD_BYTES;
+    if payload.len() != expected {
+        return Err(format!(
+            "0x03 delta length mismatch: got {} bytes, expected {}",
+            payload.len(),
+            expected
+        ));
+    }
+    let mut voxels = Vec::with_capacity(count);
+    for rec in payload[WS_DELTA_HEADER_BYTES..].chunks_exact(WS_DELTA_RECORD_BYTES) {
+        let idx = u16::from_le_bytes([rec[0], rec[1]]);
+        let den = [rec[2], rec[3], rec[4], rec[5]];
+        let alb = [rec[6], rec[7], rec[8], rec[9]];
+        voxels.push((idx, den, alb));
+    }
+    Ok(DecodedBrickDelta {
+        bx,
+        by,
+        depth,
+        flags,
+        voxels,
+    })
+}
+
 /// Wave 17C: Additive tactical/synergy event entry streamed in the `0x02` live JSON `"events"` feed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WsTacticalEvent {
@@ -342,6 +515,18 @@ fn ordered_brick_coords(chunks_x: usize, chunks_y: usize) -> VecDeque<(u16, u16)
 struct WsPeerState {
     tx: mpsc::Sender<Arc<[u8]>>,
     pending_initial_bricks: VecDeque<(u16, u16)>,
+    pending_dirty_bricks: HashSet<(u16, u16)>,
+    brick_shadow: HashMap<(u16, u16), RawBrick>,
+}
+
+#[derive(Clone)]
+enum CachedDelta {
+    Unchanged,
+    Delta {
+        frame: Arc<[u8]>,
+        changed_voxels: usize,
+    },
+    FullRequired,
 }
 
 /// Shared handle to the live RFC 6455 WebSocket bridge server.
@@ -398,6 +583,8 @@ impl WsBridge {
         let mut peers = self.peers.lock().unwrap();
         for peer in peers.values_mut() {
             peer.pending_initial_bricks = coords.clone();
+            peer.pending_dirty_bricks.clear();
+            peer.brick_shadow.clear();
         }
     }
 
@@ -406,6 +593,8 @@ impl WsBridge {
         let mut peers = self.peers.lock().unwrap();
         if let Some(peer) = peers.get_mut(&peer_id) {
             peer.pending_initial_bricks = coords;
+            peer.pending_dirty_bricks.clear();
+            peer.brick_shadow.clear();
         }
     }
 
@@ -432,38 +621,62 @@ impl WsBridge {
         }
     }
 
-    /// Smoothly pump throttled initial full-sync bricks and live dirty `0x01` bricks to connected WS peers.
-    /// Encodes each distinct `(bx, by)` at most once per tick via `encode_brick`.
-    pub fn pump_bricks<F>(
+    /// Wave 24A: Smoothly pump paced initial full-sync `0x01` bricks and budget-capped `0x03`
+    /// delta-bricks (with `0x01` fallback for `>= 30%` changes) using per-client shadow caches.
+    ///
+    /// - Encodes each distinct `(bx, by)` raw brick and each `(bx, by, prev_shadow_ptr)` delta
+    ///   at most once per tick across all connected WS clients.
+    /// - Prioritizes closest-to-center and most-changed bricks within `max_delta_bytes_per_peer`.
+    /// - Deferred dirty bricks remain in each peer's `pending_dirty_bricks` and coalesce automatically.
+    pub fn pump_bricks_delta<F>(
         &self,
         dirty_coords: &[(u16, u16)],
+        depth: u16,
         max_initial_per_peer: usize,
-        mut encode_brick: F,
+        max_delta_bytes_per_peer: usize,
+        deadzone: u8,
+        mut get_raw_brick: F,
     ) where
-        F: FnMut(u16, u16) -> Arc<[u8]>,
+        F: FnMut(u16, u16) -> RawBrick,
     {
         let mut peers = self.peers.lock().unwrap();
         if peers.is_empty() {
             return;
         }
-        let mut frame_cache: HashMap<(u16, u16), Arc<[u8]>> = HashMap::new();
+
+        let mut raw_cache: HashMap<(u16, u16), RawBrick> = HashMap::new();
+        let mut full_frame_cache: HashMap<(u16, u16), Arc<[u8]>> = HashMap::new();
+        let mut delta_cache: HashMap<(u16, u16, usize), CachedDelta> = HashMap::new();
         let mut dead = Vec::new();
+
+        let cx_mid = (self.chunks_x as f32) * 0.5 - 0.5;
+        let cy_mid = (self.chunks_y as f32) * 0.5 - 0.5;
+        let depth_u8 = depth.min(u8::MAX as u16) as u8;
 
         for (&pid, peer) in peers.iter_mut() {
             let mut is_dead = false;
 
-            // 1. Stream throttled initial full-sync bricks (center-outward)
+            // 1. Stream paced initial full-sync 0x01 bricks (center-outward)
             let mut sent_init = 0usize;
             while sent_init < max_initial_per_peer {
                 let Some((bx, by)) = peer.pending_initial_bricks.pop_front() else {
                     break;
                 };
-                let frame = frame_cache
+                let raw = raw_cache
                     .entry((bx, by))
-                    .or_insert_with(|| encode_brick(bx, by))
+                    .or_insert_with(|| get_raw_brick(bx, by))
+                    .clone();
+                let frame = full_frame_cache
+                    .entry((bx, by))
+                    .or_insert_with(|| {
+                        let payload = encode_brick_payload(bx, by, depth_u8, &raw.0, &raw.1);
+                        Arc::from(encode_ws_binary_frame(&payload))
+                    })
                     .clone();
                 match peer.tx.try_send(frame) {
                     Ok(()) => {
+                        peer.brick_shadow.insert((bx, by), raw);
+                        peer.pending_dirty_bricks.remove(&(bx, by));
                         sent_init += 1;
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -482,20 +695,187 @@ impl WsBridge {
                 continue;
             }
 
-            // 2. Broadcast live dirty bricks (skip any still queued for initial sync to avoid redundant sends)
+            // 2. Queue dirty bricks that have already been synced into this peer's pending set
+            let has_initial = !peer.pending_initial_bricks.is_empty();
             for &(bx, by) in dirty_coords {
-                if !peer.pending_initial_bricks.is_empty()
-                    && peer.pending_initial_bricks.contains(&(bx, by))
-                {
+                if has_initial && !peer.brick_shadow.contains_key(&(bx, by)) {
                     continue;
                 }
-                let frame = frame_cache
+                peer.pending_dirty_bricks.insert((bx, by));
+            }
+
+            // While initial sync is actively streaming full bricks this tick, hold incremental
+            // deltas in `pending_dirty_bricks` so 50 concurrent joins never spike bandwidth.
+            if sent_init > 0 || peer.pending_dirty_bricks.is_empty() {
+                continue;
+            }
+
+            // 3. Evaluate diffs against this peer's shadow cache & prioritize closest/most-changed
+            struct Candidate {
+                bx: u16,
+                by: u16,
+                ring_band: u32,
+                dist2_q: u32,
+                is_full: bool,
+                changed_voxels: usize,
+                frame: Arc<[u8]>,
+                cur_arc: RawBrick,
+            }
+
+            let pending_coords: Vec<(u16, u16)> = peer.pending_dirty_bricks.drain().collect();
+            let mut candidates: Vec<Candidate> = Vec::with_capacity(pending_coords.len());
+
+            for (bx, by) in pending_coords {
+                let cur_arc = raw_cache
                     .entry((bx, by))
-                    .or_insert_with(|| encode_brick(bx, by))
+                    .or_insert_with(|| get_raw_brick(bx, by))
                     .clone();
-                match peer.tx.try_send(frame) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => break,
+
+                let dx = bx as f32 - cx_mid;
+                let dy = by as f32 - cy_mid;
+                let dist2_q = ((dx * dx + dy * dy) * 16.0) as u32;
+                let ring_band = dist2_q / (16 * 16); // concentric 4-brick rings
+
+                match peer.brick_shadow.get(&(bx, by)) {
+                    Some(prev_arc) if Arc::ptr_eq(prev_arc, &cur_arc) => {
+                        // Identical Arc -> 0 bytes!
+                    }
+                    Some(prev_arc) => {
+                        let cache_key = (bx, by, Arc::as_ptr(prev_arc) as usize);
+                        let cached = delta_cache
+                            .entry(cache_key)
+                            .or_insert_with(|| {
+                                match encode_brick_delta_payload(
+                                    bx,
+                                    by,
+                                    depth,
+                                    &prev_arc.0,
+                                    &prev_arc.1,
+                                    &cur_arc.0,
+                                    &cur_arc.1,
+                                    deadzone,
+                                ) {
+                                    BrickDeltaOutcome::Unchanged => CachedDelta::Unchanged,
+                                    BrickDeltaOutcome::Delta {
+                                        payload,
+                                        changed_voxels,
+                                    } => CachedDelta::Delta {
+                                        frame: Arc::from(encode_ws_binary_frame(&payload)),
+                                        changed_voxels,
+                                    },
+                                    BrickDeltaOutcome::FullRequired => CachedDelta::FullRequired,
+                                }
+                            })
+                            .clone();
+
+                        match cached {
+                            CachedDelta::Unchanged => {
+                                // 0 voxels exceeded deadzone -> 0 bytes! Keep shadow so slow drift accumulates.
+                            }
+                            CachedDelta::Delta {
+                                frame,
+                                changed_voxels,
+                            } => {
+                                candidates.push(Candidate {
+                                    bx,
+                                    by,
+                                    ring_band,
+                                    dist2_q,
+                                    is_full: false,
+                                    changed_voxels,
+                                    frame,
+                                    cur_arc,
+                                });
+                            }
+                            CachedDelta::FullRequired => {
+                                let frame = full_frame_cache
+                                    .entry((bx, by))
+                                    .or_insert_with(|| {
+                                        let payload = encode_brick_payload(
+                                            bx,
+                                            by,
+                                            depth_u8,
+                                            &cur_arc.0,
+                                            &cur_arc.1,
+                                        );
+                                        Arc::from(encode_ws_binary_frame(&payload))
+                                    })
+                                    .clone();
+                                candidates.push(Candidate {
+                                    bx,
+                                    by,
+                                    ring_band,
+                                    dist2_q,
+                                    is_full: true,
+                                    changed_voxels: cur_arc.0.len() / 4,
+                                    frame,
+                                    cur_arc,
+                                });
+                            }
+                        }
+                    }
+                    None => {
+                        let frame = full_frame_cache
+                            .entry((bx, by))
+                            .or_insert_with(|| {
+                                let payload = encode_brick_payload(
+                                    bx,
+                                    by,
+                                    depth_u8,
+                                    &cur_arc.0,
+                                    &cur_arc.1,
+                                );
+                                Arc::from(encode_ws_binary_frame(&payload))
+                            })
+                            .clone();
+                        candidates.push(Candidate {
+                            bx,
+                            by,
+                            ring_band,
+                            dist2_q,
+                            is_full: true,
+                            changed_voxels: cur_arc.0.len() / 4,
+                            frame,
+                            cur_arc,
+                        });
+                    }
+                }
+            }
+
+            // Prioritize compact 0x03 delta bricks before heavy 32KB full-brick fallbacks so one
+            // massive brick never starves dozens of delta updates under the 20 KB/tick cap!
+            candidates.sort_by(|a, b| {
+                a.is_full
+                    .cmp(&b.is_full)
+                    .then_with(|| a.ring_band.cmp(&b.ring_band))
+                    .then_with(|| b.changed_voxels.cmp(&a.changed_voxels))
+                    .then_with(|| a.dist2_q.cmp(&b.dist2_q))
+                    .then_with(|| a.by.cmp(&b.by))
+                    .then_with(|| a.bx.cmp(&b.bx))
+            });
+
+            let mut bytes_sent = 0usize;
+            let mut tx_full = false;
+            for cand in candidates {
+                if tx_full {
+                    peer.pending_dirty_bricks.insert((cand.bx, cand.by));
+                    continue;
+                }
+                let frame_len = cand.frame.len();
+                if bytes_sent > 0 && bytes_sent.saturating_add(frame_len) > max_delta_bytes_per_peer
+                {
+                    peer.pending_dirty_bricks.insert((cand.bx, cand.by));
+                    continue;
+                }
+                match peer.tx.try_send(cand.frame) {
+                    Ok(()) => {
+                        bytes_sent = bytes_sent.saturating_add(frame_len);
+                        peer.brick_shadow.insert((cand.bx, cand.by), cand.cur_arc);
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        peer.pending_dirty_bricks.insert((cand.bx, cand.by));
+                        tx_full = true;
+                    }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         dead.push(pid);
                         break;
@@ -517,6 +897,8 @@ impl WsBridge {
             WsPeerState {
                 tx,
                 pending_initial_bricks,
+                pending_dirty_bricks: HashSet::new(),
+                brick_shadow: HashMap::new(),
             },
         );
         peer_id
@@ -858,5 +1240,203 @@ mod tests {
         assert_eq!(pkt[0], 0x02);
         let body = std::str::from_utf8(&pkt[1..]).expect("utf8 json");
         assert!(body.contains(r#""world_law":{"id":3,"name":"LOW-G MAGMA","gravity_g":0.35,"ambient_shift":5500.0,"precipitation":0.25}"#));
+    }
+
+    #[test]
+    fn test_wave24a_ws_0x03_delta_encoding_deadzone_and_compression() {
+        let depth = 16u16;
+        let voxels = 16 * 16 * (depth as usize);
+        let byte_len = voxels * 4;
+        let prev_den = vec![100u8; byte_len];
+        let prev_alb = vec![120u8; byte_len];
+
+        // 1. Sub-deadzone jitter (<= 5 across all 8 channels) must emit 0 bytes (Unchanged)
+        let mut jitter_den = prev_den.clone();
+        let mut jitter_alb = prev_alb.clone();
+        for idx in (0..voxels).step_by(7) {
+            let o = idx * 4;
+            jitter_den[o] = prev_den[o] + 5;
+            jitter_alb[o + 3] = prev_alb[o + 3] - 4;
+        }
+        assert_eq!(
+            encode_brick_delta_payload(
+                4,
+                9,
+                depth,
+                &prev_den,
+                &prev_alb,
+                &jitter_den,
+                &jitter_alb,
+                WS_DELTA_DEADZONE,
+            ),
+            BrickDeltaOutcome::Unchanged
+        );
+
+        // 2. Realistic 48-voxel mutation -> exact 0x03 roundtrip and > 15x compression vs 0x01
+        let mut cur_den = prev_den.clone();
+        let mut cur_alb = prev_alb.clone();
+        let mut expected_indices = Vec::new();
+        for k in 0..48usize {
+            let idx = k * 73;
+            let o = idx * 4;
+            cur_den[o] = 250;
+            cur_den[o + 1] = (k as u8).wrapping_mul(5);
+            cur_den[o + 2] = 42;
+            cur_den[o + 3] = 180;
+            cur_alb[o] = 255;
+            cur_alb[o + 1] = 140;
+            cur_alb[o + 2] = 32;
+            cur_alb[o + 3] = 220;
+            expected_indices.push(idx as u16);
+        }
+
+        let full_pkt = encode_brick_payload(4, 9, depth as u8, &cur_den, &cur_alb);
+        let outcome = encode_brick_delta_payload(
+            4,
+            9,
+            depth,
+            &prev_den,
+            &prev_alb,
+            &cur_den,
+            &cur_alb,
+            WS_DELTA_DEADZONE,
+        );
+        let (delta_pkt, changed_voxels) = match outcome {
+            BrickDeltaOutcome::Delta {
+                payload,
+                changed_voxels,
+            } => (payload, changed_voxels),
+            other => panic!("Expected Delta outcome, got {:?}", other),
+        };
+        assert_eq!(changed_voxels, 48);
+        assert_eq!(delta_pkt.len(), WS_DELTA_HEADER_BYTES + 48 * WS_DELTA_RECORD_BYTES);
+        assert_eq!(delta_pkt[0], 0x03);
+        // 32,778 bytes vs 490 bytes = 66.9x smaller (far above 15x requirement!)
+        assert!(
+            full_pkt.len() > delta_pkt.len() * 15,
+            "Expected > 15x compression: full={} vs delta={}",
+            full_pkt.len(),
+            delta_pkt.len()
+        );
+
+        // Apply decoded delta onto prev copy and verify exact match with cur
+        let decoded = decode_brick_delta_payload(&delta_pkt).expect("decode 0x03 delta");
+        assert_eq!((decoded.bx, decoded.by, decoded.depth, decoded.flags), (4, 9, depth, 0));
+        assert_eq!(decoded.voxels.len(), 48);
+
+        let mut recon_den = prev_den.clone();
+        let mut recon_alb = prev_alb.clone();
+        for (i, &(idx, d4, a4)) in decoded.voxels.iter().enumerate() {
+            assert_eq!(idx, expected_indices[i]);
+            let o = (idx as usize) * 4;
+            recon_den[o..o + 4].copy_from_slice(&d4);
+            recon_alb[o..o + 4].copy_from_slice(&a4);
+        }
+        assert_eq!(recon_den, cur_den);
+        assert_eq!(recon_alb, cur_alb);
+
+        // 3. >= 30% mutation triggers FullRequired fallback to 0x01
+        let mut huge_den = prev_den.clone();
+        let cutoff = (voxels * WS_DELTA_MAX_CHANGE_PCT).div_ceil(100);
+        for idx in 0..cutoff {
+            huge_den[idx * 4] = 255;
+        }
+        assert_eq!(
+            encode_brick_delta_payload(
+                4,
+                9,
+                depth,
+                &prev_den,
+                &prev_alb,
+                &huge_den,
+                &prev_alb,
+                WS_DELTA_DEADZONE,
+            ),
+            BrickDeltaOutcome::FullRequired
+        );
+    }
+
+    #[test]
+    fn test_wave24a_ws_bridge_shadow_cache_and_budget_pacing() {
+        let bridge = WsBridge {
+            chunks_x: 4,
+            chunks_y: 4,
+            next_peer_id: AtomicU64::new(1),
+            peers: Mutex::new(HashMap::new()),
+            commands: Mutex::new(VecDeque::new()),
+        };
+        let (tx, mut rx) = mpsc::channel::<Arc<[u8]>>(256);
+        let _pid = bridge.register_peer(tx);
+
+        let depth = 16u16;
+        let byte_len = 16 * 16 * (depth as usize) * 4;
+        let base_brick: RawBrick = Arc::new((vec![50u8; byte_len], vec![80u8; byte_len]));
+
+        // Drain all 16 initial bricks across 2 ticks (8 bricks/tick) -> all 0x01
+        bridge.pump_bricks_delta(&[], depth, 8, WS_MAX_DELTA_BYTES_PER_TICK, WS_DELTA_DEADZONE, |_, _| {
+            base_brick.clone()
+        });
+        bridge.pump_bricks_delta(&[], depth, 8, WS_MAX_DELTA_BYTES_PER_TICK, WS_DELTA_DEADZONE, |_, _| {
+            base_brick.clone()
+        });
+
+        let mut init_full_count = 0usize;
+        while let Ok(frame) = rx.try_recv() {
+            // 32,778-byte payload uses 4-byte WS header (0x82, 126, len_be_u16)
+            assert_eq!(frame[0], 0x82);
+            let payload_tag = if frame[1] == 126 { frame[4] } else { frame[2] };
+            assert_eq!(payload_tag, 0x01);
+            init_full_count += 1;
+        }
+        assert_eq!(init_full_count, 16);
+
+        // Next tick with sub-deadzone jitter -> 0 frames sent!
+        let mut jitter_dm = vec![50u8; byte_len];
+        jitter_dm[0] = 54;
+        let jitter_brick: RawBrick = Arc::new((jitter_dm, vec![80u8; byte_len]));
+        bridge.pump_bricks_delta(
+            &[(1, 1), (2, 2)],
+            depth,
+            8,
+            WS_MAX_DELTA_BYTES_PER_TICK,
+            WS_DELTA_DEADZONE,
+            |_, _| jitter_brick.clone(),
+        );
+        assert!(rx.try_recv().is_err(), "sub-deadzone jitter must send 0 bytes");
+
+        // Next tick with real 20-voxel edit on 3 bricks -> 3 x 0x03 delta frames!
+        let mut mod_dm = vec![50u8; byte_len];
+        let mut mod_at = vec![80u8; byte_len];
+        for k in 0..20usize {
+            let o = (k * 100) * 4;
+            mod_dm[o] = 240;
+            mod_at[o + 3] = 210;
+        }
+        let mod_brick: RawBrick = Arc::new((mod_dm, mod_at));
+        bridge.pump_bricks_delta(
+            &[(1, 1), (2, 1), (0, 0)],
+            depth,
+            8,
+            WS_MAX_DELTA_BYTES_PER_TICK,
+            WS_DELTA_DEADZONE,
+            |_, _| mod_brick.clone(),
+        );
+
+        let mut delta_frames = 0usize;
+        while let Ok(frame) = rx.try_recv() {
+            assert_eq!(frame[0], 0x82);
+            let payload = if frame[1] < 126 {
+                &frame[2..]
+            } else if frame[1] == 126 {
+                &frame[4..]
+            } else {
+                &frame[10..]
+            };
+            assert_eq!(payload[0], 0x03);
+            let dec = decode_brick_delta_payload(payload).expect("valid 0x03");
+            assert_eq!(dec.voxels.len(), 20);
+            delta_frames += 1;
+        }
+        assert_eq!(delta_frames, 3);
     }
 }

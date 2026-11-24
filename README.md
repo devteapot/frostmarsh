@@ -120,7 +120,11 @@
   - **`22–24×` Per-Client Bandwidth Reduction (`4,676 KB/s` → `191.7–212.0 KB/s`):** Temporal `VolumetricBrick3DDelta` LZ4 codec (`4–5/255` visual deadzone skipping quiescent bricks), concentric Euclidean AOI distance rings (`Near <= 64m @ 10 Hz`, `Mid <= 112m @ 2 Hz`, `Far @ 0.5 Hz`), and `--entity-aoi-radius 110m` entity culling (`<= 48` closest players per snapshot). Also cut client Surface-Nets dirty-brick update latency **`4.2×`** (`9.21 ms` → **`2.19 ms`** p50).
   - **Atomic Disk Persistence & Persistent Open-World Mode (`persistence.rs`, `--state-file`, `--persistent-world`):** Lossless `"FMW1"` LZ4-bincode atomic (`tmp → fsync → rename`) checkpoints preserve full `1.05M`-voxel worlds, carved tunnels (`7,347+`), Living World Epochs, `WorldLaws`, and persistent player accounts across hard server restarts with verified **`mass_err == 0 && energy_err == 0`**.
   - **Live `op=11` (`OP_WORLD_V8_STEP`) 6-Float World-Law RPC & `1.87×` `torch.compile` Speedup:** Passes the live 6-float `world_laws` vector into compiled `WorldModel3D-v8` (`135.9 ms` → **`72.8–78.0 ms` dense compiled**, **`43.3 ms` sparse**, `0` Dynamo recompiles, `3.6×` neural gravity shift between `FREEZE-OUT` & `LOW-G MAGMA`).
-  - **100-Client Real Concurrent QUIC + WebSocket Load Test ([MMO_LOADTEST_METRICS.json](models/MMO_LOADTEST_METRICS.json), `mmo-loadtest`):** **`100/100`** simultaneous connections (`50` QUIC + `50` WS, **`110`** online players alongside `60` live neural bots, server-authoritative anti-cheat guards) held **`77.9–78.3 ms`** `WorldModel3D-v8` ticks, **`191.7–206.6 KB/s`** steady-state QUIC wire per client, `max_players_in_snap = 48`, and `mass_err = 0, energy_err = 0`.
+  - **100-Client Real Concurrent QUIC + WebSocket Load Test ([MMO_LOADTEST_METRICS.json](models/MMO_LOADTEST_METRICS.json), `mmo-loadtest`):** **`100/100`** simultaneous connections (`50` QUIC + `50` WS, **`110`** online players alongside `60` live neural bots, server-authoritative anti-cheat guards) held **`77.7–78.3 ms`** `WorldModel3D-v8` ticks, **`54.0%` QUIC delta share (`3.95 ms` p50)**, **`100.0%` post-sync WebSocket `0x03` delta share (`12,800 = 50×256` initial full + `8,242` `0x03` deltas, cutting WS egress `10.6×` avg `6,703 → 634 KB/s` and `~31×` steady-state `< 215 KB/s`)**, `max_players_in_snap = 48`, and `mass_err = 0, energy_err = 0`.
+- **Iterations 24–25 — MMO Phase 2 (WebSocket `0x03` Delta Bricks, Seamless `2×2` Multi-Region Ghost-Halo Sharding & `4.19M`-Voxel `10.6 Hz` Scaling):**
+  - **WebSocket `0x03` Delta-Brick Compression + WebGPU WASM Receiver (`ws_bridge.rs`, `crates/frostmarsh-web-client`, `web/pkg/`, `13/13` server + `8/8` WebGPU tests, `0` warnings):** Zero-dependency `0x03` delta binary frames cut partial `16×16×16` brick payloads **`33.8–66.9×`** (`490–970 B` vs `32,778 B`), send `0 B` on sub-deadzone (`<= 5/255`) jitter, prioritize compact deltas ahead of full fallbacks under a `20 KB/tick` per-client cap, and patch directly into WebGPU 3D textures.
+  - **Single-Model Multi-Region Ghost-Halo Sharding & Spatial `world_laws[6, H, W]` (`ml/world_model_3d_v8.py`, `ml/multi_region_sharding.py`, [MULTI_REGION_SHARD_METRICS.json](models/MULTI_REGION_SHARD_METRICS.json), [multi_region_shard_viz.png](models/multi_region_shard_viz.png)):** Promoted `WorldModel3D-v8` to accept continuous 2D spatial `world_laws[6, H, W]` fields with **0 extra parameters and 0 retraining**, smoothly blending Freeze-Out ↔ Nordic ↔ Rising Flood ↔ Low-G Magma over `32m` borders. With `HALO_XY = 6`, `2×2` sharded inference matches a full monolith to **`2.22e-15` (FP64)** / **`1.19e-07` (`z_flux`) & `9.54e-07` (`Z_world_3d`, FP32)**! One shared `330 KB` FP16 model simulates **`4,194,304` voxels (`512×512×16`) at `10.63 Hz` (`94.03 ms` p50, `3.58×` vs dense, `1.96 GB` VRAM)** on Spark GB10 with **`91.7 KB/tick`** compressed inter-shard halos.
+  - **Exact Cross-Shard Conservation & Toroidal Client Clipmap (`crates/field-core/src/sharding.rs`, `19/19` `field-core` tests, `0` warnings):** Proves `global_mass_error == 0 && global_energy_error == 0` across both synchronous `2×2` cross-border rivers/fires and asynchronous `10 Hz / 2 Hz` `BorderFluxEscrow` (zero lockstep stalls), alongside `16m` hysteresis authority handoff and toroidal `RollingClipmap256` (`93.75%` brick retention across shard crossings).
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
@@ -139,13 +143,13 @@
 
 ## Visual Showcase
 
-| `WorldModel3D-v8` (Law-Conditioned Across 4 Physical Regimes vs Law-Blind `v7`) | Universal `MorphologyActuatorNet` (3 Emergent Games & Zero-Shot Hybrid Bodies) |
+| Seamless `2×2` Multi-Region Sharding (`4.19M` Vox @ `10.6 Hz`, `2.2e-15` Seam Parity) | `WorldModel3D-v8` (Law-Conditioned Across 4 Physical Regimes vs Law-Blind `v7`) |
 |---|---|
-| ![WorldModel3D-v8 Multi-Law Benchmarks](models/world_3d_v8_viz.png) | ![Emergent Games Zero-Rule Policy](models/emergent_games_viz.png) |
+| ![Multi-Region Ghost-Halo Sharding](models/multi_region_shard_viz.png) | ![WorldModel3D-v8 Multi-Law Benchmarks](models/world_3d_v8_viz.png) |
 
-| `WorldModel3D-v7` (`636×` Heat Fix `0.953`, `1.43%` Firewall, `25.3 ms` Sparse) | Live `F5` Action Close-Up: Rim-Lit 5-Archetype Skirmish + Live 3D Speech Cards |
+| Universal `MorphologyActuatorNet` (3 Emergent Games & Zero-Shot Hybrid Bodies) | Live `F5` Action Close-Up: Rim-Lit 5-Archetype Skirmish + Live 3D Speech Cards |
 |---|---|
-| ![WorldModel3D-v7 Benchmarks](models/world_3d_v7_viz.png) | ![Live F5 Action Close-Up](models/unified_iter17_polished/unified_closeup_action_1080p.png) |
+| ![Emergent Games Zero-Rule Policy](models/emergent_games_viz.png) | ![Live F5 Action Close-Up](models/unified_iter17_polished/unified_closeup_action_1080p.png) |
 
 | Live 60-Player 4-Style WGSL Orbit (`WorldModel3D-v7` + AAA Shaders, `135-149 FPS`) | Champion `ActuatorPolicyNetV3` (`100.0%` `24W–0L` Sweep Across All 3 Tournaments) |
 |---|---|

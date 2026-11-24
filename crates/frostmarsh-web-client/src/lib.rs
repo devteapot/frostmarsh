@@ -42,7 +42,7 @@ mod wasm_app {
     use crate::renderer::WebRenderer;
     use crate::style_name_for;
     use crate::surface_nets_3d::SurfaceNetsWorld;
-    use crate::volume::{BrickOccupancy3D, WorldVolume3D};
+    use crate::volume::{parse_ws_brick3d_delta_frame, BrickOccupancy3D, WorldVolume3D};
     use glam::Vec3;
     use std::collections::HashSet;
     use wasm_bindgen::prelude::*;
@@ -105,6 +105,7 @@ mod wasm_app {
         live_server_tps: f32,
         live_status: String,
         live_bricks_rx: u32,
+        live_delta_bricks_rx: u32,
         last_brick_rebuild_ms: f64,
     }
 
@@ -218,6 +219,7 @@ mod wasm_app {
                 live_server_tps: 0.0,
                 live_status: "Offline".to_string(),
                 live_bricks_rx: 0,
+                live_delta_bricks_rx: 0,
                 last_brick_rebuild_ms: 0.0,
             })
         }
@@ -464,6 +466,106 @@ mod wasm_app {
             Ok(elapsed_ms)
         }
 
+        /// Wave 24A: Apply a live binary `0x03` sparse delta-brick payload (10-byte packed records)
+        /// onto `16×16×D` brick `(bx, by)`, triggering incremental occupancy, Surface-Nets, and GPU
+        /// 3D texture sub-region upload! Returns elapsed rebuild+upload time in milliseconds.
+        pub fn apply_ws_brick_delta(
+            &mut self,
+            bx: u16,
+            by: u16,
+            depth: u16,
+            payload: &[u8],
+        ) -> Result<f64, JsValue> {
+            let t0 = perf_now_ms();
+            let (patch, applied) = self
+                .volume
+                .apply_brick3d_delta_with_patch(
+                    bx as usize,
+                    by as usize,
+                    depth as usize,
+                    payload,
+                )
+                .map_err(|e| JsValue::from_str(&e))?;
+
+            if patch.resized_depth {
+                self.bricks = self.volume.build_brick_occupancy();
+                self.sn_world = SurfaceNetsWorld::build_all(&self.volume);
+                self.renderer
+                    .upload_volume(&self.volume, &self.bricks, &self.sn_world);
+            } else if applied > 0 {
+                let occ_sub = self.volume.update_brick_occupancy_region(
+                    &mut self.bricks,
+                    bx as usize,
+                    by as usize,
+                );
+                self.sn_world
+                    .rebuild_brick_and_neighbors(&self.volume, bx as usize, by as usize);
+                self.renderer.upload_brick_subregion(
+                    &self.volume,
+                    &self.bricks,
+                    &self.sn_world,
+                    patch,
+                    occ_sub,
+                );
+            }
+
+            let elapsed_ms = (perf_now_ms() - t0).max(0.0);
+            self.live_bricks_rx = self.live_bricks_rx.saturating_add(1);
+            self.live_delta_bricks_rx = self.live_delta_bricks_rx.saturating_add(1);
+            self.last_brick_rebuild_ms = elapsed_ms;
+            self.volume_source = format!("Live WS Stream (Z={})", self.volume.depth);
+            Ok(elapsed_ms)
+        }
+
+        /// Wave 24A: Unified WebSocket binary frame dispatcher for `0x01` full bricks,
+        /// `0x02` live entities JSON, and `0x03` sparse delta bricks. Returns handled frame tag.
+        pub fn apply_ws_binary_frame(&mut self, frame: &[u8]) -> Result<u32, JsValue> {
+            let Some(&tag) = frame.first() else {
+                return Ok(0);
+            };
+            match tag {
+                0x01 => {
+                    if frame.len() < 10 {
+                        return Err(JsValue::from_str("Truncated 0x01 brick frame header"));
+                    }
+                    let bx = u16::from_le_bytes([frame[1], frame[2]]);
+                    let by = u16::from_le_bytes([frame[3], frame[4]]);
+                    let depth = frame[5];
+                    let den_len =
+                        u32::from_le_bytes([frame[6], frame[7], frame[8], frame[9]]) as usize;
+                    if frame.len() < 10 + den_len * 2 {
+                        return Err(JsValue::from_str("Truncated 0x01 brick frame payload"));
+                    }
+                    self.apply_brick3d_raw(
+                        bx,
+                        by,
+                        depth,
+                        &frame[10..10 + den_len],
+                        &frame[10 + den_len..10 + den_len * 2],
+                    )?;
+                    Ok(0x01)
+                }
+                0x02 => {
+                    let json = std::str::from_utf8(&frame[1..])
+                        .map_err(|e| JsValue::from_str(&format!("Invalid UTF-8 in 0x02: {e}")))?;
+                    self.apply_live_entities_json(json)?;
+                    Ok(0x02)
+                }
+                0x03 => {
+                    let parsed = parse_ws_brick3d_delta_frame(frame)
+                        .map_err(|e| JsValue::from_str(&e))?;
+                    self.apply_ws_brick_delta(
+                        parsed.bx,
+                        parsed.by,
+                        parsed.depth,
+                        parsed.payload,
+                    )?;
+                    Ok(0x03)
+                }
+                _ => Ok(0),
+            }
+        }
+
         /// Apply a live `0x02` multiplayer JSON entity, actuator beam, & evolution frame from WebSocket!
         /// Updates live 5-archetype hero figurines, glowing projectiles, diagonal beam orb-streams,
         /// world evolution stats, and telemetry HUD.
@@ -691,6 +793,7 @@ mod wasm_app {
                     "\"world_law_dt\":{:.1},",
                     "\"world_law_precip\":{:.2},",
                     "\"live_bricks_rx\":{},",
+                    "\"live_delta_bricks_rx\":{},",
                     "\"last_brick_ms\":{:.3},",
                     "\"live_tick\":{},",
                     "\"live_server_tps\":{:.1},",
@@ -744,6 +847,7 @@ mod wasm_app {
                 wl_dt,
                 wl_precip,
                 self.live_bricks_rx,
+                self.live_delta_bricks_rx,
                 self.last_brick_rebuild_ms,
                 self.live_tick,
                 self.live_server_tps,
@@ -1107,6 +1211,91 @@ mod tests {
         assert_eq!((vol.width, vol.height, vol.depth), (4, 4, 32));
         assert_eq!(vol.density_mat[0], 128);
         assert_eq!(vol.albedo_thermal[0], 200);
+    }
+
+    #[test]
+    fn test_ws_0x03_brick3d_delta_roundtrip() {
+        use crate::volume::parse_ws_brick3d_delta_frame;
+
+        let depth = 16usize;
+        let mut vol = WorldVolume3D::new_empty(64, depth, 64);
+        // Seed brick (1, 2) with baseline horizontal floor at y = 0..4
+        let n = depth * 16 * 16 * 4;
+        let mut base_den = vec![0u8; n];
+        let mut base_alb = vec![0u8; n];
+        for alt in 0..4 {
+            for dy in 0..16 {
+                for dx in 0..16 {
+                    let off = ((alt * 16 + dy) * 16 + dx) * 4;
+                    base_den[off] = 240;
+                    base_den[off + 3] = 180;
+                    base_alb[off] = 90;
+                    base_alb[off + 1] = 110;
+                    base_alb[off + 2] = 120;
+                }
+            }
+        }
+        vol.apply_brick3d_raw(1, 2, depth, &base_den, &base_alb)
+            .expect("seed baseline brick");
+        let mut occ = vol.build_brick_occupancy();
+        let mut sn = SurfaceNetsWorld::build_all(&vol);
+        let tris_before = sn.total_triangles();
+
+        // Build a 0x03 delta frame raising a 4x4x6 glowing spire in the center of brick (1, 2)
+        let mut records = Vec::new();
+        let mut count = 0u16;
+        for alt in 4..10usize {
+            for dy in 6..10usize {
+                for dx in 6..10usize {
+                    let idx = ((alt * 16 + dy) * 16 + dx) as u16;
+                    records.extend_from_slice(&idx.to_le_bytes());
+                    records.extend_from_slice(&[255, 0, 0, 120]); // solid magma rock
+                    records.extend_from_slice(&[255, 130, 30, 245]); // glowing ember albedo
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(count, 96);
+
+        let mut frame = Vec::with_capacity(10 + records.len());
+        frame.push(0x03);
+        frame.extend_from_slice(&1u16.to_le_bytes()); // bx = 1
+        frame.extend_from_slice(&2u16.to_le_bytes()); // by = 2
+        frame.extend_from_slice(&(depth as u16).to_le_bytes());
+        frame.extend_from_slice(&count.to_le_bytes());
+        frame.push(0u8); // flags = 0 (raw packed 10-byte records)
+        frame.extend_from_slice(&records);
+
+        // Verify > 30x compression vs full 0x01 Z=16 brick (32,778 vs 970 bytes)
+        assert_eq!(frame.len(), 10 + 96 * 10);
+        assert!(32_778 > frame.len() * 30);
+
+        let parsed = parse_ws_brick3d_delta_frame(&frame).expect("parse 0x03 frame");
+        assert_eq!((parsed.bx, parsed.by, parsed.depth, parsed.count, parsed.flags), (1, 2, 16, 96, 0));
+
+        let applied = vol
+            .apply_brick3d_delta(
+                parsed.bx as usize,
+                parsed.by as usize,
+                parsed.depth as usize,
+                parsed.payload,
+            )
+            .expect("apply_brick3d_delta");
+        assert_eq!(applied, 96);
+
+        // Check modified voxel coordinates and untouched neighbor voxels
+        let hit = vol.byte_index(16 + 7, 7, 32 + 8);
+        assert_eq!(&vol.density_mat[hit..hit + 4], &[255, 0, 0, 120]);
+        assert_eq!(&vol.albedo_thermal[hit..hit + 4], &[255, 130, 30, 245]);
+        let untouched = vol.byte_index(16 + 1, 2, 32 + 1);
+        assert_eq!(&vol.density_mat[untouched..untouched + 4], &[240, 0, 0, 180]);
+
+        // Verify incremental occupancy + Surface-Nets rebuild picks up the new 3D spire
+        let occ_sub = vol.update_brick_occupancy_region(&mut occ, 1, 2);
+        assert!(occ_sub.cw > 0 && occ_sub.ch > 0);
+        let rebuilt = sn.rebuild_brick_and_neighbors(&vol, 1, 2);
+        assert_eq!(rebuilt, 9);
+        assert!(sn.total_triangles() > tris_before);
     }
 
     #[test]

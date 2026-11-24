@@ -18,6 +18,17 @@ export class FrostmarshApp {
      * Returns total active rendered entities (`players + projectiles + beams`).
      */
     apply_live_entities_json(json_str: string): number;
+    /**
+     * Wave 24A: Unified WebSocket binary frame dispatcher for `0x01` full bricks,
+     * `0x02` live entities JSON, and `0x03` sparse delta bricks. Returns handled frame tag.
+     */
+    apply_ws_binary_frame(frame: Uint8Array): number;
+    /**
+     * Wave 24A: Apply a live binary `0x03` sparse delta-brick payload (10-byte packed records)
+     * onto `16×16×D` brick `(bx, by)`, triggering incremental occupancy, Surface-Nets, and GPU
+     * 3D texture sub-region upload! Returns elapsed rebuild+upload time in milliseconds.
+     */
+    apply_ws_brick_delta(bx: number, by: number, depth: number, payload: Uint8Array): number;
     clear_keys(): void;
     /**
      * Create and initialize the Frostmarsh WebGPU application on the given `<canvas>` id.
@@ -72,6 +83,8 @@ export interface InitOutput {
     readonly __wbg_frostmarshapp_free: (a: number, b: number) => void;
     readonly frostmarshapp_apply_brick3d_raw: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly frostmarshapp_apply_live_entities_json: (a: number, b: number, c: number, d: number) => void;
+    readonly frostmarshapp_apply_ws_binary_frame: (a: number, b: number, c: number, d: number) => void;
+    readonly frostmarshapp_apply_ws_brick_delta: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly frostmarshapp_clear_keys: (a: number) => void;
     readonly frostmarshapp_create: (a: number, b: number, c: number) => number;
     readonly frostmarshapp_cycle_style_mode: (a: number) => number;
@@ -89,11 +102,11 @@ export interface InitOutput {
     readonly frostmarshapp_toggle_capsule_mode: (a: number) => number;
     readonly frostmarshapp_toggle_pixel_style: (a: number) => number;
     readonly frostmarshapp_zoom_wheel: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_6604: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6625: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_832: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_832_22: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_832_23: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6613: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6634: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_841: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_841_24: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_841_25: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

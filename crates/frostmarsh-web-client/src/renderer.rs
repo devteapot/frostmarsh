@@ -1026,7 +1026,7 @@ impl WebRenderer {
         self.rebuild_bind_groups();
     }
 
-    /// Incremental GPU sub-brick upload (`queue.write_texture`) for live `0x01` WebSocket bricks!
+    /// Incremental GPU sub-brick upload (`queue.write_texture`) for live `0x01` full and `0x03` delta WS bricks!
     pub fn upload_brick_subregion(
         &mut self,
         volume: &WorldVolume3D,

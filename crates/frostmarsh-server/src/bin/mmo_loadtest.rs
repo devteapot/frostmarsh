@@ -114,7 +114,8 @@ struct QuicClientMetrics {
 struct WsClientMetrics {
     connected: bool,
     bytes_rx: u64,
-    bricks_rx: u64,
+    bricks_full: u64,
+    bricks_delta: u64,
     entity_frames_rx: u64,
     max_online_players: usize,
     elapsed_secs: f64,
@@ -450,7 +451,10 @@ async fn run_ws_client(
                     0x02 => {
                         match payload.first().copied() {
                             Some(0x01) => {
-                                metrics.bricks_rx += 1;
+                                metrics.bricks_full += 1;
+                            }
+                            Some(0x03) => {
+                                metrics.bricks_delta += 1;
                             }
                             Some(0x02) => {
                                 metrics.entity_frames_rx += 1;
@@ -576,7 +580,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ws_ok = ws_results.iter().filter(|m| m.connected).count();
     let ws_bytes_total: u64 = ws_results.iter().map(|m| m.bytes_rx).sum();
-    let ws_bricks_total: u64 = ws_results.iter().map(|m| m.bricks_rx).sum();
+    let ws_bricks_full: u64 = ws_results.iter().map(|m| m.bricks_full).sum();
+    let ws_bricks_delta: u64 = ws_results.iter().map(|m| m.bricks_delta).sum();
+    let ws_bricks_total = ws_bricks_full + ws_bricks_delta;
+    let ws_delta_share_pct = if ws_bricks_total > 0 {
+        (ws_bricks_delta as f64 * 100.0) / (ws_bricks_total as f64)
+    } else {
+        0.0
+    };
     let ws_entities_total: u64 = ws_results.iter().map(|m| m.entity_frames_rx).sum();
     let ws_max_online_players = ws_results
         .iter()
@@ -619,15 +630,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "| Full Bricks RX         | {:>17} | {:>17} |",
-        quic_bricks_full, ws_bricks_total
+        quic_bricks_full, ws_bricks_full
     );
     println!(
         "| Delta Bricks RX        | {:>17} | {:>17} |",
-        quic_bricks_delta, "-"
+        quic_bricks_delta, ws_bricks_delta
     );
     println!(
-        "| Delta Brick Share      | {:>16.1}% | {:>17} |",
-        delta_share_pct, "-"
+        "| Delta Brick Share      | {:>16.1}% | {:>16.1}% |",
+        delta_share_pct, ws_delta_share_pct
     );
     println!(
         "| Entity Snapshots RX    | {:>17} | {:>17} |",
@@ -683,6 +694,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "    \"per_client_kbps\": {:.2},\n",
                 "    \"total_kbps\": {:.2},\n",
                 "    \"bricks_rx\": {},\n",
+                "    \"bricks_full\": {},\n",
+                "    \"bricks_delta\": {},\n",
+                "    \"delta_share_pct\": {:.2},\n",
                 "    \"entity_frames_rx\": {},\n",
                 "    \"max_online_players\": {}\n",
                 "  }}\n",
@@ -709,6 +723,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ws_per_client_kbps,
             ws_total_kbps,
             ws_bricks_total,
+            ws_bricks_full,
+            ws_bricks_delta,
+            ws_delta_share_pct,
             ws_entities_total,
             ws_max_online_players,
         );

@@ -5689,12 +5689,6 @@ impl GameState {
         }
     }
 
-    fn encode_ws_brick_frame(&self, bx: u16, by: u16) -> Arc<[u8]> {
-        let (dm, at) = self.volume.encode_3d_brick_16(bx as usize, by as usize);
-        let payload = ws_bridge::encode_brick_payload(bx, by, self.grid_d as u8, &dm, &at);
-        Arc::from(ws_bridge::encode_ws_binary_frame(&payload))
-    }
-
     fn build_ws_entities_json(&self) -> String {
         let mut sorted_players: Vec<&PlayerEntity> = self.players.values().collect();
         sorted_players.sort_by_key(|p| p.id);
@@ -6305,26 +6299,42 @@ impl GameState {
     }
 
     fn broadcast_chunks_10hz(&mut self, dirty: &[(u8, u16, u16)]) {
-        if let Some(ws) = self.ws_bridge.clone() {
-            if ws.has_clients() {
-                let mut dirty_xy: Vec<(u16, u16)> = Vec::new();
-                for &(_layer, cx, cy) in dirty {
-                    if !dirty_xy.contains(&(cx, cy)) {
-                        dirty_xy.push((cx, cy));
-                    }
+        let ws_opt = self.ws_bridge.clone().filter(|ws| ws.has_clients());
+        let has_quic = !self.peers.is_empty();
+        if ws_opt.is_none() && !has_quic {
+            return;
+        }
+
+        let is_z16 = self.is_z16();
+        let mut dirty_xy: Vec<(u16, u16)> = Vec::new();
+        let mut dirty_xy_set: HashSet<(u16, u16)> = HashSet::new();
+        if ws_opt.is_some() || is_z16 {
+            for &(_layer, cx, cy) in dirty {
+                if dirty_xy_set.insert((cx, cy)) {
+                    dirty_xy.push((cx, cy));
                 }
-                ws.pump_bricks(
-                    &dirty_xy,
-                    ws_bridge::WS_INITIAL_BRICKS_PER_TICK,
-                    |bx, by| self.encode_ws_brick_frame(bx, by),
-                );
+            }
+            for &(bx, by) in &dirty_xy {
+                let raw = Arc::new(self.volume.encode_3d_brick_16(bx as usize, by as usize));
+                self.brick_raw_cache.insert((bx, by), raw);
             }
         }
 
-        if self.peers.is_empty() {
+        if let Some(ws) = ws_opt {
+            let depth_u16 = self.grid_d as u16;
+            ws.pump_bricks_delta(
+                &dirty_xy,
+                depth_u16,
+                ws_bridge::WS_INITIAL_BRICKS_PER_TICK,
+                ws_bridge::WS_MAX_DELTA_BYTES_PER_TICK,
+                ws_bridge::WS_DELTA_DEADZONE,
+                |bx, by| self.get_or_encode_raw_brick(bx, by),
+            );
+        }
+
+        if !has_quic {
             return;
         }
-        let is_z16 = self.is_z16();
         let surf_l = self.surf_layer() as u8;
         let total_2d = self.chunks_x * self.chunks_y;
         let aoi_r = self.aoi_radius as i32;
@@ -6334,21 +6344,11 @@ impl GameState {
         let cx_dim = self.chunks_x;
         let cy_dim = self.chunks_y;
 
-        // Pre-encode dirty 3D chunks/raw bricks once per 10 Hz tick!
+        // Pre-encode dirty 2D chunks for L=4 mode (Z=16 raw bricks already refreshed above!)
         let mut dirty_map: HashMap<(u8, u16, u16), Bytes> = HashMap::with_capacity(dirty.len());
-        let mut dirty_xy: Vec<(u16, u16)> = Vec::new();
-        let mut dirty_xy_set: HashSet<(u16, u16)> = HashSet::new();
-        for &(layer, cx, cy) in dirty {
-            if !is_z16 {
+        if !is_z16 {
+            for &(layer, cx, cy) in dirty {
                 dirty_map.insert((layer, cx, cy), self.encode_chunk_pkt(layer, cx, cy));
-            } else if dirty_xy_set.insert((cx, cy)) {
-                dirty_xy.push((cx, cy));
-            }
-        }
-        if is_z16 {
-            for &(bx, by) in &dirty_xy {
-                let raw = Arc::new(self.volume.encode_3d_brick_16(bx as usize, by as usize));
-                self.brick_raw_cache.insert((bx, by), raw);
             }
         }
 

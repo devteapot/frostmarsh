@@ -80,6 +80,7 @@ cp models/unified_iter12_40bots_evolving/unified_metrics.json "$STAGE_DIR/metric
 cp models/unified_iter14_60bots_5arch/unified_metrics.json "$STAGE_DIR/metrics/unified_60bots_5arch_metrics.json" 2>/dev/null || true
 cp models/unified_iter17_polished/unified_metrics.json "$STAGE_DIR/metrics/unified_iter17_polished_metrics.json" 2>/dev/null || true
 cp models/unified_iter21_world_laws/unified_metrics.json "$STAGE_DIR/metrics/unified_iter21_world_laws_metrics.json" 2>/dev/null || true
+cp models/unified_iter23_mmo_phase1/unified_metrics.json "$STAGE_DIR/metrics/unified_iter23_mmo_phase1_metrics.json" 2>/dev/null || true
 cp models/unified_iter10_z16/unified_live_1080p_hud.png models/unified_iter10_z16/unified_orbit_4view.png models/stylized_3d_z16_showcase.png models/render_3d_headtohead_viz.png models/neural_e2e_z16_metal.png models/neural_field_3d_viz.png models/world_dt_structures_viz.png models/actuator_emergence_viz.png models/world_3d_v5_viz.png models/world_3d_v6_viz.png models/world_3d_v7_viz.png models/world_3d_v8_viz.png models/emergent_games_viz.png models/actuator_v3_viz.png "$STAGE_DIR/assets/" 2>/dev/null || true
 cp models/unified_iter11_z32_volcanic/unified_live_1080p_hud.png "$STAGE_DIR/assets/live_z32_volcanic_1080p.png" 2>/dev/null || true
 cp models/unified_iter11_z32_glacier/unified_live_1080p_hud.png "$STAGE_DIR/assets/live_z32_glacier_1080p.png" 2>/dev/null || true

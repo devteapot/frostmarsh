@@ -1,0 +1,29 @@
+{
+  "wall_secs": 12.002,
+  "quic": {
+    "requested": 50,
+    "connected": 50,
+    "bytes_rx_total": 223906103,
+    "per_client_kbps": 368.44,
+    "total_kbps": 18218.68,
+    "bricks_full": 13028,
+    "bricks_delta": 4242,
+    "delta_share_pct": 24.56,
+    "chunks_aplus": 0,
+    "snapshots_rx": 17686,
+    "snap_interval_p50_ms": 6.065,
+    "snap_interval_p99_ms": 230.468,
+    "max_players_in_snap": 48,
+    "active_bots": 60
+  },
+  "ws": {
+    "requested": 50,
+    "connected": 50,
+    "bytes_rx_total": 4078904524,
+    "per_client_kbps": 6703.45,
+    "total_kbps": 331890.23,
+    "bricks_rx": 119150,
+    "entity_frames_rx": 8964,
+    "max_online_players": 110
+  }
+}

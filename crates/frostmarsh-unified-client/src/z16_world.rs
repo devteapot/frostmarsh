@@ -288,6 +288,80 @@ impl Z16World {
         (rebuilt, t0.elapsed().as_secs_f64() * 1000.0)
     }
 
+    /// Directly patch a `VolumetricBrick3DDelta` payload into `Z16World`'s GPU-ordered staging buffers,
+    /// mark the brick dirty for GPU 3D texture sub-region upload, update occupancy/minimap/hotspots,
+    /// and rebuild only the affected Surface-Nets brick + seam neighbors.
+    #[allow(dead_code)]
+    pub fn apply_brick3d_delta(
+        &mut self,
+        bx: usize,
+        bz: usize,
+        lz4_deltas: &[u8],
+    ) -> Result<usize, String> {
+        if bx >= self.bricks_x || bz >= self.bricks_z {
+            return Err(format!("brick ({}, {}) out of bounds", bx, bz));
+        }
+        let patches = frostmarsh_proto::decode_brick3d_delta_voxels(lz4_deltas)?;
+        if patches.is_empty() {
+            return Ok(0);
+        }
+        let w = self.width;
+        let h = self.height;
+        let d = self.depth;
+        let x0 = bx * SN_BRICK_SIZE;
+        let z0 = bz * SN_BRICK_SIZE;
+        let total_voxels = SN_BRICK_SIZE * SN_BRICK_SIZE * d;
+        let mut applied = 0usize;
+        for (idx, dm, at) in patches {
+            let v = idx as usize;
+            if v >= total_voxels {
+                continue;
+            }
+            let iy = v / (SN_BRICK_SIZE * SN_BRICK_SIZE);
+            let rem = v % (SN_BRICK_SIZE * SN_BRICK_SIZE);
+            let dz = rem / SN_BRICK_SIZE;
+            let dx = rem % SN_BRICK_SIZE;
+            let ix = x0 + dx;
+            let iz = z0 + dz;
+            if ix >= w || iz >= h || iy >= d {
+                continue;
+            }
+            let dst = ((iz * d + iy) * w + ix) * 4;
+            self.density_mat[dst..dst + 4].copy_from_slice(&dm);
+            self.albedo_thermal[dst..dst + 4].copy_from_slice(&at);
+            applied += 1;
+        }
+        if applied > 0 {
+            if !self.gpu_tex_full_dirty && !self.gpu_dirty_bricks.contains(&(bx, bz)) {
+                self.gpu_dirty_bricks.push((bx, bz));
+            }
+            self.update_occupancy_for_bricks(&[(bx, bz)]);
+            self.gpu_occ_dirty = true;
+            for dz in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let nx = bx as i32 + dx;
+                    let nz = bz as i32 + dz;
+                    if nx >= 0
+                        && nz >= 0
+                        && (nx as usize) < self.bricks_x
+                        && (nz as usize) < self.bricks_z
+                    {
+                        let nbx = nx as usize;
+                        let nbz = nz as usize;
+                        let mesh = extract_brick(&self.density_mat, w, d, h, nbx, nbz);
+                        self.brick_meshes[nbz * self.bricks_x + nbx] = mesh;
+                    }
+                }
+            }
+            self.flatten_mesh_buffers();
+            self.gpu_mesh_dirty = true;
+            self.update_minimap_brick(bx, bz);
+            self.rebuild_pines_and_hotspots_brick(bx, bz);
+            self.minimap_dirty = true;
+        }
+        Ok(applied)
+    }
+
     fn flatten_mesh_buffers(&mut self) {
         let v_tot: usize = self.brick_meshes.iter().map(|b| b.vertices.len()).sum();
         let i_tot: usize = self.brick_meshes.iter().map(|b| b.indices.len()).sum();
@@ -1166,5 +1240,42 @@ mod tests {
         let enc_sky = world.sample_cave_enclosure(16.0, 16.0, 28.5);
         assert!(enc_cave > 0.7, "Inside Z=32 vaulted cave should have enclosure > 0.7, got {enc_cave}");
         assert!(enc_sky < 0.1, "Above Z=32 mountain peak should have enclosure < 0.1, got {enc_sky}");
+    }
+
+    #[test]
+    fn test_z16_apply_brick3d_delta_updates_voxels_and_marks_dirty() {
+        let (w, h, d) = (32usize, 32usize, 16usize);
+        let mut world = Z16World::new(w, h, d);
+        world.gpu_tex_full_dirty = false;
+        world.gpu_dirty_bricks.clear();
+
+        let brick_bytes = SN_BRICK_SIZE * SN_BRICK_SIZE * d * 4;
+        let prev_dm = vec![0u8; brick_bytes];
+        let prev_at = vec![0u8; brick_bytes];
+        let mut cur_dm = prev_dm.clone();
+        let mut cur_at = prev_at.clone();
+
+        // Carve/deposit a small 3x3x3 glowing solid block inside brick (1, 0)
+        for z in 2..5 {
+            for dy in 4..7 {
+                for dx in 4..7 {
+                    let idx = (z * SN_BRICK_SIZE + dy) * SN_BRICK_SIZE + dx;
+                    let o = idx * 4;
+                    cur_dm[o..o + 4].copy_from_slice(&[240, 0, 0, 180]);
+                    cur_at[o..o + 4].copy_from_slice(&[255, 130, 30, 220]);
+                }
+            }
+        }
+
+        let lz4 = frostmarsh_proto::encode_brick3d_delta(&prev_dm, &prev_at, &cur_dm, &cur_at, 4)
+            .expect("delta");
+        let applied = world.apply_brick3d_delta(1, 0, &lz4).expect("apply delta");
+        assert_eq!(applied, 27);
+        assert!(world.gpu_dirty_bricks.contains(&(1, 0)));
+        assert!(world.gpu_mesh_dirty);
+        assert!(world.total_triangles() > 0, "patched solid voxels must emit Surface-Nets triangles");
+        let off = world.byte_index(16 + 5, 3, 5);
+        assert_eq!(&world.density_mat[off..off + 4], &[240, 0, 0, 180]);
+        assert_eq!(&world.albedo_thermal[off..off + 4], &[255, 130, 30, 220]);
     }
 }

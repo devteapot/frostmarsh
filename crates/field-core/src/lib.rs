@@ -3,6 +3,8 @@
 //!
 //! Matches `FIELD_CONTRACT.md` bit-for-bit in species, reactions, and ONNX tensor layout.
 
+use serde::{Deserialize, Serialize};
+
 pub const NUM_SPECIES: usize = 10;
 pub const NUM_MOBILE: usize = 4;
 pub const NUM_REACTIONS: usize = 7;
@@ -53,7 +55,7 @@ pub const NUM_WORLD_LAW_PRESETS: u8 = 4;
 
 /// Live 6-float world-law parameter vector governing gravity, ambient temperature shift,
 /// combustion volatility, fluid viscosity, hydrologic precipitation, and thermal conductivity.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorldLaws {
     pub gravity_g: f32,
     pub ambient_temp_shift: f32,
@@ -418,6 +420,14 @@ impl Field {
             total += grid_s * SPECIES[s].u0;
         }
         total + self.atmosphere_energy - self.faucet_energy
+    }
+
+    pub fn mass_error(&self) -> i64 {
+        self.current_accounted_mass() - self.initial_total_mass
+    }
+
+    pub fn energy_error(&self) -> i64 {
+        self.current_accounted_energy() - self.initial_total_energy
     }
 
     /// Build the playable Frostmarsh arena: a N->S river splitting West and East banks,
@@ -1759,13 +1769,56 @@ pub struct EntityVoxelPhysics {
     pub support_solid: bool,    // whether solid ground/bridge exists at or directly below entity
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldEvolutionStats {
     pub basalt_forged: u64,
     pub saplings_grown: u64,
     pub glaciers_formed: u64,
     pub erosion_events: u64,
     pub world_epoch: u64,
+}
+
+/// Lossless serializable snapshot of a single 2D stratum `Field`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FieldSnapshot {
+    pub width: usize,
+    pub height: usize,
+    pub mass: [Vec<u16>; NUM_SPECIES],
+    pub energy: Vec<i64>,
+    pub flow_e: Vec<i16>,
+    pub flow_s: Vec<i16>,
+    pub elevation: Vec<u8>,
+    pub forcing_energy: Vec<i64>,
+    pub forcing_mass: Vec<i32>,
+    pub critter_density: Vec<u8>,
+    pub atmosphere_mass: [i64; NUM_SPECIES],
+    pub atmosphere_energy: i64,
+    pub faucet_mass: [i64; NUM_SPECIES],
+    pub faucet_energy: i64,
+    pub initial_total_mass: i64,
+    pub initial_total_energy: i64,
+    pub tick: u64,
+}
+
+/// Lossless serializable snapshot of an entire 3D `VolumeField` preserving exact integer
+/// conservation (`mass_error() == 0 && energy_error() == 0`) immediately upon reload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VolumeFieldSnapshot {
+    pub width: usize,
+    pub height: usize,
+    pub depth: usize,
+    pub biome_id: u8,
+    pub seed: u64,
+    pub layers: Vec<FieldSnapshot>,
+    pub prev_temp: Vec<i32>,
+    pub prev_steam: Vec<i32>,
+    pub initial_total_mass: i64,
+    pub initial_total_energy: i64,
+    pub tick: u64,
+    pub world_time_secs: f64,
+    pub evolution_stats: WorldEvolutionStats,
+    pub world_laws: WorldLaws,
+    pub world_law_preset: u8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1803,6 +1856,7 @@ pub struct VolumeField {
     pub initial_total_mass: i64,
     pub initial_total_energy: i64,
     pub tick: u64,
+    pub world_time_secs: f64,
     pub evolution_stats: WorldEvolutionStats,
     pub world_laws: WorldLaws,
     pub world_law_preset: u8,
@@ -1849,6 +1903,7 @@ impl VolumeField {
                 initial_total_mass: 0,
                 initial_total_energy: 0,
                 tick: 0,
+                world_time_secs: 0.0,
                 evolution_stats: WorldEvolutionStats::default(),
                 world_laws: WorldLaws::default(),
                 world_law_preset: WORLD_LAW_STANDARD,
@@ -1985,6 +2040,7 @@ impl VolumeField {
             initial_total_mass: 0,
             initial_total_energy: 0,
             tick: 0,
+            world_time_secs: 0.0,
             evolution_stats: WorldEvolutionStats::default(),
             world_laws: WorldLaws::default(),
             world_law_preset: WORLD_LAW_STANDARD,
@@ -2046,6 +2102,151 @@ impl VolumeField {
 
     pub fn current_accounted_energy(&self) -> i64 {
         self.layers.iter().map(|l| l.current_accounted_energy()).sum()
+    }
+
+    pub fn mass_error(&self) -> i64 {
+        self.current_accounted_mass() - self.initial_total_mass
+    }
+
+    pub fn energy_error(&self) -> i64 {
+        self.current_accounted_energy() - self.initial_total_energy
+    }
+
+    /// Capture an exact lossless snapshot of the entire 3D `VolumeField`.
+    pub fn to_snapshot(&self) -> VolumeFieldSnapshot {
+        let layers = self
+            .layers
+            .iter()
+            .map(|l| FieldSnapshot {
+                width: l.width,
+                height: l.height,
+                mass: l.mass.clone(),
+                energy: l.energy.clone(),
+                flow_e: l.flow_e.clone(),
+                flow_s: l.flow_s.clone(),
+                elevation: l.elevation.clone(),
+                forcing_energy: l.forcing_energy.clone(),
+                forcing_mass: l.forcing_mass.clone(),
+                critter_density: l.critter_density.clone(),
+                atmosphere_mass: l.atmosphere_mass,
+                atmosphere_energy: l.atmosphere_energy,
+                faucet_mass: l.faucet_mass,
+                faucet_energy: l.faucet_energy,
+                initial_total_mass: l.initial_total_mass,
+                initial_total_energy: l.initial_total_energy,
+                tick: l.tick,
+            })
+            .collect();
+        VolumeFieldSnapshot {
+            width: self.width,
+            height: self.height,
+            depth: self.depth,
+            biome_id: self.biome_id,
+            seed: self.seed,
+            layers,
+            prev_temp: self.prev_temp.clone(),
+            prev_steam: self.prev_steam.clone(),
+            initial_total_mass: self.initial_total_mass,
+            initial_total_energy: self.initial_total_energy,
+            tick: self.tick,
+            world_time_secs: self.world_time_secs,
+            evolution_stats: self.evolution_stats,
+            world_laws: self.world_laws,
+            world_law_preset: self.world_law_preset,
+        }
+    }
+
+    /// Restore a `VolumeField` losslessly from a `VolumeFieldSnapshot`, validating dimensions
+    /// and guaranteeing exact conservation (`mass_error() == 0 && energy_error() == 0`).
+    pub fn from_snapshot(snap: VolumeFieldSnapshot) -> Result<Self, String> {
+        if snap.width == 0 || snap.height == 0 || snap.depth == 0 {
+            return Err("VolumeFieldSnapshot has zero dimension".to_string());
+        }
+        if snap.layers.len() != snap.depth {
+            return Err(format!(
+                "VolumeFieldSnapshot layer count {} != depth {}",
+                snap.layers.len(),
+                snap.depth
+            ));
+        }
+        let area = snap.width * snap.height;
+        let chunks_x = snap.width.div_ceil(CHUNK_SIZE);
+        let chunks_y = snap.height.div_ceil(CHUNK_SIZE);
+        let mut layers = Vec::with_capacity(snap.depth);
+        for (z, ls) in snap.layers.into_iter().enumerate() {
+            if ls.width != snap.width || ls.height != snap.height {
+                return Err(format!("layer {} dimensions mismatch", z));
+            }
+            for s in 0..NUM_SPECIES {
+                if ls.mass[s].len() != area {
+                    return Err(format!("layer {} species {} mass len mismatch", z, s));
+                }
+            }
+            if ls.energy.len() != area
+                || ls.flow_e.len() != area
+                || ls.flow_s.len() != area
+                || ls.elevation.len() != area
+                || ls.forcing_energy.len() != area
+                || ls.forcing_mass.len() != area
+                || ls.critter_density.len() != area
+            {
+                return Err(format!("layer {} field vector length mismatch", z));
+            }
+            layers.push(Field {
+                width: ls.width,
+                height: ls.height,
+                mass: ls.mass,
+                energy: ls.energy,
+                flow_e: ls.flow_e,
+                flow_s: ls.flow_s,
+                elevation: ls.elevation,
+                forcing_energy: ls.forcing_energy,
+                forcing_mass: ls.forcing_mass,
+                critter_density: ls.critter_density,
+                atmosphere_mass: ls.atmosphere_mass,
+                atmosphere_energy: ls.atmosphere_energy,
+                faucet_mass: ls.faucet_mass,
+                faucet_energy: ls.faucet_energy,
+                initial_total_mass: ls.initial_total_mass,
+                initial_total_energy: ls.initial_total_energy,
+                tick: ls.tick,
+                prev_display_hash: vec![u64::MAX; chunks_x * chunks_y],
+            });
+        }
+        let vlen = snap.depth * area;
+        let mut vf = Self {
+            width: snap.width,
+            height: snap.height,
+            depth: snap.depth,
+            biome_id: snap.biome_id % NUM_BIOMES,
+            seed: snap.seed,
+            layers,
+            prev_temp: if snap.prev_temp.len() == vlen {
+                snap.prev_temp
+            } else {
+                vec![T_AMB as i32; vlen]
+            },
+            prev_steam: if snap.prev_steam.len() == vlen {
+                snap.prev_steam
+            } else {
+                vec![0i32; vlen]
+            },
+            initial_total_mass: snap.initial_total_mass,
+            initial_total_energy: snap.initial_total_energy,
+            tick: snap.tick,
+            world_time_secs: if snap.world_time_secs.is_finite() && snap.world_time_secs >= 0.0 {
+                snap.world_time_secs
+            } else {
+                snap.tick as f64 * 0.1
+            },
+            evolution_stats: snap.evolution_stats,
+            world_laws: snap.world_laws,
+            world_law_preset: snap.world_law_preset % NUM_WORLD_LAW_PRESETS,
+        };
+        if vf.prev_temp.len() != vlen || vf.prev_steam.len() != vlen {
+            vf.snapshot_prev_sensors();
+        }
+        Ok(vf)
     }
 
     /// Encode all `L` vertical layers concatenated into `[L, 18, H, W]` CHW f32 for batched GPU inference.
@@ -3640,6 +3841,7 @@ impl VolumeField {
             self.step_vertical_exchange_3d()
         };
         self.tick += 1;
+        self.world_time_secs += 0.1;
 
         let mut dirty_chunks = Vec::new();
         for (z, l) in self.layers.iter_mut().enumerate() {
@@ -6650,5 +6852,53 @@ mod tests {
             "LOW-G MAGMA must exhibit higher vertical buoyancy transport than STANDARD: {:?}",
             total_buoy
         );
+    }
+
+    #[test]
+    fn test_volume_snapshot_exact_conservation_roundtrip() {
+        let mut vf = VolumeField::new_biome_3d(32, 32, 16, BIOME_VOLCANIC_CALDERA, 42);
+        vf.set_world_law_preset(WORLD_LAW_LOW_G_MAGMA);
+        vf.apply_weather_and_springs_3d(3, 1);
+        vf.layers[4].apply_fire_bolt(16, 16, 3, 1.5);
+        vf.layers[4].apply_oil_splash(12, 12, 2, 1.0);
+        vf.carve_tunnel_3d(16.0, 16.0, 4.0, 1.0, 0.0, 2.0);
+        for _ in 0..4 {
+            vf.step_world_evolution_3d(4.0);
+            let raws = vf.refsim_raw_outputs_all();
+            let st = vf.step_3d(&raws);
+            assert_eq!(st.mass_error, 0);
+            assert_eq!(st.energy_error, 0);
+        }
+        assert_eq!(vf.mass_error(), 0);
+        assert_eq!(vf.energy_error(), 0);
+        assert!(vf.tick == 4 && vf.world_time_secs >= 0.39);
+
+        let snap = vf.to_snapshot();
+        let mut restored = VolumeField::from_snapshot(snap).expect("restore snapshot");
+        assert_eq!(restored.width, vf.width);
+        assert_eq!(restored.height, vf.height);
+        assert_eq!(restored.depth, vf.depth);
+        assert_eq!(restored.biome_id, BIOME_VOLCANIC_CALDERA);
+        assert_eq!(restored.seed, 42);
+        assert_eq!(restored.tick, vf.tick);
+        assert_eq!(restored.world_law_preset, WORLD_LAW_LOW_G_MAGMA);
+        assert_eq!(restored.world_laws, vf.world_laws);
+        assert_eq!(restored.evolution_stats, vf.evolution_stats);
+        assert!((restored.world_time_secs - vf.world_time_secs).abs() < 1e-9);
+        assert_eq!(restored.mass_error(), 0, "restored mass_error must be 0");
+        assert_eq!(restored.energy_error(), 0, "restored energy_error must be 0");
+
+        // Verify post-reload stepping preserves exact conservation and identical encoded bricks
+        let (dm_orig, at_orig) = vf.encode_3d_brick_16(1, 1);
+        let (dm_rest, at_rest) = restored.encode_3d_brick_16(1, 1);
+        assert_eq!(dm_orig, dm_rest);
+        assert_eq!(at_orig, at_rest);
+
+        for tick in 0..3 {
+            let raws = restored.refsim_raw_outputs_all();
+            let st = restored.step_3d(&raws);
+            assert_eq!(st.mass_error, 0, "post-reload mass_error at tick {}", tick);
+            assert_eq!(st.energy_error, 0, "post-reload energy_error at tick {}", tick);
+        }
     }
 }

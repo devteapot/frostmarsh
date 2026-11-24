@@ -167,7 +167,7 @@ def normalize_world_laws(
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
     """Normalize `world_laws` into a `[B, 6]` tensor on `(device, dtype)`."""
-    dev = torch.device(device)
+    dev = device if isinstance(device, torch.device) else torch.device(device)
     if world_laws is None:
         t = torch.tensor(DEFAULT_WORLD_LAWS, dtype=dtype, device=dev).unsqueeze(0)
     elif isinstance(world_laws, torch.Tensor):
@@ -204,12 +204,15 @@ def encode_law_features(
     EVERY feature is IDENTICALLY `0.0` at `DEFAULT_WORLD_LAWS = (1.0, 0.0, 1.0, 1.0, 1.0, 1.0)`!
     """
     if isinstance(world_laws, torch.Tensor):
-        dev = world_laws.device if device == "cpu" and world_laws.device.type != "cpu" else torch.device(device)
+        if device == "cpu" and world_laws.device.type != "cpu":
+            dev = world_laws.device
+        else:
+            dev = device if isinstance(device, torch.device) else torch.device(device)
         bsz = batch_size if batch_size is not None else (1 if world_laws.ndim == 1 else int(world_laws.shape[0]))
-        t = normalize_world_laws(world_laws, batch_size=bsz, dtype=dtype, device=dev)
+        t = normalize_world_laws(world_laws, batch_size=bsz, dtype=torch.float32, device=dev)
     else:
         bsz = batch_size if batch_size is not None else 1
-        t = normalize_world_laws(world_laws, batch_size=bsz, dtype=dtype, device=device)
+        t = normalize_world_laws(world_laws, batch_size=bsz, dtype=torch.float32, device=device)
 
     g = t[:, LAW_GRAVITY : LAW_GRAVITY + 1].clamp(0.10, 3.0)
     dT = t[:, LAW_AMBIENT_TEMP_SHIFT : LAW_AMBIENT_TEMP_SHIFT + 1].clamp(-10000.0, 10000.0)
@@ -218,7 +221,7 @@ def encode_law_features(
     precip = t[:, LAW_PRECIPITATION : LAW_PRECIPITATION + 1].clamp(0.10, 4.0)
     k_th = t[:, LAW_THERMAL_COND : LAW_THERMAL_COND + 1].clamp(0.20, 4.0)
 
-    return torch.cat(
+    feats = torch.cat(
         [
             torch.log(g),                    # 0: log gravity (0 at 1.0)
             g - 1.0,                         # 1: linear gravity delta (0 at 1.0)
@@ -235,6 +238,7 @@ def encode_law_features(
         ],
         dim=1,
     )
+    return feats.to(dtype=dtype) if feats.dtype != dtype else feats
 
 
 # =============================================================================
@@ -1301,7 +1305,9 @@ class SparseWorld3DV8Runner:
     """
     Production True 3D `16x16x8` Sparse Active-Brick Runner for `WorldModel3DV8`.
     Supports arbitrary dynamic `world_laws` (automatically refreshes dense cache whenever
-    `world_laws` changes, and maintains exact FP32 `< 1e-6` dense-vs-sparse parity!).
+    `world_laws` changes, keeps `world_laws` as a static `[6]` float32 tensor input for
+    zero-recompile `torch.compile(mode="reduce-overhead")` CUDA graphs, and maintains
+    exact FP32 `<= 1e-6` dense-vs-sparse parity with `activity_eps=0.0`!).
     """
 
     def __init__(
@@ -1311,7 +1317,7 @@ class SparseWorld3DV8Runner:
         use_fp16: bool = True,
         brick_xy: int = 16,
         brick_z: int = 8,
-        sparse_threshold: float = 0.42,
+        sparse_threshold: float = 0.30,
         diff_eps: float = 1e-4,
         activity_eps: float = 0.0,
         bucket_size: int = 32,
@@ -1337,6 +1343,25 @@ class SparseWorld3DV8Runner:
             p.requires_grad_(False)
         self._wm_dense: Any = self._wm
         self._brick_mod: Any = _CompiledBrickModuleV8(self._wm, (self.brick_z, self.brick_xy, self.brick_xy)).eval()
+        if self.device.type == "cuda" and self.use_fp16 and hasattr(torch, "compile"):
+            try:
+                self._wm_dense = torch.compile(self._wm, mode="reduce-overhead")
+            except Exception:
+                self._wm_dense = self._wm
+            try:
+                self._brick_mod = torch.compile(self._brick_mod, mode="reduce-overhead")
+            except Exception:
+                pass
+
+        # Persistent [6] float32 world_laws buffers so CUDA graphs never recompile on law value changes
+        self._host_laws: torch.Tensor = torch.tensor(
+            DEFAULT_WORLD_LAWS,
+            dtype=torch.float32,
+            pin_memory=(self.device.type == "cuda"),
+        )
+        self._static_laws: torch.Tensor = torch.tensor(
+            DEFAULT_WORLD_LAWS, dtype=torch.float32, device=self.device
+        )
 
         self._last_horiz: torch.Tensor | None = None
         self._last_z_flux_pad: torch.Tensor | None = None
@@ -1344,6 +1369,7 @@ class SparseWorld3DV8Runner:
         self._last_x: torch.Tensor | None = None
         self._last_dt: torch.Tensor | None = None
         self._last_laws: torch.Tensor | None = None
+        self._last_laws_tuple: tuple[float, ...] | None = None
 
     def reset(self) -> None:
         self._last_horiz = None
@@ -1352,6 +1378,57 @@ class SparseWorld3DV8Runner:
         self._last_x = None
         self._last_dt = None
         self._last_laws = None
+        self._last_laws_tuple = None
+
+    def _prepare_world_laws(self, world_laws: WorldLawsLike) -> tuple[torch.Tensor, bool]:
+        """
+        Update persistent `[6]` float32 `self._static_laws` on `self.device` and return
+        `(laws_6_f32, laws_changed)` with zero GPU-CPU sync for CPU/Python inputs.
+        """
+        if world_laws is None:
+            tup: tuple[float, ...] = DEFAULT_WORLD_LAWS
+            changed = self._last_laws_tuple is None or tup != self._last_laws_tuple
+            if changed:
+                self._host_laws.copy_(torch.tensor(tup, dtype=torch.float32))
+                self._static_laws.copy_(self._host_laws, non_blocking=(self.device.type == "cuda"))
+                self._last_laws_tuple = tup
+                self._last_laws = self._static_laws.clone()
+            return self._static_laws, changed
+
+        if isinstance(world_laws, torch.Tensor):
+            if world_laws.device.type == "cpu":
+                flat = world_laws.detach().float().reshape(-1)
+                if flat.numel() != LAW_DIM:
+                    raise ValueError(f"Expected world_laws with {LAW_DIM} elements, got {flat.numel()}")
+                tup = tuple(float(v) for v in flat.tolist())
+                changed = self._last_laws_tuple is None or tup != self._last_laws_tuple
+                if changed:
+                    self._host_laws.copy_(flat)
+                    self._static_laws.copy_(self._host_laws, non_blocking=(self.device.type == "cuda"))
+                    self._last_laws_tuple = tup
+                    self._last_laws = self._static_laws.clone()
+                return self._static_laws, changed
+
+            flat_dev = world_laws.detach().to(device=self.device, dtype=torch.float32).reshape(-1)
+            if flat_dev.numel() != LAW_DIM:
+                raise ValueError(f"Expected world_laws with {LAW_DIM} elements, got {flat_dev.numel()}")
+            changed = self._last_laws is None or not bool(torch.equal(flat_dev, self._last_laws))
+            if changed:
+                self._static_laws.copy_(flat_dev)
+                self._last_laws = flat_dev.clone()
+                self._last_laws_tuple = None
+            return self._static_laws, changed
+
+        if len(world_laws) != LAW_DIM:
+            raise ValueError(f"Expected {LAW_DIM} floats for world_laws, got {len(world_laws)}")
+        tup = tuple(float(v) for v in world_laws)
+        changed = self._last_laws_tuple is None or tup != self._last_laws_tuple
+        if changed:
+            self._host_laws.copy_(torch.tensor(tup, dtype=torch.float32))
+            self._static_laws.copy_(self._host_laws, non_blocking=(self.device.type == "cuda"))
+            self._last_laws_tuple = tup
+            self._last_laws = self._static_laws.clone()
+        return self._static_laws, changed
 
     def _normalize_dt(self, local_dt: torch.Tensor | float | None, L: int, H: int, W: int) -> torch.Tensor:
         if local_dt is None:
@@ -1401,11 +1478,10 @@ class SparseWorld3DV8Runner:
                 diff_vox = torch.maximum(diff_vox, dt_diff.to(dtype=self.compute_dtype))
         else:
             eps = self.activity_eps
-            d_sp = (x_cur[:, :10] - ref[:, :10]).abs().amax(dim=1) > max(eps * 24.0, self.diff_eps, 0.012)
-            d_tmp = (x_cur[:, 10] - ref[:, 10]).abs() > max(eps * 70.0, self.diff_eps * 4.0, 0.035)
-            d_flow = (x_cur[:, 12:14] - ref[:, 12:14]).abs().amax(dim=1) > max(eps * 20.0, 0.010)
-            has_force = (x_cur[:, 16].abs() > max(eps, 0.01)) | (x_cur[:, 17].abs() > max(eps, 0.01))
-            diff_vox = (d_sp | d_tmp | d_flow | has_force).to(dtype=self.compute_dtype)
+            d_sp = (x_cur[:, :10] - ref[:, :10]).abs().amax(dim=1) > eps
+            d_tmp = (x_cur[:, 10] - ref[:, 10]).abs() > (8.0 * eps)
+            has_force = x_cur[:, 16:18].abs().amax(dim=1) > 1e-4
+            diff_vox = (d_sp | d_tmp | has_force).to(dtype=self.compute_dtype)
             if self._last_dt is not None and self._last_dt.shape == dt_cur.shape:
                 dt_diff = (dt_cur[:, 0] - self._last_dt[:, 0]).abs() > 1e-3
                 diff_vox = torch.maximum(diff_vox, dt_diff.to(dtype=self.compute_dtype))
@@ -1429,15 +1505,12 @@ class SparseWorld3DV8Runner:
         x_cur = x.to(device=self.device, dtype=self.compute_dtype, non_blocking=(self.device.type == "cuda"))
         L, C, H, W = x_cur.shape
         dt_cur = self._normalize_dt(local_dt, L, H, W)
-        laws_cur = normalize_world_laws(world_laws, batch_size=1, dtype=self.compute_dtype, device=self.device)
+        laws_cur, laws_changed = self._prepare_world_laws(world_laws)
         Bz, By, Bx = self.brick_z, self.brick_xy, self.brick_xy
-
-        laws_changed = (
-            self._last_laws is None or float((laws_cur - self._last_laws).abs().max().item()) > 0.0
-        )
 
         need_dense = (
             laws_changed
+            or self.sparse_threshold <= 0.0
             or self._last_horiz is None
             or self._last_z_flux_pad is None
             or self._last_z is None
@@ -1467,7 +1540,10 @@ class SparseWorld3DV8Runner:
 
             if k == 0:
                 self._last_x.copy_(x_cur)
-                self._last_dt = dt_cur.clone()
+                if self._last_dt is not None and self._last_dt.shape == dt_cur.shape:
+                    self._last_dt.copy_(dt_cur)
+                else:
+                    self._last_dt = dt_cur.clone()
                 return self._last_horiz, self._last_z_flux_pad[:-1], self._last_z, 0.0
 
             if active_frac < self.sparse_threshold:
@@ -1509,9 +1585,19 @@ class SparseWorld3DV8Runner:
                 m_x0 = (rtx == 0).view(k_r, 1, 1, 1, 1)
                 m_x1 = (rtx == (nx - 1)).view(k_r, 1, 1, 1, 1)
 
-                y_horiz, y_z_flux, y_z = self._brick_mod(
-                    patches_x_run, patches_dt_run, laws_cur, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1
-                )
+                if self.device.type == "cuda" and hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                    torch.compiler.cudagraph_mark_step_begin()
+                try:
+                    y_horiz, y_z_flux, y_z = self._brick_mod(
+                        patches_x_run, patches_dt_run, laws_cur, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1
+                    )
+                except Exception:
+                    self._brick_mod = _CompiledBrickModuleV8(
+                        self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
+                    ).eval()
+                    y_horiz, y_z_flux, y_z = self._brick_mod(
+                        patches_x_run, patches_dt_run, laws_cur, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1
+                    )
                 if k_pad > k:
                     y_horiz = y_horiz[:k]
                     y_z_flux = y_z_flux[:k]
@@ -1526,22 +1612,34 @@ class SparseWorld3DV8Runner:
                 self._last_z.view(nz, Bz, z_ch, ny, By, nx, Bx).permute(0, 3, 5, 1, 2, 4, 6)[tz, ty, tx] = y_z
 
                 self._last_x.copy_(x_cur)
-                self._last_dt = dt_cur.clone()
-                self._last_laws = laws_cur.clone()
+                if self._last_dt is not None and self._last_dt.shape == dt_cur.shape:
+                    self._last_dt.copy_(dt_cur)
+                else:
+                    self._last_dt = dt_cur.clone()
                 return self._last_horiz, self._last_z_flux_pad[:-1], self._last_z, active_frac
 
-        horiz, z_flux, z_world = self._wm_dense(
-            x_cur, local_dt=dt_cur, world_laws=laws_cur, return_z_flux=True, return_latent=True
-        )
-        self._last_horiz = horiz.clone().contiguous()
+        if self.device.type == "cuda" and hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
+        try:
+            horiz, z_flux, z_world = self._wm_dense(
+                x_cur, local_dt=dt_cur, world_laws=laws_cur, return_z_flux=True, return_latent=True
+            )
+        except Exception:
+            self._wm_dense = self._wm
+            horiz, z_flux, z_world = self._wm_dense(
+                x_cur, local_dt=dt_cur, world_laws=laws_cur, return_z_flux=True, return_latent=True
+            )
+        horiz = horiz.clone()
+        z_flux = z_flux.clone()
+        z_world = z_world.clone()
+        self._last_horiz = horiz.contiguous()
         zf_pad = horiz.new_zeros((L, self._wm.z_flux_ch, H, W))
         if L > 1:
             zf_pad[:-1].copy_(z_flux)
         self._last_z_flux_pad = zf_pad.contiguous()
-        self._last_z = z_world.clone().contiguous()
+        self._last_z = z_world.contiguous()
         self._last_x = x_cur.clone()
         self._last_dt = dt_cur.clone()
-        self._last_laws = laws_cur.clone()
         return self._last_horiz, self._last_z_flux_pad[:-1], self._last_z, 1.0
 
 

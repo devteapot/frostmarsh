@@ -12,6 +12,8 @@ Serves low-latency GPU inference on TCP_NODELAY and optional Unix domain socket:
   - op=7: ActuatorPolicy  ([N, 168]      f32 -> [N, 26]       f32) continuous physical actuators (10 floats) + 16 (4x4) Z_world saliency!
   - op=8: WorldModel3D    ([L, 18, H, W] f32 -> [L, 17, H, W] + [L-1, 5, H, W] f32) true 3D sparse/dense horizontal + vertical interface fluxes + Z_world cache!
   - op=9: WorldModelDT    ([L, 18, H, W] + [H, W] local_dt f32 -> [L, 17, H, W] + [L-1, 5, H, W] f32) spatial time-dilation domes!
+  - op=10: ActuatorV3     ([N, 168]      f32 -> [N, 28]       f32) true 3D volumetric actuators (12 floats) + 16 (4x4) Z_world saliency!
+  - op=11: WorldModelV8   ([L, 18, H, W] + [H, W] local_dt + [6] world_laws f32 -> [L, 17, H, W] + [L-1, 5, H, W] f32) live World-Law RPC!
 """
 
 from __future__ import annotations
@@ -90,8 +92,11 @@ OP_ACTUATOR_POLICY = 7
 OP_WORLD_3D_STEP = 8
 OP_WORLD_DT_STEP = 9
 OP_ACTUATOR_V3 = 10
+OP_WORLD_V8_STEP = 11
 
 Z_FLUX_CH = 5
+WORLD_LAWS_DIM = 6
+WORLD_LAWS_BYTES = WORLD_LAWS_DIM * 4  # 24 bytes (6 x f32)
 ACTUATOR_OUT_DIM = 10
 ACTUATOR_INSPECT_OUT_DIM = ACTUATOR_OUT_DIM + 16  # 26 floats per bot
 ACTUATOR_V3_INSPECT_OUT_DIM = ACT3D_DIM + 16      # 28 floats per bot
@@ -509,7 +514,7 @@ class _SparseWorld3DAdapter:
 
 
 class _SparseWorldDTAdapter:
-    """Wraps SparseWorldDTRunner with pinned host I/O buffers for op=9 (`OP_WORLD_DT_STEP`)."""
+    """Wraps SparseWorldDTRunner / SparseWorld3DV5Runner / SparseWorld3DV8Runner with pinned host I/O buffers for op=9 & op=11."""
 
     def __init__(
         self,
@@ -528,6 +533,7 @@ class _SparseWorldDTAdapter:
         self.dt_shape = (h, w)
         self.x_elems = batch * 18 * h * w
         self.dt_elems = h * w
+        self.laws_elems = WORLD_LAWS_DIM
         self.horiz_shape = (batch, 17, h, w)
         self.z_flux_layers = max(0, batch - 1)
         self.z_flux_shape = (self.z_flux_layers, Z_FLUX_CH, h, w)
@@ -536,13 +542,15 @@ class _SparseWorldDTAdapter:
 
         self.static_in_x = torch.zeros(self.x_shape, dtype=torch.float32, device=device)
         self.static_in_dt = torch.ones(self.dt_shape, dtype=torch.float32, device=device)
-        self.host_in = torch.empty(
-            (self.x_elems + self.dt_elems,),
+        self.host_in_v8 = torch.empty(
+            (self.x_elems + self.dt_elems + self.laws_elems,),
             dtype=torch.float32,
             pin_memory=(device.type == "cuda"),
         )
-        self.host_in_x = self.host_in[: self.x_elems].view(*self.x_shape)
-        self.host_in_dt = self.host_in[self.x_elems :].view(*self.dt_shape)
+        self.host_in = self.host_in_v8[: self.x_elems + self.dt_elems]
+        self.host_in_x = self.host_in_v8[: self.x_elems].view(*self.x_shape)
+        self.host_in_dt = self.host_in_v8[self.x_elems : self.x_elems + self.dt_elems].view(*self.dt_shape)
+        self.host_in_laws = self.host_in_v8[self.x_elems + self.dt_elems :]
         self.host_out = torch.empty(
             (self.horiz_elems + self.z_flux_elems,),
             dtype=torch.float32,
@@ -555,8 +563,10 @@ class _SparseWorldDTAdapter:
             else None
         )
         self.host_in_np = self.host_in.numpy()
+        self.host_in_v8_np = self.host_in_v8.numpy()
         self.host_out_np = self.host_out.numpy()
         self.host_in_u8 = self.host_in_np.view(np.uint8).ravel()
+        self.host_in_v8_u8 = self.host_in_v8_np.view(np.uint8).ravel()
         self.host_out_bytes = memoryview(self.host_out_np).cast("B")
         self.runner = _call_with_accepted_kwargs(
             runner_cls,
@@ -564,17 +574,27 @@ class _SparseWorldDTAdapter:
             device=device,
             use_fp16=use_fp16,
             sparse_threshold=(0.30 if use_sparse else 0.0),
-            activity_eps=5e-4,
+            activity_eps=2e-3,
+        )
+        step_params = inspect.signature(self.runner.step).parameters
+        self._accepts_world_laws = (
+            "world_laws" in step_params
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in step_params.values())
         )
 
-    def infer_from_host_in(self) -> tuple[memoryview, torch.Tensor, torch.Tensor, float, int]:
+    def infer_from_host_in(self, with_world_laws: bool = False) -> tuple[memoryview, torch.Tensor, torch.Tensor, float, int]:
         t0 = time.perf_counter()
         with torch.inference_mode():
             self.static_in_x.copy_(self.host_in_x, non_blocking=(self.device.type == "cuda"))
             self.static_in_dt.copy_(self.host_in_dt, non_blocking=(self.device.type == "cuda"))
-            horiz_t, z_flux_t, z_world, active_frac = self.runner.step(
-                self.static_in_x, local_dt=self.static_in_dt
-            )
+            if with_world_laws and self._accepts_world_laws:
+                horiz_t, z_flux_t, z_world, active_frac = self.runner.step(
+                    self.static_in_x, local_dt=self.static_in_dt, world_laws=self.host_in_laws
+                )
+            else:
+                horiz_t, z_flux_t, z_world, active_frac = self.runner.step(
+                    self.static_in_x, local_dt=self.static_in_dt
+                )
             self.host_out_horiz.copy_(horiz_t.float(), non_blocking=False)
             if self.host_out_zflux is not None:
                 self.host_out_zflux.copy_(z_flux_t.float(), non_blocking=False)
@@ -1160,7 +1180,22 @@ class InferenceEngine:
             adapter = self._get_sparse_dt_runner(h, w, batch)
             if not recv_fn(memoryview(adapter.host_in_u8)):
                 raise ConnectionError("EOF reading op=9 request payload")
-            out_view, z_latent, x_dev, active_frac, infer_us = adapter.infer_from_host_in()
+            out_view, z_latent, x_dev, active_frac, infer_us = adapter.infer_from_host_in(with_world_laws=False)
+            self.last_z_world = z_latent
+            self.last_world_state = x_dev
+            self._invalidate_strata_pool_cache()
+            self.last_sparse_active_frac = active_frac
+            out_copy = bytes(out_view)
+        return memoryview(out_copy), infer_us
+
+    def infer_world_v8_bytes(self, h: int, w: int, recv_fn, batch: int = 4) -> tuple[memoryview, int]:
+        if self.world_model_dt is None or self._sparse_dt_runner_cls is None:
+            raise RuntimeError("world_model_3d_v8.pt / world_model_dt.pt not loaded")
+        with self.lock:
+            adapter = self._get_sparse_dt_runner(h, w, batch)
+            if not recv_fn(memoryview(adapter.host_in_v8_u8)):
+                raise ConnectionError("EOF reading op=11 request payload")
+            out_view, z_latent, x_dev, active_frac, infer_us = adapter.infer_from_host_in(with_world_laws=True)
             self.last_z_world = z_latent
             self.last_world_state = x_dev
             self._invalidate_strata_pool_cache()
@@ -2113,6 +2148,38 @@ class GPUInferDaemon:
                 if not _recv_exact(conn, hdr_view):
                     break
                 op, pad_batch, channels, height, width, payload_bytes, _seq = HEADER_STRUCT.unpack(hdr_buf)
+
+                if op == OP_WORLD_V8_STEP:
+                    batch = max(1, int(pad_batch))
+                    expected_bytes = (batch * 18 + 1) * height * width * 4 + WORLD_LAWS_BYTES
+                    if (
+                        self.engine.world_model_dt is None
+                        or channels != 18
+                        or height == 0
+                        or width == 0
+                        or payload_bytes != expected_bytes
+                    ):
+                        if 0 < payload_bytes <= 512 * 1024 * 1024:
+                            _recv_exact(conn, memoryview(bytearray(payload_bytes)))
+                        self._send_error(conn, STATUS_BAD_REQUEST, height, width)
+                        continue
+                    try:
+                        out_bytes, infer_us = self.engine.infer_world_v8_bytes(
+                            height, width, lambda mv: _recv_exact(conn, mv), batch=batch
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[gpu_infer_daemon] WorldModel3D-v8 op=11 error ({height}x{width}): {exc}",
+                            file=sys.stderr,
+                        )
+                        self._send_error(conn, STATUS_INTERNAL_ERROR, height, width)
+                        continue
+                    resp_hdr = HEADER_STRUCT.pack(
+                        STATUS_OK, batch, 17, height, width, len(out_bytes), infer_us
+                    )
+                    conn.sendall(resp_hdr)
+                    conn.sendall(out_bytes)
+                    continue
 
                 if op == OP_WORLD_DT_STEP:
                     batch = max(1, int(pad_batch))

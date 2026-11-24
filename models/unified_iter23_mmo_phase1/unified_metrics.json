@@ -1,0 +1,72 @@
+{
+  "server": "spark-gb10:4433",
+  "gpu_adapter": "Apple M4 Pro",
+  "gpu_backend": "Metal",
+  "grid_w": 256,
+  "grid_h": 256,
+  "total_chunks": 256,
+  "parametric_build_ms": 3.19,
+  "sim_mode": "neural",
+  "backend": "cuda-fp16-v8",
+  "field_tick": 128,
+  "world_infer_ms": 78.483,
+  "eco_infer_ms": 2.041,
+  "proj_active_pct": 13.55215,
+  "mass_error": 0,
+  "energy_error": 0,
+  "wire_kbps": 211.97751,
+  "aoi_chunks_sent": 1,
+  "active_bots": 60,
+  "weather_kind": 1,
+  "dirty_update_p50_ms": 2.19,
+  "dirty_update_p99_ms": 4.371,
+  "full_sync_build_ms": 16.178,
+  "visible_chunks": 256,
+  "terrain_triangles": 225488,
+  "mesh_instances": 163,
+  "surfel_draws": 20322,
+  "volumetric_splats": 327,
+  "hud_vertices": 168534,
+  "gpu_benchmarks": [
+    {
+      "label": "1080p Pixel-Art + Vol3DGS + HUD",
+      "resolution": "1920x1080",
+      "art_resolution": "960x540",
+      "style": "PIXEL-2XSS",
+      "p50_ms": 8.141,
+      "p99_ms": 9.198,
+      "mean_ms": 8.279,
+      "fps_p50": 122.8
+    },
+    {
+      "label": "1080p Clean 3D + Vol3DGS + HUD",
+      "resolution": "1920x1080",
+      "art_resolution": "1920x1080",
+      "style": "CLEAN-3D",
+      "p50_ms": 7.573,
+      "p99_ms": 8.566,
+      "mean_ms": 7.663,
+      "fps_p50": 132.1
+    },
+    {
+      "label": "4K Pixel-Art + Vol3DGS + HUD",
+      "resolution": "3840x2160",
+      "art_resolution": "960x540",
+      "style": "PIXEL-2XSS",
+      "p50_ms": 8.037,
+      "p99_ms": 9.275,
+      "mean_ms": 8.176,
+      "fps_p50": 124.4
+    },
+    {
+      "label": "4K Clean 3D + Vol3DGS + HUD",
+      "resolution": "3840x2160",
+      "art_resolution": "3840x2160",
+      "style": "CLEAN-3D",
+      "p50_ms": 22.608,
+      "p99_ms": 23.946,
+      "mean_ms": 22.794,
+      "fps_p50": 44.2
+    }
+  ]
+}

@@ -115,6 +115,7 @@ pub struct LiveWorldState {
     pub dirty_z16_bricks: Vec<(usize, usize)>,
     pub has_z16_bricks: bool,
     pub bricks_3d_rx: u64,
+    pub bricks_3d_delta_rx: u64,
     pub latest_field_tick: u64,
     pub entities: Option<LiveEntityState>,
     pub chunks_rx: u64,
@@ -151,6 +152,7 @@ impl LiveWorldState {
             dirty_z16_bricks: Vec::new(),
             has_z16_bricks: d >= 16,
             bricks_3d_rx: 0,
+            bricks_3d_delta_rx: 0,
             latest_field_tick: 0,
             entities: None,
             chunks_rx: 0,
@@ -316,6 +318,79 @@ impl LiveWorldState {
         if bi < self.dirty_z16_mask.len() && !self.dirty_z16_mask[bi] {
             self.dirty_z16_mask[bi] = true;
             self.dirty_z16_bricks.push((bx, by));
+        }
+    }
+
+    pub fn apply_brick3d_delta(
+        &mut self,
+        raw_len: u64,
+        bx: u16,
+        by: u16,
+        depth: u16,
+        tick: u64,
+        lz4_deltas: &[u8],
+    ) {
+        let d = depth as usize;
+        let bx_u = bx as usize;
+        let by_u = by as usize;
+        if d == 0 || bx_u >= self.chunks_x || by_u >= self.chunks_y {
+            return;
+        }
+        if d != self.depth {
+            if (16..=64).contains(&d) {
+                self.resize_if_needed(self.width, self.height, d);
+            } else {
+                return;
+            }
+        }
+        let Ok(patches) = decode_brick3d_delta_voxels(lz4_deltas) else {
+            return;
+        };
+
+        let w = self.width;
+        let h = self.height;
+        let total_bytes = w * h * d * 4;
+        if self.z16_density_mat.len() != total_bytes {
+            self.z16_density_mat = vec![0u8; total_bytes];
+            self.z16_albedo_thermal = vec![0u8; total_bytes];
+        }
+
+        let x0 = bx_u * CHUNK_SIZE;
+        let y0 = by_u * CHUNK_SIZE;
+        let total_brick_voxels = CHUNK_SIZE * CHUNK_SIZE * d;
+        for (idx, dm, at) in patches {
+            let v = idx as usize;
+            if v >= total_brick_voxels {
+                continue;
+            }
+            let z = v / (CHUNK_SIZE * CHUNK_SIZE);
+            let rem = v % (CHUNK_SIZE * CHUNK_SIZE);
+            let dy = rem / CHUNK_SIZE;
+            let dx = rem % CHUNK_SIZE;
+            let gx = x0 + dx;
+            let gy = y0 + dy;
+            if gx >= w || gy >= h || z >= d {
+                continue;
+            }
+            // GPU (X=width, Y=depth, Z=height): [iz=gy][iy=z][ix=gx][4]
+            let dst = ((gy * d + z) * w + gx) * 4;
+            self.z16_density_mat[dst..dst + 4].copy_from_slice(&dm);
+            self.z16_albedo_thermal[dst..dst + 4].copy_from_slice(&at);
+        }
+
+        self.bytes_rx += raw_len;
+        self.bricks_3d_rx += 1;
+        self.bricks_3d_delta_rx += 1;
+        self.latest_field_tick = self.latest_field_tick.max(tick);
+        self.has_z16_bricks = true;
+
+        let bi = by_u * self.chunks_x + bx_u;
+        if bi < self.received_z16_bricks.len() {
+            self.received_z16_bricks[bi] = true;
+        }
+        if bi < self.dirty_z16_mask.len() && !self.dirty_z16_mask[bi] {
+            self.dirty_z16_mask[bi] = true;
+            self.dirty_z16_bricks.push((bx_u, by_u));
         }
     }
 
@@ -534,6 +609,16 @@ impl QuicClientHandle {
                                     let mut st = st_rel.lock().unwrap();
                                     st.apply_brick3d(raw_len, &brick);
                                 }
+                                ServerDatagram::VolumetricBrick3DDelta {
+                                    bx,
+                                    by,
+                                    depth,
+                                    tick,
+                                    lz4_deltas,
+                                } => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    st.apply_brick3d_delta(raw_len, bx, by, depth, tick, &lz4_deltas);
+                                }
                             }
                         }
                     } else if let Some(ServerReliable::Welcome {
@@ -627,6 +712,16 @@ impl QuicClientHandle {
                     ServerDatagram::VolumetricBrick3D(brick) => {
                         let mut st = st_dg.lock().unwrap();
                         st.apply_brick3d(raw_len, &brick);
+                    }
+                    ServerDatagram::VolumetricBrick3DDelta {
+                        bx,
+                        by,
+                        depth,
+                        tick,
+                        lz4_deltas,
+                    } => {
+                        let mut st = st_dg.lock().unwrap();
+                        st.apply_brick3d_delta(raw_len, bx, by, depth, tick, &lz4_deltas);
                     }
                 }
             }

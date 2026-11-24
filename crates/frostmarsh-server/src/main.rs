@@ -13,6 +13,7 @@
 //! - **3D Combat & Verticality:** Players/bots/projectiles move in 3D `(x, y, z)` with climbing ramps,
 //!   under-bridge rivers, cliff-drop gravity, destructible Layer 2 timber skybridges, and +25% High-Ground damage!
 
+mod persistence;
 mod ws_bridge;
 
 use bytes::Bytes;
@@ -30,7 +31,7 @@ use ort::session::Session;
 #[cfg(feature = "onnx")]
 use ort::value::Tensor;
 use quinn::{Connection, Endpoint, ServerConfig};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 #[cfg(unix)]
@@ -76,6 +77,18 @@ struct Args {
     /// Optional zero-dependency RFC 6455 WebSocket bridge bind address for Wave 12C WebGPU browser clients (e.g. 0.0.0.0:4434)
     #[arg(long)]
     ws_bind: Option<String>,
+    /// Per-peer EntitySnapshot AOI radius in meters (default 110.0m, max 48 players per snapshot)
+    #[arg(long, default_value_t = 110.0)]
+    entity_aoi_radius: f32,
+    /// Optional atomic persistence file path ("FMW1" LZ4-compressed world + player state)
+    #[arg(long)]
+    state_file: Option<PathBuf>,
+    /// Periodic atomic autosave interval in seconds when --state-file is set
+    #[arg(long, default_value_t = 15)]
+    autosave_secs: u64,
+    /// Enable persistent open-world MMO mode (disables 5-minute full-world reset)
+    #[arg(long, default_value_t = false)]
+    persistent_world: bool,
 }
 
 // ---------------- Neural Backends ----------------
@@ -119,6 +132,7 @@ struct CudaRpcClient {
     stream: Option<RpcStream>,
     seq: u32,
     actuator_v3_backoff: u32,
+    world_v8_unsupported: bool,
 }
 
 impl CudaRpcClient {
@@ -128,6 +142,7 @@ impl CudaRpcClient {
             stream: None,
             seq: 0,
             actuator_v3_backoff: 0,
+            world_v8_unsupported: false,
         };
         let _ = c.ensure_connected();
         c
@@ -154,7 +169,7 @@ impl CudaRpcClient {
         Ok(self.stream.as_mut().unwrap())
     }
 
-    fn call_batched(
+    fn call_batched_status(
         &mut self,
         op: u8,
         batch: u8,
@@ -162,7 +177,7 @@ impl CudaRpcClient {
         h: u16,
         w: u16,
         data: &[f32],
-    ) -> Result<(Vec<f32>, f32), Box<dyn std::error::Error>> {
+    ) -> Result<(Vec<f32>, f32), (Option<u8>, String)> {
         self.seq = self.seq.wrapping_add(1);
         let seq = self.seq;
         let payload_bytes = (data.len() * 4) as u32;
@@ -180,21 +195,26 @@ impl CudaRpcClient {
             payload.extend_from_slice(&v.to_le_bytes());
         }
 
-        let res = (|| -> Result<(Vec<f32>, f32), Box<dyn std::error::Error>> {
-            let s = self.ensure_connected()?;
-            s.write_all(&hdr)?;
-            s.write_all(&payload)?;
+        let res = (|| -> Result<(Vec<f32>, f32), (Option<u8>, String)> {
+            let s = self
+                .ensure_connected()
+                .map_err(|e| (None, e.to_string()))?;
+            s.write_all(&hdr).map_err(|e| (None, e.to_string()))?;
+            s.write_all(&payload).map_err(|e| (None, e.to_string()))?;
 
             let mut rhdr = [0u8; 16];
-            s.read_exact(&mut rhdr)?;
+            s.read_exact(&mut rhdr).map_err(|e| (None, e.to_string()))?;
             let status = rhdr[0];
             if status != 0 {
-                return Err(format!("CUDA daemon returned error status {}", status).into());
+                return Err((
+                    Some(status),
+                    format!("CUDA daemon op={} returned error status {}", op, status),
+                ));
             }
             let rlen = u32::from_le_bytes(rhdr[8..12].try_into().unwrap()) as usize;
             let infer_us = u32::from_le_bytes(rhdr[12..16].try_into().unwrap());
             let mut rbuf = vec![0u8; rlen];
-            s.read_exact(&mut rbuf)?;
+            s.read_exact(&mut rbuf).map_err(|e| (None, e.to_string()))?;
             let mut out = Vec::with_capacity(rlen / 4);
             for chunk in rbuf.chunks_exact(4) {
                 out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
@@ -202,10 +222,88 @@ impl CudaRpcClient {
             Ok((out, infer_us as f32 / 1000.0))
         })();
 
-        if res.is_err() {
-            self.stream = None;
+        if let Err((status, _)) = &res {
+            // STATUS_BAD_REQUEST (1): daemon drained payload and kept connection open
+            if *status != Some(1) {
+                self.stream = None;
+                self.world_v8_unsupported = false;
+            }
         }
         res
+    }
+
+    fn call_batched(
+        &mut self,
+        op: u8,
+        batch: u8,
+        in_ch: u16,
+        h: u16,
+        w: u16,
+        data: &[f32],
+    ) -> Result<(Vec<f32>, f32), Box<dyn std::error::Error>> {
+        self.call_batched_status(op, batch, in_ch, h, w, data)
+            .map_err(|(_, msg)| msg.into())
+    }
+
+    /// Wave 22B: Try live `op=11` (`OP_WORLD_V8_STEP`) appending the 6-float `world_laws` (`24` bytes)
+    /// after `local_dt_map`, with automatic one-time fallback to `op=9` (`OP_WORLD_DT_STEP`) if the
+    /// daemon returns `STATUS_BAD_REQUEST` (`status == 1`).
+    /// Returns `(flat_output, infer_ms, used_v8)`.
+    fn step_world_v8(
+        &mut self,
+        gd: usize,
+        gh: usize,
+        gw: usize,
+        batched_state: &[f32],
+        local_dt_map: &[f32],
+        laws: WorldLaws,
+    ) -> Result<(Vec<f32>, f32, bool), Box<dyn std::error::Error>> {
+        if !self.world_v8_unsupported {
+            let mut v8_payload = Vec::with_capacity(batched_state.len() + local_dt_map.len() + 6);
+            v8_payload.extend_from_slice(batched_state);
+            v8_payload.extend_from_slice(local_dt_map);
+            v8_payload.extend_from_slice(&[
+                laws.gravity_g,
+                laws.ambient_temp_shift,
+                laws.volatility,
+                laws.viscosity,
+                laws.precipitation,
+                laws.thermal_cond,
+            ]);
+            match self.call_batched_status(
+                11,
+                gd as u8,
+                INPUT_CHANNELS as u16,
+                gh as u16,
+                gw as u16,
+                &v8_payload,
+            ) {
+                Ok((flat, gpu_ms)) => return Ok((flat, gpu_ms, true)),
+                Err((Some(1), msg)) => {
+                    log::info!(
+                        "CUDA daemon returned STATUS_BAD_REQUEST for op=11 (OP_WORLD_V8_STEP: {}); latching fallback to op=9",
+                        msg
+                    );
+                    self.world_v8_unsupported = true;
+                }
+                Err((_, msg)) => {
+                    log::debug!("CUDA op=11 failed ({}); falling back to op=9", msg);
+                }
+            }
+        }
+
+        let mut dt_payload = Vec::with_capacity(batched_state.len() + local_dt_map.len());
+        dt_payload.extend_from_slice(batched_state);
+        dt_payload.extend_from_slice(local_dt_map);
+        let (flat, gpu_ms) = self.call_batched(
+            9,
+            gd as u8,
+            INPUT_CHANNELS as u16,
+            gh as u16,
+            gw as u16,
+            &dt_payload,
+        )?;
+        Ok((flat, gpu_ms, false))
     }
 
     fn call_json(
@@ -811,6 +909,8 @@ struct PlayerEntity {
     in_tunnel: bool,
     in_water: bool,
     airborne: bool,
+    actuator_window_tick: u64,
+    actuator_casts_in_window: u32,
 }
 
 impl PlayerEntity {
@@ -901,10 +1001,205 @@ struct TimeDomeEntity {
     owner_team: u8,
 }
 
+const MAX_SNAPSHOT_PLAYERS: usize = 48;
+const MAX_ACTUATOR_CASTS_PER_SEC: u32 = 8;
+/// Per-peer incremental Z=16 brick byte budget per 10 Hz tick (`15 KB/tick` = `150 KB/s` max terrain
+/// wire rate so total steady-state bandwidth including 30 Hz `EntitySnapshot` stays `< 220 KB/s`!).
+const MAX_PEER_BRICK_BYTES_PER_TICK: u64 = 15 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AoiRing {
+    /// `dist <= 4` bricks (`<= 64 m`): up to `10 Hz` (every tick), deadzone `4`.
+    Near,
+    /// `4 < dist <= 7` bricks (`<= 112 m`): `2 Hz` (every 5th tick), deadzone `5`.
+    Mid,
+    /// `dist > 7` bricks: `0.5 Hz` (every 20th tick), deadzone `5`.
+    Far,
+}
+
+#[inline]
+fn classify_aoi_ring(bx: i32, by: i32, pcx: i32, pcy: i32) -> AoiRing {
+    let dx = bx - pcx;
+    let dy = by - pcy;
+    let d2 = dx * dx + dy * dy;
+    if d2 <= 16 {
+        AoiRing::Near
+    } else if d2 <= 49 {
+        AoiRing::Mid
+    } else {
+        AoiRing::Far
+    }
+}
+
+#[inline]
+fn aoi_ring_due(ring: AoiRing, field_tick: u64, bx: u16, by: u16) -> bool {
+    let phase = (bx as u64).wrapping_add((by as u64).wrapping_mul(3));
+    match ring {
+        AoiRing::Near => true,
+        AoiRing::Mid => field_tick.wrapping_add(phase) % 5 == 0,
+        AoiRing::Far => field_tick.wrapping_add(phase) % 20 == 0,
+    }
+}
+
+#[inline]
+fn aoi_ring_deadzone(ring: AoiRing) -> u8 {
+    match ring {
+        AoiRing::Near => DEFAULT_BRICK3D_DELTA_DEADZONE,
+        AoiRing::Mid | AoiRing::Far => 5,
+    }
+}
+
+/// Select `my_pid` plus up to `max_players - 1` closest players within `radius` meters.
+fn select_aoi_players(
+    all_players: &[PlayerSnap],
+    my_pid: u32,
+    my_x: f32,
+    my_y: f32,
+    radius: f32,
+    max_players: usize,
+) -> Vec<PlayerSnap> {
+    let cap = max_players.max(1);
+    let r2 = if radius > 0.0 && radius.is_finite() {
+        radius * radius
+    } else {
+        f32::INFINITY
+    };
+    let mut out = Vec::with_capacity(all_players.len().min(cap));
+    let mut others: Vec<(f32, usize)> = Vec::with_capacity(all_players.len());
+    for (idx, p) in all_players.iter().enumerate() {
+        if p.id == my_pid {
+            out.push(p.clone());
+        } else {
+            let dx = p.x - my_x;
+            let dy = p.y - my_y;
+            let d2 = dx * dx + dy * dy;
+            if d2 <= r2 || p.carrying_relic {
+                // Prioritize relic carrier slightly while ordering primarily by proximity
+                let sort_key = if p.carrying_relic { d2 * 0.25 } else { d2 };
+                others.push((sort_key, idx));
+            }
+        }
+    }
+    others.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let remain = cap.saturating_sub(out.len());
+    for &(_, idx) in others.iter().take(remain) {
+        out.push(all_players[idx].clone());
+    }
+    out
+}
+
+/// Server-authoritative input sanitizer: strips `NaN`/`Inf` and enforces `||move|| <= 1.0`.
+fn sanitize_client_input(inp: &ClientInputDatagram) -> ClientInputDatagram {
+    let mut out = inp.clone();
+    if !out.move_x.is_finite() {
+        out.move_x = 0.0;
+    }
+    if !out.move_y.is_finite() {
+        out.move_y = 0.0;
+    }
+    let mlen = out.move_x.hypot(out.move_y);
+    if !mlen.is_finite() {
+        out.move_x = 0.0;
+        out.move_y = 0.0;
+    } else if mlen > 1.0 {
+        out.move_x /= mlen;
+        out.move_y /= mlen;
+    }
+    if !out.aim_x.is_finite() {
+        out.aim_x = 0.0;
+    }
+    if !out.aim_y.is_finite() {
+        out.aim_y = 0.0;
+    }
+    let alen = out.aim_x.hypot(out.aim_y);
+    if !alen.is_finite() || alen <= 1e-4 {
+        out.aim_x = 0.0;
+        out.aim_y = 0.0;
+    } else {
+        out.aim_x /= alen;
+        out.aim_y /= alen;
+    }
+    out.bolt_element %= 3;
+    out
+}
+
+/// Enforce per-tick maximum displacement consistent with `BodyMorphology` and world bounds.
+#[allow(clippy::too_many_arguments)]
+fn clamp_player_displacement(
+    prev: (f32, f32, f32),
+    next: (f32, f32, f32),
+    class_id: u8,
+    level: u8,
+    dashing: bool,
+    in_water: bool,
+    haste: bool,
+    kb_mag: f32,
+    dt: f32,
+    grid_w: f32,
+    grid_h: f32,
+    grid_d: f32,
+) -> (f32, f32, f32) {
+    let (px, py, pz) = prev;
+    let (mut nx, mut ny, mut nz) = next;
+    if !nx.is_finite() {
+        nx = px;
+    }
+    if !ny.is_finite() {
+        ny = py;
+    }
+    if !nz.is_finite() {
+        nz = pz;
+    }
+
+    let morph = BodyMorphology::from_archetype(class_id);
+    let (_, _, _, base_spd) = PlayerEntity::class_stats(class_id, level);
+    let mut max_speed = if dashing { 44.0 } else { base_spd * 1.35 };
+    if morph.buoyancy >= 0.70 && in_water {
+        max_speed *= 2.45;
+    }
+    if haste {
+        max_speed *= 1.35;
+    }
+    if class_id == CLASS_EMBERSTALKER {
+        max_speed *= 1.30;
+    }
+    // Include legitimate knockback / raft momentum + 15% safety margin
+    let max_h_disp = ((max_speed + kb_mag.max(0.0).min(45.0)) * dt * 1.15).max(0.35);
+    let dx = nx - px;
+    let dy = ny - py;
+    let h_dist = dx.hypot(dy);
+    if h_dist > max_h_disp && h_dist > 1e-5 {
+        let s = max_h_disp / h_dist;
+        nx = px + dx * s;
+        ny = py + dy * s;
+    }
+
+    // Vertical displacement consistent with wing_lift / climb_grip / buoyancy / gravity
+    let max_v_speed = 24.0
+        + morph.wing_lift * 12.0
+        + morph.climb_grip * 10.0
+        + morph.buoyancy * 8.0;
+    let max_v_disp = (max_v_speed * dt).max(1.25);
+    let dz = nz - pz;
+    if dz.abs() > max_v_disp {
+        nz = pz + dz.signum() * max_v_disp;
+    }
+
+    (
+        nx.clamp(2.5, (grid_w - 2.5).max(3.0)),
+        ny.clamp(2.5, (grid_h - 2.5).max(3.0)),
+        nz.clamp(0.0, (grid_d - 0.5).max(1.0)),
+    )
+}
+
+type RawBrickArc = Arc<(Vec<u8>, Vec<u8>)>;
+
 struct ClientPeer {
     conn: Connection,
     needs_full_sync: bool,
     macro_cursor: usize,
+    brick_shadow: HashMap<(u16, u16), RawBrickArc>,
+    pending_bricks: HashSet<(u16, u16)>,
 }
 
 #[derive(Clone, Debug)]
@@ -941,6 +1236,11 @@ struct GameState {
     chunks_x: usize,
     chunks_y: usize,
     aoi_radius: usize,
+    entity_aoi_radius: f32,
+    persistent_world: bool,
+    match_elapsed_offset_secs: u64,
+    persistent_players: HashMap<String, persistence::PersistentPlayerRecord>,
+    brick_raw_cache: HashMap<(u16, u16), RawBrickArc>,
     volume: VolumeField,
     eco: EcosystemState,
     sim_mode: String,
@@ -1098,6 +1398,11 @@ impl GameState {
             chunks_x,
             chunks_y,
             aoi_radius,
+            entity_aoi_radius: 110.0,
+            persistent_world: false,
+            match_elapsed_offset_secs: 0,
+            persistent_players: HashMap::new(),
+            brick_raw_cache: HashMap::new(),
             hazard_layers: vec![vec![1u8; grid_w * grid_h]; grid_d],
             volume,
             eco,
@@ -1680,6 +1985,8 @@ impl GameState {
                 in_tunnel: false,
                 in_water: false,
                 airborne: cls == CLASS_SKYWING,
+                actuator_window_tick: 0,
+                actuator_casts_in_window: 0,
             },
         );
         id
@@ -1989,7 +2296,8 @@ impl GameState {
         }
     }
 
-    fn apply_input(&mut self, pid: u32, inp: &ClientInputDatagram) {
+    fn apply_input(&mut self, pid: u32, inp_raw: &ClientInputDatagram) {
+        let inp = sanitize_client_input(inp_raw);
         if self.match_phase != MATCH_PHASE_ACTIVE {
             if let Some(p) = self.players.get_mut(&pid) {
                 if inp.seq > p.ack_input_seq || p.is_bot {
@@ -2021,7 +2329,12 @@ impl GameState {
                 p.aim_y = inp.aim_y / alen;
             }
             let mlen = inp.move_x.hypot(inp.move_y);
-            let (dx, dy) = if mlen > 0.01 { (inp.move_x / mlen, inp.move_y / mlen) } else { (0.0, 0.0) };
+            let (dx, dy) = if mlen > 0.01 {
+                (inp.move_x / mlen, inp.move_y / mlen)
+            } else {
+                (0.0, 0.0)
+            };
+            let move_scale = mlen.clamp(0.0, 1.0);
 
             let (_, _, _, base_spd) = PlayerEntity::class_stats(p.class_id, p.level);
             let dash_cd_ticks = match p.class_id {
@@ -2057,8 +2370,8 @@ impl GameState {
                 if tick < p.haste_until {
                     speed *= 1.32;
                 }
-                p.vx = dx * speed;
-                p.vy = dy * speed;
+                p.vx = dx * speed * move_scale;
+                p.vy = dy * speed * move_scale;
             }
 
             if inp.melee && tick >= p.melee_cd {
@@ -2437,10 +2750,22 @@ impl GameState {
         }
 
         let mana_cost = (tf.abs() * 4.5 + (sw + so + ss) * 4.0 + imp * 7.5) * (0.65 + r * 0.08);
+        let sim_tick_now = self.sim_tick;
         let (px, py, pz, team, class_id, burrow_ambush_until, scale) = {
             let Some(p) = self.players.get_mut(&pid) else {
                 return;
             };
+            // Anti-cheat actuator cast burst cap per second (30 ticks = 1.0s) for human clients
+            if !p.is_bot {
+                if sim_tick_now.saturating_sub(p.actuator_window_tick) >= 30 {
+                    p.actuator_window_tick = sim_tick_now;
+                    p.actuator_casts_in_window = 0;
+                }
+                if p.actuator_casts_in_window >= MAX_ACTUATOR_CASTS_PER_SEC {
+                    return;
+                }
+                p.actuator_casts_in_window = p.actuator_casts_in_window.saturating_add(1);
+            }
             if p.mana < 1.5 {
                 return;
             }
@@ -3259,7 +3584,10 @@ impl GameState {
         }
         for peer in self.peers.values_mut() {
             peer.needs_full_sync = true;
+            peer.brick_shadow.clear();
+            peer.pending_bricks.clear();
         }
+        self.brick_raw_cache.clear();
         if let Some(ref ws) = self.ws_bridge {
             ws.queue_full_sync_all();
         }
@@ -3312,7 +3640,10 @@ impl GameState {
         self.push_event(5, (self.grid_w as f32) * 0.5, (self.grid_h as f32) * 0.5, 0, 2, banner);
         for peer in self.peers.values_mut() {
             peer.needs_full_sync = true;
+            peer.brick_shadow.clear();
+            peer.pending_bricks.clear();
         }
+        self.brick_raw_cache.clear();
         if let Some(ref ws) = self.ws_bridge {
             ws.queue_full_sync_all();
         }
@@ -4481,8 +4812,12 @@ impl GameState {
             }
             return;
         }
-        let elapsed_s = self.match_start_instant.elapsed().as_secs() as u16;
-        self.match_time_left_s = MATCH_DURATION_SECS.saturating_sub(elapsed_s);
+        let elapsed_s = (self.match_elapsed_offset_secs + self.match_start_instant.elapsed().as_secs()) as u16;
+        self.match_time_left_s = if self.persistent_world {
+            MATCH_DURATION_SECS
+        } else {
+            MATCH_DURATION_SECS.saturating_sub(elapsed_s)
+        };
 
         if self.pending_chat.is_some() || (tick % 3 == 0 && self.neural_bots_on) {
             self.step_acoustics_rpc();
@@ -4858,6 +5193,25 @@ impl GameState {
                 }
                 fz = mz;
             }
+
+            let (p_level, p_haste) = {
+                let p = &self.players[&pid];
+                (p.level, tick < p.haste_until)
+            };
+            let (fx, fy, fz) = clamp_player_displacement(
+                (px, py, pz),
+                (fx, fy, fz),
+                class_id,
+                p_level,
+                tick < dash_until,
+                in_water,
+                p_haste,
+                kb_vx.hypot(kb_vy),
+                dt,
+                gw,
+                gh,
+                self.grid_d as f32,
+            );
 
             let critter_here = (self.sample_hazard(fx, fy, surf_l) >> 5) & 0x07;
             let near_friendly_shrine = {
@@ -5250,11 +5604,12 @@ impl GameState {
             self.push_event(4, px, py, 0, team, format!("{} TOOK RELIC!", name));
         }
 
-        // Check 5-minute match timeout or player-scaled early victory (500 pts @ 12P, 1600 pts @ 40P, 2560 pts @ 64P)
+        // Check 5-minute match timeout or player-scaled early victory (disabled in --persistent-world MMO mode!)
         let score_limit = MATCH_SCORE_LIMIT.max((self.players.len() as u16).saturating_mul(40));
-        if self.score_west >= score_limit
-            || self.score_east >= score_limit
-            || self.match_time_left_s == 0
+        if !self.persistent_world
+            && (self.score_west >= score_limit
+                || self.score_east >= score_limit
+                || self.match_time_left_s == 0)
         {
             self.match_phase = if self.score_west > self.score_east {
                 MATCH_PHASE_WEST_VICTORY
@@ -5637,7 +5992,7 @@ impl GameState {
             active_time_domes: time_domes.len().min(255) as u8,
             system2_slm_active: self.system2_slm_active,
         };
-        let match_secs = self.match_start_instant.elapsed().as_secs() as u32;
+        let match_secs = (self.match_elapsed_offset_secs + self.match_start_instant.elapsed().as_secs()) as u32;
         let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
         let speech_bubbles: Vec<SpeechBubbleSnap> =
             self.speech_bubbles.iter().map(|(_, b)| b.clone()).collect();
@@ -5651,10 +6006,42 @@ impl GameState {
         let actuator_pulses: Vec<ActuatorPulseSnap> =
             active_pulses.into_iter().take(16).map(|(_, s)| s).collect();
 
+        let entity_aoi_r = self.entity_aoi_radius;
+        let proj_r2 = if entity_aoi_r > 0.0 && entity_aoi_r.is_finite() {
+            let pr = entity_aoi_r + 32.0;
+            pr * pr
+        } else {
+            f32::INFINITY
+        };
         let mut dead = Vec::new();
         let mut total_bytes = 0u64;
         for (&pid, peer) in &self.peers {
-            let echo = self.players.get(&pid).map(|p| p.echo_client_time_ms).unwrap_or(0);
+            let (echo, my_x, my_y) = self
+                .players
+                .get(&pid)
+                .map(|p| (p.echo_client_time_ms, p.x, p.y))
+                .unwrap_or((0, self.grid_w as f32 * 0.5, self.grid_h as f32 * 0.5));
+            let peer_players = select_aoi_players(
+                &players,
+                pid,
+                my_x,
+                my_y,
+                entity_aoi_r,
+                MAX_SNAPSHOT_PLAYERS,
+            );
+            let peer_projectiles: Vec<ProjectileSnap> = if proj_r2.is_finite() {
+                projectiles
+                    .iter()
+                    .filter(|pr| {
+                        let dx = pr.x - my_x;
+                        let dy = pr.y - my_y;
+                        dx * dx + dy * dy <= proj_r2
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                projectiles.clone()
+            };
             let msg = ServerDatagram::EntitySnapshot {
                 sim_tick: tick,
                 match_time_secs: match_secs,
@@ -5662,8 +6049,8 @@ impl GameState {
                 echo_client_time_ms: echo,
                 relic_x: self.relic_x,
                 relic_y: self.relic_y,
-                players: players.clone(),
-                projectiles: projectiles.clone(),
+                players: peer_players,
+                projectiles: peer_projectiles,
                 bodies: bodies.clone(),
                 shrines: shrines.clone(),
                 events: events.clone(),
@@ -5702,9 +6089,147 @@ impl GameState {
         }
         self.record_wire_bytes(total_bytes / (self.peers.len().max(1) as u64));
         for pid in dead {
+            self.record_player_persistence(pid);
             self.peers.remove(&pid);
             self.players.remove(&pid);
         }
+    }
+
+    fn record_player_persistence(&mut self, pid: u32) {
+        if let Some(p) = self.players.get(&pid) {
+            if !p.is_bot && !p.name.is_empty() {
+                self.persistent_players.insert(
+                    p.name.clone(),
+                    persistence::PersistentPlayerRecord {
+                        x: p.x,
+                        y: p.y,
+                        z: p.z,
+                        class_id: p.class_id,
+                        team: p.team,
+                        xp: p.xp,
+                        kills: p.kills,
+                        deaths: p.deaths,
+                        level: p.level,
+                        score: p.score,
+                    },
+                );
+            }
+        }
+    }
+
+    fn apply_persistent_player_on_join(&mut self, pid: u32, name: &str, team: u8) {
+        let gw = self.grid_w as f32;
+        let gh = self.grid_h as f32;
+        let gd = self.grid_d as f32;
+        let saved = self.persistent_players.get(name).cloned();
+        if let Some(p) = self.players.get_mut(&pid) {
+            p.name = name.to_string();
+            if let Some(rec) = saved {
+                p.team = rec.team % 2;
+                p.class_id = rec.class_id % 5;
+                p.level = rec.level.clamp(1, 5);
+                let (mhp, mmp, mst, _) = PlayerEntity::class_stats(p.class_id, p.level);
+                p.max_hp = mhp;
+                p.hp = mhp;
+                p.max_mana = mmp;
+                p.mana = mmp;
+                p.max_stamina = mst;
+                p.stamina = mst;
+                p.x = rec.x.clamp(3.0, (gw - 4.0).max(3.5));
+                p.y = rec.y.clamp(3.0, (gh - 4.0).max(3.5));
+                p.z = rec.z.clamp(0.5, (gd - 1.5).max(1.0));
+                p.xp = rec.xp;
+                p.kills = rec.kills;
+                p.deaths = rec.deaths;
+                p.score = rec.score;
+            } else {
+                p.team = team % 2;
+            }
+        }
+    }
+
+    fn build_persistence_payload(&self) -> persistence::WorldPersistencePayload {
+        let mut players = self.persistent_players.clone();
+        for p in self.players.values() {
+            if !p.is_bot && !p.name.is_empty() {
+                players.insert(
+                    p.name.clone(),
+                    persistence::PersistentPlayerRecord {
+                        x: p.x,
+                        y: p.y,
+                        z: p.z,
+                        class_id: p.class_id,
+                        team: p.team,
+                        xp: p.xp,
+                        kills: p.kills,
+                        deaths: p.deaths,
+                        level: p.level,
+                        score: p.score,
+                    },
+                );
+            }
+        }
+        persistence::WorldPersistencePayload {
+            volume: self.volume.to_snapshot(),
+            players,
+            world_epoch: self.volume.evolution_stats.world_epoch,
+            match_elapsed_secs: self.match_elapsed_offset_secs
+                + self.match_start_instant.elapsed().as_secs(),
+            world_day: self.world_day,
+            weather_kind: self.weather_kind,
+            day_time: self.day_time,
+            score_west: self.score_west,
+            score_east: self.score_east,
+            tunnels_carved: self.tunnels_carved,
+            tunnel_mass_displaced: self.tunnel_mass_displaced,
+        }
+    }
+
+    fn restore_from_persistence(
+        &mut self,
+        payload: persistence::WorldPersistencePayload,
+    ) -> Result<(), String> {
+        let restored = VolumeField::from_snapshot(payload.volume)?;
+        let (w, h, d) = (restored.width, restored.height, restored.depth);
+        self.grid_w = w;
+        self.grid_h = h;
+        self.grid_d = d;
+        self.biome_id = restored.biome_id;
+        self.world_seed = restored.seed;
+        self.chunks_x = chunks_for_dim(w);
+        self.chunks_y = chunks_for_dim(h);
+        self.hazard_layers = vec![vec![1u8; w * h]; d];
+        self.eco = EcosystemState::new(w, h);
+        self.shrines = GameState::build_shrines(w, h);
+        self.last_epoch_name = restored.evolution_epoch_name();
+        self.mass_error = restored.mass_error();
+        self.energy_error = restored.energy_error();
+        self.volume = restored;
+        self.persistent_players = payload.players;
+        self.match_elapsed_offset_secs = payload.match_elapsed_secs;
+        self.match_start_instant = Instant::now();
+        if payload.world_day > 0 {
+            self.world_day = payload.world_day;
+        }
+        self.weather_kind = payload.weather_kind % 4;
+        if payload.day_time.is_finite() {
+            self.day_time = payload.day_time.rem_euclid(1.0);
+        }
+        self.score_west = payload.score_west;
+        self.score_east = payload.score_east;
+        self.tunnels_carved = payload.tunnels_carved;
+        self.tunnel_mass_displaced = payload.tunnel_mass_displaced;
+        self.brick_raw_cache.clear();
+        for peer in self.peers.values_mut() {
+            peer.needs_full_sync = true;
+            peer.brick_shadow.clear();
+            peer.pending_bricks.clear();
+        }
+        if let Some(ref ws) = self.ws_bridge {
+            ws.queue_full_sync_all();
+        }
+        self.refresh_hazard_grids();
+        Ok(())
     }
 
     fn encode_chunk_pkt(&self, layer: u8, cx: u16, cy: u16) -> Bytes {
@@ -5720,12 +6245,20 @@ impl GameState {
         Bytes::from(encode_server_datagram(&pkt))
     }
 
-    fn encode_brick3d_pkt(&self, bx: u16, by: u16) -> Bytes {
+    fn encode_brick3d_from_raw(&self, bx: u16, by: u16, dm: &[u8], at: &[u8]) -> Bytes {
         let brick_id = (by as u32) * (self.chunks_x as u32) + (bx as u32);
-        let (dm, at) = self.volume.encode_3d_brick_16(bx as usize, by as usize);
-        let brick = encode_brick3d_lz4(brick_id, bx, by, self.grid_d as u8, &dm, &at);
+        let brick = encode_brick3d_lz4(brick_id, bx, by, self.grid_d as u8, dm, at);
         let pkt = ServerDatagram::VolumetricBrick3D(brick);
         Bytes::from(encode_server_datagram(&pkt))
+    }
+
+    fn get_or_encode_raw_brick(&mut self, bx: u16, by: u16) -> RawBrickArc {
+        if let Some(arc) = self.brick_raw_cache.get(&(bx, by)) {
+            return arc.clone();
+        }
+        let raw = Arc::new(self.volume.encode_3d_brick_16(bx as usize, by as usize));
+        self.brick_raw_cache.insert((bx, by), raw.clone());
+        raw
     }
 
     fn send_packet_datagram_or_uni(rt_handle: &tokio::runtime::Handle, conn: &Connection, raw: Bytes) {
@@ -5796,77 +6329,80 @@ impl GameState {
         let total_2d = self.chunks_x * self.chunks_y;
         let aoi_r = self.aoi_radius as i32;
         let rt_handle = self.rt_handle.clone();
+        let field_tick = self.volume.tick;
+        let grid_d_u16 = self.grid_d as u16;
+        let cx_dim = self.chunks_x;
+        let cy_dim = self.chunks_y;
 
-        // Pre-encode dirty 3D chunks once (on Z=16 only surface APlusChunks + full 16-layer VolumetricBrick3D!)
+        // Pre-encode dirty 3D chunks/raw bricks once per 10 Hz tick!
         let mut dirty_map: HashMap<(u8, u16, u16), Bytes> = HashMap::with_capacity(dirty.len());
-        let mut dirty_bricks: HashMap<(u16, u16), Bytes> = HashMap::new();
+        let mut dirty_xy: Vec<(u16, u16)> = Vec::new();
+        let mut dirty_xy_set: HashSet<(u16, u16)> = HashSet::new();
         for &(layer, cx, cy) in dirty {
-            if !is_z16 || layer == surf_l {
+            if !is_z16 {
                 dirty_map.insert((layer, cx, cy), self.encode_chunk_pkt(layer, cx, cy));
+            } else if dirty_xy_set.insert((cx, cy)) {
+                dirty_xy.push((cx, cy));
             }
-            if is_z16 && !dirty_bricks.contains_key(&(cx, cy)) {
-                dirty_bricks.insert((cx, cy), self.encode_brick3d_pkt(cx, cy));
+        }
+        if is_z16 {
+            for &(bx, by) in &dirty_xy {
+                let raw = Arc::new(self.volume.encode_3d_brick_16(bx as usize, by as usize));
+                self.brick_raw_cache.insert((bx, by), raw);
             }
         }
 
         let any_full = self.peers.values().any(|p| p.needs_full_sync);
-        let (full_pkts, full_bricks): (Vec<Bytes>, Vec<Bytes>) = if any_full {
+        let mut full_pkts: Vec<Bytes> = Vec::new();
+        let mut full_bricks: Vec<((u16, u16), RawBrickArc, Bytes)> = Vec::new();
+        if any_full {
             if is_z16 {
-                // On --layers 16: stream full surface APlusChunks (minimap/2D fallback) + ALL VolumetricBrick3D bricks!
-                let mut surf_v = Vec::with_capacity(total_2d);
-                let mut brick_v = Vec::with_capacity(total_2d);
-                for by in 0..(self.chunks_y as u16) {
-                    for bx in 0..(self.chunks_x as u16) {
-                        if let Some(b) = dirty_map.get(&(surf_l, bx, by)) {
-                            surf_v.push(b.clone());
-                        } else {
-                            surf_v.push(self.encode_chunk_pkt(surf_l, bx, by));
-                        }
-                        if let Some(b) = dirty_bricks.get(&(bx, by)) {
-                            brick_v.push(b.clone());
-                        } else {
-                            brick_v.push(self.encode_brick3d_pkt(bx, by));
-                        }
+                full_bricks.reserve(total_2d);
+                for by in 0..(cy_dim as u16) {
+                    for bx in 0..(cx_dim as u16) {
+                        let raw = self.get_or_encode_raw_brick(bx, by);
+                        let pkt = self.encode_brick3d_from_raw(bx, by, &raw.0, &raw.1);
+                        full_bricks.push(((bx, by), raw, pkt));
                     }
                 }
-                (surf_v, brick_v)
             } else {
-                let mut v = Vec::with_capacity(total_2d * 2);
-                // Always send full surface layer (L1) + sparse non-empty chunks on L2 & L3!
+                full_pkts.reserve(total_2d * 2);
                 for layer in 0..(self.grid_d as u8) {
                     if layer == 0 && self.grid_d >= 2 {
-                        // L0 is deep riverbed beneath L1; only upper layers need client visuals!
                         continue;
                     }
-                    for cy in 0..(self.chunks_y as u16) {
-                        for cx in 0..(self.chunks_x as u16) {
-                            if layer != surf_l && !self.volume.is_chunk_non_empty(layer as usize, cx, cy) {
+                    for cy in 0..(cy_dim as u16) {
+                        for cx in 0..(cx_dim as u16) {
+                            if layer != surf_l
+                                && !self.volume.is_chunk_non_empty(layer as usize, cx, cy)
+                            {
                                 continue;
                             }
                             if let Some(b) = dirty_map.get(&(layer, cx, cy)) {
-                                v.push(b.clone());
+                                full_pkts.push(b.clone());
                             } else {
-                                v.push(self.encode_chunk_pkt(layer, cx, cy));
+                                full_pkts.push(self.encode_chunk_pkt(layer, cx, cy));
                             }
                         }
                     }
                 }
-                (v, Vec::new())
             }
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        }
 
         let player_chunks: HashMap<u32, (i32, i32)> = self
             .players
             .iter()
-            .map(|(&pid, p)| (pid, ((p.x as i32) / CHUNK_SIZE as i32, (p.y as i32) / CHUNK_SIZE as i32)))
+            .map(|(&pid, p)| {
+                (
+                    pid,
+                    ((p.x as i32) / CHUNK_SIZE as i32, (p.y as i32) / CHUNK_SIZE as i32),
+                )
+            })
             .collect();
 
-        let cx_dim = self.chunks_x;
+        // L=4 macro sweep cache (Z=16 uses per-peer shadow delta bricks + Concentric AOI Rate Rings!)
         let mut macro_cache: HashMap<(u16, u16), Bytes> = HashMap::new();
-        let mut macro_brick_cache: HashMap<(u16, u16), Bytes> = HashMap::new();
-        if aoi_r > 0 {
+        if !is_z16 && aoi_r > 0 {
             let cursors: Vec<usize> = self
                 .peers
                 .values()
@@ -5878,45 +6414,42 @@ impl GameState {
                     let ci = (cur + step) % total_2d;
                     let cx = (ci % cx_dim) as u16;
                     let cy = (ci / cx_dim) as u16;
-                    if !dirty_map.contains_key(&(surf_l, cx, cy)) && !macro_cache.contains_key(&(cx, cy)) {
-                        macro_cache.insert((cx, cy), self.encode_chunk_pkt(surf_l, cx, cy));
-                    }
-                    if is_z16
-                        && step < 2
-                        && !dirty_bricks.contains_key(&(cx, cy))
-                        && !macro_brick_cache.contains_key(&(cx, cy))
+                    if !dirty_map.contains_key(&(surf_l, cx, cy)) && !macro_cache.contains_key(&(cx, cy))
                     {
-                        macro_brick_cache.insert((cx, cy), self.encode_brick3d_pkt(cx, cy));
+                        macro_cache.insert((cx, cy), self.encode_chunk_pkt(surf_l, cx, cy));
                     }
                 }
             }
         }
-        let mut bytes_one_peer = 0u64;
-        let mut chunks_sent_one = 0u16;
+
+        // Lazy cache for full-brick fallback packets during incremental delta ticks
+        let mut fallback_full_cache: HashMap<(u16, u16), Bytes> = HashMap::new();
+        let grid_d_u8 = self.grid_d as u8;
+
+        let mut total_peer_bytes = 0u64;
+        let mut total_peer_chunks = 0u64;
+        let peer_count = self.peers.len().max(1) as u64;
+
         for (&pid, peer) in self.peers.iter_mut() {
             let mut peer_b = 0u64;
             let mut sent_cnt = 0u16;
             if peer.needs_full_sync {
                 peer.needs_full_sync = false;
+                peer.pending_bricks.clear();
+                peer.brick_shadow.clear();
                 if is_z16 {
-                    let mut batch_pkts = Vec::with_capacity(full_bricks.len() + full_pkts.len());
-                    // Prioritize full 3D VolumetricBrick3D world first so client renders all 16 layers immediately!
-                    for b in &full_bricks {
-                        peer_b += b.len() as u64;
+                    let mut batch_pkts = Vec::with_capacity(full_bricks.len());
+                    for ((bx, by), raw_arc, pkt) in &full_bricks {
+                        peer.brick_shadow.insert((*bx, *by), raw_arc.clone());
+                        peer_b += pkt.len() as u64;
                         sent_cnt = sent_cnt.saturating_add(1);
-                        batch_pkts.push(b.clone());
-                    }
-                    for b in &full_pkts {
-                        peer_b += b.len() as u64;
-                        sent_cnt = sent_cnt.saturating_add(1);
-                        batch_pkts.push(b.clone());
+                        batch_pkts.push(pkt.clone());
                     }
                     log::info!(
-                        "Full Z={} sync queued for player {}: {} VolumetricBrick3D bricks + {} surf chunks ({:.1} KB)",
+                        "Full Z={} sync queued for player {}: {} VolumetricBrick3D bricks ({:.1} KB)",
                         self.grid_d,
                         pid,
                         full_bricks.len(),
-                        full_pkts.len(),
                         peer_b as f32 / 1024.0
                     );
                     Self::send_packets_batched(&rt_handle, peer.conn.clone(), batch_pkts);
@@ -5931,60 +6464,167 @@ impl GameState {
                 let (pcx, pcy) = player_chunks
                     .get(&pid)
                     .copied()
-                    .unwrap_or(((cx_dim / 2) as i32, (self.chunks_y / 2) as i32));
-                for (&(layer, cx, cy), b) in &dirty_map {
-                    if layer == 0 && self.grid_d >= 2 {
-                        continue;
-                    }
-                    let in_aoi = aoi_r == 0
-                        || ((cx as i32 - pcx).abs() <= aoi_r && (cy as i32 - pcy).abs() <= aoi_r);
-                    if in_aoi {
-                        peer_b += b.len() as u64;
-                        sent_cnt = sent_cnt.saturating_add(1);
-                        let _ = peer.conn.send_datagram(b.clone());
-                    }
-                }
-                let mut z16_bricks_out: Vec<Bytes> = Vec::new();
+                    .unwrap_or(((cx_dim / 2) as i32, (cy_dim / 2) as i32));
+
                 if is_z16 {
-                    for (&(bx, by), b) in &dirty_bricks {
-                        let in_aoi = aoi_r == 0
-                            || ((bx as i32 - pcx).abs() <= aoi_r && (by as i32 - pcy).abs() <= aoi_r);
-                        if in_aoi {
-                            peer_b += b.len() as u64;
-                            sent_cnt = sent_cnt.saturating_add(1);
-                            z16_bricks_out.push(b.clone());
+                    // Queue dirty bricks into peer's pending set
+                    for &(bx, by) in &dirty_xy {
+                        peer.pending_bricks.insert((bx, by));
+                    }
+
+                    // Drain bricks whose Concentric AOI Distance Rate Ring is due this tick!
+                    let mut due_bricks: Vec<(i32, (u16, u16), AoiRing)> = Vec::new();
+                    peer.pending_bricks.retain(|&(bx, by)| {
+                        let ring = classify_aoi_ring(bx as i32, by as i32, pcx, pcy);
+                        if aoi_ring_due(ring, field_tick, bx, by) {
+                            let dx = bx as i32 - pcx;
+                            let dy = by as i32 - pcy;
+                            due_bricks.push((dx * dx + dy * dy, (bx, by), ring));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    // Prioritize closest bricks to the player first (rotating tie-break so outer Near bricks never starve)
+                    let tie_salt = (field_tick as u16).wrapping_mul(17);
+                    due_bricks.sort_by_key(|&(d2, (bx, by), _)| {
+                        let rot = bx.wrapping_add(by.wrapping_mul(7)).wrapping_add(tie_salt);
+                        (d2, rot)
+                    });
+
+                    let mut z16_out: Vec<Bytes> = Vec::with_capacity(due_bricks.len());
+                    let mut budget_hit = false;
+                    for &(_, (bx, by), ring) in &due_bricks {
+                        if budget_hit {
+                            peer.pending_bricks.insert((bx, by));
+                            continue;
+                        }
+                        let Some(cur_arc) = self.brick_raw_cache.get(&(bx, by)) else {
+                            continue;
+                        };
+                        let deadzone = aoi_ring_deadzone(ring);
+                        match peer.brick_shadow.get(&(bx, by)) {
+                            Some(prev_arc) if Arc::ptr_eq(prev_arc, cur_arc) => {
+                                // Identical Arc -> 0 bytes!
+                            }
+                            Some(prev_arc) => {
+                                match encode_brick3d_delta(
+                                    &prev_arc.0,
+                                    &prev_arc.1,
+                                    &cur_arc.0,
+                                    &cur_arc.1,
+                                    deadzone,
+                                ) {
+                                    None => {
+                                        // 0 voxels exceeded deadzone -> skip completely (0 bytes!)
+                                    }
+                                    Some(lz4_deltas)
+                                        if !is_brick3d_delta_full_signal(&lz4_deltas) =>
+                                    {
+                                        let pkt = ServerDatagram::VolumetricBrick3DDelta {
+                                            bx,
+                                            by,
+                                            depth: grid_d_u16,
+                                            tick: field_tick,
+                                            lz4_deltas,
+                                        };
+                                        let raw_pkt = Bytes::from(encode_server_datagram(&pkt));
+                                        peer_b += raw_pkt.len() as u64;
+                                        sent_cnt = sent_cnt.saturating_add(1);
+                                        z16_out.push(raw_pkt);
+                                        peer.brick_shadow.insert((bx, by), cur_arc.clone());
+                                        if peer_b >= MAX_PEER_BRICK_BYTES_PER_TICK {
+                                            budget_hit = true;
+                                        }
+                                    }
+                                    Some(_) => {
+                                        // >= 35% of voxels changed -> send full VolumetricBrick3D
+                                        let raw_pkt = fallback_full_cache
+                                            .entry((bx, by))
+                                            .or_insert_with(|| {
+                                                let brick_id =
+                                                    (by as u32) * (cx_dim as u32) + (bx as u32);
+                                                let brick = encode_brick3d_lz4(
+                                                    brick_id, bx, by, grid_d_u8, &cur_arc.0,
+                                                    &cur_arc.1,
+                                                );
+                                                Bytes::from(encode_server_datagram(
+                                                    &ServerDatagram::VolumetricBrick3D(brick),
+                                                ))
+                                            })
+                                            .clone();
+                                        peer_b += raw_pkt.len() as u64;
+                                        sent_cnt = sent_cnt.saturating_add(1);
+                                        z16_out.push(raw_pkt);
+                                        peer.brick_shadow.insert((bx, by), cur_arc.clone());
+                                        if peer_b >= MAX_PEER_BRICK_BYTES_PER_TICK {
+                                            budget_hit = true;
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                let raw_pkt = fallback_full_cache
+                                    .entry((bx, by))
+                                    .or_insert_with(|| {
+                                        let brick_id =
+                                            (by as u32) * (cx_dim as u32) + (bx as u32);
+                                        let brick = encode_brick3d_lz4(
+                                            brick_id, bx, by, grid_d_u8, &cur_arc.0, &cur_arc.1,
+                                        );
+                                        Bytes::from(encode_server_datagram(
+                                            &ServerDatagram::VolumetricBrick3D(brick),
+                                        ))
+                                    })
+                                    .clone();
+                                peer_b += raw_pkt.len() as u64;
+                                sent_cnt = sent_cnt.saturating_add(1);
+                                z16_out.push(raw_pkt);
+                                peer.brick_shadow.insert((bx, by), cur_arc.clone());
+                                if peer_b >= MAX_PEER_BRICK_BYTES_PER_TICK {
+                                    budget_hit = true;
+                                }
+                            }
                         }
                     }
-                }
-                if aoi_r > 0 {
-                    for step in 0..12 {
-                        let ci = (peer.macro_cursor + step) % total_2d;
-                        let cx = (ci % cx_dim) as u16;
-                        let cy = (ci / cx_dim) as u16;
-                        if let Some(b) = macro_cache.get(&(cx, cy)) {
+
+                    if !z16_out.is_empty() {
+                        Self::send_packets_batched(&rt_handle, peer.conn.clone(), z16_out);
+                    }
+                } else {
+                    for (&(layer, cx, cy), b) in &dirty_map {
+                        if layer == 0 && self.grid_d >= 2 {
+                            continue;
+                        }
+                        let in_aoi = aoi_r == 0
+                            || ((cx as i32 - pcx).abs() <= aoi_r
+                                && (cy as i32 - pcy).abs() <= aoi_r);
+                        if in_aoi {
                             peer_b += b.len() as u64;
                             sent_cnt = sent_cnt.saturating_add(1);
                             let _ = peer.conn.send_datagram(b.clone());
                         }
-                        if is_z16 && step < 2 {
-                            if let Some(b) = macro_brick_cache.get(&(cx, cy)) {
+                    }
+                    if aoi_r > 0 {
+                        for step in 0..12 {
+                            let ci = (peer.macro_cursor + step) % total_2d;
+                            let cx = (ci % cx_dim) as u16;
+                            let cy = (ci / cx_dim) as u16;
+                            if let Some(b) = macro_cache.get(&(cx, cy)) {
                                 peer_b += b.len() as u64;
                                 sent_cnt = sent_cnt.saturating_add(1);
-                                z16_bricks_out.push(b.clone());
+                                let _ = peer.conn.send_datagram(b.clone());
                             }
                         }
+                        peer.macro_cursor = (peer.macro_cursor + 12) % total_2d;
                     }
-                    peer.macro_cursor = (peer.macro_cursor + 12) % total_2d;
-                }
-                if !z16_bricks_out.is_empty() {
-                    Self::send_packets_batched(&rt_handle, peer.conn.clone(), z16_bricks_out);
                 }
             }
-            bytes_one_peer = peer_b;
-            chunks_sent_one = sent_cnt;
+            total_peer_bytes += peer_b;
+            total_peer_chunks += sent_cnt as u64;
         }
-        self.aoi_chunks_sent_last = chunks_sent_one;
-        self.record_wire_bytes(bytes_one_peer);
+        self.aoi_chunks_sent_last = (total_peer_chunks / peer_count) as u16;
+        self.record_wire_bytes(total_peer_bytes / peer_count);
     }
 
     fn record_wire_bytes(&mut self, bytes_per_client: u64) {
@@ -6028,16 +6668,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server_cfg = make_quic_server_config()?;
     let endpoint = Endpoint::server(server_cfg, args.bind)?;
-    let state = Arc::new(Mutex::new(GameState::new(
-        args.backend.clone(),
-        args.cuda_addr.clone(),
-        args.size,
-        args.layers,
-        args.biome,
-        args.seed,
-        args.bots,
-        args.aoi_radius,
-    )));
+    let state = Arc::new(Mutex::new({
+        let mut gs = GameState::new(
+            args.backend.clone(),
+            args.cuda_addr.clone(),
+            args.size,
+            args.layers,
+            args.biome,
+            args.seed,
+            args.bots,
+            args.aoi_radius,
+        );
+        gs.entity_aoi_radius = args.entity_aoi_radius;
+        gs.persistent_world = args.persistent_world;
+        if let Some(ref sf) = args.state_file {
+            if sf.exists() {
+                match persistence::load_world(sf) {
+                    Ok(payload) => match gs.restore_from_persistence(payload) {
+                        Ok(()) => {
+                            log::info!(
+                                "Restored persistent world from {} (tick={}, {}x{}x{}, biome={}, players={}, mass_err={}, energy_err={})",
+                                sf.display(),
+                                gs.volume.tick,
+                                gs.grid_w,
+                                gs.grid_h,
+                                gs.grid_d,
+                                biome_name(gs.biome_id),
+                                gs.persistent_players.len(),
+                                gs.volume.mass_error(),
+                                gs.volume.energy_error()
+                            );
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Failed to apply persisted world from {}: {} (starting fresh)",
+                                sf.display(),
+                                e
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        log::error!(
+                            "Failed to load persisted world from {}: {} (starting fresh)",
+                            sf.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        gs
+    }));
     let (grid_w, grid_h, grid_d, biome_id, world_seed, chunks_x, chunks_y, bot_counts) = {
         let gs = state.lock().unwrap();
         let mut cls_cnt = [0usize; 5];
@@ -6098,7 +6779,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut world_3d_backoff: u32 = 0;
         loop {
             let t_loop = Instant::now();
-            let (mode, eco_on, gw, gh, gd, weather_kind, day_time_now, batched_in, eco_in, fallback_raws, local_dt_map, has_active_domes) = {
+            let (mode, eco_on, gw, gh, gd, weather_kind, day_time_now, batched_in, eco_in, fallback_raws, local_dt_map, has_active_domes, world_laws) = {
                 let gs = field_state.lock().unwrap();
                 let sl = gs.surf_layer();
                 let m = gs.sim_mode.clone();
@@ -6108,7 +6789,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let raws = if m != "neural" { Some(gs.volume.refsim_raw_outputs_all()) } else { None };
                 let has_d = !gs.time_domes.is_empty();
                 let dt_map = gs.build_local_dt_map();
-                (m, e, gs.grid_w, gs.grid_h, gs.grid_d, gs.weather_kind, gs.day_time, bin, ein, raws, dt_map, has_d)
+                let laws = gs.volume.world_laws;
+                (m, e, gs.grid_w, gs.grid_h, gs.grid_d, gs.weather_kind, gs.day_time, bin, ein, raws, dt_map, has_d, laws)
             };
 
             let t0 = Instant::now();
@@ -6119,15 +6801,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let z_len = gd.saturating_sub(1) * 5 * gw * gh;
                     let expected_3d_len = horiz_len + z_len;
 
-                    // 1. Try op=9 (`OP_WORLD_DT_STEP` — WorldModelDT continuous local_dt Time-Dilation Domes!)
-                    let mut op9_result: Option<(Vec<RawStepOutput>, Vec<f32>, f32)> = None;
+                    // 1. Try op=11 (`OP_WORLD_V8_STEP` with live 6-float `world_laws`) with automatic
+                    //    one-time fallback to op=9 (`OP_WORLD_DT_STEP`) on `STATUS_BAD_REQUEST`!
+                    let mut op9_result: Option<(Vec<RawStepOutput>, Vec<f32>, f32, bool)> = None;
                     if world_dt_backoff == 0 && gd >= 2 {
                         let bin = batched_in.as_ref().unwrap();
-                        let mut dt_payload = Vec::with_capacity(bin.len() + local_dt_map.len());
-                        dt_payload.extend_from_slice(bin);
-                        dt_payload.extend_from_slice(&local_dt_map);
-                        match rpc.call_batched(9, gd as u8, INPUT_CHANNELS as u16, gh as u16, gw as u16, &dt_payload) {
-                            Ok((flat, gpu_ms)) if flat.len() == expected_3d_len => {
+                        match rpc.step_world_v8(gd, gh, gw, bin, &local_dt_map, world_laws) {
+                            Ok((flat, gpu_ms, used_v8)) if flat.len() == expected_3d_len => {
                                 let mut layers_out = Vec::with_capacity(gd);
                                 for z in 0..gd {
                                     let s = z * per;
@@ -6138,19 +6818,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     });
                                 }
                                 let z_flux = flat[horiz_len..expected_3d_len].to_vec();
-                                op9_result = Some((layers_out, z_flux, gpu_ms));
+                                op9_result = Some((layers_out, z_flux, gpu_ms, used_v8));
                             }
-                            Ok((flat, _)) => {
+                            Ok((flat, _, _)) => {
                                 log::warn!(
-                                    "CUDA op=9 returned unexpected payload len {} (expected {}), falling back to op=8",
+                                    "CUDA op=11/op=9 returned unexpected payload len {} (expected {}), falling back to op=8",
                                     flat.len(),
                                     expected_3d_len
                                 );
                                 world_dt_backoff = 50;
                             }
                             Err(e) => {
-                                // Daemon does not have world_model_dt.pt loaded; retry periodically
-                                log::debug!("CUDA op=9 unavailable for {}x{}x{} ({}); falling back to op=8", gw, gh, gd, e);
+                                log::debug!("CUDA op=11/op=9 unavailable for {}x{}x{} ({}); falling back to op=8", gw, gh, gd, e);
                                 world_dt_backoff = 50;
                             }
                         }
@@ -6158,8 +6837,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         world_dt_backoff -= 1;
                     }
 
-                    if let Some((layers_out, z_flux, gpu_ms)) = op9_result {
-                        (layers_out, Some(z_flux), gpu_ms, "cuda-fp16-dt".to_string(), true, true)
+                    if let Some((layers_out, z_flux, gpu_ms, used_v8)) = op9_result {
+                        let label = if used_v8 { "cuda-fp16-v8" } else { "cuda-fp16-dt" };
+                        (layers_out, Some(z_flux), gpu_ms, label.to_string(), true, true)
                     } else {
                         // 2. Fallback to op=8 (`WorldModel3D` v4)
                         let mut op8_result: Option<(Vec<RawStepOutput>, Vec<f32>, f32)> = None;
@@ -6388,7 +7068,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    while let Some(incoming) = endpoint.accept().await {
+    // Periodic atomic persistence autosave task when --state-file is provided
+    if let Some(ref sf) = args.state_file {
+        if args.autosave_secs > 0 {
+            let save_state = state.clone();
+            let save_path = sf.clone();
+            let every = Duration::from_secs(args.autosave_secs);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(every);
+                interval.tick().await; // skip immediate tick at t=0
+                loop {
+                    interval.tick().await;
+                    let payload = { save_state.lock().unwrap().build_persistence_payload() };
+                    let path_c = save_path.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        persistence::save_world_atomic(&path_c, &payload)
+                    })
+                    .await
+                    {
+                        Ok(Ok(bytes)) => {
+                            log::info!(
+                                "Autosaved persistent world atomically -> {} ({:.1} KB)",
+                                save_path.display(),
+                                bytes as f32 / 1024.0
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            log::error!("Autosave to {} failed: {}", save_path.display(), e);
+                        }
+                        Err(e) => {
+                            log::error!("Autosave task join error: {}", e);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    let shutdown_fut = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+                return;
+            }
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    tokio::pin!(shutdown_fut);
+
+    loop {
+        let incoming = tokio::select! {
+            _ = &mut shutdown_fut => {
+                log::info!("Shutdown signal received; flushing persistent world state...");
+                break;
+            }
+            inc = endpoint.accept() => {
+                match inc {
+                    Some(i) => i,
+                    None => break,
+                }
+            }
+        };
         let st = state.clone();
         tokio::spawn(async move {
             let Ok(conn) = incoming.await else { return; };
@@ -6396,7 +7141,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (pid, gw, gh, gd) = {
                 let mut gs = st.lock().unwrap();
                 let pid = gs.spawn_player(format!("Hero-{}", remote.port() % 1000), 0, CLASS_WARDEN, false);
-                gs.peers.insert(pid, ClientPeer { conn: conn.clone(), needs_full_sync: true, macro_cursor: 0 });
+                gs.peers.insert(
+                    pid,
+                    ClientPeer {
+                        conn: conn.clone(),
+                        needs_full_sync: true,
+                        macro_cursor: 0,
+                        brick_shadow: HashMap::new(),
+                        pending_bricks: HashSet::new(),
+                    },
+                );
                 (pid, gs.grid_w as u16, gs.grid_h as u16, gs.grid_d as u8)
             };
             log::info!("QUIC client connected from {} -> player_id={} ({}x{}x{})", remote, pid, gw, gh, gd);
@@ -6424,10 +7178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut gs = st.lock().unwrap();
                         match cmd {
                             ClientReliable::Join { name, team } => {
-                                if let Some(p) = gs.players.get_mut(&pid) {
-                                    p.name = name;
-                                    p.team = team % 2;
-                                }
+                                gs.apply_persistent_player_on_join(pid, &name, team);
                             }
                             ClientReliable::SelectClass { class_id } => {
                                 if let Some(p) = gs.players.get_mut(&pid) {
@@ -6579,9 +7330,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             dg_task.abort();
             let mut gs = st.lock().unwrap();
+            gs.record_player_persistence(pid);
             gs.peers.remove(&pid);
             gs.players.remove(&pid);
         });
+    }
+
+    if let Some(ref sf) = args.state_file {
+        let (payload, mass_err, energy_err) = {
+            let gs = state.lock().unwrap();
+            (
+                gs.build_persistence_payload(),
+                gs.volume.mass_error(),
+                gs.volume.energy_error(),
+            )
+        };
+        match persistence::save_world_atomic(sf, &payload) {
+            Ok(bytes) => {
+                log::info!(
+                    "Saved final persistent world state -> {} ({:.1} KB, mass_err={}, energy_err={})",
+                    sf.display(),
+                    bytes as f32 / 1024.0,
+                    mass_err,
+                    energy_err
+                );
+            }
+            Err(e) => {
+                log::error!("Final atomic save to {} failed: {}", sf.display(), e);
+            }
+        }
     }
 
     Ok(())
@@ -6932,5 +7709,189 @@ mod tests {
             vz_low_g,
             vz_std
         );
+    }
+
+    #[tokio::test]
+    async fn test_wave22b_delta_aoi_rings_entity_culling_anticheat_and_persistence() {
+        // 1. Concentric AOI Distance Rate Rings (Near <=4 @ 10Hz dz=4, Mid 5..=7 @ 2Hz dz=5, Far >7 @ 0.5Hz dz=5)
+        assert_eq!(classify_aoi_ring(4, 4, 4, 4), AoiRing::Near);
+        assert_eq!(classify_aoi_ring(8, 4, 4, 4), AoiRing::Near);
+        assert_eq!(classify_aoi_ring(9, 4, 4, 4), AoiRing::Mid);
+        assert_eq!(classify_aoi_ring(11, 4, 4, 4), AoiRing::Mid);
+        assert_eq!(classify_aoi_ring(12, 4, 4, 4), AoiRing::Far);
+        assert_eq!(aoi_ring_deadzone(AoiRing::Near), 4);
+        assert_eq!(aoi_ring_deadzone(AoiRing::Mid), 5);
+        assert_eq!(aoi_ring_deadzone(AoiRing::Far), 5);
+
+        let near_hits: usize = (0..20).filter(|&t| aoi_ring_due(AoiRing::Near, t, 2, 3)).count();
+        let mid_hits: usize = (0..20).filter(|&t| aoi_ring_due(AoiRing::Mid, t, 2, 3)).count();
+        let far_hits: usize = (0..20).filter(|&t| aoi_ring_due(AoiRing::Far, t, 2, 3)).count();
+        assert_eq!(near_hits, 20, "Near ring must fire at 10 Hz (20/20 ticks)");
+        assert_eq!(mid_hits, 4, "Mid ring must fire at 2 Hz (4/20 ticks)");
+        assert_eq!(far_hits, 1, "Far ring must fire at 0.5 Hz (1/20 ticks)");
+
+        // 2. Entity AOI Culling: 64 players -> <= 48 in snapshot, always includes self, closest prioritized
+        let all_snaps: Vec<PlayerSnap> = (1..=64u32)
+            .map(|id| PlayerSnap {
+                id,
+                name: format!("P{}", id),
+                team: (id % 2) as u8,
+                class_id: (id % 5) as u8,
+                is_bot: id != 1,
+                x: if id == 1 { 64.0 } else { 64.0 + (id as f32) * 1.2 },
+                y: 64.0,
+                z: 4.0,
+                vx: 0.0,
+                vy: 0.0,
+                vz: 0.0,
+                aim_x: 1.0,
+                aim_y: 0.0,
+                hp: 100,
+                max_hp: 100,
+                mana: 100,
+                max_mana: 100,
+                stamina: 100,
+                max_stamina: 100,
+                level: 1,
+                xp: 0,
+                kills: 0,
+                deaths: 0,
+                status_flags: 0,
+                dashing: false,
+                melee_active: false,
+                ult_active: false,
+                carrying_relic: false,
+                dash_cd_frac: 0.0,
+                ability_e_cd_frac: 0.0,
+                ult_r_cd_frac: 0.0,
+                ack_input_seq: 0,
+                score: 0,
+            })
+            .collect();
+        let culled = select_aoi_players(&all_snaps, 1, 64.0, 64.0, 110.0, MAX_SNAPSHOT_PLAYERS);
+        assert_eq!(culled.len(), MAX_SNAPSHOT_PLAYERS);
+        assert_eq!(culled[0].id, 1, "self must always be included first");
+        assert!(culled.iter().all(|p| (p.x - 64.0).abs() <= 110.0));
+
+        // 3. Anti-cheat: NaN/Inf sanitization, move norm <= 1.0, BodyMorphology displacement clamp, actuator rate cap
+        let bad_inp = ClientInputDatagram {
+            seq: 1,
+            move_x: 100.0,
+            move_y: 100.0,
+            aim_x: f32::NAN,
+            aim_y: f32::INFINITY,
+            dash: false,
+            melee: false,
+            cast_bolt: false,
+            bolt_element: 99,
+            carve_ice: false,
+            cast_ability_e: false,
+            cast_ultimate_r: false,
+            client_time_ms: 1,
+        };
+        let clean = sanitize_client_input(&bad_inp);
+        assert!(clean.move_x.hypot(clean.move_y) <= 1.0001);
+        assert!(clean.aim_x.is_finite() && clean.aim_y.is_finite());
+        assert!(clean.bolt_element < 3);
+
+        let clamped = clamp_player_displacement(
+            (32.0, 32.0, 4.0),
+            (60.0, 32.0, 14.0),
+            CLASS_STRIDER,
+            1,
+            false,
+            false,
+            false,
+            0.0,
+            1.0 / 30.0,
+            64.0,
+            64.0,
+            16.0,
+        );
+        assert!((clamped.0 - 32.0).abs() < 2.0, "teleport displacement must be clamped: {:?}", clamped);
+        assert!((clamped.2 - 4.0).abs() < 2.0, "vertical spike must be clamped: {:?}", clamped);
+
+        // 4. Actuator burst rate limiter & Persistent World + Atomic Save/Reload roundtrip
+        let mut gs = GameState::new(
+            "refsim".to_string(),
+            "127.0.0.1:14440".to_string(),
+            64,
+            16,
+            1,
+            9,
+            4,
+            4,
+        );
+        gs.persistent_world = true;
+        let human_id = gs.spawn_player("Tester".into(), 0, CLASS_SKYWING, false);
+        if let Some(p) = gs.players.get_mut(&human_id) {
+            p.x = 30.0;
+            p.y = 30.0;
+            p.z = 5.0;
+            p.kills = 4;
+            p.xp = 65;
+            p.mana = 145.0;
+        }
+        // Spam 20 actuator casts in the same tick -> capped at MAX_ACTUATOR_CASTS_PER_SEC (8)
+        for _ in 0..20 {
+            if let Some(p) = gs.players.get_mut(&human_id) {
+                p.mana = 145.0;
+            }
+            gs.apply_player_physical_actuator(human_id, 4.0, 0.0, 0.8, 0.0, 0.0, 0.0, 3.0, 0.0);
+        }
+        assert_eq!(
+            gs.players[&human_id].actuator_casts_in_window,
+            MAX_ACTUATOR_CASTS_PER_SEC,
+            "human actuator cast burst must be strictly capped per second"
+        );
+
+        // Persistent world must NOT trigger match-over reset even when score >= limit
+        gs.score_west = 9999;
+        gs.tick_combat_30hz();
+        assert_eq!(
+            gs.match_phase, MATCH_PHASE_ACTIVE,
+            "--persistent-world must prevent 5-minute/score full-world reset"
+        );
+
+        // Step 3D physics + save atomically + reload into fresh GameState -> exact conservation!
+        for _ in 0..3 {
+            let raws = gs.volume.refsim_raw_outputs_all();
+            let st = gs.volume.step_3d(&raws);
+            assert_eq!(st.mass_error, 0);
+            assert_eq!(st.energy_error, 0);
+        }
+        let tmp_path = std::env::temp_dir().join(format!(
+            "frostmarsh_server_persist_{}.fmw1",
+            std::process::id()
+        ));
+        let payload = gs.build_persistence_payload();
+        persistence::save_world_atomic(&tmp_path, &payload).expect("save_world_atomic");
+        let loaded = persistence::load_world(&tmp_path).expect("load_world");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut gs2 = GameState::new(
+            "refsim".to_string(),
+            "127.0.0.1:14440".to_string(),
+            64,
+            16,
+            0,
+            1,
+            2,
+            4,
+        );
+        gs2.restore_from_persistence(loaded).expect("restore_from_persistence");
+        assert_eq!(gs2.volume.mass_error(), 0);
+        assert_eq!(gs2.volume.energy_error(), 0);
+        assert_eq!(gs2.volume.biome_id, 1);
+        assert_eq!(gs2.volume.tick, gs.volume.tick);
+
+        // Rejoining player restores persisted position/class/kills/xp
+        let rejoin_id = gs2.spawn_player("Temp".into(), 1, CLASS_WARDEN, false);
+        gs2.apply_persistent_player_on_join(rejoin_id, "Tester", 1);
+        let rp = &gs2.players[&rejoin_id];
+        assert_eq!(rp.class_id, CLASS_SKYWING);
+        assert_eq!(rp.kills, 4);
+        assert_eq!(rp.xp, 65);
+        assert!((rp.x - 30.0).abs() < 2.0);
     }
 }

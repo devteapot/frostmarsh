@@ -1164,6 +1164,9 @@ dependencies = [
 [[package]]
 name = "field-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -1264,16 +1267,19 @@ dependencies = [
 name = "frostmarsh-server"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "bytes",
  "clap",
  "env_logger",
  "field-core",
  "frostmarsh-proto",
  "log",
+ "lz4_flex",
  "ort",
  "quinn",
  "rcgen",
  "rustls",
+ "serde",
  "tokio",
 ]
 

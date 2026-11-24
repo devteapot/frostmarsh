@@ -366,6 +366,14 @@ pub enum ServerDatagram {
     },
     /// 10 Hz LZ4-compressed `16×16×D` 3D volumetric brick (`density_mat` + `albedo_thermal` RGBA8).
     VolumetricBrick3D(Brick3DPayload),
+    /// 10 Hz sparse temporal delta for a `16×16×D` 3D volumetric brick (`(u16 idx, dm[4], at[4])` × N, LZ4).
+    VolumetricBrick3DDelta {
+        bx: u16,
+        by: u16,
+        depth: u16,
+        tick: u64,
+        lz4_deltas: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -410,6 +418,143 @@ pub fn decode_brick3d_lz4(payload: &Brick3DPayload) -> Option<(Vec<u8>, Vec<u8>)
     let density_mat = lz4_flex::decompress_size_prepended(&payload.density_mat_lz4).ok()?;
     let albedo_thermal = lz4_flex::decompress_size_prepended(&payload.albedo_thermal_lz4).ok()?;
     Some((density_mat, albedo_thermal))
+}
+
+/// Default per-channel visual deadzone for temporal 3D brick delta encoding (suppresses sub-4K jitter).
+pub const DEFAULT_BRICK3D_DELTA_DEADZONE: u8 = 4;
+
+/// Returns `true` when `encode_brick3d_delta` returned the full-brick fallback signal (`Some(vec![])`),
+/// indicating `>= 35%` of voxels changed (or buffer geometry changed) and the caller should send
+/// a full `ServerDatagram::VolumetricBrick3D`.
+#[inline]
+pub fn is_brick3d_delta_full_signal(encoded: &[u8]) -> bool {
+    encoded.is_empty()
+}
+
+/// Compute a sparse LZ4-compressed temporal delta between two Z-major `16×16×D` RGBA8 bricks.
+///
+/// - Scans each voxel `idx` in `0..(cur_density.len() / 4)`.
+/// - Skips any voxel whose maximum per-channel absolute difference across all 8 bytes
+///   (`density[4]` + `albedo[4]`) is `<= deadzone`.
+/// - Returns `None` when `0` voxels exceeded `deadzone` (caller sends **0 bytes**!).
+/// - Returns `Some(lz4_deltas)` when `0 < changed < 35%` of total voxels, packing each changed
+///   voxel as 10 bytes `(idx as u16 LE, density[4], albedo[4])` and LZ4-compressing.
+/// - Returns `Some(Vec::new())` (full-brick signal) when `changed >= 35%` of total voxels (or
+///   lengths mismatch / exceed `u16::MAX` voxels), signaling the caller to send `VolumetricBrick3D`.
+pub fn encode_brick3d_delta(
+    prev_density: &[u8],
+    prev_albedo: &[u8],
+    cur_density: &[u8],
+    cur_albedo: &[u8],
+    deadzone: u8,
+) -> Option<Vec<u8>> {
+    let byte_len = cur_density.len();
+    if byte_len == 0
+        || byte_len % 4 != 0
+        || prev_density.len() != byte_len
+        || prev_albedo.len() != byte_len
+        || cur_albedo.len() != byte_len
+    {
+        return Some(Vec::new());
+    }
+    let total_voxels = byte_len / 4;
+    if total_voxels > u16::MAX as usize {
+        return Some(Vec::new());
+    }
+    // 35% threshold: if changed * 100 >= total_voxels * 35 -> full brick fallback
+    let max_delta_voxels = (total_voxels * 35).saturating_sub(1) / 100;
+    let mut packed: Vec<u8> = Vec::new();
+    let mut changed = 0usize;
+
+    for idx in 0..total_voxels {
+        let o = idx * 4;
+        let max_diff = cur_density[o]
+            .abs_diff(prev_density[o])
+            .max(cur_density[o + 1].abs_diff(prev_density[o + 1]))
+            .max(cur_density[o + 2].abs_diff(prev_density[o + 2]))
+            .max(cur_density[o + 3].abs_diff(prev_density[o + 3]))
+            .max(cur_albedo[o].abs_diff(prev_albedo[o]))
+            .max(cur_albedo[o + 1].abs_diff(prev_albedo[o + 1]))
+            .max(cur_albedo[o + 2].abs_diff(prev_albedo[o + 2]))
+            .max(cur_albedo[o + 3].abs_diff(prev_albedo[o + 3]));
+        if max_diff <= deadzone {
+            continue;
+        }
+        changed += 1;
+        if changed > max_delta_voxels {
+            return Some(Vec::new());
+        }
+        if packed.is_empty() {
+            packed.reserve(64 * 10);
+        }
+        let idx_le = (idx as u16).to_le_bytes();
+        packed.extend_from_slice(&idx_le);
+        packed.extend_from_slice(&cur_density[o..o + 4]);
+        packed.extend_from_slice(&cur_albedo[o..o + 4]);
+    }
+
+    if changed == 0 {
+        return None;
+    }
+
+    Some(lz4_flex::compress_prepend_size(&packed))
+}
+
+/// Decompress `VolumetricBrick3DDelta::lz4_deltas` into raw `(idx, density[4], albedo[4])` voxel patches.
+pub fn decode_brick3d_delta_voxels(
+    lz4_deltas: &[u8],
+) -> Result<Vec<(u16, [u8; 4], [u8; 4])>, String> {
+    if lz4_deltas.is_empty() {
+        return Err("empty lz4_deltas payload (full-brick signal)".to_string());
+    }
+    let raw = lz4_flex::decompress_size_prepended(lz4_deltas)
+        .map_err(|e| format!("brick3d delta lz4 decompress failed: {}", e))?;
+    if raw.len() % 10 != 0 {
+        return Err(format!(
+            "brick3d delta payload length {} is not a multiple of 10 bytes",
+            raw.len()
+        ));
+    }
+    let count = raw.len() / 10;
+    let mut out = Vec::with_capacity(count);
+    for rec in raw.chunks_exact(10) {
+        let idx = u16::from_le_bytes([rec[0], rec[1]]);
+        let dm = [rec[2], rec[3], rec[4], rec[5]];
+        let at = [rec[6], rec[7], rec[8], rec[9]];
+        out.push((idx, dm, at));
+    }
+    Ok(out)
+}
+
+/// Apply an LZ4-compressed `VolumetricBrick3DDelta` payload in-place onto Z-major `density` & `albedo`
+/// brick buffers (`16×16×D×4` bytes each). Returns the exact number of patched voxels.
+pub fn apply_brick3d_delta(
+    density: &mut [u8],
+    albedo: &mut [u8],
+    lz4_deltas: &[u8],
+) -> Result<usize, String> {
+    if density.len() != albedo.len() || density.len() % 4 != 0 {
+        return Err(format!(
+            "brick3d buffer length mismatch: density={} albedo={}",
+            density.len(),
+            albedo.len()
+        ));
+    }
+    let total_voxels = density.len() / 4;
+    let patches = decode_brick3d_delta_voxels(lz4_deltas)?;
+    for &(idx, dm, at) in &patches {
+        let v = idx as usize;
+        if v >= total_voxels {
+            return Err(format!(
+                "brick3d delta voxel index {} out of range (total {})",
+                v, total_voxels
+            ));
+        }
+        let o = v * 4;
+        density[o..o + 4].copy_from_slice(&dm);
+        albedo[o..o + 4].copy_from_slice(&at);
+    }
+    Ok(patches.len())
 }
 
 pub fn encode_msg<T: Serialize>(msg: &T) -> Vec<u8> {
@@ -553,5 +698,113 @@ mod tests {
         assert_eq!(CLASS_RANGER, CLASS_TIDEKIN);
         assert_eq!(CLASS_EMBERSTALKER, 3);
         assert_eq!(CLASS_BURROWER, 4);
+    }
+
+    #[test]
+    fn test_brick3d_delta_roundtrip_and_compression_ratio() {
+        let depth = 16usize;
+        let total_voxels = CHUNK_SIZE * CHUNK_SIZE * depth; // 4096 voxels
+        let byte_len = total_voxels * 4; // 16384 bytes per channel buffer
+
+        // Populate realistic pseudo-terrain brick so full LZ4 brick isn't trivially all-zeros
+        let mut prev_dm = vec![0u8; byte_len];
+        let mut prev_at = vec![0u8; byte_len];
+        for z in 0..depth {
+            for dy in 0..CHUNK_SIZE {
+                for dx in 0..CHUNK_SIZE {
+                    let idx = (z * CHUNK_SIZE + dy) * CHUNK_SIZE + dx;
+                    let o = idx * 4;
+                    let h_surf = 5 + ((dx * 7 + dy * 13) % 4);
+                    if z <= h_surf {
+                        prev_dm[o] = (200 + ((dx * 11 + dy * 5 + z * 3) % 55)) as u8;
+                        prev_dm[o + 1] = ((dx * 3 + dy * 7) % 40) as u8;
+                        prev_dm[o + 2] = 0;
+                        prev_dm[o + 3] = (170 + ((dx + dy * 3) % 60)) as u8;
+                        prev_at[o] = (80 + ((dx * 9 + z * 7) % 90)) as u8;
+                        prev_at[o + 1] = (95 + ((dy * 11 + z * 5) % 85)) as u8;
+                        prev_at[o + 2] = (70 + ((dx * 5 + dy * 9) % 80)) as u8;
+                        prev_at[o + 3] = ((dx + dy + z) % 20) as u8;
+                    }
+                }
+            }
+        }
+
+        // 1. Sub-deadzone micro-jitter (<= 4) -> MUST return None (0 bytes on wire!)
+        let mut jitter_dm = prev_dm.clone();
+        let mut jitter_at = prev_at.clone();
+        for i in (0..byte_len).step_by(4) {
+            jitter_at[i + 3] = jitter_at[i + 3].saturating_add(3);
+            jitter_dm[i] = jitter_dm[i].saturating_sub(4);
+        }
+        assert!(
+            encode_brick3d_delta(&prev_dm, &prev_at, &jitter_dm, &jitter_at, 4).is_none(),
+            "sub-deadzone jitter must suppress wire traffic completely (None)"
+        );
+
+        // 2. Partial brick edit (24 changed voxels = ~0.6% of 4096 voxels, e.g. fire/tunnel/waterfall splash)
+        let mut cur_dm = prev_dm.clone();
+        let mut cur_at = prev_at.clone();
+        let edited_indices: Vec<usize> = (0..24).map(|k| 1024 + k * 7).collect();
+        for &idx in &edited_indices {
+            let o = idx * 4;
+            cur_dm[o] = 10;
+            cur_dm[o + 1] = 210;
+            cur_dm[o + 2] = 160;
+            cur_dm[o + 3] = 45;
+            cur_at[o] = 250;
+            cur_at[o + 1] = 120;
+            cur_at[o + 2] = 30;
+            cur_at[o + 3] = 235;
+        }
+
+        let full_pkt = encode_server_datagram(&ServerDatagram::VolumetricBrick3D(
+            encode_brick3d_lz4(7, 3, 4, depth as u8, &cur_dm, &cur_at),
+        ));
+        let lz4_deltas = encode_brick3d_delta(&prev_dm, &prev_at, &cur_dm, &cur_at, 4)
+            .expect("partial edit must emit delta");
+        assert!(!is_brick3d_delta_full_signal(&lz4_deltas));
+
+        let delta_wire = encode_server_datagram(&ServerDatagram::VolumetricBrick3DDelta {
+            bx: 3,
+            by: 4,
+            depth: depth as u16,
+            tick: 99,
+            lz4_deltas: lz4_deltas.clone(),
+        });
+        let ratio = full_pkt.len() as f64 / delta_wire.len() as f64;
+        assert!(
+            ratio > 10.0,
+            "partial brick delta must achieve >10x compression over full brick (full={} B, delta={} B, ratio={:.2}x)",
+            full_pkt.len(),
+            delta_wire.len(),
+            ratio
+        );
+
+        // Decode ServerDatagram::VolumetricBrick3DDelta and verify exact roundtrip
+        let mut recon_dm = prev_dm.clone();
+        let mut recon_at = prev_at.clone();
+        match decode_server_datagram(&delta_wire).expect("decode VolumetricBrick3DDelta") {
+            ServerDatagram::VolumetricBrick3DDelta { bx, by, depth: d, tick, lz4_deltas: d_lz4 } => {
+                assert_eq!((bx, by, d, tick), (3, 4, 16, 99));
+                let patched = apply_brick3d_delta(&mut recon_dm, &mut recon_at, &d_lz4)
+                    .expect("apply_brick3d_delta");
+                assert_eq!(patched, edited_indices.len());
+            }
+            other => panic!("unexpected datagram variant: {:?}", other),
+        }
+        assert_eq!(recon_dm, cur_dm);
+        assert_eq!(recon_at, cur_at);
+
+        // 3. Massive edit (>= 35% of voxels) -> returns Some(vec![]) full-brick signal
+        let mut huge_dm = prev_dm.clone();
+        for idx in 0..(total_voxels / 2) {
+            huge_dm[idx * 4] = huge_dm[idx * 4].wrapping_add(120);
+        }
+        let huge_res = encode_brick3d_delta(&prev_dm, &prev_at, &huge_dm, &prev_at, 4)
+            .expect("massive edit must return Some full-brick signal");
+        assert!(
+            is_brick3d_delta_full_signal(&huge_res),
+            ">=35% change must signal full-brick fallback"
+        );
     }
 }

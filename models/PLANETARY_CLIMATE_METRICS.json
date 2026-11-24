@@ -1,0 +1,244 @@
+{
+  "wave": "33A",
+  "title": "PlanetaryClimateNet: Purpose-Built Macro 6-Face Cubed-Sphere Climate Neural Operator",
+  "checkpoint": "planetary_climate_v1.pt",
+  "model_params": 286684,
+  "architecture": {
+    "type": "C4/SO(2) Gauge-Equivariant Cubed-Sphere Neural Operator + Antisymmetric Conservative Fluxes",
+    "grid_faces": 6,
+    "grid_levels": 4,
+    "grid_channels": 10,
+    "grid_n": 64,
+    "total_macro_cells": 98304,
+    "halo_xy": 4,
+    "c_s": 20,
+    "c_v": 6,
+    "num_blocks": 4
+  },
+  "orthonormal_bases_check": {
+    "num_faces": 6,
+    "max_orthonormality_err": 0.0,
+    "min_det": 1.0,
+    "max_det": 1.0,
+    "all_right_handed": true
+  },
+  "training": {
+    "epochs": 65,
+    "train_planets": 32,
+    "val_planets": 6,
+    "traj_len": 40,
+    "batch_size": 6,
+    "lr": 0.0025,
+    "train_time_sec": 772.0051755269524,
+    "train_device": "NVIDIA GB10",
+    "curriculum": "1-step (1..29) -> 4-step (30..51) -> 8-step (52..65)",
+    "history": [
+      {
+        "epoch": 1,
+        "roll_k": 1,
+        "loss": 0.00033204014936119266,
+        "r2_1step": 0.9763394172665687,
+        "r2_20step": 0.685263528798902
+      },
+      {
+        "epoch": 5,
+        "roll_k": 1,
+        "loss": 4.427008479979122e-05,
+        "r2_1step": 0.9819960943896577,
+        "r2_20step": 0.883155498579202
+      },
+      {
+        "epoch": 10,
+        "roll_k": 1,
+        "loss": 2.8366377440155095e-05,
+        "r2_1step": 0.9924103838745925,
+        "r2_20step": 0.9444474104437552
+      },
+      {
+        "epoch": 15,
+        "roll_k": 1,
+        "loss": 2.252739573628383e-05,
+        "r2_1step": 0.9933269059819612,
+        "r2_20step": 0.9404031123024669
+      },
+      {
+        "epoch": 20,
+        "roll_k": 1,
+        "loss": 1.8964472474181093e-05,
+        "r2_1step": 0.9954766971189623,
+        "r2_20step": 0.9593581984592564
+      },
+      {
+        "epoch": 25,
+        "roll_k": 1,
+        "loss": 1.5494514198306002e-05,
+        "r2_1step": 0.9972379079396939,
+        "r2_20step": 0.969459521856146
+      },
+      {
+        "epoch": 30,
+        "roll_k": 4,
+        "loss": 0.007484336797086357,
+        "r2_1step": 0.9598665415343911,
+        "r2_20step": -0.7251306843372691
+      },
+      {
+        "epoch": 35,
+        "roll_k": 4,
+        "loss": 0.0003180031053489074,
+        "r2_1step": 0.9916402077307607,
+        "r2_20step": 0.9326943871389282
+      },
+      {
+        "epoch": 40,
+        "roll_k": 4,
+        "loss": 0.00021242264997186686,
+        "r2_1step": 0.9935374839793862,
+        "r2_20step": 0.9499128967040812
+      },
+      {
+        "epoch": 45,
+        "roll_k": 4,
+        "loss": 0.00018900309762958547,
+        "r2_1step": 0.9938937778226308,
+        "r2_20step": 0.9573725915684058
+      },
+      {
+        "epoch": 50,
+        "roll_k": 4,
+        "loss": 0.00014945896263645196,
+        "r2_1step": 0.993766551045661,
+        "r2_20step": 0.9597798092043504
+      },
+      {
+        "epoch": 55,
+        "roll_k": 8,
+        "loss": 0.00038881353102624414,
+        "r2_1step": 0.9938188254957592,
+        "r2_20step": 0.9621875682674249
+      },
+      {
+        "epoch": 60,
+        "roll_k": 8,
+        "loss": 0.0003621865122113377,
+        "r2_1step": 0.9940735294554066,
+        "r2_20step": 0.963694483704371
+      },
+      {
+        "epoch": 65,
+        "roll_k": 8,
+        "loss": 0.00035956818028353154,
+        "r2_1step": 0.9939325095934194,
+        "r2_20step": 0.9641278307551612
+      }
+    ]
+  },
+  "held_out_eval": {
+    "num_unseen_planets": 6,
+    "step_1": {
+      "temp_r2": 0.9999850880888163,
+      "wind_r2": 0.983728243310672,
+      "moisture_r2": 0.9996505466706107,
+      "pressure_r2": 0.9999375117088453,
+      "ocean_heat_r2": 0.9999808158239744,
+      "ash_r2": 0.9998497858873425,
+      "overall_r2": 0.9972379079396939
+    },
+    "step_20": {
+      "temp_r2": 0.9971912772426647,
+      "wind_r2": 0.9895410665599548,
+      "moisture_r2": 0.9459782097854216,
+      "pressure_r2": 0.9954041528714175,
+      "ocean_heat_r2": 0.9970247243460725,
+      "ash_r2": 0.9500571772526184,
+      "overall_r2": 0.969459521856146
+    }
+  },
+  "coriolis_polarity_test": {
+    "steps": 20,
+    "test_latitude_deg": 40.0,
+    "nh_vorticity": 0.027588795870542526,
+    "sh_vorticity": -0.027165621519088745,
+    "ref_nh_vorticity": 0.021321933716535568,
+    "ref_sh_vorticity": -0.021321933716535568,
+    "nh_sh_asymmetry_ratio": 0.00772858833365866,
+    "vorticity_trajectory_corr": 0.9974081639140822,
+    "coriolis_polarity_match": true
+  },
+  "seam_and_200tick_test": {
+    "edge_involution_mismatches": 0,
+    "tangent_rotation_roundtrip_max_err": 0.0,
+    "seam_jump_ratio_rotated": 2.4018751018021818,
+    "seam_jump_ratio_unrotated": 6.65285536916842,
+    "seam_error_reduction_x": 2.769859000651879,
+    "rollout_ticks": 200,
+    "nan_or_inf_count": 0,
+    "max_moisture_conservation_drift": 1.1867134611518668e-07,
+    "final_moisture_conservation_drift": 0.0,
+    "max_ash_conservation_drift": 6.864812618074777e-08,
+    "final_ash_conservation_drift": 0.0,
+    "min_state_moisture": 1.6288525432964218e-12,
+    "min_state_ash": 2.5881939373150845e-28,
+    "mean_day_minus_night_land_dT_K": 23.85976275205612,
+    "passed_stability_and_conservation": true
+  },
+  "amr_coupling_test": {
+    "downscale_world_laws_shape": [
+      6,
+      64,
+      256,
+      256
+    ],
+    "downscale_wind_uv_shape": [
+      2,
+      256,
+      256
+    ],
+    "downscale_precip_shape": [
+      256,
+      256
+    ],
+    "shard_wind_speed_max": 0.21221816539764404,
+    "shard_precip_max": 0.37869930267333984,
+    "shard_dT_amb_range_cK": [
+      -4344.943359375,
+      1259.3597412109375
+    ],
+    "upscale_ash_injected": 18.0,
+    "upscale_ash_deposit_rel_err": 0.0,
+    "cross_seam_ash_on_east_face": 1.3620460033416748,
+    "cross_seam_transport_fraction": 0.07566922240787083,
+    "ash_25tick_conservation_drift": 0.0,
+    "downwind_radiative_cooling_K": -2.808225452899933,
+    "amr_coupling_verified": true
+  },
+  "spark_gb10_fp16_benchmark": {
+    "device": "NVIDIA GB10",
+    "precision": "fp16",
+    "grid_shape": [
+      6,
+      4,
+      10,
+      64,
+      64
+    ],
+    "macro_cells": 98304,
+    "p50_ms": 5.902916076593101,
+    "p95_ms": 19.864101754501462,
+    "mean_ms": 9.972357617225498,
+    "hz_p50": 169.40779557502285,
+    "peak_vram_mb": 117.642578125,
+    "finite_after_bench": true
+  },
+  "gates": {
+    "step1_r2_ge_094": true,
+    "step20_r2_ge_085": true,
+    "coriolis_polarity_match": true,
+    "seam_rot_err_zero": true,
+    "rollout_200tick_zero_nan": true,
+    "moisture_drift_lt_1e5": true,
+    "ash_drift_lt_1e5": true,
+    "amr_coupling_verified": true,
+    "fp16_latency_lt_10ms": true
+  }
+}

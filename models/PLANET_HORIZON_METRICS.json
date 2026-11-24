@@ -1,0 +1,78 @@
+{
+  "wave": "Wave 33B: Dual-Scale Locally-Flat R=1,300m Cubed-Sphere Planet (1.61B Virtual Voxels) + Apple M4 Pro Metal Proof",
+  "adapter": "Apple M4 Pro",
+  "backend": "Metal",
+  "r_core_m": 1280.0,
+  "r_surface_m": 1304.0,
+  "circumference_m": 8193.27,
+  "horizon_drop_50m_m": 0.9589,
+  "shards_per_face_axis": 8,
+  "total_shards": 384,
+  "shard_topology_directed_edges": 1536,
+  "shard_size_1m": 256,
+  "face_size_virtual": 2048,
+  "depth": 64,
+  "virtual_voxels": 1610612736,
+  "global_climate_columns": 24576,
+  "hydrated_hero_shard": {
+    "face": 1,
+    "sx": 6,
+    "sy": 4
+  },
+  "hydrated_1m_voxels": 4194304,
+  "hydrate_ms": 93.84,
+  "global_mass_error": 0,
+  "global_energy_error": 0,
+  "f64_floating_origin_err_1300m_m": 1.3586750077805008e-7,
+  "f64_floating_origin_err_earth_m": 1.3586750077805008e-7,
+  "mesh_stats": {
+    "near_1m_terrain_triangles": 161788,
+    "near_1m_ocean_triangles": 63698,
+    "macro_planet_terrain_triangles": 248320,
+    "macro_planet_ocean_triangles": 248320,
+    "sister_sky_islands_triangles": 8640,
+    "total_triangles": 730766
+  },
+  "bench_ground_1080p": {
+    "width": 1920,
+    "height": 1080,
+    "iters": 25,
+    "p50_ms": 3.175,
+    "p99_ms": 3.25,
+    "mean_ms": 3.18,
+    "fps_p50": 314.97
+  },
+  "bench_ground_4k": {
+    "width": 3840,
+    "height": 2160,
+    "iters": 25,
+    "p50_ms": 10.462,
+    "p99_ms": 10.522,
+    "mean_ms": 10.461,
+    "fps_p50": 95.58
+  },
+  "bench_orbital_1080p": {
+    "width": 1920,
+    "height": 1080,
+    "iters": 25,
+    "p50_ms": 2.638,
+    "p99_ms": 2.74,
+    "mean_ms": 2.648,
+    "fps_p50": 379.06
+  },
+  "bench_orbital_4k": {
+    "width": 3840,
+    "height": 2160,
+    "iters": 25,
+    "p50_ms": 7.42,
+    "p99_ms": 8.089,
+    "mean_ms": 7.504,
+    "fps_p50": 134.77
+  },
+  "showcase_outputs": [
+    "models/planet_horizon_showcase/horizon_ground_1080p.png",
+    "models/planet_horizon_showcase/horizon_low_flight_1080p.png",
+    "models/planet_horizon_showcase/horizon_orbital_1080p.png",
+    "models/planet_horizon_showcase/horizon_4view.png"
+  ]
+}

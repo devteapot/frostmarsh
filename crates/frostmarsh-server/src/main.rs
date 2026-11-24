@@ -1394,6 +1394,7 @@ struct GameState {
     macro_seam_mass_cached: u64,
     macro_field_tick_cached: u64,
     macro_total_chunks_cached: u16,
+    macro_hero_spawn_cached: (u8, f32, f32, f32, f32, f32),
     planet_r_core: f32,
     eco: EcosystemState,
     sim_mode: String,
@@ -1586,6 +1587,9 @@ impl GameState {
     fn volume_at(&self, face: u8, x: f32, y: f32) -> Option<(&VolumeField, f32, f32)> {
         if let Some(ref mr) = self.macro_planet_runtime {
             mr.shard_at_virtual(face, x, y)
+        } else if self.macro_planet_enabled {
+            // Runtime temporarily taken by lock-free background macro tick; never fall back to dummy Z=4 self.volume!
+            None
         } else if let Some(ref pr) = self.planet_runtime {
             Some((&pr.planet.faces[(face as usize) % FACE_COUNT], x, y))
         } else {
@@ -1597,6 +1601,8 @@ impl GameState {
     fn volume_at_mut(&mut self, face: u8, x: f32, y: f32) -> Option<(&mut VolumeField, f32, f32)> {
         if let Some(ref mut mr) = self.macro_planet_runtime {
             mr.shard_at_virtual_mut(face, x, y)
+        } else if self.macro_planet_enabled {
+            None
         } else if let Some(ref mut pr) = self.planet_runtime {
             Some((&mut pr.planet.faces[(face as usize) % FACE_COUNT], x, y))
         } else {
@@ -1668,6 +1674,7 @@ impl GameState {
                 * (mr.shard_chunks_xy() as usize)
                 * (mr.subbricks_z() as usize))
                 .min(u16::MAX as usize) as u16,
+            macro_hero_spawn_cached: mr.human_spawn_point(),
             macro_planet_runtime: Some(mr),
             planet_r_core: r_core,
             eco,
@@ -1859,6 +1866,7 @@ impl GameState {
             macro_seam_mass_cached: 0,
             macro_field_tick_cached: 0,
             macro_total_chunks_cached: 0,
+            macro_hero_spawn_cached: (0, 0.0, 0.0, 0.0, 1.0, 0.0),
             planet_r_core: r_core,
             eco,
             sim_mode: "neural".to_string(),
@@ -2026,6 +2034,7 @@ impl GameState {
             macro_seam_mass_cached: 0,
             macro_field_tick_cached: 0,
             macro_total_chunks_cached: 0,
+            macro_hero_spawn_cached: (0, 0.0, 0.0, 0.0, 1.0, 0.0),
             planet_r_core: 0.0,
             eco,
             sim_mode: "neural".to_string(),
@@ -2605,6 +2614,23 @@ impl GameState {
                     bx,
                     by,
                     bz,
+                    if team % 2 == 0 { 1.0 } else { -1.0 },
+                    0.0,
+                )
+            }
+        } else if self.macro_planet_enabled {
+            let (hf, hx, hy, hz, hax, hay) = self.macro_hero_spawn_cached;
+            if !is_bot {
+                (hf, hx, hy, hz, hax, hay)
+            } else {
+                let ang = (id as f32) * 2.399_963_1;
+                let dist = 16.0 + ((id % 12) as f32) * 3.5;
+                let max_xy = (self.grid_w as f32 - 8.0).max(8.0);
+                (
+                    preferred_face.unwrap_or(hf),
+                    (hx + ang.cos() * dist).clamp(8.0, max_xy),
+                    (hy + ang.sin() * dist).clamp(8.0, max_xy),
+                    hz,
                     if team % 2 == 0 { 1.0 } else { -1.0 },
                     0.0,
                 )
@@ -4239,6 +4265,20 @@ impl GameState {
                 (hf, hx, hy, hz)
             } else {
                 mr.spawn_point_for_bot(pid as usize % 60, 60, class_id, self.sim_tick as u32 + pid)
+            }
+        } else if self.macro_planet_enabled {
+            let (hf, hx, hy, hz, _, _) = self.macro_hero_spawn_cached;
+            if !is_bot_p {
+                (hf, hx, hy, hz)
+            } else {
+                let ang = ((self.sim_tick as u32 + pid) as f32) * 2.399_963_1;
+                let max_xy = (self.grid_w as f32 - 8.0).max(8.0);
+                (
+                    hf,
+                    (hx + ang.cos() * 24.0).clamp(8.0, max_xy),
+                    (hy + ang.sin() * 24.0).clamp(8.0, max_xy),
+                    hz,
+                )
             }
         } else if let Some(ref pr) = self.planet_runtime {
             pr.spawn_point_for_entity(prev_face, class_id, self.sim_tick as u32 + pid)
@@ -6889,6 +6929,8 @@ impl GameState {
                 CLASS_TIDEKIN => {
                     let z_sea = if let Some(ref mr) = self.macro_planet_runtime {
                         (mr.config().z_sea as f32 * (gd / 64.0)).clamp(3.0, gd - 4.0)
+                    } else if self.macro_planet_enabled {
+                        (self.macro_planet_cfg.z_sea as f32 * (gd / 64.0)).clamp(3.0, gd - 4.0)
                     } else {
                         (15.0 * (gd / 32.0)).clamp(3.0, gd - 4.0)
                     };

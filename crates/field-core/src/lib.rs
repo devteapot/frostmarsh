@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod sharding;
+pub mod structural;
 
 pub const NUM_SPECIES: usize = 10;
 pub const NUM_MOBILE: usize = 4;
@@ -1865,6 +1866,7 @@ pub struct VolumeField {
     pub evolution_stats: WorldEvolutionStats,
     pub world_laws: WorldLaws,
     pub world_law_preset: u8,
+    pub structural: structural::StructuralState,
 }
 
 impl VolumeField {
@@ -1912,6 +1914,7 @@ impl VolumeField {
                 evolution_stats: WorldEvolutionStats::default(),
                 world_laws: WorldLaws::default(),
                 world_law_preset: WORLD_LAW_STANDARD,
+                structural: structural::StructuralState::default(),
             };
             vf.init_biome_3d(b_id, seed);
             return vf;
@@ -2049,6 +2052,7 @@ impl VolumeField {
             evolution_stats: WorldEvolutionStats::default(),
             world_laws: WorldLaws::default(),
             world_law_preset: WORLD_LAW_STANDARD,
+            structural: structural::StructuralState::default(),
         };
         vf.snapshot_conservation_baseline();
         vf.snapshot_prev_sensors();
@@ -2247,7 +2251,11 @@ impl VolumeField {
             evolution_stats: snap.evolution_stats,
             world_laws: snap.world_laws,
             world_law_preset: snap.world_law_preset % NUM_WORLD_LAW_PRESETS,
+            structural: structural::StructuralState::default(),
         };
+        if vf.biome_id == BIOME_SKY_ABYSS && vf.depth >= 16 {
+            structural::init_sky_abyss_buoyant_cores(&mut vf);
+        }
         if vf.prev_temp.len() != vlen || vf.prev_steam.len() != vlen {
             vf.snapshot_prev_sensors();
         }
@@ -3805,7 +3813,21 @@ impl VolumeField {
             }
         }
 
+        if total_displaced > 0 {
+            self.structural.dirty = true;
+        }
         total_displaced
+    }
+
+    /// Run one conservation-exact 3D structural support, realistic arch/cave collapse,
+    /// and Buoyant Crystal Core stability step (`mass_error() == 0 && energy_error() == 0`).
+    pub fn step_structural_mechanics(&mut self) -> structural::StructuralStepStats {
+        structural::step_structural_mechanics(self)
+    }
+
+    /// Mark the 3D structural support graph dirty after terrain/thermal mutations.
+    pub fn mark_structural_dirty(&mut self) {
+        self.structural.dirty = true;
     }
 
     /// Apply a single layer step while snapshotting `prev_temp` / `prev_steam` first.
@@ -4150,6 +4172,9 @@ impl VolumeField {
             }
         }
 
+        if total_de.abs() > 250_000 {
+            self.structural.dirty = true;
+        }
         (total_dm, total_de)
     }
 
@@ -4246,6 +4271,11 @@ impl VolumeField {
 
         self.snapshot_conservation_baseline();
         self.snapshot_prev_sensors();
+        if b_id == BIOME_SKY_ABYSS && d >= 16 {
+            structural::init_sky_abyss_buoyant_cores(self);
+        } else {
+            self.structural = structural::StructuralState::default();
+        }
     }
 
     fn init_biome_nordic_viaduct(&mut self, seed_ox: f32, seed_oy: f32, seed_phase: f32) {
@@ -5824,7 +5854,9 @@ impl VolumeField {
                                     .max((arch_z - 0.85) - zm);
                                 if sb_sdf < sdf {
                                     sdf = sb_sdf;
-                                    mat_kind = if lat < 1.4 { 2 } else { 1 };
+                                    // Timber suspension Sky-Bridges: hold cleanly between intact islands,
+                                    // burnable by wildfire, and snap cleanly if either island's core fails!
+                                    mat_kind = 2;
                                 }
                             }
                         }

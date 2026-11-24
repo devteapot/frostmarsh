@@ -7398,6 +7398,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         log::info!("Living World Epoch advanced -> {}", new_epoch);
                     }
                 }
+                if gs.volume.depth >= 12 {
+                    let st_struct = gs.volume.step_structural_mechanics();
+                    for (_cid, cname, cx, cy, _cz) in st_struct.newly_fracturing_cores {
+                        let msg = format!("{} CORE FRACTURING! EVACUATE!", cname);
+                        gs.push_event(5, cx, cy, 0, 2, msg.clone());
+                        log::info!("STRUCTURAL: {} (tick={})", msg, tick_now);
+                    }
+                    for (_cid, cname, cx, cy, _cz) in st_struct.newly_impacted_cores {
+                        let msg = format!("{} CRASHED INTO GORGE!", cname);
+                        gs.push_event(5, cx, cy, 0, 2, msg.clone());
+                        log::info!(
+                            "STRUCTURAL: {} (fallen={} splashed={})",
+                            msg,
+                            st_struct.fallen_solid_mass,
+                            st_struct.splashed_fluid_mass
+                        );
+                    }
+                    if st_struct.fallen_solid_mass > 25_000 && tick_now % 5 == 0 {
+                        log::info!(
+                            "STRUCTURAL COLLAPSE tick={} unsupported={} fallen={} splashed={} total_fallen={}",
+                            tick_now,
+                            st_struct.unsupported_voxels,
+                            st_struct.fallen_solid_mass,
+                            st_struct.splashed_fluid_mass,
+                            gs.volume.structural.total_collapsed_mass
+                        );
+                    }
+                }
                 let stats = gs.volume.step_3d_with_neural_z(&raw_layers, z_flux_opt.as_deref());
                 gs.check_terrain_engineering_milestones();
                 gs.neural_3d_vertical = used_neural_3d_z;
@@ -7627,6 +7655,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .take(72)
                                     .collect();
                                 if !clean.is_empty() {
+                                    // Wave 28: Conservation-exact interactive structural collapse triggers!
+                                    if clean.starts_with("/collapse_isle") || clean.starts_with("/shatter_core") {
+                                        let cid: u8 = clean
+                                            .split_whitespace()
+                                            .nth(1)
+                                            .and_then(|s| s.parse::<u8>().ok())
+                                            .unwrap_or(1);
+                                        if let Some((cname, cx, cy, _cz)) =
+                                            field_core::structural::fracture_buoyant_core(&mut gs.volume, cid)
+                                        {
+                                            let msg = format!("THERMAL SHOCK! {} CORE DESTABILIZED!", cname);
+                                            gs.push_event(5, cx, cy, 0, 2, msg.clone());
+                                            log::info!("ChatCommand {} -> {}", clean, msg);
+                                        }
+                                    } else if clean.starts_with("/undercut_viaduct") {
+                                        let px = gs.grid_w as f32 * 0.44;
+                                        let py = gs.grid_h as f32 * 0.50;
+                                        let z_lo = ((20.0 * (gs.volume.depth as f32 / 64.0)).round() as usize).max(1);
+                                        let z_hi = ((29.0 * (gs.volume.depth as f32 / 64.0)).round() as usize)
+                                            .min(gs.volume.depth.saturating_sub(1));
+                                        let moved = field_core::structural::undercut_support_pier(
+                                            &mut gs.volume,
+                                            px,
+                                            py,
+                                            z_lo,
+                                            z_hi,
+                                            3.6,
+                                        );
+                                        let msg = format!("VIADUCT PIER UNDERCUT! ({} mass carved)", moved);
+                                        gs.push_event(5, px, py, 0, 2, msg.clone());
+                                        log::info!("ChatCommand {} -> {}", clean, msg);
+                                    }
                                     let vol = volume.clamp(0.1, 1.0);
                                     if let Some((px, py, pz, team)) = gs
                                         .players

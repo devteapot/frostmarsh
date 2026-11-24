@@ -550,13 +550,23 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         cave_lit = (cave_albedo * (magma_glow_amb + cavern_rim + bounce_emit * 2.2) + crystal_emit * 1.15) * in_cave;
     }
 
-    // Upper Sky-Island cloud-lit mist & underside sky-bounce illumination (`p.y > vol_dims.y * 0.62`, Z>=48)
+    // Upper Sky-Island cloud-lit mist, underside sky-bounce & pulsing Buoyant Crystal Core veins (`Z>=48`)
     var sky_island_lit = vec3<f32>(0.0);
     if (z16.vol_dims.y >= 48.0 && h_norm > 0.58) {
         let sky_w_alt = smoothstep(0.58, 0.82, h_norm);
         let underside = max(-n.y, 0.0) * 0.55 + pow(1.0 - ndv, 2.2) * 0.38;
         let mist_col = mix(z16.sky_horizon.rgb, z16.sky_top.rgb * 1.35 + u.sun_col.rgb * 0.32, 0.45);
         sky_island_lit = albedo * mist_col * (0.20 + underside * 0.58) * sky_w_alt;
+
+        // Glowing cyan-amethyst Buoyant Crystal Core veins along tapered Sky-Island undersides (`h_norm 0.60..0.75`)
+        let keel_band = smoothstep(0.59, 0.64, h_norm) * smoothstep(0.76, 0.70, h_norm) * smoothstep(-0.15, -0.58, n_base.y);
+        if (keel_band > 0.04) {
+            let core_n = triplanar_fbm(p * 0.55 + vec3<f32>(0.0, sim_t * 0.08, 0.0), n_base, 0.95);
+            let core_vein = 1.0 - smoothstep(0.015, 0.085, abs(core_n - 0.50));
+            let pulse = 0.70 + 0.30 * sin(sim_t * 2.8 + p.x * 0.18 + p.z * 0.18);
+            let aether_col = mix(vec3<f32>(0.12, 0.92, 1.00), vec3<f32>(0.68, 0.28, 1.00), smoothstep(0.35, 0.68, macro_n));
+            sky_island_lit += aether_col * core_vein * keel_band * pulse * 1.15;
+        }
     }
 
     var hdr = albedo * (direct + ambient * 0.78 + bounce_emit) + cave_lit + sky_island_lit + magma_emit + u.sun_col.rgb * spec;

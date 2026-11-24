@@ -129,6 +129,9 @@
   - **3D Altitude-Varying World Laws `θ_world[6, Z, H, W]` & Vertical `HALO_Z = 3` Slab Sharding (`ml/world_model_3d_v8.py`, `ml/vertical_world_scaling.py`, [VERTICAL_SCALING_METRICS.json](models/VERTICAL_SCALING_METRICS.json), [vertical_scaling_viz.png](models/vertical_scaling_viz.png)):** Extended `WorldModel3D-v8` (`164,622` params, **0 extra parameters, 0 retraining**) to accept continuous 3D volumetric law fields blending Abyssal Geothermal (`1.15g, +42 K`) → Temperate Surface (`1.0g, 0 K`) → Floating Sky-Isles (`0.35g, -45 K`) with exact `0.0` identity parity at canonical laws. Vertically sharding `4` stacked slabs (`HALO_Z = 3`) matches monoliths to **`3.55e-15` (`Z=64`) / `1.58e-15` (`Z=128`)** in FP64 (`<= 2.55e-07` FP32) at just **`245–278 KB/tick`** compressed inter-slab halo traffic.
   - **Sparse `16×16×8` Vertical GPU Scaling on Spark GB10 (FP16, `max_bricks_per_batch=192`):** Skips `87.3%` (`Z=64`) and **`90.7%`** (`Z=128`) of empty sky, solid bedrock, and quiescent bricks — accelerating **`256×256×64` (`4.19M` vox)** **`2.93×`** (`479.7 → 163.5 ms` @ `6.1 Hz` bench / `36.7 ms` daemon sparse steady-state, **`2.37 GB` VRAM**) and scaling **`256×256×128` (`8.39M` vox)** **`4.65×`** (`1,027.7 → 220.8 ms` @ `4.5 Hz`, **`3.40 GB` VRAM `<= 3.5 GB`**)!
   - **True `16×16×16` Cubic Bricks (`bz`) & Live 3-Strata `Z=64` Sky-Isles & Abyss (`BIOME_SKY_ABYSS = 5`, `20/20` `field-core`, `3/3` `frostmarsh-proto`, `14/14` `frostmarsh-server`, `6/6` client, `0` warnings):** Stacked **Abyssal Magma & Crystal Caverns (`z=0..18m`)** + **Surface Arched Viaduct & Gorge (`z=18..38m`)** + **4 Floating Low-G Sky-Islands, `28m` Plunging Waterfalls & Cloud Deck (`z=38..63m`)** with 3 vertical shrines (`ABYSSAL HEART` / `CENTRAL VIADUCT` / `SKY CITADEL`), altitude-coupled conservation-exact physics (`mass_err = 0`, `energy_err = 0`), cubic `VolumetricSubBrick3D` / `VolumetricSubBrick3DDelta` streaming (**skipping `44.4–45.7%` pure sky & solid bedrock cubes**), and atomic LZ4 `"FMW1"` persistence verified across hard restart at `4.19M` voxels. Live Spark GB10 → Apple M4 Pro Metal renders `410.4K` Surface-Nets triangles across all 4 WGSL neural styles at **`110.0 FPS` @ 1080p Clean-3D (`9.09 ms`) / `103.5 FPS` @ 1080p Pixel-2×SS (`9.66 ms`) / `103.6 FPS` @ 4K Pixel-2×SS (`9.65 ms`)** over **`141.6 KB/s`** QUIC wire!
+- **Iteration 28 — Planet-Ready Unified Structural Support, Realistic Arch/Cave Collapse & Destructible Buoyant Sky-Island Cores (`crates/field-core/src/structural.rs`, `24/24` `field-core` tests, `0` ML Retraining):**
+  - **One Unified Support Graph (`BaseAnchorMode::{GroundedFloor, RadialInnerShell, CustomAnchors}` + `BuoyantCore`):** Propagates material-specific load/cantilever support (`SP_ROCK`, `SP_WOOD` cool vs burning `>= 550 K`, `SP_ICE` cold vs melting `>= 278 K`, `SP_SOIL` steep landslide repose, `SP_ASH` loose; timber bridges support themselves but never cantilever stone islands!) using a 2-stage vertical-compression + 256-bucket Dial's BFS overhang solver — zero hardcoded bedrock dependency so it transfers 1:1 to Cubed-Sphere planetary shells.
+  - **Live Sky-Island Crash & Hydrodynamic Splash (`mass_err == 0`, `energy_err == 0`):** Embedded glowing cyan-amethyst **Buoyant Crystal Core** veins underneath all 4 Sky-Islands (`field_mesh_z16.wgsl`) and interactive `/collapse_isle` + `/undercut_viaduct` chat commands. Shattering South Sky-Isle's core live on Spark GB10 (`256×256×64`, `60` bots) fractured its rim inward, snapped its timber Sky-Bridge, dropped **`56.9M` mass units** straight into the turquoise Surface Gorge (splashing `1.22M` river water outward and permanently creating a river-damming island crater in the canyon!) while the other 3 Sky-Islands stayed stably aloft with **`mass_err == 0 && energy_err == 0`**.
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
@@ -150,17 +153,17 @@
 
 ## Visual Showcase
 
-| Vertical Scaling `Z=16..128` (`8.39M` Vox, `HALO_Z=3` `1.58e-15` Parity) | Live `256×256×64` (`4.19M` Vox) 4-Style WGSL Sky-Isles & Abyss (`104–110 FPS`) |
+| Live Sky-Island Core Fracture & Gorge Crash (`56.9M` mass, `mass_err=0`) | Live `256×256×64` (`4.19M` Vox) 4-Style WGSL Sky-Isles & Abyss (`104–110 FPS`) |
 |---|---|
-| ![Vertical Scaling Z=16..128 GPU Proof](models/vertical_scaling_viz.png) | ![Live Z=64 4-Style Sky-Isles & Abyss Orbit](models/unified_iter27_z64_sky_abyss/unified_orbit_4view.png) |
+| ![Live Sky-Island Crash Into Gorge](models/unified_iter28_sky_collapse_after/unified_live_1080p_hud.png) | ![Live Z=64 4-Style Sky-Isles & Abyss Orbit](models/unified_iter27_z64_sky_abyss/unified_orbit_4view.png) |
 
-| Seamless `2×2` Multi-Region Sharding (`4.19M` Vox @ `10.6 Hz`, `2.2e-15` Seam Parity) | `WorldModel3D-v8` (Law-Conditioned Across 4 Physical Regimes vs Law-Blind `v7`) |
+| Vertical Scaling `Z=16..128` (`8.39M` Vox, `HALO_Z=3` `1.58e-15` Parity) | Seamless `2×2` Multi-Region Sharding (`4.19M` Vox @ `10.6 Hz`, `2.2e-15` Seam Parity) |
 |---|---|
-| ![Multi-Region Ghost-Halo Sharding](models/multi_region_shard_viz.png) | ![WorldModel3D-v8 Multi-Law Benchmarks](models/world_3d_v8_viz.png) |
+| ![Vertical Scaling Z=16..128 GPU Proof](models/vertical_scaling_viz.png) | ![Multi-Region Ghost-Halo Sharding](models/multi_region_shard_viz.png) |
 
-| Universal `MorphologyActuatorNet` (3 Emergent Games & Zero-Shot Hybrid Bodies) | Live `F5` Action Close-Up: Rim-Lit 5-Archetype Skirmish + Live 3D Speech Cards |
+| `WorldModel3D-v8` (Law-Conditioned Across 4 Physical Regimes vs Law-Blind `v7`) | Universal `MorphologyActuatorNet` (3 Emergent Games & Zero-Shot Hybrid Bodies) |
 |---|---|
-| ![Emergent Games Zero-Rule Policy](models/emergent_games_viz.png) | ![Live F5 Action Close-Up](models/unified_iter17_polished/unified_closeup_action_1080p.png) |
+| ![WorldModel3D-v8 Multi-Law Benchmarks](models/world_3d_v8_viz.png) | ![Emergent Games Zero-Rule Policy](models/emergent_games_viz.png) |
 
 | Live 60-Player 4-Style WGSL Orbit (`WorldModel3D-v7` + AAA Shaders, `135-149 FPS`) | Champion `ActuatorPolicyNetV3` (`100.0%` `24W–0L` Sweep Across All 3 Tournaments) |
 |---|---|

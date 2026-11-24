@@ -10,8 +10,8 @@
 
 use crate::camera::CameraMatrices;
 use crate::mesh_gen::{
-    MeshInstance, MeshKind, MeshVertex, CLASS_EMBERSTALKER, CLASS_SKYWING, CLASS_STRIDER,
-    CLASS_TIDEKIN, MESH_KIND_COUNT,
+    archetype_is_solo, MeshInstance, MeshKind, MeshVertex, CLASS_BURROWER, CLASS_EMBERSTALKER,
+    CLASS_SKYWING, CLASS_STRIDER, CLASS_TIDEKIN, MESH_KIND_COUNT,
 };
 use crate::net::LiveEntityState;
 use crate::parametric::hash2i;
@@ -1364,6 +1364,8 @@ pub struct AssembledFrame {
     pub point_pos: [[f32; 4]; 8],
     pub point_col: [[f32; 4]; 8],
     pub visible_chunks: usize,
+    #[allow(dead_code)]
+    pub squad_arc_count: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1401,6 +1403,7 @@ pub fn assemble_live_frame(
     sim_time: f32,
     layer_slice_mode: u8, // 0=ALL 4L (3D), 1=GROUND (L0-L1), 2=HIGH+SKY (L2-L3)
     aim_reticle: Option<AimReticle>,
+    show_squad_links: bool,
 ) -> AssembledFrame {
     let origin = mats.origin;
     let cull_rad = (cam_dist * 1.95 + 42.0).max(96.0);
@@ -1578,7 +1581,9 @@ pub fn assemble_live_frame(
         push_light(fpos, rad, [0.95 * flicker, 0.44 * flicker, 0.14 * flicker]);
     }
 
-    // 30 Hz Entities: Shrines, Rafts, Golden Relic, 3-Class Heroes, Projectiles!
+    let mut squad_arc_count = 0usize;
+
+    // 30 Hz Entities: Shrines, Rafts, Golden Relic, 5-Archetype Heroes, Squad Links, Projectiles!
     if let Some(ent) = entities {
         // 3 Capturable Elemental Shrines
         for s in &ent.shrines {
@@ -1673,7 +1678,7 @@ pub fn assemble_live_frame(
             });
         }
 
-        // 4-Archetype Heroes & Bots (scales smoothly to 40–64 live players in true 3D `(x, y, z)`!)
+        // 5-Archetype Heroes & Bots (scales smoothly to 40–64 live players in true 3D `(x, y, z)`!)
         for p in &ent.players {
             let (wx, wz) = grid_to_xz(p.x, p.y);
             let ground_y = sample_g_y(p.x, p.y);
@@ -1771,6 +1776,32 @@ pub fn assemble_live_frame(
                         0.04
                     };
                     (MeshKind::HeroTidekin, Vec3::new(1.08, 1.12, 1.12), bob, pitch, swim_roll)
+                }
+                CLASS_BURROWER => {
+                    // Subterranean Crystal-Plated Golem: rhythmic drilling lunge & heavy lateral sway!
+                    let active_drill = speed > 0.8 || p.melee_active || p.dashing;
+                    let drill_freq = if p.melee_active || p.dashing { 15.5 } else { 10.2 };
+                    let drill_osc = (sim_time * drill_freq + phase).sin();
+                    let bob = if active_drill {
+                        drill_osc.abs() * 0.14 + 0.04
+                    } else {
+                        (sim_time * 3.2 + phase).sin() * 0.035
+                    };
+                    let drill_sway = if active_drill {
+                        drill_osc * 0.12
+                    } else {
+                        (sim_time * 2.4 + phase).sin() * 0.03
+                    } + (-lat_vel * 0.015).clamp(-0.14, 0.14);
+                    let pitch = if p.dashing {
+                        0.36
+                    } else if p.melee_active {
+                        0.28 + drill_osc * 0.10
+                    } else if speed > 0.8 {
+                        0.16 + drill_osc.abs() * 0.08
+                    } else {
+                        0.05
+                    };
+                    (MeshKind::HeroBurrower, Vec3::new(1.16, 1.08, 1.18), bob, pitch, drill_sway)
                 }
                 _ => {
                     // CLASS_EMBERSTALKER (3) — Solo Cavern Climber / Raider: agile low-slung crouched gait
@@ -1957,6 +1988,50 @@ pub fn assemble_live_frame(
                         });
                     }
                 }
+                CLASS_BURROWER => {
+                    // Team footprint + glowing crystal dust & rock-spark wake ring beneath!
+                    let ring_rel = Vec3::new(wx, gy + 0.05, wz) - origin;
+                    let rs = if is_self { 1.28 } else { 1.06 };
+                    mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                        pos_yaw: [ring_rel.x, ring_rel.y, ring_rel.z, 0.0],
+                        scale_pitch: [rs, 1.0, rs, 0.0],
+                        tint_glow: [ring_col[0], ring_col[1], ring_col[2], 0.74],
+                        flags: [-1.0, 0.0, 0.0, 0.0],
+                    });
+                    // Rotating terracotta-amber / amethyst crystal dust & rock-spark wake ring
+                    let drill_pulse = 1.30 + 0.22 * (sim_time * 4.8 + phase).sin();
+                    mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                        pos_yaw: [ring_rel.x, ring_rel.y + 0.04, ring_rel.z, sim_time * 2.6 + phase],
+                        scale_pitch: [drill_pulse, 0.82, drill_pulse, 0.0],
+                        tint_glow: [0.98, 0.58, 0.26, 0.80],
+                        flags: [-1.0, 0.0, 0.0, 0.0],
+                    });
+                    // Orbiting crystal dust & subterranean rock-spark wake splats around treads/drills
+                    let active_drill = speed > 0.9 || p.melee_active || p.dashing;
+                    let spark_r = if active_drill { 0.96 } else { 0.72 };
+                    let ang0 = sim_time * if active_drill { 6.2 } else { 2.8 } + phase;
+                    let dust_rel = Vec3::new(
+                        wx + ang0.cos() * spark_r - p.vx * 0.04,
+                        gy + 0.28 + (sim_time * 7.0 + phase).sin().abs() * 0.26,
+                        wz + ang0.sin() * spark_r - p.vy * 0.04,
+                    ) - origin;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [dust_rel.x, dust_rel.y, dust_rel.z, if active_drill { 0.44 } else { 0.30 }],
+                        color_alpha: [1.18, 0.68, 0.28, if active_drill { 0.56 } else { 0.36 }],
+                        params: [0.95, 2.0, phase + 1.3, 0.25],
+                    });
+                    let ang1 = ang0 + std::f32::consts::PI;
+                    let crystal_rel = Vec3::new(
+                        wx + ang1.cos() * (spark_r * 0.85),
+                        gy + 0.36 + (sim_time * 8.4 + phase + 1.2).sin().abs() * 0.32,
+                        wz + ang1.sin() * (spark_r * 0.85),
+                    ) - origin;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [crystal_rel.x, crystal_rel.y, crystal_rel.z, if active_drill { 0.34 } else { 0.24 }],
+                        color_alpha: [0.96, 0.42, 1.24, if active_drill { 0.54 } else { 0.34 }],
+                        params: [1.10, 3.0, phase + 3.7, 0.15],
+                    });
+                }
                 _ => {
                     // CLASS_EMBERSTALKER (3): Compact Solo-Raider ember ground ring + ember aura!
                     let ring_rel = Vec3::new(wx, gy + 0.05, wz) - origin;
@@ -2003,6 +2078,8 @@ pub fn assemble_live_frame(
                     [1.0, 0.44, 0.16]
                 } else if p.class_id == CLASS_TIDEKIN {
                     [0.36, 0.98, 1.0]
+                } else if p.class_id == CLASS_BURROWER {
+                    [0.98, 0.60, 0.26]
                 } else {
                     [1.0, 0.95, 0.65]
                 };
@@ -2034,6 +2111,96 @@ pub fn assemble_live_frame(
             }
         }
 
+        // `G`-Key Squad Cohesion Tether Arcs: subtle translucent volumetric bead arcs
+        // connecting nearby same-team non-solo allies (`dist < 14m`, capped at 24 arcs/frame)
+        if show_squad_links && ent.players.len() >= 2 {
+            const MAX_SQUAD_ARCS: usize = 24;
+            const MAX_LINK_DIST: f32 = 14.0;
+            const MIN_LINK_DIST: f32 = 0.6;
+            const MAX_DEG_PER_ALLY: u8 = 2;
+
+            let mut squad_nodes: Vec<(usize, u8, u32, Vec3)> = Vec::with_capacity(ent.players.len());
+            for (idx, p) in ent.players.iter().enumerate() {
+                if p.hp <= 0 || archetype_is_solo(p.class_id) {
+                    continue;
+                }
+                let (wx, wz) = grid_to_xz(p.x, p.y);
+                let gy = sample_e_y(p.x, p.y, p.z);
+                squad_nodes.push((idx, p.team, p.id, Vec3::new(wx, gy + 1.45, wz)));
+            }
+
+            let link_cull_r2 = (cull_rad + 20.0) * (cull_rad + 20.0);
+            let mut candidates: Vec<(f32, usize, usize)> = Vec::new();
+            for a in 0..squad_nodes.len() {
+                let (_, team_a, _, pos_a) = squad_nodes[a];
+                for b in (a + 1)..squad_nodes.len() {
+                    let (_, team_b, _, pos_b) = squad_nodes[b];
+                    if team_a != team_b {
+                        continue;
+                    }
+                    let d = pos_a.distance(pos_b);
+                    if d <= MIN_LINK_DIST || d >= MAX_LINK_DIST {
+                        continue;
+                    }
+                    let mid = (pos_a + pos_b) * 0.5;
+                    let cdx = mid.x - cam_target.x;
+                    let cdz = mid.z - cam_target.z;
+                    if cdx * cdx + cdz * cdz > link_cull_r2 {
+                        continue;
+                    }
+                    candidates.push((d, a, b));
+                }
+            }
+            candidates.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut deg = vec![0u8; squad_nodes.len()];
+            for (dist, a, b) in candidates {
+                if squad_arc_count >= MAX_SQUAD_ARCS {
+                    break;
+                }
+                if deg[a] >= MAX_DEG_PER_ALLY || deg[b] >= MAX_DEG_PER_ALLY {
+                    continue;
+                }
+                deg[a] += 1;
+                deg[b] += 1;
+                squad_arc_count += 1;
+
+                let (_, team, id_a, pos_a) = squad_nodes[a];
+                let (_, _, id_b, pos_b) = squad_nodes[b];
+                let base_col = if team == 0 {
+                    [0.34, 0.84, 1.18]
+                } else {
+                    [1.18, 0.44, 0.34]
+                };
+                let prox = (1.0 - (dist / MAX_LINK_DIST).powi(2)).clamp(0.28, 1.0);
+                let beads = ((dist / 2.2).ceil() as usize).clamp(4, 7);
+                let arch_h = (0.45 + dist * 0.085).min(1.65);
+                let pair_seed = (id_a ^ id_b.rotate_left(7)) as f32 * 0.17;
+                let flow = (sim_time * 0.55 + pair_seed).fract();
+
+                for k in 0..beads {
+                    let t = (k as f32 + 0.5) / beads as f32;
+                    let lift = (t * std::f32::consts::PI).sin() * arch_h;
+                    let wpos = pos_a.lerp(pos_b, t) + Vec3::new(0.0, lift, 0.0);
+                    let rel = wpos - origin;
+                    let d_flow = ((t - flow).abs()).min(1.0 - (t - flow).abs());
+                    let pulse_boost = (1.0 - d_flow * 4.5).clamp(0.0, 1.0);
+                    let alpha = (0.18 + 0.16 * pulse_boost) * prox;
+                    let rad = 0.16 + 0.09 * pulse_boost;
+                    vol_splats.push(VolSplat {
+                        pos_rad: [rel.x, rel.y, rel.z, rad],
+                        color_alpha: [
+                            base_col[0] * (0.90 + 0.25 * pulse_boost),
+                            base_col[1] * (0.90 + 0.25 * pulse_boost),
+                            base_col[2] * (0.90 + 0.25 * pulse_boost),
+                            alpha,
+                        ],
+                        params: [0.85, 3.0, pair_seed + k as f32 * 0.9, 0.0],
+                    });
+                }
+            }
+        }
+
         // Elemental Projectiles + Soft Volumetric Trails (in true 3D `(x, y, z)`!)
         for pr in &ent.projectiles {
             let (wx, wz) = grid_to_xz(pr.x, pr.y);
@@ -2060,11 +2227,19 @@ pub fn assemble_live_frame(
         }
 
         // Live 3D Volumetric Physical Actuator Beams, Cryo Fields, Matter Streams & Shockwaves!
+        // In Z16 true-3D mode, endpoints interpolate directly from `(wx0, z0 + 1.1, wz0)` to
+        // `(wx1, z1 + 1.0, wz1)` so aerial-to-bridge and ground-to-air diagonal beams shine in 3D!
         for (p_idx, pulse) in ent.actuator_pulses.iter().enumerate() {
             let (wx0, wz0) = grid_to_xz(pulse.x0, pulse.y0);
-            let wy0 = sample_e_y(pulse.x0, pulse.y0, pulse.z0) + 1.35;
             let (wx1, wz1) = grid_to_xz(pulse.x1, pulse.y1);
-            let wy1 = sample_e_y(pulse.x1, pulse.y1, pulse.z1) + 1.10;
+            let (wy0, wy1) = if z16.is_some() {
+                (pulse.z0 + 1.1, pulse.z1 + 1.0)
+            } else {
+                (
+                    sample_e_y(pulse.x0, pulse.y0, pulse.z0) + 1.1,
+                    sample_e_y(pulse.x1, pulse.y1, pulse.z1) + 1.0,
+                )
+            };
             let p0 = Vec3::new(wx0, wy0, wz0);
             let p1 = Vec3::new(wx1, wy1, wz1);
             let beam_vec = p1 - p0;
@@ -2072,19 +2247,21 @@ pub fn assemble_live_frame(
             let focus_r = pulse.focus_radius.clamp(1.5, 8.5);
             let seed = pulse.x0 * 0.73 + pulse.y0 * 1.19 + pulse.x1 * 0.41 + pulse.y1 * 0.89 + p_idx as f32 * 2.1;
 
-            // Orthogonal horizontal axis for cones, droplets & rings
-            let dir_xz = Vec3::new(beam_vec.x, 0.0, beam_vec.z).normalize_or(Vec3::X);
-            let perp_xz = Vec3::new(-dir_xz.z, 0.0, dir_xz.x);
+            // True 3D orthonormal frame around the diagonal beam ray (safe even for steep vertical fire!)
+            let beam_dir = beam_vec.normalize_or(Vec3::X);
+            let up_ref = if beam_dir.y.abs() > 0.92 { Vec3::X } else { Vec3::Y };
+            let perp_u = beam_dir.cross(up_ref).normalize_or(Vec3::X);
+            let perp_v = perp_u.cross(beam_dir).normalize_or(Vec3::Y);
 
-            // 1. Focused Heat Beam (thermal_flux > 0.2): orange-gold plasma beam + glowing core impact sphere
+            // 1. Focused Heat Beam (thermal_flux > 0.2): orange-gold 3D diagonal plasma beam + glowing core impact sphere
             if pulse.thermal_flux > 0.2 {
                 let inten = pulse.thermal_flux.clamp(0.2, 1.0);
-                let steps = ((beam_len / 1.45).ceil() as usize).clamp(4, 16);
-                for s in 1..=steps {
+                let steps = ((beam_len / 1.15).ceil() as usize).clamp(5, 22);
+                for s in 0..=steps {
                     let t = s as f32 / steps as f32;
                     let wpos = p0.lerp(p1, t);
                     let rel = wpos - origin;
-                    let rad = (0.34 + 0.24 * inten) * (0.72 + 0.46 * t);
+                    let rad = (0.32 + 0.24 * inten) * (0.68 + 0.50 * t);
                     vol_splats.push(VolSplat {
                         pos_rad: [rel.x, rel.y, rel.z, rad],
                         color_alpha: [1.45, 0.72 + 0.22 * (1.0 - t), 0.14, (0.66 + 0.22 * inten).min(0.90)],
@@ -2111,19 +2288,19 @@ pub fn assemble_live_frame(
                 );
             }
 
-            // 2. Cryo Field (thermal_flux < -0.2): crisp ice-cyan crystalline cone & cloud splats
+            // 2. Cryo Field (thermal_flux < -0.2): crisp ice-cyan 3D diagonal crystalline cone & cloud splats
             if pulse.thermal_flux < -0.2 {
                 let inten = (-pulse.thermal_flux).clamp(0.2, 1.0);
-                let steps = ((beam_len / 1.85).ceil() as usize).clamp(4, 12);
-                for s in 1..=steps {
+                let steps = ((beam_len / 1.40).ceil() as usize).clamp(5, 18);
+                for s in 0..=steps {
                     let t = s as f32 / steps as f32;
                     let ang = seed + s as f32 * 2.39996;
-                    let cone_spread = focus_r * 0.42 * t;
-                    let jitter = perp_xz * (ang.cos() * cone_spread) + Vec3::new(0.0, ang.sin() * cone_spread * 0.28, 0.0);
+                    let cone_spread = focus_r * 0.40 * t;
+                    let jitter = perp_u * (ang.cos() * cone_spread) + perp_v * (ang.sin() * cone_spread * 0.52);
                     let rel = (p0.lerp(p1, t) + jitter) - origin;
                     let is_crystal = s % 2 == 0;
                     vol_splats.push(VolSplat {
-                        pos_rad: [rel.x, rel.y, rel.z, (0.34 + focus_r * 0.18 * t) * (0.75 + 0.30 * inten)],
+                        pos_rad: [rel.x, rel.y, rel.z, (0.32 + focus_r * 0.17 * t) * (0.75 + 0.30 * inten)],
                         color_alpha: if is_crystal {
                             [0.40, 0.92, 1.20, (0.60 + 0.24 * inten).min(0.86)]
                         } else {
@@ -2132,7 +2309,7 @@ pub fn assemble_live_frame(
                         params: [if is_crystal { 1.15 } else { 0.90 }, if is_crystal { 3.0 } else { 2.0 }, seed + s as f32 * 1.9, 0.2],
                     });
                 }
-                // Crystalline impact cloud ring scaled by focus_radius
+                // Crystalline impact cloud ring scaled by focus_radius around true 3D impact point p1
                 for k in 0..6 {
                     let ang = (k as f32 / 6.0) * std::f32::consts::TAU + seed * 0.4;
                     let rr = focus_r * 0.44;
@@ -2151,15 +2328,16 @@ pub fn assemble_live_frame(
                 );
             }
 
-            // 3A. Matter Stream — Oil (sp_oil > 0.2): dark-violet glossy droplets
+            // 3A. Matter Stream — Oil (sp_oil > 0.2): dark-violet glossy droplets along true 3D arc
             if pulse.sp_oil > 0.2 {
                 let inten = pulse.sp_oil.clamp(0.2, 1.0);
-                let steps = ((beam_len / 1.75).ceil() as usize).clamp(4, 10);
+                let steps = ((beam_len / 1.55).ceil() as usize).clamp(4, 14);
+                let horiz_factor = (1.0 - beam_dir.y.abs()).clamp(0.25, 1.0);
                 for s in 1..=steps {
                     let t = s as f32 / steps as f32;
-                    let arc_y = (t * std::f32::consts::PI).sin() * (1.1 + beam_len * 0.07);
+                    let arc_y = (t * std::f32::consts::PI).sin() * (1.1 + beam_len * 0.07) * horiz_factor;
                     let wobble = (seed + s as f32 * 3.1).sin() * (0.25 + focus_r * 0.10 * t);
-                    let wpos = p0.lerp(p1, t) + Vec3::new(0.0, arc_y, 0.0) + perp_xz * wobble;
+                    let wpos = p0.lerp(p1, t) + Vec3::new(0.0, arc_y, 0.0) + perp_u * wobble;
                     let rel = wpos - origin;
                     vol_splats.push(VolSplat {
                         pos_rad: [rel.x, rel.y, rel.z, 0.34 + 0.26 * inten],
@@ -2179,14 +2357,14 @@ pub fn assemble_live_frame(
                 }
             }
 
-            // 3B. Matter Stream — Water (sp_water > 0.2): azure mist stream + spray cloud
+            // 3B. Matter Stream — Water (sp_water > 0.2): azure mist stream + spray cloud along true 3D ray
             if pulse.sp_water > 0.2 {
                 let inten = pulse.sp_water.clamp(0.2, 1.0);
-                let steps = ((beam_len / 1.9).ceil() as usize).clamp(4, 10);
+                let steps = ((beam_len / 1.65).ceil() as usize).clamp(4, 14);
                 for s in 1..=steps {
                     let t = s as f32 / steps as f32;
                     let wobble = (seed + s as f32 * 2.1).cos() * (0.30 + focus_r * 0.14 * t);
-                    let rel = (p0.lerp(p1, t) + perp_xz * wobble) - origin;
+                    let rel = (p0.lerp(p1, t) + perp_u * wobble) - origin;
                     vol_splats.push(VolSplat {
                         pos_rad: [rel.x, rel.y, rel.z, 0.42 + focus_r * 0.15 * t],
                         color_alpha: [0.26, 0.76, 1.08, (0.50 + 0.22 * inten).min(0.76)],
@@ -2386,6 +2564,7 @@ pub fn assemble_live_frame(
         point_pos,
         point_col,
         visible_chunks,
+        squad_arc_count,
     }
 }
 
@@ -2394,21 +2573,26 @@ mod tests {
     use super::*;
     use crate::camera::MobaCamera;
     use crate::hud::{build_hud, HudConfig};
-    use crate::mesh_gen::StaticMeshBank;
-    use frostmarsh_proto::{PlayerSnap, TelemetrySnap};
+    use crate::mesh_gen::{archetype_color, archetype_tag, StaticMeshBank};
+    use frostmarsh_proto::{ActuatorPulseSnap, BotBrainSnap, PlayerSnap, TelemetrySnap};
 
     fn make_mock_entities(player_count: usize) -> LiveEntityState {
         let mut players = Vec::with_capacity(player_count);
         for i in 0..player_count {
-            let class_id = (i % 4) as u8;
+            let class_id = (i % 5) as u8;
             let team = (i % 2) as u8;
-            let angle = (i as f32 / player_count.max(1) as f32) * std::f32::consts::TAU;
-            let radius = 8.0 + (i as f32 * 1.15);
-            let x = (128.0 + angle.cos() * radius).clamp(6.0, 250.0);
-            let y = (128.0 + angle.sin() * radius).clamp(6.0, 250.0);
+            // Cluster allies in compact squads so squad cohesion arcs (<14m) engage naturally
+            let squad_idx = i / 6;
+            let slot_in_squad = i % 6;
+            let base_angle = (squad_idx as f32 / ((player_count + 5) / 6).max(1) as f32) * std::f32::consts::TAU;
+            let squad_rad = 10.0 + (squad_idx % 3) as f32 * 9.0;
+            let sub_angle = (slot_in_squad as f32 / 6.0) * std::f32::consts::TAU;
+            let x = (128.0 + base_angle.cos() * squad_rad + sub_angle.cos() * 3.8).clamp(6.0, 250.0);
+            let y = (128.0 + base_angle.sin() * squad_rad + sub_angle.sin() * 3.8).clamp(6.0, 250.0);
             let z = match class_id {
                 CLASS_SKYWING => 2.2 + (i % 3) as f32 * 0.4,
                 CLASS_EMBERSTALKER => 1.6,
+                CLASS_BURROWER => 0.65,
                 _ => 1.0,
             };
             players.push(PlayerSnap {
@@ -2420,11 +2604,11 @@ mod tests {
                 x,
                 y,
                 z,
-                vx: angle.sin() * 14.0,
-                vy: -angle.cos() * 14.0,
+                vx: base_angle.sin() * 14.0,
+                vy: -base_angle.cos() * 14.0,
                 vz: if class_id == CLASS_SKYWING { 0.8 } else { 0.0 },
-                aim_x: angle.cos(),
-                aim_y: angle.sin(),
+                aim_x: base_angle.cos(),
+                aim_y: base_angle.sin(),
                 hp: 110,
                 max_hp: 140,
                 mana: 85,
@@ -2447,6 +2631,15 @@ mod tests {
                 score: (player_count - i) as u32 * 10,
             });
         }
+        let bot_brains = vec![BotBrainSnap {
+            bot_id: 5,
+            team: 0,
+            class_id: CLASS_BURROWER,
+            z_heatmap_4x4: [120; 16],
+            elem_probs: [200, 90, 40],
+            ability_probs: [140, 180, 120, 60, 210, 95],
+            target_id: 2,
+        }];
         LiveEntityState {
             sim_tick: 120,
             match_time_secs: 95,
@@ -2494,7 +2687,7 @@ mod tests {
                 active_time_domes: 0,
                 system2_slm_active: false,
             },
-            bot_brains: Vec::new(),
+            bot_brains,
             kill_feed: Vec::new(),
             speech_bubbles: Vec::new(),
             actuator_pulses: Vec::new(),
@@ -2507,7 +2700,12 @@ mod tests {
     }
 
     #[test]
-    fn test_four_archetype_meshes_and_48_player_assembly_finite() {
+    fn test_five_archetype_meshes_64p_diagonal_beams_and_squad_links() {
+        assert_eq!(archetype_tag(CLASS_BURROWER), "BURROWER");
+        assert!(!archetype_is_solo(CLASS_BURROWER));
+        assert!(archetype_is_solo(CLASS_EMBERSTALKER));
+        assert!(archetype_color(CLASS_BURROWER).iter().all(|c| c.is_finite()));
+
         let bank = StaticMeshBank::build(1);
         let archetype_kinds = [
             MeshKind::HeroStrider,
@@ -2516,6 +2714,7 @@ mod tests {
             MeshKind::SkywingWingR,
             MeshKind::HeroTidekin,
             MeshKind::HeroStalker,
+            MeshKind::HeroBurrower,
         ];
         for kind in archetype_kinds {
             let sl = bank.slices[kind as usize];
@@ -2531,7 +2730,7 @@ mod tests {
             }
         }
 
-        // Verify 48-player AND 64-player assembly + HUD scaling (no overflow, all finite)
+        // Verify 48-player AND 64-player assembly across all 5 archetypes + Squad Links + HUD scaling
         let world = LiveApproach4World::new(256, 256, 4);
         let surfels = SurfelProtoBank::build();
         let cam = MobaCamera {
@@ -2557,17 +2756,38 @@ mod tests {
                 3.25,
                 0,
                 None,
+                true,
+            );
+            let frame_no_links = assemble_live_frame(
+                &world,
+                None,
+                Some(&ent),
+                &surfels,
+                &mats,
+                cam.target,
+                cam.dist,
+                3.25,
+                0,
+                None,
+                false,
             );
 
-            let per_arch = player_count / 4;
-            assert_eq!(frame.mesh_batches[MeshKind::HeroStrider as usize].len(), per_arch);
-            assert_eq!(frame.mesh_batches[MeshKind::HeroSkywing as usize].len(), per_arch);
-            assert_eq!(frame.mesh_batches[MeshKind::SkywingWingL as usize].len(), per_arch);
-            assert_eq!(frame.mesh_batches[MeshKind::SkywingWingR as usize].len(), per_arch);
-            assert_eq!(frame.mesh_batches[MeshKind::HeroTidekin as usize].len(), per_arch);
-            assert_eq!(frame.mesh_batches[MeshKind::HeroStalker as usize].len(), per_arch);
+            let expected = |cls: usize| (player_count + 4 - cls) / 5;
+            assert_eq!(frame.mesh_batches[MeshKind::HeroStrider as usize].len(), expected(0));
+            assert_eq!(frame.mesh_batches[MeshKind::HeroSkywing as usize].len(), expected(1));
+            assert_eq!(frame.mesh_batches[MeshKind::SkywingWingL as usize].len(), expected(1));
+            assert_eq!(frame.mesh_batches[MeshKind::SkywingWingR as usize].len(), expected(1));
+            assert_eq!(frame.mesh_batches[MeshKind::HeroTidekin as usize].len(), expected(2));
+            assert_eq!(frame.mesh_batches[MeshKind::HeroStalker as usize].len(), expected(3));
+            assert_eq!(frame.mesh_batches[MeshKind::HeroBurrower as usize].len(), expected(4));
             assert!(frame.mesh_batches[MeshKind::GroundRing as usize].len() >= player_count);
             assert!(!frame.vol_splats.is_empty());
+
+            // Squad cohesion tether arcs: active when enabled, capped <= 24, disabled when off
+            assert!(frame.squad_arc_count > 0, "expected active squad links for {}p", player_count);
+            assert!(frame.squad_arc_count <= 24, "squad links must be capped at 24");
+            assert_eq!(frame_no_links.squad_arc_count, 0);
+            assert!(frame.vol_splats.len() > frame_no_links.vol_splats.len());
 
             for batch in &frame.mesh_batches {
                 for inst in batch {
@@ -2594,7 +2814,7 @@ mod tests {
                     show_hud: true,
                     show_telemetry: true,
                     show_brain_inspector: true,
-                    brain_selected_idx: None,
+                    brain_selected_idx: Some(0),
                     selected_element: 0,
                     focus_radius: 4.0,
                     style_label: "PIXEL-2XSS",
@@ -2609,6 +2829,7 @@ mod tests {
                     audio_muted: false,
                     audio_available: true,
                     cave_enclosure: 0.0,
+                    show_squad_links: true,
                 },
             );
             assert!(!hud_batch.vertices.is_empty());
@@ -2617,5 +2838,99 @@ mod tests {
                 assert!(hv.color.iter().all(|c| c.is_finite()));
             }
         }
+
+        // Verify Solo Emberstalkers are NEVER linked by squad cohesion tethers
+        let mut solo_ent = make_mock_entities(6);
+        for (i, p) in solo_ent.players.iter_mut().enumerate() {
+            p.class_id = CLASS_EMBERSTALKER;
+            p.team = 0;
+            p.x = 128.0 + (i as f32) * 1.5;
+            p.y = 128.0;
+        }
+        let solo_frame = assemble_live_frame(
+            &world,
+            None,
+            Some(&solo_ent),
+            &surfels,
+            &mats,
+            cam.target,
+            cam.dist,
+            1.0,
+            0,
+            None,
+            true,
+        );
+        assert_eq!(solo_frame.squad_arc_count, 0, "solo Emberstalkers must never be tethered");
+
+        // Verify True 3D Diagonal Vertical Actuator Beams (z0 -> z1) in Z16 mode:
+        // Skywing firing heat beam diagonally DOWN (z0=11.0 -> z1=4.0) &
+        // Strider firing cryo beam diagonally UP (z0=2.0 -> z1=11.5)
+        let z16 = Z16World::new(128, 128, 16);
+        let mut beam_ent = make_mock_entities(5);
+        beam_ent.players.clear();
+        beam_ent.actuator_pulses.push(ActuatorPulseSnap {
+            x0: 64.0,
+            y0: 64.0,
+            z0: 11.0,
+            x1: 72.0,
+            y1: 68.0,
+            z1: 4.0,
+            thermal_flux: 0.95,
+            sp_oil: 0.0,
+            sp_water: 0.0,
+            sp_smoke: 0.0,
+            focus_radius: 3.5,
+            impulse: 0.0,
+            team: 0,
+        });
+        beam_ent.actuator_pulses.push(ActuatorPulseSnap {
+            x0: 60.0,
+            y0: 60.0,
+            z0: 2.0,
+            x1: 66.0,
+            y1: 64.0,
+            z1: 11.5,
+            thermal_flux: -0.90,
+            sp_oil: 0.0,
+            sp_water: 0.0,
+            sp_smoke: 0.0,
+            focus_radius: 3.5,
+            impulse: 0.0,
+            team: 1,
+        });
+        let beam_frame = assemble_live_frame(
+            &world,
+            Some(&z16),
+            Some(&beam_ent),
+            &surfels,
+            &mats,
+            cam.target,
+            cam.dist,
+            2.0,
+            0,
+            None,
+            false,
+        );
+        // Convert relative splat Y back to world Y using mats.origin.y
+        let beam_ys: Vec<f32> = beam_frame
+            .vol_splats
+            .iter()
+            .filter(|s| s.pos_rad[3] >= 0.31) // exclude small ambient weather motes (0.20)
+            .map(|s| s.pos_rad[1] + mats.origin.y)
+            .collect();
+        assert!(
+            beam_ys.iter().any(|&y| y >= 11.0),
+            "diagonal 3D beams must reach airborne z0/z1 altitude >= 11.0m, got max {:?}",
+            beam_ys.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        );
+        assert!(
+            beam_ys.iter().any(|&y| y <= 4.5),
+            "diagonal 3D beams must reach ground/bridge z0/z1 altitude <= 4.5m, got min {:?}",
+            beam_ys.iter().copied().fold(f32::INFINITY, f32::min)
+        );
+        assert!(
+            beam_ys.iter().any(|&y| y > 6.0 && y < 9.5),
+            "diagonal 3D beams must interpolate smoothly through mid-air altitude"
+        );
     }
 }

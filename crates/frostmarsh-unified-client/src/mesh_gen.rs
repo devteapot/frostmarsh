@@ -1,10 +1,11 @@
 //! Approach 4 Parametric CSG/SDF Greedy-Meshed Baked-AO 3D Characters & Props for Live Frostmarsh.
 //!
-//! 4 Distinct 3D Player Archetypes (`class_id` 0..=3):
+//! 5 Distinct 3D Player Archetypes (`class_id` 0..=4):
 //! - `HeroStrider` (0 — Heavy Walker / Squad Anchor: broad pauldrons, heavy shield crest, banner plume)
 //! - `HeroSkywing` + `SkywingWingL`/`SkywingWingR` (1 — True 3D Flyer / Thermal Glider: articulated glowing wings)
 //! - `HeroTidekin` (2 — Amphibious Swimmer / Diver: sleek dorsal fin, hydro-fins, aqua bioluminescent trim)
 //! - `HeroStalker` (3 — Emberstalker Solo Cavern Climber / Raider: dark hooded cloak + glowing twin ember-blades)
+//! - `HeroBurrower` (4 — Subterranean Crystal-Plated Golem: twin conical drill-gauntlets, glowing amethyst/amber dorsal crystal spine, heavy subterranean treads/claws)
 //!
 //! Plus Props & FX:
 //! - IceRaft, RelicPedestal, GoldenRelic, DashHalo, MeleeArc, ProjectileOrb,
@@ -19,6 +20,7 @@ pub const CLASS_STRIDER: u8 = 0;
 pub const CLASS_SKYWING: u8 = 1;
 pub const CLASS_TIDEKIN: u8 = 2;
 pub const CLASS_EMBERSTALKER: u8 = 3;
+pub const CLASS_BURROWER: u8 = 4;
 
 #[inline]
 pub fn archetype_tag(class_id: u8) -> &'static str {
@@ -26,6 +28,8 @@ pub fn archetype_tag(class_id: u8) -> &'static str {
         CLASS_STRIDER => "STRIDER",
         CLASS_SKYWING => "SKYWING",
         CLASS_TIDEKIN => "TIDEKIN",
+        CLASS_EMBERSTALKER => "STALKER",
+        CLASS_BURROWER => "BURROWER",
         _ => "STALKER",
     }
 }
@@ -36,6 +40,8 @@ pub fn archetype_color(class_id: u8) -> [f32; 4] {
         CLASS_STRIDER => [0.46, 0.90, 1.00, 1.0],
         CLASS_SKYWING => [1.00, 0.74, 0.28, 1.0],
         CLASS_TIDEKIN => [0.22, 0.96, 0.86, 1.0],
+        CLASS_EMBERSTALKER => [1.00, 0.36, 0.22, 1.0],
+        CLASS_BURROWER => [0.94, 0.58, 0.34, 1.0],
         _ => [1.00, 0.36, 0.22, 1.0],
     }
 }
@@ -74,7 +80,7 @@ pub struct MeshSlice {
     pub index_count: u32,
 }
 
-pub const MESH_KIND_COUNT: usize = 17;
+pub const MESH_KIND_COUNT: usize = 18;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum MeshKind {
@@ -95,6 +101,7 @@ pub enum MeshKind {
     HeroStalker = 14,
     SkywingWingL = 15,
     SkywingWingR = 16,
+    HeroBurrower = 17,
 }
 
 pub struct StaticMeshBank {
@@ -619,6 +626,134 @@ fn build_parametric_stalker(v_out: &mut Vec<MeshVertex>, i_out: &mut Vec<u32>, d
     vol.compile_to_mesh(v_out, i_out, 0.14, true, 0.44);
 }
 
+/// Archetype 4: BURROWER — Subterranean Crystal-Plated Golem
+/// Stocky armored terracotta-amber chassis, heavy subterranean treads/claws,
+/// twin conical spiral drill-gauntlets with glowing amber tips, and a blazing
+/// amethyst/amber crystal dorsal spine erupting along the back and shoulders!
+fn build_parametric_burrower(v_out: &mut Vec<MeshVertex>, i_out: &mut Vec<u32>, detail: u32) {
+    let det = detail.clamp(1, 2);
+    let mut vol = ParamVolume::new(19.0, 20.0, 19.0, det);
+    let (cx, cz) = (9.5f32, 8.2f32);
+
+    let team = vol.color_mat(0xffffff, 12.0);
+    let terracotta = vol.color_mat(0xcc6c3c, 1.0);
+    let terracotta_d = vol.color_mat(0x884224, 1.0);
+    let basalt = vol.color_mat(0x362f3c, 1.0);
+    let bronze = vol.color_mat(0xdc9844, 10.0);
+    let drill_steel = vol.color_mat(0xc2cedc, 10.0);
+    let amber_glow = vol.color_mat(0xffaa30, 5.0);
+    let amethyst_glow = vol.color_mat(0xc95cff, 5.0);
+
+    // Wide heavy subterranean treads & digging claws
+    for s in [-1.0f32, 1.0] {
+        let lx = cx + s * 2.45;
+        // Armored basalt tread housing
+        vol.rounded_box(lx - 1.45, 0.0, cz - 2.35, 2.9, 2.3, 4.9, 0.5, basalt);
+        // Stocky hydraulic piston legs
+        vol.rounded_box(lx - 1.25, 2.0, cz - 1.35, 2.5, 3.0, 2.8, 0.55, terracotta_d);
+        // Bronze tread cleats & twin forward subterranean digging claws
+        vol.box_f(lx - 1.55, 0.25, cz - 1.9, 3.1, 0.75, 0.8, bronze);
+        vol.box_f(lx - 1.55, 0.25, cz + 0.1, 3.1, 0.75, 0.8, bronze);
+        for c_off in [-0.75f32, 0.75] {
+            vol.column(lx + c_off, 0.2, cz + 2.65, 1.3, 0.45, 0.14, bronze);
+        }
+    }
+
+    // Stocky broad crystal-plated terracotta golem torso + faction chest carapace + amber furnace core
+    vol.rounded_box(cx - 3.65, 4.4, cz - 2.65, 7.3, 6.2, 5.3, 1.0, terracotta);
+    vol.rounded_box(cx - 3.10, 5.8, cz - 2.25, 6.2, 4.2, 4.9, 0.85, team);
+    vol.rounded_box(cx - 3.85, 4.3, cz - 2.75, 7.7, 1.4, 5.5, 0.65, basalt);
+    vol.box_f(cx - 1.4, 4.4, cz + 2.55, 2.8, 1.2, 0.6, bronze);
+    // Glowing amber core furnace nestled in armored chest
+    vol.ellipsoid(cx, 7.8, cz + 2.55, 1.2, 1.05, 0.6, amber_glow);
+    vol.box_f(cx - 1.8, 7.3, cz + 2.35, 3.6, 0.35, 0.55, bronze);
+
+    // Massive hunched boulder-plated pauldrons
+    for s in [-1.0f32, 1.0] {
+        let sx = cx + s * 4.45;
+        vol.ellipsoid(sx, 9.6, cz - 0.15, 2.25, 1.85, 2.45, terracotta_d);
+        vol.ellipsoid(sx + s * 0.2, 10.6, cz - 0.15, 1.75, 0.85, 2.0, bronze);
+        vol.ellipsoid(sx + s * 0.55, 9.2, cz - 0.1, 1.45, 0.95, 1.8, team);
+    }
+
+    // Low-set armored subterranean golem head / brow nestled between shoulders
+    vol.rounded_box(cx - 2.35, 10.2, cz - 1.75, 4.7, 3.5, 4.1, 0.85, terracotta);
+    vol.rounded_box(cx - 2.55, 12.2, cz - 1.85, 5.1, 1.5, 4.4, 0.65, terracotta_d);
+    vol.box_f(cx - 1.55, 11.1, cz + 2.05, 3.1, 0.9, 0.6, basalt);
+    // Twin glowing amber visor eyes + crown crystal ridge
+    vol.box_f(cx - 1.25, 11.25, cz + 2.35, 0.9, 0.55, 0.45, amber_glow);
+    vol.box_f(cx + 0.35, 11.25, cz + 2.35, 0.9, 0.55, 0.45, amber_glow);
+    vol.column(cx, 13.4, cz - 0.3, 2.4, 0.72, 0.18, amethyst_glow);
+
+    // Glowing Amethyst & Amber Crystal Dorsal Spine erupting along the back & shoulders (-Z)
+    vol.sculpt(cx - 4.6, 6.2, cz - 6.6, cx + 4.6, 18.8, cz - 1.0, |wx, wy, wz| {
+        // 5 sculpted angled crystal spires: (base_x, base_y, base_z, dir_x, dir_y, dir_z, len, rad, is_amethyst)
+        let spires: [(f32, f32, f32, f32, f32, f32, f32, f32, bool); 5] = [
+            (cx, 10.6, cz - 2.0, 0.0, 0.82, -0.57, 7.6, 1.15, true),
+            (cx - 2.0, 10.0, cz - 2.2, -0.26, 0.78, -0.56, 6.0, 0.95, false),
+            (cx + 2.0, 10.0, cz - 2.2, 0.26, 0.78, -0.56, 6.0, 0.95, false),
+            (cx - 1.2, 7.4, cz - 2.4, -0.18, 0.48, -0.86, 4.6, 0.85, true),
+            (cx + 1.2, 7.4, cz - 2.4, 0.18, 0.48, -0.86, 4.6, 0.85, true),
+        ];
+        for (bx, by, bz, dx, dy, dz, len, rad, is_amethyst) in spires {
+            let rx = wx - bx;
+            let ry = wy - by;
+            let rz = wz - bz;
+            let proj = rx * dx + ry * dy + rz * dz;
+            if proj < 0.0 || proj > len {
+                continue;
+            }
+            let t = proj / len;
+            let px = rx - dx * proj;
+            let py = ry - dy * proj;
+            let pz = rz - dz * proj;
+            let d = (px * px + py * py + pz * pz).sqrt();
+            let max_r = rad * (1.0 - t * 0.84) * (0.88 + 0.14 * (t * PI).sin());
+            if d <= max_r {
+                return if t > 0.72 {
+                    if is_amethyst { amber_glow } else { amethyst_glow }
+                } else if is_amethyst {
+                    amethyst_glow
+                } else {
+                    amber_glow
+                };
+            }
+        }
+        0
+    });
+
+    // Twin Conical Spiral Drill-Gauntlets extending forward (+Z) on both arms (-X and +X)!
+    for s in [-1.0f32, 1.0] {
+        let sx = cx + s * 4.75;
+        let arm_y = 6.9f32;
+        // Heavy forearm housing + bronze rotary collar
+        vol.rounded_box(sx - 1.25, arm_y - 1.35, cz - 1.1, 2.5, 2.7, 3.6, 0.55, basalt);
+        vol.rounded_box(sx - 1.45, arm_y - 1.55, cz + 2.1, 2.9, 3.1, 1.3, 0.45, bronze);
+        // Sculpted conical spiral auger drill bit (+Z)
+        vol.sculpt(sx - 1.85, arm_y - 1.85, cz + 3.2, sx + 1.85, arm_y + 1.85, cz + 9.4, |wx, wy, wz| {
+            let u = ((wz - (cz + 3.2)) / 6.0).clamp(0.0, 1.0);
+            let dx = wx - sx;
+            let dy = wy - arm_y;
+            let r = dx.hypot(dy);
+            let ang = dy.atan2(dx);
+            let flute = (u * 16.0 + ang * 2.0 * s).sin();
+            let cone_r = (1.52 * (1.0 - u * 0.88)).max(0.16) + flute * 0.20 * (1.0 - u * 0.5);
+            if r > cone_r || wz > cz + 9.2 {
+                return 0;
+            }
+            if u > 0.76 {
+                amber_glow
+            } else if flute > 0.45 {
+                if u > 0.45 { amethyst_glow } else { bronze }
+            } else {
+                drill_steel
+            }
+        });
+    }
+
+    vol.compile_to_mesh(v_out, i_out, 0.14, true, 0.42);
+}
+
 /// Parametric Sculpted Carved Ice Raft (`CellBody` beveled glacial floe with frosted rim & cyan veins!)
 fn build_parametric_ice_raft(v_out: &mut Vec<MeshVertex>, i_out: &mut Vec<u32>, detail: u32) {
     let det = detail.clamp(1, 2);
@@ -960,6 +1095,9 @@ impl StaticMeshBank {
         let skywing_wing_l = make_slice(&mut |v, i| build_skywing_wing(v, i, detail, -1.0));
         let skywing_wing_r = make_slice(&mut |v, i| build_skywing_wing(v, i, detail, 1.0));
 
+        // 17: Burrower (Subterranean Crystal-Plated Golem — twin conical drill-gauntlets + crystal dorsal spine!)
+        let hero_burrower = make_slice(&mut |v, i| build_parametric_burrower(v, i, detail));
+
         Self {
             vertices: verts,
             indices: idxs,
@@ -981,6 +1119,7 @@ impl StaticMeshBank {
                 hero_stalker,
                 skywing_wing_l,
                 skywing_wing_r,
+                hero_burrower,
             ],
         }
     }

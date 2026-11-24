@@ -32,9 +32,12 @@ mod wasm_app {
         step_capsule_3d, CAPSULE_EYE_HEIGHT, DEFAULT_CAPSULE_HEIGHT, DEFAULT_CAPSULE_RADIUS,
     };
     use crate::hero_mesh::{
-        build_hero_knight_mesh, build_projectile_orb_mesh, showcase_hero_instances, HeroInstance,
+        build_archetype_meshes, build_projectile_orb_mesh, showcase_archetype_heroes, HeroInstance,
+        ARCHETYPE_STRIDER, NUM_ARCHETYPES,
     };
-    use crate::live_entities::parse_live_entities_json;
+    use crate::live_entities::{
+        expand_beams_to_orbs, parse_live_entities_json, EvolutionStats, LiveBeam,
+    };
     use crate::renderer::WebRenderer;
     use crate::style_name_for;
     use crate::surface_nets_3d::SurfaceNetsWorld;
@@ -89,7 +92,11 @@ mod wasm_app {
         volume_ms: f64,
         sn_build_ms: f64,
         base_heroes: Vec<HeroInstance>,
+        base_hero_classes: Vec<u8>,
+        archetype_counts: [usize; NUM_ARCHETYPES],
         live_projectiles: Vec<HeroInstance>,
+        live_beams: Vec<LiveBeam>,
+        live_evolution: Option<EvolutionStats>,
         live_entities_active: bool,
         live_tick: u64,
         live_server_tps: f32,
@@ -142,9 +149,21 @@ mod wasm_app {
             let sn_world = SurfaceNetsWorld::build_all(&volume);
             let sn_build_ms = (perf_now_ms() - t_sn).max(0.0);
 
-            let hero_mesh = build_hero_knight_mesh();
+            let archetype_meshes = build_archetype_meshes();
             let orb_mesh = build_projectile_orb_mesh();
-            let base_heroes = showcase_hero_instances();
+            let showcase = showcase_archetype_heroes();
+            let mut base_heroes = Vec::with_capacity(showcase.len());
+            let mut base_hero_classes = Vec::with_capacity(showcase.len());
+            let mut archetype_counts = [0usize; NUM_ARCHETYPES];
+            let mut initial_buckets: [Vec<HeroInstance>; NUM_ARCHETYPES] =
+                std::array::from_fn(|_| Vec::new());
+            for (inst, cls) in showcase {
+                let c = (cls as usize) % NUM_ARCHETYPES;
+                base_heroes.push(inst);
+                base_hero_classes.push(c as u8);
+                archetype_counts[c] += 1;
+                initial_buckets[c].push(inst);
+            }
 
             let renderer = WebRenderer::from_canvas(
                 canvas,
@@ -153,8 +172,8 @@ mod wasm_app {
                 &volume,
                 &bricks,
                 &sn_world,
-                &hero_mesh,
-                &base_heroes,
+                &archetype_meshes,
+                &initial_buckets,
                 &orb_mesh,
             )
             .await
@@ -184,7 +203,11 @@ mod wasm_app {
                 volume_ms,
                 sn_build_ms,
                 base_heroes,
+                base_hero_classes,
+                archetype_counts,
                 live_projectiles: Vec::new(),
+                live_beams: Vec::new(),
+                live_evolution: None,
                 live_entities_active: false,
                 live_tick: 0,
                 live_server_tps: 0.0,
@@ -300,12 +323,32 @@ mod wasm_app {
             }
         }
 
+        fn build_orb_instances(&self) -> Vec<HeroInstance> {
+            let mut orbs = Vec::with_capacity(
+                self.live_projectiles.len() + self.live_beams.len() * 20,
+            );
+            orbs.extend_from_slice(&self.live_projectiles);
+            if !self.live_beams.is_empty() {
+                expand_beams_to_orbs(&self.live_beams, self.sim_time, &mut orbs);
+            }
+            orbs
+        }
+
         fn sync_entities_to_gpu(&mut self) {
+            let mut buckets: [Vec<HeroInstance>; NUM_ARCHETYPES] =
+                std::array::from_fn(|_| Vec::new());
+            for (idx, inst) in self.base_heroes.iter().enumerate() {
+                let cls = self
+                    .base_hero_classes
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(ARCHETYPE_STRIDER) as usize
+                    % NUM_ARCHETYPES;
+                buckets[cls].push(*inst);
+            }
             if self.capsule_mode && self.capsule_cam_dist > 0.6 {
-                let mut combined = Vec::with_capacity(self.base_heroes.len() + 1);
-                combined.extend_from_slice(&self.base_heroes);
-                // Render the player's own Hero Knight figurine inside Capsule Walk Mode
-                combined.push(HeroInstance {
+                // Render the player's own Strider Hero Knight figurine inside Capsule Walk Mode
+                buckets[ARCHETYPE_STRIDER as usize].push(HeroInstance {
                     pos_yaw: [
                         self.capsule_pos.x,
                         self.capsule_pos.y,
@@ -314,12 +357,9 @@ mod wasm_app {
                     ],
                     faction_scale: [0.34, 0.86, 1.00, 1.0],
                 });
-                self.renderer
-                    .update_entities(&combined, &self.live_projectiles);
-            } else {
-                self.renderer
-                    .update_entities(&self.base_heroes, &self.live_projectiles);
             }
+            let orbs = self.build_orb_instances();
+            self.renderer.update_entities(&buckets, &orbs);
         }
 
         /// Hot-swap to an external `FM3D` neural volume (`Z=16..32+`) in browser.
@@ -419,14 +459,21 @@ mod wasm_app {
             Ok(elapsed_ms)
         }
 
-        /// Apply a live `0x02` multiplayer JSON entity & telemetry frame from WebSocket!
-        /// Updates live multiplayer hero figurines, glowing projectiles, and telemetry HUD.
-        /// Returns total active rendered entities (`players + projectiles`).
+        /// Apply a live `0x02` multiplayer JSON entity, actuator beam, & evolution frame from WebSocket!
+        /// Updates live 5-archetype hero figurines, glowing projectiles, diagonal beam orb-streams,
+        /// world evolution stats, and telemetry HUD.
+        /// Returns total active rendered entities (`players + projectiles + beams`).
         pub fn apply_live_entities_json(&mut self, json_str: &str) -> Result<u32, JsValue> {
             let parsed =
                 parse_live_entities_json(json_str).map_err(|e| JsValue::from_str(&e))?;
             self.base_heroes = parsed.heroes;
+            self.base_hero_classes = parsed.hero_classes;
+            self.archetype_counts = parsed.archetype_counts;
             self.live_projectiles = parsed.projectiles;
+            self.live_beams = parsed.beams;
+            if parsed.evolution.is_some() {
+                self.live_evolution = parsed.evolution;
+            }
             self.live_entities_active = true;
             self.live_tick = parsed.tick;
             self.live_server_tps = parsed.server_tps;
@@ -436,7 +483,8 @@ mod wasm_app {
                 self.live_status = "Live WS".to_string();
             }
             self.sync_entities_to_gpu();
-            Ok((self.base_heroes.len() + self.live_projectiles.len()) as u32)
+            Ok((self.base_heroes.len() + self.live_projectiles.len() + self.live_beams.len())
+                as u32)
         }
 
         pub fn tick_and_render(&mut self, dt_sec: f32) {
@@ -515,6 +563,10 @@ mod wasm_app {
                     self.cam.pos.y -= fly_speed * dt;
                 }
                 self.clamp_cam_bounds();
+                if !self.live_beams.is_empty() {
+                    let orbs = self.build_orb_instances();
+                    self.renderer.update_orb_instances(&orbs);
+                }
             }
 
             let player_cutaway = [
@@ -553,6 +605,8 @@ mod wasm_app {
             } else {
                 "Free-Fly"
             };
+            let archetype_types = self.archetype_counts.iter().filter(|&&c| c > 0).count();
+            let evo = self.live_evolution.unwrap_or_default();
             format!(
                 concat!(
                     "{{",
@@ -583,6 +637,15 @@ mod wasm_app {
                     "\"live_active\":{},",
                     "\"live_players\":{},",
                     "\"live_projectiles\":{},",
+                    "\"live_beams\":{},",
+                    "\"archetype_types\":{},",
+                    "\"archetype_counts\":[{},{},{},{},{}],",
+                    "\"evo_active\":{},",
+                    "\"evo_epoch\":{},",
+                    "\"evo_basalt\":{},",
+                    "\"evo_trees\":{},",
+                    "\"evo_glaciers\":{},",
+                    "\"evo_erosion\":{},",
                     "\"live_bricks_rx\":{},",
                     "\"last_brick_ms\":{:.3},",
                     "\"live_tick\":{},",
@@ -617,6 +680,19 @@ mod wasm_app {
                 self.live_entities_active,
                 self.base_heroes.len(),
                 self.live_projectiles.len(),
+                self.live_beams.len(),
+                archetype_types,
+                self.archetype_counts[0],
+                self.archetype_counts[1],
+                self.archetype_counts[2],
+                self.archetype_counts[3],
+                self.archetype_counts[4],
+                self.live_evolution.is_some(),
+                evo.epoch,
+                evo.basalt,
+                evo.trees,
+                evo.glaciers,
+                evo.erosion,
                 self.live_bricks_rx,
                 self.last_brick_rebuild_ms,
                 self.live_tick,
@@ -634,9 +710,12 @@ pub use wasm_app::FrostmarshApp;
 mod tests {
     use crate::collision::{step_capsule_3d, DEFAULT_CAPSULE_HEIGHT, DEFAULT_CAPSULE_RADIUS};
     use crate::hero_mesh::{
-        build_hero_knight_mesh, build_projectile_orb_mesh, showcase_hero_instances,
+        archetype_name, build_archetype_meshes, build_hero_knight_mesh, build_projectile_orb_mesh,
+        showcase_archetype_heroes, showcase_hero_instances, ARCHETYPE_BURROWER,
+        ARCHETYPE_EMBERSTALKER, ARCHETYPE_SKYWING, ARCHETYPE_STRIDER, ARCHETYPE_TIDEKIN,
+        NUM_ARCHETYPES,
     };
-    use crate::live_entities::parse_live_entities_json;
+    use crate::live_entities::{expand_beams_to_orbs, parse_live_entities_json, EvolutionStats};
     use crate::style_name_for;
     use crate::surface_nets_3d::{extract_brick, SurfaceNetsWorld};
     use crate::volume::WorldVolume3D;
@@ -784,6 +863,115 @@ mod tests {
         assert!((parsed.projectiles[0].faction_scale[3] - 0.42).abs() < 1e-4);
         assert!((parsed.server_tps - 29.8).abs() < 1e-3);
         assert_eq!(parsed.status.as_deref(), Some("Live WS Demo"));
+        assert_eq!(parsed.hero_classes, vec![0, 0]);
+        assert!(parsed.beams.is_empty());
+        assert!(parsed.evolution.is_none());
+    }
+
+    #[test]
+    fn test_wave14d_five_archetypes_beams_and_evolution() {
+        // 1. All 5 distinct 3D archetype silhouettes compile and have expected animated traits
+        let meshes = build_archetype_meshes();
+        assert_eq!(meshes.len(), NUM_ARCHETYPES);
+        for (cid, mesh) in meshes.iter().enumerate() {
+            assert!(!mesh.vertices.is_empty(), "archetype {cid} has vertices");
+            assert!(!mesh.indices.is_empty(), "archetype {cid} has indices");
+        }
+        assert_eq!(archetype_name(ARCHETYPE_STRIDER), "Strider");
+        assert_eq!(archetype_name(ARCHETYPE_SKYWING), "Skywing");
+        assert_eq!(archetype_name(ARCHETYPE_TIDEKIN), "Tidekin");
+        assert_eq!(archetype_name(ARCHETYPE_EMBERSTALKER), "Emberstalker");
+        assert_eq!(archetype_name(ARCHETYPE_BURROWER), "Burrower");
+
+        // Skywing must have wide soaring wingspan (> 3.5m total) and GPU wing-flap weights
+        let sky = &meshes[ARCHETYPE_SKYWING as usize];
+        let max_abs_x = sky
+            .vertices
+            .iter()
+            .map(|v| v.pos[0].abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs_x > 1.8, "Skywing half-wingspan should exceed 1.8m, got {max_abs_x}");
+        assert!(
+            sky.vertices.iter().any(|v| v.flags[2] >= 0.9),
+            "Skywing must encode wing-flap weight in flags.z"
+        );
+
+        // Burrower must encode spinning crystal-amber bore drill (flags.w >= 1.5)
+        let bur = &meshes[ARCHETYPE_BURROWER as usize];
+        assert!(
+            bur.vertices.iter().any(|v| v.flags[3] >= 1.5 && v.flags[1] > 0.5),
+            "Burrower must have glowing spinning crystal-amber drill vertices"
+        );
+
+        // Default showcase features all 5 archetypes
+        let showcase = showcase_archetype_heroes();
+        assert_eq!(showcase.len(), 5);
+        for expected_cls in 0..5u8 {
+            assert!(
+                showcase.iter().any(|(_, cls)| *cls == expected_cls),
+                "showcase missing archetype {expected_cls}"
+            );
+        }
+
+        // 2. Parse full Wave 14D JSON frame with class_id (0..4), diagonal beams, and evolution stats
+        let json = r#"{
+            "tick": 1024,
+            "world_day": 5,
+            "players": [
+                {"id": 1, "class_id": 0, "x": 126.5, "y": 9.04, "z": 128.8, "yaw": 1.15},
+                {"id": 2, "class_id": 1, "x": 120.0, "y": 14.5, "z": 125.0, "yaw": 0.4, "scale": 1.1},
+                {"id": 3, "class_id": 2, "x": 115.0, "y": 3.15, "z": 129.0, "yaw": -0.2},
+                {"id": 4, "class_id": 3, "x": 100.2, "y": 4.25, "z": 151.4, "yaw": -1.9},
+                {"id": 5, "class_id": 4, "x": 93.2, "y": 4.25, "z": 153.6, "yaw": -1.7, "color": [1.0, 0.7, 0.15]}
+            ],
+            "projectiles": [
+                {"id": 50, "x": 125.0, "y": 11.0, "z": 127.0, "color": [0.2, 0.9, 1.0], "radius": 0.35}
+            ],
+            "beams": [
+                {"x0": 120.0, "y0": 14.5, "z0": 125.0, "x1": 128.0, "y1": 9.1, "z1": 128.5, "color": [1.0, 0.56, 0.14]},
+                {"x0": 115.0, "y0": 4.0, "z0": 129.0, "x1": 102.0, "y1": 6.5, "z1": 148.0, "color": [0.16, 0.92, 1.0], "radius": 0.30}
+            ],
+            "evolution": {
+                "epoch": 42,
+                "basalt": 128,
+                "trees": 64,
+                "glaciers": 19,
+                "erosion": 310
+            },
+            "telemetry": {
+                "server_tps": 30.0,
+                "online_players": 5,
+                "status": "Nordic Viaduct Z=32"
+            }
+        }"#;
+
+        let parsed = parse_live_entities_json(json).expect("parse Wave 14D payload");
+        assert_eq!(parsed.tick, 1024);
+        assert_eq!(parsed.heroes.len(), 5);
+        assert_eq!(parsed.hero_classes, vec![0, 1, 2, 3, 4]);
+        assert_eq!(parsed.archetype_counts, [1, 1, 1, 1, 1]);
+        assert!((parsed.heroes[1].pos_yaw[1] - 14.5).abs() < 1e-4);
+        assert_eq!(parsed.beams.len(), 2);
+        assert!((parsed.beams[0].start[1] - 14.5).abs() < 1e-4);
+        assert!((parsed.beams[0].end[1] - 9.1).abs() < 1e-4);
+        assert!((parsed.beams[1].radius - 0.30).abs() < 1e-4);
+        assert_eq!(
+            parsed.evolution,
+            Some(EvolutionStats {
+                epoch: 42,
+                basalt: 128,
+                trees: 64,
+                glaciers: 19,
+                erosion: 310,
+            })
+        );
+
+        // 3. Diagonal beams expand into glowing 3D volumetric orb-streams spanning start -> end
+        let mut beam_orbs = Vec::new();
+        expand_beams_to_orbs(&parsed.beams, 1.25, &mut beam_orbs);
+        assert!(beam_orbs.len() >= 20, "expected dense volumetric orb-stream, got {}", beam_orbs.len());
+        let first = beam_orbs[0].pos_yaw;
+        assert!((first[0] - 120.0).abs() < 1e-3 && (first[1] - 14.5).abs() < 1e-3);
     }
 
     #[test]

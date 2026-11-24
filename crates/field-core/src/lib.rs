@@ -3189,6 +3189,215 @@ impl VolumeField {
         self.evolution_stats.glaciers_formed = self.evolution_stats.glaciers_formed.saturating_add(glaciers_formed);
     }
 
+    /// Living World Epoch classifier driven by `evolution_stats` (`basalt_forged`, `saplings_grown`,
+    /// `glaciers_formed`, `world_epoch`).
+    pub fn evolution_epoch_name(&self) -> &'static str {
+        let ev = self.evolution_stats;
+        let total_events = ev
+            .basalt_forged
+            .saturating_add(ev.saplings_grown)
+            .saturating_add(ev.glaciers_formed);
+        if total_events < 15 && ev.world_epoch < 15 {
+            return "EPOCH I: PRISTINE";
+        }
+        if ev.glaciers_formed >= 15
+            && ev.glaciers_formed > ev.basalt_forged
+            && ev.glaciers_formed > ev.saplings_grown
+        {
+            "EPOCH IV: GLACIAL AGE"
+        } else if ev.saplings_grown >= 15 && ev.saplings_grown >= ev.basalt_forged {
+            "EPOCH III: VERDANT REGROWTH"
+        } else if ev.basalt_forged >= 15 {
+            "EPOCH II: VOLCANIC FORGE"
+        } else if ev.world_epoch >= 180 {
+            "EPOCH IV: GLACIAL AGE"
+        } else if ev.world_epoch >= 90 {
+            "EPOCH III: VERDANT REGROWTH"
+        } else if ev.world_epoch >= 15 {
+            "EPOCH II: VOLCANIC FORGE"
+        } else {
+            "EPOCH I: PRISTINE"
+        }
+    }
+
+    /// Conservative subterranean tunnel carving for `CLASS_BURROWER` (`Terramole`):
+    /// Displaces `SP_SOIL` and soft `SP_ROCK` (up to 60% per step) in a small sphere around `(gx, gy, gz)`
+    /// (strictly respecting the `z >= 1` bedrock floor and outer perimeter cliffs) into adjacent
+    /// perimeter / behind-the-burrower cells via exact antisymmetric integer mass & proportional
+    /// enthalpy transfer so **`mass_error == 0 && energy_error == 0` ALWAYS**!
+    /// Returns total mass units conservatively displaced.
+    pub fn carve_tunnel_3d(
+        &mut self,
+        gx: f32,
+        gy: f32,
+        gz: f32,
+        dir_x: f32,
+        dir_y: f32,
+        radius: f32,
+    ) -> u32 {
+        let (w, h, d) = (self.width, self.height, self.depth);
+        if d < 2 || w < 6 || h < 6 {
+            return 0;
+        }
+        let gx = sanitize_f32(gx).clamp(2.0, (w - 3) as f32);
+        let gy = sanitize_f32(gy).clamp(2.0, (h - 3) as f32);
+        let gz = sanitize_f32(gz).clamp(1.0, (d - 1) as f32);
+        let rf = sanitize_f32(radius).clamp(0.9, 4.5);
+        let r2 = rf * rf;
+
+        let dx_raw = sanitize_f32(dir_x);
+        let dy_raw = sanitize_f32(dir_y);
+        let dmag = dx_raw.hypot(dy_raw);
+        let (fwd_x, fwd_y) = if dmag > 1e-4 {
+            (dx_raw / dmag, dy_raw / dmag)
+        } else {
+            (1.0, 0.0)
+        };
+
+        let r_ceil = rf.ceil() as i32;
+        let cx = gx.floor() as i32;
+        let cy = gy.floor() as i32;
+        let cz = gz.floor() as i32;
+
+        let x_min = (cx - r_ceil).max(2);
+        let x_max = (cx + r_ceil).min((w - 3) as i32);
+        let y_min = (cy - r_ceil).max(2);
+        let y_max = (cy + r_ceil).min((h - 3) as i32);
+        let z_min = (cz - r_ceil).max(1); // Preserve z == 0 bedrock floor!
+        let z_max = (cz + r_ceil).min((d - 1) as i32);
+
+        let mut src_voxels: Vec<(usize, usize)> = Vec::new();
+        for z in z_min..=z_max {
+            let dz = (z as f32 + 0.5) - gz;
+            let zu = z as usize;
+            for y in y_min..=y_max {
+                let dy = (y as f32 + 0.5) - gy;
+                let row = (y as usize) * w;
+                for x in x_min..=x_max {
+                    let dx = (x as f32 + 0.5) - gx;
+                    if dx * dx + dy * dy + dz * dz <= r2 {
+                        let idx = row + (x as usize);
+                        if self.layers[zu].mass[SP_SOIL][idx] > 0
+                            || self.layers[zu].mass[SP_ROCK][idx] > 0
+                        {
+                            src_voxels.push((zu, idx));
+                        }
+                    }
+                }
+            }
+        }
+        if src_voxels.is_empty() {
+            return 0;
+        }
+
+        let shell_r = (rf + 2.5).ceil() as i32;
+        let shell_r2_max = (rf + 2.6) * (rf + 2.6);
+        let sx_min = (cx - shell_r).max(1);
+        let sx_max = (cx + shell_r).min((w - 2) as i32);
+        let sy_min = (cy - shell_r).max(1);
+        let sy_max = (cy + shell_r).min((h - 2) as i32);
+        let sz_min = (cz - shell_r).max(0);
+        let sz_max = (cz + shell_r).min((d - 1) as i32);
+
+        let mut dst_voxels: Vec<(f32, usize, usize)> = Vec::new();
+        for z in sz_min..=sz_max {
+            let dz = (z as f32 + 0.5) - gz;
+            let zu = z as usize;
+            for y in sy_min..=sy_max {
+                let dy = (y as f32 + 0.5) - gy;
+                let row = (y as usize) * w;
+                for x in sx_min..=sx_max {
+                    let dx = (x as f32 + 0.5) - gx;
+                    let dist2 = dx * dx + dy * dy + dz * dz;
+                    if dist2 <= r2 || dist2 > shell_r2_max {
+                        continue;
+                    }
+                    let idx = row + (x as usize);
+                    if self.layers[zu].cell_volume(idx) >= H_CAP {
+                        continue;
+                    }
+                    let dist = dist2.sqrt().max(1e-3);
+                    let forward_dot = (dx * fwd_x + dy * fwd_y) / dist;
+                    let bedrock_penalty = if zu == 0 { 2.5 } else { 0.0 };
+                    let ahead_penalty = if forward_dot > 0.35 { 3.5 } else { 0.0 };
+                    let score = forward_dot * 2.0 + (dist - rf) * 0.6 + bedrock_penalty + ahead_penalty;
+                    dst_voxels.push((score, zu, idx));
+                }
+            }
+        }
+        if dst_voxels.is_empty() {
+            return 0;
+        }
+        dst_voxels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut total_displaced = 0u32;
+        let mut dst_cursor = 0usize;
+        let dst_len = dst_voxels.len();
+
+        for (sz, sidx) in src_voxels {
+            for &sp in &[SP_SOIL, SP_ROCK] {
+                let avail = self.layers[sz].mass[sp][sidx];
+                if avail == 0 {
+                    continue;
+                }
+                let mut to_move = (((avail as u32) * 60 + 99) / 100).min(avail as u32) as u16;
+                if to_move == 0 {
+                    continue;
+                }
+
+                for pass in 0..2 {
+                    if to_move == 0 {
+                        break;
+                    }
+                    let per_cell_cap = if pass == 0 { 600u16 } else { H_CAP as u16 };
+                    for _ in 0..dst_len {
+                        if to_move == 0 {
+                            break;
+                        }
+                        let (_, dz, didx) = dst_voxels[dst_cursor];
+                        dst_cursor = (dst_cursor + 1) % dst_len;
+                        if dz == sz && didx == sidx {
+                            continue;
+                        }
+                        let room = H_CAP.saturating_sub(self.layers[dz].cell_volume(didx)) as u16;
+                        if room == 0 {
+                            continue;
+                        }
+                        let q = to_move.min(room).min(per_cell_cap);
+                        if q == 0 {
+                            continue;
+                        }
+                        let c_src = self.layers[sz].cell_heat_capacity(sidx);
+                        let e_src = self.layers[sz].energy[sidx];
+                        let e_xfer = if q == self.layers[sz].mass[sp][sidx]
+                            && self.layers[sz].cell_volume(sidx) == q as u32
+                        {
+                            e_src
+                        } else if c_src > 0 && e_src > 0 {
+                            let prop = ((q as i128)
+                                * (SPECIES[sp].c as i128)
+                                * (e_src as i128)
+                                / (c_src as i128)) as i64;
+                            prop.clamp(0, e_src)
+                        } else {
+                            0
+                        };
+
+                        self.layers[sz].mass[sp][sidx] -= q;
+                        self.layers[dz].mass[sp][didx] += q;
+                        self.layers[sz].energy[sidx] -= e_xfer;
+                        self.layers[dz].energy[didx] += e_xfer;
+
+                        to_move -= q;
+                        total_displaced = total_displaced.saturating_add(q as u32);
+                    }
+                }
+            }
+        }
+
+        total_displaced
+    }
+
     /// Apply a single layer step while snapshotting `prev_temp` / `prev_steam` first.
     pub fn step_layer(&mut self, layer: usize, raw: &RawStepOutput) -> StepStats {
         let l = layer.min(self.depth.saturating_sub(1));
@@ -6020,5 +6229,116 @@ mod tests {
             plant_wood_before,
             plant_wood_after
         );
+        // Also verify living world epoch transitions cleanly from PRISTINE
+        let epoch_name = vf.evolution_epoch_name();
+        assert_ne!(
+            epoch_name, "EPOCH I: PRISTINE",
+            "expected living epoch to advance after 30 evolution steps, got {}",
+            epoch_name
+        );
+        vf.evolution_stats = WorldEvolutionStats::default();
+        assert_eq!(vf.evolution_epoch_name(), "EPOCH I: PRISTINE");
+        vf.evolution_stats = WorldEvolutionStats {
+            basalt_forged: 80,
+            saplings_grown: 10,
+            glaciers_formed: 5,
+            erosion_events: 0,
+            world_epoch: 20,
+        };
+        assert_eq!(vf.evolution_epoch_name(), "EPOCH II: VOLCANIC FORGE");
+        vf.evolution_stats.saplings_grown = 120;
+        assert_eq!(vf.evolution_epoch_name(), "EPOCH III: VERDANT REGROWTH");
+        vf.evolution_stats.glaciers_formed = 200;
+        assert_eq!(vf.evolution_epoch_name(), "EPOCH IV: GLACIAL AGE");
+    }
+
+    #[test]
+    fn test_burrower_conservative_tunnel_carving() {
+        let mut vf = VolumeField::new_biome_3d(64, 64, 16, BIOME_NORDIC_VIADUCT, 1);
+
+        // Build a solid subterranean hillside block (soil + soft rock) at x=20..36, y=28..36, z=1..7
+        // above the z=0 bedrock floor
+        for z in 1..7 {
+            for y in 28..36 {
+                for x in 20..36 {
+                    let idx = vf.layers[z].idx(x, y);
+                    for s in 0..NUM_SPECIES {
+                        vf.layers[z].mass[s][idx] = 0;
+                    }
+                    if z <= 3 {
+                        vf.layers[z].mass[SP_ROCK][idx] = 950;
+                    } else {
+                        vf.layers[z].mass[SP_SOIL][idx] = 950;
+                    }
+                    vf.layers[z].set_cell_temp(idx, T_AMB);
+                }
+            }
+        }
+        // Record z=0 bedrock mass along the tunnel line to verify bedrock is never breached
+        let bedrock_before: u64 = (20..36)
+            .map(|x| vf.layers[0].mass[SP_ROCK][vf.layers[0].idx(x, 32)] as u64)
+            .sum();
+        vf.snapshot_conservation_baseline();
+
+        let density_before = vf.sample_solid_density_3d(26.5, 32.5, 3.5);
+        assert!(
+            density_before >= 0.85,
+            "expected solid hillside before carving, got {}",
+            density_before
+        );
+
+        // Burrower digs a horizontal tunnel straight through the solid rock/soil hillside!
+        let mut total_displaced = 0u32;
+        for step in 0..8 {
+            let gx = 22.5 + (step as f32) * 1.25;
+            for _ in 0..3 {
+                let moved = vf.carve_tunnel_3d(gx, 32.5, 3.5, 1.0, 0.0, 1.85);
+                total_displaced = total_displaced.saturating_add(moved);
+                assert_eq!(
+                    vf.current_accounted_mass() - vf.initial_total_mass,
+                    0,
+                    "burrower tunnel carving broke exact mass conservation!"
+                );
+                assert_eq!(
+                    vf.current_accounted_energy() - vf.initial_total_energy,
+                    0,
+                    "burrower tunnel carving broke exact energy conservation!"
+                );
+            }
+        }
+        // Also attempt to carve right at z=0.5 to verify z==0 bedrock floor stays intact
+        let _ = vf.carve_tunnel_3d(26.5, 32.5, 0.5, 1.0, 0.0, 1.85);
+        assert_eq!(vf.current_accounted_mass() - vf.initial_total_mass, 0);
+        assert_eq!(vf.current_accounted_energy() - vf.initial_total_energy, 0);
+
+        let bedrock_after: u64 = (20..36)
+            .map(|x| vf.layers[0].mass[SP_ROCK][vf.layers[0].idx(x, 32)] as u64)
+            .sum();
+        assert!(
+            bedrock_after >= bedrock_before,
+            "z=0 bedrock floor must never lose rock mass ({} -> {})",
+            bedrock_before,
+            bedrock_after
+        );
+        assert!(
+            total_displaced > 5000,
+            "expected significant conservative mass displacement, got {}",
+            total_displaced
+        );
+
+        // Verify a real traversable air cavity opened along the tunnel core!
+        let density_after = vf.sample_solid_density_3d(26.5, 32.5, 3.5);
+        assert!(
+            density_after < 0.25,
+            "expected traversable carved air cavity (<0.25 solid density), got {} (before={})",
+            density_after,
+            density_before
+        );
+
+        // Step the 3D physics after carving and verify conservation remains strictly 0!
+        let raws = vf.refsim_raw_outputs_all();
+        let st = vf.step_3d(&raws);
+        assert_eq!(st.mass_error, 0, "post-carve step_3d mass_error != 0");
+        assert_eq!(st.energy_error, 0, "post-carve step_3d energy_error != 0");
     }
 }

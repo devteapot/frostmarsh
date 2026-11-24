@@ -117,6 +117,7 @@ struct CudaRpcClient {
     addr: String,
     stream: Option<RpcStream>,
     seq: u32,
+    actuator_v3_backoff: u32,
 }
 
 impl CudaRpcClient {
@@ -125,6 +126,7 @@ impl CudaRpcClient {
             addr,
             stream: None,
             seq: 0,
+            actuator_v3_backoff: 0,
         };
         let _ = c.ensure_connected();
         c
@@ -246,6 +248,54 @@ impl CudaRpcClient {
             self.stream = None;
         }
         res
+    }
+
+    /// True 12-channel 3D neural actuator policy (`op=10`, returns `N × 28` f32 =
+    /// `[move_x, move_y, move_jump, aim_dx, aim_dy, aim_dz, thermal_flux, emit_water, emit_oil,
+    ///   emit_smoke, focus_radius, impulse_or_dome]` + `16` saliency floats).
+    /// Automatically falls back to `op=7` (`N × 26` f32) when `actuator_v3` is not loaded on the daemon.
+    /// Returns `(output_floats, infer_ms, is_v3)`.
+    fn infer_actuators_v3(
+        &mut self,
+        n_bots: usize,
+        feat_dim: usize,
+        feats: &[f32],
+    ) -> Result<(Vec<f32>, f32, bool), Box<dyn std::error::Error>> {
+        const ACTUATOR_V3_INSPECT_DIM: usize = 28; // 12 continuous 3D channels + 16 saliency
+        const ACTUATOR_V2_INSPECT_DIM: usize = 26; // 10 continuous 2D channels + 16 saliency
+
+        if self.actuator_v3_backoff == 0 {
+            match self.call_batched(10, 1, 1, n_bots as u16, feat_dim as u16, feats) {
+                Ok((out, gpu_ms)) if out.len() == n_bots * ACTUATOR_V3_INSPECT_DIM => {
+                    return Ok((out, gpu_ms, true));
+                }
+                Ok((out, _)) => {
+                    log::debug!(
+                        "CUDA op=10 returned unexpected len {} (expected {}); falling back to op=7",
+                        out.len(),
+                        n_bots * ACTUATOR_V3_INSPECT_DIM
+                    );
+                    self.actuator_v3_backoff = 60;
+                }
+                Err(e) => {
+                    log::debug!("CUDA op=10 actuator_v3 unavailable ({}); falling back to op=7", e);
+                    self.actuator_v3_backoff = 60;
+                }
+            }
+        } else {
+            self.actuator_v3_backoff -= 1;
+        }
+
+        let (out, gpu_ms) = self.call_batched(7, 1, 1, n_bots as u16, feat_dim as u16, feats)?;
+        if out.len() != n_bots * ACTUATOR_V2_INSPECT_DIM {
+            return Err(format!(
+                "CUDA op=7 returned unexpected len {} (expected {})",
+                out.len(),
+                n_bots * ACTUATOR_V2_INSPECT_DIM
+            )
+            .into());
+        }
+        Ok((out, gpu_ms, false))
     }
 }
 
@@ -691,16 +741,18 @@ struct PlayerEntity {
     kb_vx: f32,
     kb_vy: f32,
     last_phys_blast_field_tick: u64,
+    burrow_ambush_until: u64,
 }
 
 impl PlayerEntity {
     fn class_stats(class_id: u8, level: u8) -> (i16, f32, f32, f32) {
         let lvl_bonus = (level.saturating_sub(1)) as i16;
-        match class_id % 4 {
+        match class_id % 5 {
             CLASS_STRIDER => (175 + lvl_bonus * 20, 105.0, 110.0, 15.2),
             CLASS_SKYWING => (115 + lvl_bonus * 12, 145.0, 115.0, 17.2),
             CLASS_TIDEKIN => (128 + lvl_bonus * 14, 120.0, 135.0, 18.2),
-            _ => (122 + lvl_bonus * 13, 125.0, 145.0, 19.6), // CLASS_EMBERSTALKER
+            CLASS_EMBERSTALKER => (122 + lvl_bonus * 13, 125.0, 145.0, 19.6),
+            _ => (160 + lvl_bonus * 18, 115.0, 130.0, 16.4), // CLASS_BURROWER (Terramole)
         }
     }
 
@@ -856,6 +908,10 @@ struct GameState {
     time_scale: f32,
     evo_speed: f32,
     world_day: u32,
+    last_epoch_name: &'static str,
+    tunnels_carved: u64,
+    tunnel_mass_displaced: u64,
+    last_combo_tick: [u64; 4],
     last_squad_dome_tick: [u64; 2],
     neural_3d_vertical: bool,
     wind_x: f32,
@@ -946,6 +1002,7 @@ impl GameState {
         let chunks_x = chunks_for_dim(grid_w);
         let chunks_y = chunks_for_dim(grid_h);
         let volume = VolumeField::new_biome_3d(grid_w, grid_h, grid_d, biome_id, seed);
+        let init_epoch = volume.evolution_epoch_name();
         let eco = EcosystemState::new(grid_w, grid_h);
         let shrines = Self::build_shrines(grid_w, grid_h);
         let use_cuda = backend_name == "cuda-rpc";
@@ -1005,6 +1062,10 @@ impl GameState {
             time_scale: 1.0,
             evo_speed: 1.0,
             world_day: 1,
+            last_epoch_name: init_epoch,
+            tunnels_carved: 0,
+            tunnel_mass_displaced: 0,
+            last_combo_tick: [0; 4],
             last_squad_dome_tick: [0, 0],
             neural_3d_vertical: false,
             wind_x: 0.65,
@@ -1031,9 +1092,9 @@ impl GameState {
         let mut team_squad_counts = [0usize; 2];
         for i in 0..capped_bots {
             let team = (i % 2) as u8;
-            let class_id = ((i / 2) % 4) as u8;
+            let class_id = ((i / 2) % 5) as u8;
             let squad_id = if class_id == CLASS_EMBERSTALKER {
-                0u8 // Solo Raider (~25% of bots)
+                0u8 // Solo Raider (~20% of bots)
             } else {
                 let idx = team_squad_counts[team as usize];
                 team_squad_counts[team as usize] += 1;
@@ -1043,7 +1104,8 @@ impl GameState {
                 CLASS_STRIDER => "Strider",
                 CLASS_SKYWING => "Skywing",
                 CLASS_TIDEKIN => "Tidekin",
-                _ => "Stalker",
+                CLASS_EMBERSTALKER => "Stalker",
+                _ => "Terramole",
             };
             let prefix = if team == 0 { "Frost" } else { "Ember" };
             let name = if squad_id == 0 {
@@ -1385,10 +1447,20 @@ impl GameState {
         }
     }
 
+    fn push_combo_callout(&mut self, slot: usize, x: f32, y: f32, team: u8, label: &'static str) {
+        let tick = self.sim_tick;
+        let idx = slot.min(3);
+        if tick < self.last_combo_tick[idx].saturating_add(45) {
+            return;
+        }
+        self.last_combo_tick[idx] = tick;
+        self.push_event(2, x, y, 0, team, label.to_string());
+    }
+
     fn spawn_player(&mut self, name: String, team: u8, class_id: u8, is_bot: bool) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
-        let cls = class_id % 4;
+        let cls = class_id % 5;
         let (x, y, mut z) = self.spawn_point(team % 2, id);
         if cls == CLASS_SKYWING {
             // Skywings launch slightly aloft for immediate 3D flight!
@@ -1442,6 +1514,7 @@ impl GameState {
                 kb_vx: 0.0,
                 kb_vy: 0.0,
                 last_phys_blast_field_tick: 0,
+                burrow_ambush_until: 0,
             },
         );
         id
@@ -1741,6 +1814,7 @@ impl GameState {
             let dash_cd_ticks = match p.class_id {
                 CLASS_EMBERSTALKER => 22,
                 CLASS_TIDEKIN => 24,
+                CLASS_BURROWER => 26,
                 CLASS_SKYWING => 28,
                 _ => 32,
             };
@@ -1755,6 +1829,7 @@ impl GameState {
                     (true, CLASS_SKYWING) => 8.5,      // Skywing wing-surge aloft!
                     (true, CLASS_TIDEKIN) => 9.2,      // Tidekin breach launch out of water!
                     (true, CLASS_EMBERSTALKER) => 7.6, // Emberstalker vault!
+                    (true, CLASS_BURROWER) => 5.4,     // Terramole tunnel lunge!
                     (true, _) => 6.2,
                     (false, CLASS_SKYWING) => 2.8,
                     (false, _) => 1.8,
@@ -1773,16 +1848,18 @@ impl GameState {
                 p.melee_cd = tick + 15;
                 let dmg = match p.class_id {
                     CLASS_STRIDER => 36,
+                    CLASS_BURROWER => 34,
                     CLASS_EMBERSTALKER => 30,
                     _ => 24,
                 };
-                melee_hit_check = Some((p.team, p.x, p.y, p.z, p.aim_x, p.aim_y, dmg + (p.level as i16) * 3));
+                melee_hit_check = Some((p.team, p.class_id, p.x, p.y, p.z, p.aim_x, p.aim_y, dmg + (p.level as i16) * 3, tick <= p.burrow_ambush_until));
             }
 
             let bolt_cd_ticks = match p.class_id {
                 CLASS_EMBERSTALKER => 7,
                 CLASS_SKYWING => 8,
                 CLASS_TIDEKIN => 9,
+                CLASS_BURROWER => 10,
                 _ => 11,
             };
             if inp.cast_bolt && tick >= p.bolt_cd && p.mana >= 8.0 {
@@ -1840,11 +1917,17 @@ impl GameState {
                         ));
                         ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
                     }
-                    _ => {
+                    CLASS_EMBERSTALKER => {
                         // CLASS_EMBERSTALKER: Smoke Veil + fast Oil/Fire Ambush!
                         p.haste_until = tick + 90;
                         spawn_projs.push((p.team, 2, p.x + p.aim_x * 1.4, p.y + p.aim_y * 1.4, p.z, p.aim_x * 52.0, p.aim_y * 52.0, 0.0, 1.2, 1.1, 22));
                         spawn_projs.push((p.team, 0, p.x + p.aim_x * 1.0, p.y + p.aim_y * 1.0, p.z, p.aim_x * 58.0, p.aim_y * 58.0, 0.0, 1.1, 1.2, 24));
+                        ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
+                    }
+                    _ => {
+                        // CLASS_BURROWER (Terramole): Subterranean Tunnel Bore + Haste!
+                        p.haste_until = tick + 75;
+                        p.burrow_ambush_until = tick + 120;
                         ability_e_fx = Some((cls, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
                     }
                 }
@@ -1854,16 +1937,19 @@ impl GameState {
                 p.mana -= 55.0;
                 p.ult_r_cd = tick + 360;
                 p.ult_until = tick + 45;
-                if p.class_id == CLASS_STRIDER {
+                if p.class_id == CLASS_STRIDER || p.class_id == CLASS_BURROWER {
                     p.shield_until = tick + 120;
                 } else if p.class_id == CLASS_TIDEKIN || p.class_id == CLASS_EMBERSTALKER {
                     p.haste_until = tick + 150;
+                }
+                if p.class_id == CLASS_BURROWER {
+                    p.burrow_ambush_until = tick + 150;
                 }
                 ult_r_fx = Some((p.class_id, p.team, p.x, p.y, p.z, p.aim_x, p.aim_y));
             }
         }
 
-        if let Some((team, px, py, pz, ax, ay, dmg)) = melee_hit_check {
+        if let Some((team, cls, px, py, pz, ax, ay, dmg, burrow_ambush)) = melee_hit_check {
             let z_tol = if self.is_z16() { 2.2 } else { 0.75 };
             let targets: Vec<u32> = self
                 .players
@@ -1879,8 +1965,12 @@ impl GameState {
                 })
                 .map(|t| t.id)
                 .collect();
+            let hit_any = !targets.is_empty();
             for tid in targets {
-                self.apply_damage(Some(pid), tid, dmg, "", 3);
+                self.apply_damage(Some(pid), tid, dmg, if burrow_ambush { "AMBUSH" } else { "" }, 3);
+            }
+            if hit_any && cls == CLASS_BURROWER && burrow_ambush {
+                self.push_combo_callout(2, px, py, team, "TUNNEL AMBUSH!");
             }
         }
 
@@ -1917,9 +2007,25 @@ impl GameState {
                 }
                 CLASS_SKYWING => self.push_event(2, px, py, 0, team, "OIL BARRAGE!".into()),
                 CLASS_TIDEKIN => self.push_event(2, px, py, 0, team, "HYDRO SURGE!".into()),
-                _ => {
+                CLASS_EMBERSTALKER => {
                     self.volume.apply_physical_actuator(px, py, pl, 0.25, 0.0, 0.35, 0.85, 4.5);
                     self.push_event(2, px, py, 0, team, "SMOKE AMBUSH!".into());
+                }
+                _ => {
+                    // CLASS_BURROWER (Terramole): Conservative Subterranean Bore
+                    let moved = self.volume.carve_tunnel_3d(
+                        (px + ax * 1.6).clamp(3.0, gw - 4.0),
+                        (py + ay * 1.6).clamp(3.0, gh - 4.0),
+                        (pz + 0.7).clamp(1.0, (self.grid_d as f32 - 1.5).max(1.0)),
+                        ax,
+                        ay,
+                        2.6,
+                    );
+                    if moved > 0 {
+                        self.tunnels_carved = self.tunnels_carved.saturating_add(1);
+                        self.tunnel_mass_displaced = self.tunnel_mass_displaced.saturating_add(moved as u64);
+                    }
+                    self.push_event(2, px, py, 0, team, "SUBTERRANEAN BORE!".into());
                 }
             }
         }
@@ -1957,21 +2063,28 @@ impl GameState {
                         self.apply_damage(Some(pid), tid, 42, "METEOR", 0);
                     }
                     self.eco.inject_fear_pulse(tx, ty, 24.0, 1.2);
+                    if pz >= self.surf_layer() as f32 + 1.5 {
+                        self.push_combo_callout(0, tx, ty, team, "AERIAL OIL-IGNITION!");
+                    }
                     self.push_event(2, tx, ty, 0, team, "METEOR STORM!".into());
                 }
                 CLASS_TIDEKIN => {
                     let cx = (px + ax * 10.0).clamp(5.0, gw - 6.0) as i32;
                     let cy = (py + ay * 10.0).clamp(5.0, gh - 6.0) as i32;
-                    self.volume.apply_steam_burst_3d(cx, cy, pl, 8);
+                    let boiled = self.volume.apply_steam_burst_3d(cx, cy, pl, 8);
                     for p in self.players.values_mut() {
                         if p.team == team && (p.x - px).hypot(p.y - py) <= 24.0 {
                             p.haste_until = tick + 150;
                             p.hp = (p.hp + 20).min(p.max_hp);
                         }
                     }
+                    let phys_p = self.volume.sample_entity_physics(px, py, pl);
+                    if phys_p.water_frac > 0.10 || boiled >= 4 {
+                        self.push_combo_callout(1, px, py, team, "SUBMERGED GEYSER!");
+                    }
                     self.push_event(2, px, py, 0, team, "TIDAL SURGE!".into());
                 }
-                _ => {
+                CLASS_EMBERSTALKER => {
                     // CLASS_EMBERSTALKER: Inferno Raid (oil + fire burst + smoke veil)
                     let tx = (px + ax * 10.0).clamp(5.0, gw - 6.0);
                     let ty = (py + ay * 10.0).clamp(5.0, gh - 6.0);
@@ -1987,6 +2100,40 @@ impl GameState {
                         self.apply_damage(Some(pid), tid, 38, "AMBUSH!", 0);
                     }
                     self.push_event(2, tx, ty, 0, team, "INFERNO RAID!".into());
+                }
+                _ => {
+                    // CLASS_BURROWER (Terramole): Seismic Breach (3-step tunnel bore + shockwave!)
+                    let mut total_moved = 0u32;
+                    for step in 1..=3 {
+                        let bx = (px + ax * (step as f32 * 2.2)).clamp(3.0, gw - 4.0);
+                        let by = (py + ay * (step as f32 * 2.2)).clamp(3.0, gh - 4.0);
+                        total_moved = total_moved.saturating_add(self.volume.carve_tunnel_3d(
+                            bx,
+                            by,
+                            (pz + 0.7).clamp(1.0, (self.grid_d as f32 - 1.5).max(1.0)),
+                            ax,
+                            ay,
+                            2.8,
+                        ));
+                    }
+                    if total_moved > 0 {
+                        self.tunnels_carved = self.tunnels_carved.saturating_add(1);
+                        self.tunnel_mass_displaced =
+                            self.tunnel_mass_displaced.saturating_add(total_moved as u64);
+                    }
+                    let tx = (px + ax * 6.0).clamp(4.0, gw - 5.0);
+                    let ty = (py + ay * 6.0).clamp(4.0, gh - 5.0);
+                    let targets: Vec<u32> = self
+                        .players
+                        .values()
+                        .filter(|t| t.team != team && (t.x - tx).hypot(t.y - ty) <= 11.0)
+                        .map(|t| t.id)
+                        .collect();
+                    for tid in targets {
+                        self.apply_damage(Some(pid), tid, 36, "SEISMIC!", 3);
+                    }
+                    self.push_combo_callout(2, tx, ty, team, "TUNNEL AMBUSH!");
+                    self.push_event(2, tx, ty, 0, team, "SEISMIC BREACH!".into());
                 }
             }
         }
@@ -2025,6 +2172,34 @@ impl GameState {
         focus_radius: f32,
         impulse: f32,
     ) {
+        self.apply_player_physical_actuator_3d(
+            pid,
+            dx,
+            dy,
+            None,
+            thermal_flux,
+            sp_water,
+            sp_oil,
+            sp_smoke,
+            focus_radius,
+            impulse,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_player_physical_actuator_3d(
+        &mut self,
+        pid: u32,
+        dx: f32,
+        dy: f32,
+        target_z_override: Option<f32>,
+        thermal_flux: f32,
+        sp_water: f32,
+        sp_oil: f32,
+        sp_smoke: f32,
+        focus_radius: f32,
+        impulse: f32,
+    ) {
         if self.match_phase != MATCH_PHASE_ACTIVE {
             return;
         }
@@ -2043,7 +2218,7 @@ impl GameState {
         }
 
         let mana_cost = (tf.abs() * 4.5 + (sw + so + ss) * 4.0 + imp * 7.5) * (0.65 + r * 0.08);
-        let (px, py, pz, team, scale) = {
+        let (px, py, pz, team, class_id, burrow_ambush_until, scale) = {
             let Some(p) = self.players.get_mut(&pid) else {
                 return;
             };
@@ -2057,7 +2232,7 @@ impl GameState {
                 p.aim_x = dx / dlen;
                 p.aim_y = dy / dlen;
             }
-            (p.x, p.y, p.z, p.team, sc)
+            (p.x, p.y, p.z, p.team, p.class_id, p.burrow_ambush_until, sc)
         };
         if scale < 0.05 {
             return;
@@ -2067,21 +2242,32 @@ impl GameState {
         let gh = self.grid_h as f32;
         let tx = (px + dx).clamp(3.0, gw - 4.0);
         let ty = (py + dy).clamp(3.0, gh - 4.0);
-        let mut layer = (pz.round() as usize).clamp(0, self.grid_d - 1);
-        // Project airborne Skywing actuators downward onto terrain/water surface below when targeting open air
-        if self.is_z16() && layer > 1 {
-            let txi = (tx.round() as usize).min(self.grid_w - 1);
-            let tyi = (ty.round() as usize).min(self.grid_h - 1);
-            let tidx = tyi * self.grid_w + txi;
-            if self.volume.layers[layer].cell_volume(tidx) < 25 {
-                for z_scan in (1..layer).rev() {
-                    if self.volume.layers[z_scan].cell_volume(tidx) >= 40 {
-                        layer = z_scan;
-                        break;
+        let max_z1 = (self.grid_d as f32 - 2.0).max(1.0);
+        let (layer, z1_beam) = if let Some(tz_req) = target_z_override {
+            let z1 = if tz_req.is_finite() {
+                tz_req.clamp(1.0, max_z1)
+            } else {
+                pz.clamp(1.0, max_z1)
+            };
+            ((z1.round() as usize).clamp(0, self.grid_d - 1), z1)
+        } else {
+            let mut l = (pz.round() as usize).clamp(0, self.grid_d - 1);
+            // Project airborne Skywing actuators downward onto terrain/water surface below when targeting open air
+            if self.is_z16() && l > 1 {
+                let txi = (tx.round() as usize).min(self.grid_w - 1);
+                let tyi = (ty.round() as usize).min(self.grid_h - 1);
+                let tidx = tyi * self.grid_w + txi;
+                if self.volume.layers[l].cell_volume(tidx) < 25 {
+                    for z_scan in (1..l).rev() {
+                        if self.volume.layers[z_scan].cell_volume(tidx) >= 40 {
+                            l = z_scan;
+                            break;
+                        }
                     }
                 }
             }
-        }
+            (l, l as f32)
+        };
 
         let tf_s = tf * scale;
         let sw_s = sw * scale;
@@ -2089,10 +2275,28 @@ impl GameState {
         let ss_s = ss * scale;
         let imp_s = imp * scale;
 
+        // Pre-sample target & caster voxel physics for emergent cross-archetype combo detection
+        let txi_c = (tx.round() as usize).min(self.grid_w - 1);
+        let tyi_c = (ty.round() as usize).min(self.grid_h - 1);
+        let tidx_c = tyi_c * self.grid_w + txi_c;
+        let target_has_oil = self.volume.layers[layer].mass[SP_OIL][tidx_c] >= 40;
+        let target_has_water = self.volume.layers[layer].mass[SP_WATER][tidx_c] >= 80;
+        let pl_caster = (pz.round() as usize).clamp(0, self.grid_d - 1);
+        let caster_in_water = self.volume.sample_entity_physics(px, py, pl_caster).water_frac > 0.10;
+
         self.volume
             .apply_physical_actuator(tx, ty, layer, tf_s, sw_s, so_s, ss_s, r);
 
         let tick = self.sim_tick;
+        let surf_z = self.surf_layer() as f32;
+        if class_id == CLASS_SKYWING && pz >= surf_z + 1.5 && tf_s > 0.40 && target_has_oil {
+            self.push_combo_callout(0, tx, ty, team, "AERIAL OIL-IGNITION!");
+        } else if class_id == CLASS_TIDEKIN
+            && caster_in_water
+            && ((tf_s > 0.35 && target_has_water) || (sw_s > 0.45 && ss_s > 0.25))
+        {
+            self.push_combo_callout(1, tx, ty, team, "SUBMERGED GEYSER!");
+        }
         self.recent_actuators
             .push_back((pid, team, tx, ty, r + 4.0, tick + 90));
         while self.recent_actuators.len() > 36 {
@@ -2111,7 +2315,7 @@ impl GameState {
                     z0: pz,
                     x1: tx,
                     y1: ty,
-                    z1: layer as f32,
+                    z1: z1_beam,
                     thermal_flux: tf_s,
                     sp_oil: so_s,
                     sp_water: sw_s,
@@ -2134,10 +2338,10 @@ impl GameState {
         // Radial momentum impulse on nearby entities & floating ice rafts
         if imp_s > 0.1 {
             let eff_r = r + 4.5;
-            let shock_z_tol = if self.is_z16() { 2.2 } else { 1.1 };
+            let shock_z_tol = if self.is_z16() { 2.6 } else { 1.1 };
             let mut shock_hits: Vec<(u32, i16)> = Vec::new();
             for t in self.players.values_mut() {
-                if t.id == pid || tick < t.dash_until || (t.z - pz).abs() > shock_z_tol {
+                if t.id == pid || tick < t.dash_until || (t.z - z1_beam).abs() > shock_z_tol {
                     continue;
                 }
                 let rx = t.x - tx;
@@ -2151,7 +2355,7 @@ impl GameState {
                         let dl = dx.hypot(dy).max(1e-3);
                         (dx / dl, dy / dl)
                     };
-                    let kb_res = if t.class_id == CLASS_STRIDER { 0.40 } else { 1.0 };
+                    let kb_res = if t.class_id == CLASS_STRIDER || t.class_id == CLASS_BURROWER { 0.40 } else { 1.0 };
                     let push = 38.0 * imp_s * fall * kb_res;
                     t.kb_vx = (t.kb_vx + nx * push).clamp(-48.0, 48.0);
                     t.kb_vy = (t.kb_vy + ny * push).clamp(-48.0, 48.0);
@@ -2172,8 +2376,12 @@ impl GameState {
                     raft.vy = (raft.vy + ny * 20.0 * imp_s * fall).clamp(-26.0, 26.0);
                 }
             }
+            let hit_enemy = !shock_hits.is_empty();
             for (tid, dmg) in shock_hits {
                 self.apply_damage(Some(pid), tid, dmg, "SHOCK", 3);
+            }
+            if hit_enemy && class_id == CLASS_BURROWER && tick <= burrow_ambush_until {
+                self.push_combo_callout(2, tx, ty, team, "TUNNEL AMBUSH!");
             }
         }
     }
@@ -2244,12 +2452,17 @@ impl GameState {
             p.kb_vx = 0.0;
             p.kb_vy = 0.0;
             p.last_phys_blast_field_tick = 0;
+            p.burrow_ambush_until = 0;
         }
     }
 
     fn reset_match(&mut self) {
         let (w, h, d) = (self.grid_w, self.grid_h, self.grid_d);
         self.volume = VolumeField::new_biome_3d(w, h, d, self.biome_id, self.world_seed);
+        self.last_epoch_name = self.volume.evolution_epoch_name();
+        self.tunnels_carved = 0;
+        self.tunnel_mass_displaced = 0;
+        self.last_combo_tick = [0; 4];
         self.eco.reset();
         self.refresh_hazard_grids();
         self.shrines = GameState::build_shrines(w, h);
@@ -2317,6 +2530,7 @@ impl GameState {
                 p.kb_vx = 0.0;
                 p.kb_vy = 0.0;
                 p.last_phys_blast_field_tick = 0;
+                p.burrow_ambush_until = 0;
             }
         }
         for peer in self.peers.values_mut() {
@@ -2343,6 +2557,9 @@ impl GameState {
         let bname = biome_name(self.biome_id);
         if self.grid_d >= 16 {
             self.volume.init_biome_3d(self.biome_id, self.world_seed);
+            self.last_epoch_name = self.volume.evolution_epoch_name();
+            self.tunnels_carved = 0;
+            self.tunnel_mass_displaced = 0;
             self.eco.reset();
             self.refresh_hazard_grids();
             self.projectiles.clear();
@@ -2385,6 +2602,24 @@ impl GameState {
             self.grid_d,
             self.peers.len()
         );
+    }
+
+    fn cycle_evolution_speed(&mut self) {
+        self.evo_speed = if (self.evo_speed - 1.0).abs() < 0.05 {
+            4.0
+        } else if (self.evo_speed - 4.0).abs() < 0.05 {
+            12.0
+        } else {
+            1.0
+        };
+        let ev = self.volume.evolution_stats;
+        let epoch = self.volume.evolution_epoch_name();
+        let lbl = format!(
+            "WORLD EVOLUTION: {:.0}X | {} (BASALT:{} TREES:{})",
+            self.evo_speed, epoch, ev.basalt_forged, ev.saplings_grown
+        );
+        let (mx, my) = (self.grid_w as f32 * 0.5, self.grid_h as f32 * 0.5);
+        self.push_event(5, mx, my, 0, 2, lbl);
     }
 
     fn step_bots(&mut self) {
@@ -2439,6 +2674,7 @@ impl GameState {
             feats[base + 13] = p.level as f32 / 5.0;
             feats[base + 14] = if p.class_id == CLASS_EMBERSTALKER { 1.0 } else { 0.0 };
             feats[base + 15] = (p.squad_id as f32 / 8.0).clamp(0.0, 1.0);
+            feats[base + 16] = if p.class_id == CLASS_BURROWER { 1.0 } else { 0.0 };
             feats[base + 20] = (p.dash_cd.saturating_sub(tick) as f32 / 32.0).clamp(0.0, 1.0);
             feats[base + 21] = (p.ability_e_cd.saturating_sub(tick) as f32 / 120.0).clamp(0.0, 1.0);
             feats[base + 22] = (p.ult_r_cd.saturating_sub(tick) as f32 / 360.0).clamp(0.0, 1.0);
@@ -2490,35 +2726,79 @@ impl GameState {
 
         const ACTUATOR_OUT_DIM: usize = 10;
         const ACTUATOR_INSPECT_DIM: usize = ACTUATOR_OUT_DIM + SALIENCY_DIM; // 26
+        const ACTUATOR_V3_OUT_DIM: usize = 12;
+        const ACTUATOR_V3_INSPECT_DIM: usize = ACTUATOR_V3_OUT_DIM + SALIENCY_DIM; // 28
 
         if self.physics_native {
             let act_res = if let Some(ref mut rpc) = self.bot_rpc {
-                rpc.call_batched(7, 1, 1, n as u16, BOT_FEAT_DIM as u16, &feats)
+                rpc.infer_actuators_v3(n, BOT_FEAT_DIM, &feats)
             } else {
                 return false;
             };
-            if let Ok((out_buf, gpu_ms)) = act_res {
-                if out_buf.len() == n * ACTUATOR_INSPECT_DIM {
+            if let Ok((out_buf, gpu_ms, is_v3)) = act_res {
+                let expected_stride = if is_v3 { ACTUATOR_V3_INSPECT_DIM } else { ACTUATOR_INSPECT_DIM };
+                if out_buf.len() == n * expected_stride {
                     self.bot_infer_ms = gpu_ms;
+                    let is_z16 = self.is_z16();
+                    let max_z1 = (self.grid_d as f32 - 2.0).max(1.0);
                     let to_u8 = |v: f32| -> u8 { (v.clamp(0.0, 1.0) * 255.0).round() as u8 };
                     let mut brains = Vec::with_capacity(n);
 
                     for (bi, &bid) in bot_ids.iter().enumerate() {
-                        let row = &out_buf[bi * ACTUATOR_INSPECT_DIM..(bi + 1) * ACTUATOR_INSPECT_DIM];
-                        let mut move_x = row[0];
-                        let mut move_y = row[1];
-                        let mut aim_dx = row[2];
-                        let mut aim_dy = row[3];
-                        let mut thermal_flux = row[4].clamp(-1.0, 1.0);
-                        let mut sp_water = row[5].clamp(0.0, 1.0);
-                        let mut sp_oil = row[6].clamp(0.0, 1.0);
-                        let mut sp_smoke = row[7].clamp(0.0, 1.0);
-                        let focus_radius = if row[8] <= 1.0 {
-                            1.5 + row[8].clamp(0.0, 1.0) * 7.0
+                        let row = &out_buf[bi * expected_stride..(bi + 1) * expected_stride];
+                        let (
+                            mut move_x,
+                            mut move_y,
+                            move_jump,
+                            mut aim_dx,
+                            mut aim_dy,
+                            aim_dz,
+                            mut thermal_flux,
+                            mut sp_water,
+                            mut sp_oil,
+                            mut sp_smoke,
+                            focus_raw,
+                            impulse_or_dome,
+                            sal_off,
+                        ) = if is_v3 {
+                            (
+                                row[0],
+                                row[1],
+                                row[2].clamp(-1.0, 1.0),
+                                row[3],
+                                row[4],
+                                row[5].clamp(-1.0, 1.0),
+                                row[6].clamp(-1.0, 1.0),
+                                row[7].clamp(0.0, 1.0),
+                                row[8].clamp(0.0, 1.0),
+                                row[9].clamp(0.0, 1.0),
+                                row[10],
+                                row[11].clamp(-1.0, 1.0),
+                                ACTUATOR_V3_OUT_DIM,
+                            )
                         } else {
-                            row[8].clamp(1.5, 8.5)
+                            (
+                                row[0],
+                                row[1],
+                                0.0f32,
+                                row[2],
+                                row[3],
+                                0.0f32,
+                                row[4].clamp(-1.0, 1.0),
+                                row[5].clamp(0.0, 1.0),
+                                row[6].clamp(0.0, 1.0),
+                                row[7].clamp(0.0, 1.0),
+                                row[8],
+                                row[9].clamp(0.0, 1.0),
+                                ACTUATOR_OUT_DIM,
+                            )
                         };
-                        let mut impulse = row[9].clamp(0.0, 1.0);
+                        let focus_radius = if focus_raw <= 1.0 {
+                            1.5 + focus_raw.clamp(0.0, 1.0) * 7.0
+                        } else {
+                            focus_raw.clamp(1.5, 8.5)
+                        };
+                        let mut impulse = impulse_or_dome.clamp(0.0, 1.0);
 
                         if let Some(&ov) = self.bot_overrides.get(&bid) {
                             if tick <= ov.expires_tick {
@@ -2554,13 +2834,101 @@ impl GameState {
                             (aim_dx.clamp(-36.0, 36.0), aim_dy.clamp(-36.0, 36.0))
                         };
 
+                        // True 12-channel 3D neural verticality (`op=10` on Z >= 16):
+                        // - `move_jump`: Skywing vertical flight lift, Emberstalker cliff climbing,
+                        //   Tidekin river breaches, and Burrower conservative tunnel carving!
+                        // - `aim_dz`: True diagonal 3D actuator beams (`z0 -> z1`)!
+                        // - `impulse_or_dome < -0.50`: Autonomous bot `0.15x` Stasis TimeDome deployment!
+                        let mut target_z_override: Option<f32> = None;
+                        let mut neural_dome_req: Option<(u8, f32, f32)> = None;
+                        let mut neural_burrow_req: Option<(f32, f32, f32, f32, f32)> = None;
+                        if is_v3 && is_z16 {
+                            if let Some(p) = self.players.get_mut(&bid) {
+                                let z1 = (p.z + aim_dz * 6.0).clamp(1.0, max_z1);
+                                target_z_override = Some(z1);
+                                match p.class_id {
+                                    CLASS_SKYWING => {
+                                        p.desired_vz = (move_jump * 7.5).clamp(-3.8, 8.5);
+                                    }
+                                    CLASS_EMBERSTALKER => {
+                                        if move_jump > 0.20 {
+                                            p.desired_vz = (move_jump * 8.5).clamp(2.0, 9.5);
+                                            p.vz = p.vz.max(6.4 + move_jump * 2.8);
+                                        } else {
+                                            p.desired_vz = 0.0;
+                                        }
+                                    }
+                                    CLASS_TIDEKIN => {
+                                        p.desired_vz = (move_jump * 6.5).clamp(-4.5, 9.0);
+                                        if move_jump > 0.50 {
+                                            p.vz = p.vz.max(8.2);
+                                        }
+                                    }
+                                    CLASS_BURROWER => {
+                                        p.desired_vz = 0.0;
+                                        if move_jump.abs() > 0.20 {
+                                            let mlen = move_x.hypot(move_y);
+                                            let (bx_d, by_d) = if mlen > 0.05 {
+                                                (move_x / mlen, move_y / mlen)
+                                            } else {
+                                                (p.aim_x, p.aim_y)
+                                            };
+                                            let z_bias = (p.z + 0.75 + move_jump * 0.9).clamp(1.0, max_z1);
+                                            neural_burrow_req = Some((
+                                                (p.x + bx_d * 1.15).clamp(3.0, gw - 4.0),
+                                                (p.y + by_d * 1.15).clamp(3.0, gh - 4.0),
+                                                z_bias,
+                                                bx_d,
+                                                by_d,
+                                            ));
+                                        }
+                                    }
+                                    _ => {
+                                        p.desired_vz = 0.0;
+                                        if move_jump > 0.65 {
+                                            p.vz = p.vz.max(6.0);
+                                        }
+                                    }
+                                }
+                                if impulse_or_dome < -0.50
+                                    && p.mana >= 32.0
+                                    && tick >= p.ability_e_cd
+                                    && self.time_domes.len() < 4
+                                    && tick >= self.last_squad_dome_tick[p.team as usize].saturating_add(360)
+                                {
+                                    p.mana -= 32.0;
+                                    p.ability_e_cd = tick + 240;
+                                    let dtx = (p.x + tdx).clamp(8.0, gw - 8.0);
+                                    let dty = (p.y + tdy).clamp(8.0, gh - 8.0);
+                                    neural_dome_req = Some((p.team, dtx, dty));
+                                }
+                            }
+                        }
+
+                        if let Some((bx, by, bz, dx_b, dy_b)) = neural_burrow_req {
+                            let moved = self.volume.carve_tunnel_3d(bx, by, bz, dx_b, dy_b, 1.9);
+                            if moved > 0 {
+                                self.tunnels_carved = self.tunnels_carved.saturating_add(1);
+                                self.tunnel_mass_displaced =
+                                    self.tunnel_mass_displaced.saturating_add(moved as u64);
+                                if let Some(p) = self.players.get_mut(&bid) {
+                                    p.burrow_ambush_until = tick + 90;
+                                }
+                            }
+                        }
+                        if let Some((dteam, dtx, dty)) = neural_dome_req {
+                            self.last_squad_dome_tick[dteam as usize] = tick;
+                            self.place_time_dome(bid, dtx, dty, 1);
+                            self.push_combo_callout(3, dtx, dty, dteam, "STASIS RESCUE!");
+                        }
+
                         let move_inp = ClientInputDatagram {
                             seq: tick as u32,
                             move_x,
                             move_y,
                             aim_x: aim_dx,
                             aim_y: aim_dy,
-                            dash: impulse > 0.78,
+                            dash: impulse > 0.78 || (is_v3 && move_jump > 0.72),
                             melee: false,
                             cast_bolt: false,
                             bolt_element: 0,
@@ -2570,10 +2938,11 @@ impl GameState {
                             client_time_ms: 0,
                         };
                         self.apply_input(bid, &move_inp);
-                        self.apply_player_physical_actuator(
+                        self.apply_player_physical_actuator_3d(
                             bid,
                             tdx,
                             tdy,
+                            target_z_override,
                             thermal_flux,
                             sp_water,
                             sp_oil,
@@ -2585,7 +2954,7 @@ impl GameState {
                         if let Some(p) = self.players.get(&bid) {
                             let mut z_heatmap_4x4 = [0u8; 16];
                             for k in 0..SALIENCY_DIM {
-                                z_heatmap_4x4[k] = to_u8(row[ACTUATOR_OUT_DIM + k]);
+                                z_heatmap_4x4[k] = to_u8(row[sal_off + k]);
                             }
                             let elem_probs = [
                                 to_u8(thermal_flux.max(0.0)),
@@ -3112,12 +3481,20 @@ impl GameState {
                                 }
                                 if edist < 9.0 { imp = 0.65; }
                             }
-                            _ => {
+                            CLASS_EMBERSTALKER => {
                                 // CLASS_EMBERSTALKER: rapid oil/smoke/ignition ambush burst!
                                 match (tick / 9 + bid as u64) % 3 {
                                     0 => { so = 0.90; ss = 0.60; rad = 4.0; }
                                     1 => { tf = 1.0; rad = 4.2; if edist < 10.0 { imp = 0.75; } }
                                     _ => { ss = 0.80; so = 0.50; rad = 4.4; }
+                                }
+                            }
+                            _ => {
+                                // CLASS_BURROWER (Terramole): subterranean seismic shock + thermal smoke breach!
+                                match (tick / 12 + bid as u64) % 3 {
+                                    0 => { imp = 0.88; ss = 0.55; rad = 4.6; }
+                                    1 => { tf = 0.90; rad = 4.2; if edist < 11.0 { imp = 0.80; } }
+                                    _ => { tf = -0.85; ss = 0.45; rad = 4.4; }
                                 }
                             }
                         }
@@ -3143,10 +3520,16 @@ impl GameState {
                 self.apply_input(bid, &move_inp);
                 let dlen = move_inp.aim_x.hypot(move_inp.aim_y).max(1e-3);
                 let dist_off = edist.min(16.0).max(4.0);
-                self.apply_player_physical_actuator(
+                let target_z_opt = if is_z16 {
+                    enemy_pos_z.map(|(_, _, ez)| ez)
+                } else {
+                    None
+                };
+                self.apply_player_physical_actuator_3d(
                     bid,
                     (move_inp.aim_x / dlen) * dist_off,
                     (move_inp.aim_y / dlen) * dist_off,
+                    target_z_opt,
                     tf,
                     sw,
                     so,
@@ -3211,6 +3594,7 @@ impl GameState {
             if tick >= self.last_squad_dome_tick[team as usize].saturating_add(480) {
                 self.last_squad_dome_tick[team as usize] = tick;
                 self.place_time_dome(bid, wx, wy, 1);
+                self.push_combo_callout(3, wx, wy, team, "STASIS RESCUE!");
             }
         }
     }
@@ -3297,18 +3681,19 @@ impl GameState {
         }
         self.rafts = new_rafts;
 
-        // Move players in 3D `(x, y, z)` with 4 Physically Distinct Archetype Locomotion Modes!
+        // Move players in 3D `(x, y, z)` with 5 Physically Distinct Archetype Locomotion Modes!
         let pids: Vec<u32> = self.players.keys().copied().collect();
         let mut phys_dmg_events: Vec<(Option<u32>, u32, i16, &'static str, u8)> = Vec::new();
         let mut combo_callouts: Vec<(f32, f32, u8, String)> = Vec::new();
+        let mut named_combo_callouts: Vec<(usize, f32, f32, u8, &'static str)> = Vec::new();
         let field_tick = self.volume.tick;
         let physics_native = self.physics_native;
         for pid in pids {
-            let (px, py, pz, vx, vy, mut vz, desired_vz, mut kb_vx, mut kb_vy, dash_until, chilled_until, team, class_id, last_blast_ft) = {
+            let (px, py, pz, vx, vy, mut vz, desired_vz, mut kb_vx, mut kb_vy, dash_until, chilled_until, team, class_id, last_blast_ft, mut burrow_ambush_until) = {
                 let p = &self.players[&pid];
                 (
                     p.x, p.y, p.z, p.vx, p.vy, p.vz, p.desired_vz, p.kb_vx, p.kb_vy, p.dash_until,
-                    p.chilled_until, p.team, p.class_id, p.last_phys_blast_field_tick,
+                    p.chilled_until, p.team, p.class_id, p.last_phys_blast_field_tick, p.burrow_ambush_until,
                 )
             };
             let is_z16 = self.is_z16();
@@ -3461,6 +3846,47 @@ impl GameState {
                             }
                         }
                     }
+                    CLASS_BURROWER => {
+                        // Terramole: Grounded Subterranean Tunnel-Carver — conservatively bores through solid
+                        // soil & rock hills/cliffs whenever moving into terrain walls (preserving z >= 1 bedrock)!
+                        let spd_h = vx_s.hypot(vy_s);
+                        if spd_h > 1.5 {
+                            let nx_d = vx_s / spd_h;
+                            let ny_d = vy_s / spd_h;
+                            let probe_x = (px + nx_d * 1.10).clamp(3.0, gw - 4.0);
+                            let probe_y = (py + ny_d * 1.10).clamp(3.0, gh - 4.0);
+                            let d_low = self.volume.sample_solid_density_3d(probe_x, probe_y, (pz + 0.35).clamp(1.0, max_alt));
+                            let d_mid = self.volume.sample_solid_density_3d(probe_x, probe_y, (pz + 0.95).clamp(1.0, max_alt));
+                            let d_hi = self.volume.sample_solid_density_3d(probe_x, probe_y, (pz + 1.55).clamp(1.0, max_alt));
+                            if d_low >= 0.35 || d_mid >= 0.35 || d_hi >= 0.35 {
+                                let moved = self.volume.carve_tunnel_3d(
+                                    probe_x,
+                                    probe_y,
+                                    (pz + 0.85).clamp(1.2, max_alt),
+                                    nx_d,
+                                    ny_d,
+                                    1.95,
+                                );
+                                if moved > 0 {
+                                    self.tunnels_carved = self.tunnels_carved.saturating_add(1);
+                                    self.tunnel_mass_displaced =
+                                        self.tunnel_mass_displaced.saturating_add(moved as u64);
+                                    burrow_ambush_until = tick + 90;
+                                }
+                            } else if tick <= burrow_ambush_until
+                                && self.volume.measure_vertical_clearance_3d((px, py, pz)) >= 4.5
+                            {
+                                // Emerging from a freshly carved subterranean tunnel near an enemy!
+                                let enemy_near = self.players.values().any(|o| {
+                                    o.team != team && (o.x - px).hypot(o.y - py) < 14.0
+                                });
+                                if enemy_near {
+                                    named_combo_callouts.push((2, px, py, team, "TUNNEL AMBUSH!"));
+                                    burrow_ambush_until = 0;
+                                }
+                            }
+                        }
+                    }
                     _ => {} // CLASS_STRIDER: Heavy Grounded Walker via step_capsule_3d
                 }
                 let ((nx, ny, nz), (_nvx, _nvy, nvz), _grounded) =
@@ -3477,6 +3903,28 @@ impl GameState {
                 // Continuous bilinear solid-density gradient capsule collider (L=4 strata mode)
                 let coll_layer = if pz >= 1.55 { 2.min(self.grid_d - 1) } else { surf_l };
                 let dashing_now = tick < dash_until;
+                let mut mx = (px + vx_s * dt).clamp(3.5, gw - 3.5);
+                let mut my = (py + vy_s * dt).clamp(3.5, gh - 3.5);
+                if class_id == CLASS_BURROWER
+                    && vx_s.hypot(vy_s) > 1.5
+                    && self.sample_capsule_density(mx, my, coll_layer, false) > 0.35
+                {
+                    let spd_h = vx_s.hypot(vy_s).max(1e-3);
+                    let moved = self.volume.carve_tunnel_3d(
+                        mx,
+                        my,
+                        (pz.round()).max(1.0),
+                        vx_s / spd_h,
+                        vy_s / spd_h,
+                        1.85,
+                    );
+                    if moved > 0 {
+                        self.tunnels_carved = self.tunnels_carved.saturating_add(1);
+                        self.tunnel_mass_displaced =
+                            self.tunnel_mass_displaced.saturating_add(moved as u64);
+                        burrow_ambush_until = tick + 90;
+                    }
+                }
                 let capsule_at = |tx: f32, ty: f32| -> f32 {
                     let allow_water = dashing_now
                         || class_id == CLASS_SKYWING
@@ -3489,8 +3937,6 @@ impl GameState {
                     self.sample_capsule_density(tx, ty, coll_layer, allow_water)
                 };
 
-                let mut mx = (px + vx_s * dt).clamp(3.5, gw - 3.5);
-                let mut my = (py + vy_s * dt).clamp(3.5, gh - 3.5);
                 for _ in 0..2 {
                     let dens = capsule_at(mx, my);
                     if dens <= 0.35 {
@@ -3588,7 +4034,7 @@ impl GameState {
                 + if near_friendly_shrine { 0.55 } else { 0.0 };
 
             let mut new_last_blast_ft = last_blast_ft;
-            let kb_res = if class_id == CLASS_STRIDER { 0.40 } else { 1.0 };
+            let kb_res = if class_id == CLASS_STRIDER || class_id == CLASS_BURROWER { 0.40 } else { 1.0 };
             if physics_native && tick >= dash_until {
                 let owner = self.find_recent_actuator_owner(fx, fy, team);
                 // 1. Emergent Blast Damage & Knockback from combustion (delta_temp_spike) & flash-boil (delta_steam_burst)
@@ -3600,6 +4046,13 @@ impl GameState {
                         kb_vx = (kb_vx + bx * push).clamp(-48.0, 48.0);
                         kb_vy = (kb_vy + by * push).clamp(-48.0, 48.0);
                         phys_dmg_events.push((owner, pid, dmg, "DETONATION!", 0));
+                        if let Some(oid) = owner {
+                            if let Some(op) = self.players.get(&oid) {
+                                if op.class_id == CLASS_SKYWING && op.z >= surf_z + 1.5 {
+                                    named_combo_callouts.push((0, fx, fy, op.team, "AERIAL OIL-IGNITION!"));
+                                }
+                            }
+                        }
                         if dmg >= 14 {
                             combo_callouts.push((fx, fy, 1 - team, "COMBUSTION BLAST!".into()));
                         }
@@ -3611,6 +4064,16 @@ impl GameState {
                         kb_vx = (kb_vx + bx * push).clamp(-48.0, 48.0);
                         kb_vy = (kb_vy + by * push).clamp(-48.0, 48.0);
                         phys_dmg_events.push((owner, pid, dmg, "FLASH-BOIL!", 0));
+                        if let Some(oid) = owner {
+                            if let Some(op) = self.players.get(&oid) {
+                                if op.class_id == CLASS_TIDEKIN {
+                                    let ol = (op.z.round() as usize).clamp(0, self.grid_d - 1);
+                                    if self.volume.sample_entity_physics(op.x, op.y, ol).water_frac > 0.10 {
+                                        named_combo_callouts.push((1, fx, fy, op.team, "SUBMERGED GEYSER!"));
+                                    }
+                                }
+                            }
+                        }
                         if dmg >= 12 {
                             combo_callouts.push((fx, fy, 1 - team, "FLASH-BOIL BURST!".into()));
                         }
@@ -3642,6 +4105,7 @@ impl GameState {
             p.kb_vx = kb_vx;
             p.kb_vy = kb_vy;
             p.last_phys_blast_field_tick = new_last_blast_ft;
+            p.burrow_ambush_until = burrow_ambush_until;
             p.mana = (p.mana + 9.5 * regen_mul * dt).min(p.max_mana);
             p.stamina = (p.stamina + 16.0 * regen_mul * dt).min(p.max_stamina);
 
@@ -3663,6 +4127,9 @@ impl GameState {
         }
         for (cx, cy, t, lbl) in combo_callouts {
             self.push_event(2, cx, cy, 0, t, lbl);
+        }
+        for (slot, cx, cy, t, lbl) in named_combo_callouts {
+            self.push_combo_callout(slot, cx, cy, t, lbl);
         }
 
         // Advance 3D projectiles + Time-Dilation Dome Bullet-Time/Haste + High-Ground Damage Bonus!
@@ -3720,12 +4187,36 @@ impl GameState {
                         self.volume.apply_fire_3d(cx, cy, pl, 4, 1.55 * pr.power);
                         if has_oil {
                             self.volume.apply_fire_3d(cx, cy, pl, 6, 1.9);
-                            self.push_event(2, nx, ny, 0, pr.team, "OIL INFERNO!".into());
+                            let aerial_skywing = self
+                                .players
+                                .get(&pr.owner)
+                                .map(|op| op.class_id == CLASS_SKYWING && op.z >= surf_z + 1.5)
+                                .unwrap_or(false);
+                            if aerial_skywing {
+                                self.push_combo_callout(0, nx, ny, pr.team, "AERIAL OIL-IGNITION!");
+                            } else {
+                                self.push_event(2, nx, ny, 0, pr.team, "OIL INFERNO!".into());
+                            }
                             self.eco.inject_fear_pulse(nx, ny, 20.0, 1.0);
                         } else if has_water_or_ice {
                             let boiled = self.volume.apply_steam_burst_3d(cx, cy, pl, 4);
                             if boiled >= 6 {
-                                self.push_event(2, nx, ny, 0, pr.team, "STEAM BURST!".into());
+                                let submerged_tidekin = self
+                                    .players
+                                    .get(&pr.owner)
+                                    .map(|op| {
+                                        if op.class_id != CLASS_TIDEKIN {
+                                            return false;
+                                        }
+                                        let ol = (op.z.round() as usize).clamp(0, self.grid_d - 1);
+                                        self.volume.sample_entity_physics(op.x, op.y, ol).water_frac > 0.10
+                                    })
+                                    .unwrap_or(false);
+                                if submerged_tidekin {
+                                    self.push_combo_callout(1, nx, ny, pr.team, "SUBMERGED GEYSER!");
+                                } else {
+                                    self.push_event(2, nx, ny, 0, pr.team, "STEAM BURST!".into());
+                                }
                             }
                         }
                     }
@@ -3948,6 +4439,10 @@ impl GameState {
                     self.cycle_biome();
                     world_changed = true;
                 }
+                ws_bridge::WsCommand::CycleEvo => {
+                    self.cycle_evolution_speed();
+                    world_changed = true;
+                }
                 ws_bridge::WsCommand::ResetWorld => {
                     self.reset_match();
                     world_changed = true;
@@ -3968,18 +4463,23 @@ impl GameState {
         Arc::from(ws_bridge::encode_ws_binary_frame(&payload))
     }
 
-    fn broadcast_ws_entities(&self, force: bool) {
-        let Some(ref ws) = self.ws_bridge else {
-            return;
-        };
-        if !ws.has_clients() || (!force && self.sim_tick % 2 != 0) {
-            return;
-        }
-
+    fn build_ws_entities_json(&self) -> String {
         let mut sorted_players: Vec<&PlayerEntity> = self.players.values().collect();
         sorted_players.sort_by_key(|p| p.id);
 
-        let mut json = String::with_capacity(512 + sorted_players.len() * 128 + self.projectiles.len() * 96);
+        let tick = self.sim_tick;
+        let mut active_beams: Vec<(f32, &ActuatorPulseSnap)> = self
+            .actuator_pulses
+            .iter()
+            .filter(|(exp, _, _)| tick <= *exp)
+            .map(|(_, energy, snap)| (*energy, snap))
+            .collect();
+        active_beams.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        active_beams.truncate(16);
+
+        let mut json = String::with_capacity(
+            768 + sorted_players.len() * 140 + self.projectiles.len() * 96 + active_beams.len() * 128,
+        );
         use std::fmt::Write as _;
         let _ = write!(
             json,
@@ -4031,15 +4531,56 @@ impl GameState {
                 pr.id, pr.x, pr.z, pr.y, r, g, b, rad
             );
         }
+        json.push_str("],\"beams\":[");
+        for (i, &(_, pulse)) in active_beams.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            let (r, g, b) = if pulse.thermal_flux > 0.25 {
+                (1.00f32, 0.44f32, 0.12f32) // Thermal heat beam
+            } else if pulse.thermal_flux < -0.25 {
+                (0.22f32, 0.86f32, 1.00f32) // Cryo beam
+            } else if pulse.sp_oil > 0.20 {
+                (0.74f32, 0.34f32, 0.96f32) // Volatile oil stream
+            } else if pulse.sp_water > 0.20 {
+                (0.18f32, 0.66f32, 1.00f32) // Hydro stream
+            } else {
+                (0.84f32, 0.88f32, 0.94f32) // Kinetic / Smoke pulse
+            };
+            // Match WebGPU axis convention: x = east, y = altitude (z), z = north (y)
+            let _ = write!(
+                json,
+                "{{\"x0\":{:.3},\"y0\":{:.3},\"z0\":{:.3},\"x1\":{:.3},\"y1\":{:.3},\"z1\":{:.3},\"color\":[{:.2},{:.2},{:.2}]}}",
+                pulse.x0, pulse.z0, pulse.y0, pulse.x1, pulse.z1, pulse.y1, r, g, b
+            );
+        }
+        let ev = self.volume.evolution_stats;
+        let epoch_name = self.volume.evolution_epoch_name();
         let status = format!("{} Z={}", biome_name(self.biome_id), self.grid_d);
         let _ = write!(
             json,
-            "],\"telemetry\":{{\"server_tps\":{:.1},\"online_players\":{},\"status\":{}}}}}",
+            "],\"evolution\":{{\"epoch\":{},\"basalt\":{},\"trees\":{},\"glaciers\":{},\"erosion\":{}}},\"telemetry\":{{\"server_tps\":{:.1},\"online_players\":{},\"status\":{}}}}}",
+            json_escape_str(epoch_name),
+            ev.basalt_forged,
+            ev.saplings_grown,
+            ev.glaciers_formed,
+            ev.erosion_events,
             self.measured_tps,
             sorted_players.len(),
             json_escape_str(&status)
         );
+        json
+    }
 
+    fn broadcast_ws_entities(&self, force: bool) {
+        let Some(ref ws) = self.ws_bridge else {
+            return;
+        };
+        if !ws.has_clients() || (!force && self.sim_tick % 2 != 0) {
+            return;
+        }
+
+        let json = self.build_ws_entities_json();
         let payload = ws_bridge::encode_entities_payload(&json);
         let frame: Arc<[u8]> = Arc::from(ws_bridge::encode_ws_binary_frame(&payload));
         ws.broadcast_raw_frame(frame);
@@ -4608,9 +5149,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )));
     let (grid_w, grid_h, grid_d, biome_id, world_seed, chunks_x, chunks_y, bot_counts) = {
         let gs = state.lock().unwrap();
-        let mut cls_cnt = [0usize; 4];
+        let mut cls_cnt = [0usize; 5];
         for p in gs.players.values().filter(|p| p.is_bot) {
-            cls_cnt[(p.class_id as usize) % 4] += 1;
+            cls_cnt[(p.class_id as usize) % 5] += 1;
         }
         (gs.grid_w, gs.grid_h, gs.grid_d, gs.biome_id, gs.world_seed, gs.chunks_x, gs.chunks_y, cls_cnt)
     };
@@ -4626,7 +5167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     log::info!(
-        "Frostmarsh v3 3D VOLUMETRIC QUIC Server listening on {} ({}x{}x{} = {} voxels, biome={} [{}], seed={}, backend={}, bots={} [Strider={} Skywing={} Tidekin={} Emberstalker={}], aoi_r={})",
+        "Frostmarsh v3 3D VOLUMETRIC QUIC Server listening on {} ({}x{}x{} = {} voxels, biome={} [{}], seed={}, backend={}, bots={} [Strider={} Skywing={} Tidekin={} Emberstalker={} Burrower={}], aoi_r={})",
         args.bind,
         grid_w,
         grid_h,
@@ -4641,6 +5182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bot_counts[1],
         bot_counts[2],
         bot_counts[3],
+        bot_counts[4],
         args.aoi_radius
     );
 
@@ -4884,6 +5426,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gs.volume.apply_solar_cycle_3d(day_time_now, tick_now);
                 if gs.volume.depth >= 12 && (evo_speed >= 4.0 || tick_now % 2 == 0) {
                     gs.volume.step_world_evolution_3d(evo_speed);
+                    let new_epoch = gs.volume.evolution_epoch_name();
+                    if new_epoch != gs.last_epoch_name {
+                        gs.last_epoch_name = new_epoch;
+                        let (mx, my) = (gs.grid_w as f32 * 0.5, gs.grid_h as f32 * 0.5);
+                        gs.push_event(5, mx, my, 0, 2, format!("EPOCH: {}", new_epoch));
+                        log::info!("Living World Epoch advanced -> {}", new_epoch);
+                    }
                 }
                 let stats = gs.volume.step_3d_with_neural_z(&raw_layers, z_flux_opt.as_deref());
                 gs.neural_3d_vertical = used_neural_3d_z;
@@ -4911,13 +5460,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if stats.tick % 10 == 0 {
                     let bot_cnt = gs.players.values().filter(|p| p.is_bot).count();
                     let ev = gs.volume.evolution_stats;
+                    let epoch_name = gs.volume.evolution_epoch_name();
                     log::info!(
-                        "tick={} {}x{}x{} ({} vox) biome={} mode={} backend={} world={:.2}ms eco={:.2}ms grav_z={} buoy_z={} mass_err={} energy_err={} bots={} evo={:.0}x basalt={} trees={} glaciers={} erosion={} wire={:.1}KB/s dirty={} peers={}",
+                        "tick={} {}x{}x{} ({} vox) biome={} mode={} backend={} world={:.2}ms eco={:.2}ms grav_z={} buoy_z={} mass_err={} energy_err={} bots={} epoch=\"{}\" tunnels={} tunnel_mass={} evo={:.0}x basalt={} trees={} glaciers={} erosion={} wire={:.1}KB/s dirty={} peers={}",
                         stats.tick, gw, gh, gd, gw * gh * gd, biome_name(gs.biome_id), gs.sim_mode, gs.backend_name,
                         reported_ms, eco_ms, stats.vertical_gravity_mass, stats.vertical_buoyancy_mass,
-                        stats.mass_error, stats.energy_error, bot_cnt, gs.evo_speed, ev.basalt_forged,
-                        ev.saplings_grown, ev.glaciers_formed, ev.erosion_events, gs.wire_kbps,
-                        stats.dirty_chunks.len(), gs.peers.len()
+                        stats.mass_error, stats.energy_error, bot_cnt, epoch_name, gs.tunnels_carved,
+                        gs.tunnel_mass_displaced, gs.evo_speed, ev.basalt_forged, ev.saplings_grown,
+                        ev.glaciers_formed, ev.erosion_events, gs.wire_kbps, stats.dirty_chunks.len(), gs.peers.len()
                     );
                 }
             }
@@ -4989,7 +5539,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             ClientReliable::SelectClass { class_id } => {
                                 if let Some(p) = gs.players.get_mut(&pid) {
-                                    p.class_id = class_id % 4;
+                                    p.class_id = class_id % 5;
                                     let (mhp, mmp, mst, _) = PlayerEntity::class_stats(p.class_id, p.level);
                                     p.max_hp = mhp;
                                     p.hp = p.hp.min(mhp);
@@ -5125,20 +5675,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 gs.cycle_biome();
                             }
                             ClientReliable::CycleEvolutionSpeed => {
-                                gs.evo_speed = if (gs.evo_speed - 1.0).abs() < 0.05 {
-                                    4.0
-                                } else if (gs.evo_speed - 4.0).abs() < 0.05 {
-                                    12.0
-                                } else {
-                                    1.0
-                                };
-                                let ev = gs.volume.evolution_stats;
-                                let lbl = format!(
-                                    "WORLD EVOLUTION: {:.0}X (BASALT:{} TREES:{})",
-                                    gs.evo_speed, ev.basalt_forged, ev.saplings_grown
-                                );
-                                let (mx, my) = (gs.grid_w as f32 * 0.5, gs.grid_h as f32 * 0.5);
-                                gs.push_event(5, mx, my, 0, 2, lbl);
+                                gs.cycle_evolution_speed();
                             }
                         }
                     }
@@ -5153,4 +5690,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_wave14b_five_archetypes_ws_json_and_evo_cycle() {
+        let mut gs = GameState::new(
+            "refsim".to_string(),
+            "127.0.0.1:14440".to_string(),
+            64,
+            16,
+            0,
+            1,
+            60,
+            8,
+        );
+        // Verify 60 bots spawn evenly across all 5 archetypes (12 each)
+        let mut cls_counts = [0usize; 5];
+        for p in gs.players.values().filter(|p| p.is_bot) {
+            cls_counts[(p.class_id as usize) % 5] += 1;
+        }
+        assert_eq!(cls_counts, [12, 12, 12, 12, 12]);
+        assert_eq!(PlayerEntity::class_stats(CLASS_BURROWER, 1).0, 160);
+
+        // Verify cycle_evolution_speed cycles 1x -> 4x -> 12x -> 1x
+        assert!((gs.evo_speed - 1.0).abs() < 1e-3);
+        gs.cycle_evolution_speed();
+        assert!((gs.evo_speed - 4.0).abs() < 1e-3);
+        gs.cycle_evolution_speed();
+        assert!((gs.evo_speed - 12.0).abs() < 1e-3);
+        gs.cycle_evolution_speed();
+        assert!((gs.evo_speed - 1.0).abs() < 1e-3);
+
+        // Emit a true 3D diagonal actuator beam (`z0 != z1`) and verify `0x02` live JSON
+        let sample_pid = *gs.players.keys().next().unwrap();
+        let pz0 = gs.players[&sample_pid].z;
+        gs.apply_player_physical_actuator_3d(
+            sample_pid,
+            6.0,
+            0.0,
+            Some((pz0 + 3.5).clamp(1.0, 14.0)),
+            0.9,
+            0.0,
+            0.0,
+            0.0,
+            3.5,
+            0.2,
+        );
+        let json = gs.build_ws_entities_json();
+        let parsed = JsonParser::parse(&json).expect("valid 0x02 WS JSON");
+        let players = parsed.get("players").and_then(|v| v.as_arr()).expect("players array");
+        assert_eq!(players.len(), 60);
+        assert!(players[0].get("class_id").is_some());
+        let beams = parsed.get("beams").and_then(|v| v.as_arr()).expect("beams array");
+        assert!(!beams.is_empty(), "expected at least one 3D actuator beam in 0x02 JSON");
+        let b0 = &beams[0];
+        let y0 = b0.get("y0").and_then(|v| v.as_f32()).unwrap();
+        let y1 = b0.get("y1").and_then(|v| v.as_f32()).unwrap();
+        assert!((y1 - y0).abs() > 0.5, "expected diagonal 3D beam (y0={} != y1={})", y0, y1);
+        let evo = parsed.get("evolution").expect("evolution object");
+        assert_eq!(
+            evo.get("epoch").and_then(|v| v.as_str()),
+            Some("EPOCH I: PRISTINE")
+        );
+        assert!(evo.get("basalt").is_some());
+        assert!(evo.get("trees").is_some());
+        assert!(evo.get("glaciers").is_some());
+        assert!(evo.get("erosion").is_some());
+    }
 }

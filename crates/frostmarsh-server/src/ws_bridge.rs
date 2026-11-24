@@ -192,6 +192,7 @@ pub fn encode_entities_payload(json: &str) -> Vec<u8> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WsCommand {
     CycleBiome,
+    CycleEvo,
     ResetWorld,
     RequestFullSync { peer_id: u64 },
 }
@@ -201,6 +202,7 @@ pub fn parse_client_text_command(peer_id: u64, text: &str) -> Option<WsCommand> 
     let ty = extract_json_string_field(text, "type")?;
     match ty.as_str() {
         "cycle_biome" => Some(WsCommand::CycleBiome),
+        "cycle_evo" => Some(WsCommand::CycleEvo),
         "reset_world" => Some(WsCommand::ResetWorld),
         "request_full_sync" => Some(WsCommand::RequestFullSync { peer_id }),
         _ => None,
@@ -710,6 +712,10 @@ mod tests {
         assert_eq!(
             parse_client_text_command(7, r#"{"type":"cycle_biome"}"#),
             Some(WsCommand::CycleBiome)
+        );
+        assert_eq!(
+            parse_client_text_command(7, r#"{"type":"cycle_evo"}"#),
+            Some(WsCommand::CycleEvo)
         );
         assert_eq!(
             parse_client_text_command(7, r#"{ "type" : "reset_world", "v": 1 }"#),

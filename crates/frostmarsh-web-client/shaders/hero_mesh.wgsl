@@ -47,8 +47,49 @@ fn vs_main(in: VsIn) -> VsOut {
     let c = cos(yaw);
     let s = sin(yaw);
     let sc = in.inst_faction_scale.w;
+    let t = u.cam_pos.w;
 
-    let lp = in.pos * sc;
+    var anim_p = in.pos;
+    var anim_n = in.normal;
+    let phase = t * 7.2 + in.inst_pos_yaw.x * 0.31 + in.inst_pos_yaw.z * 0.27;
+
+    // Wing-flap articulation (flags.z = flap weight for flying Skywings)
+    if (abs(in.flags.z) > 0.01) {
+        let flap = sin(phase) * 0.44 * in.flags.z;
+        let side = select(-1.0, 1.0, anim_p.x >= 0.0);
+        let pivot_x = side * 0.22;
+        let pivot_y = 1.22;
+        let rx = anim_p.x - pivot_x;
+        let ry = anim_p.y - pivot_y;
+        let fc = cos(flap * side);
+        let fs = sin(flap * side);
+        anim_p.x = pivot_x + rx * fc - ry * fs;
+        anim_p.y = pivot_y + rx * fs + ry * fc;
+        anim_p.z -= abs(anim_p.x) * 0.07 * cos(phase) * in.flags.z;
+        let nrx = anim_n.x * fc - anim_n.y * fs;
+        let nry = anim_n.x * fs + anim_n.y * fc;
+        anim_n = normalize(vec3<f32>(nrx, nry, anim_n.z));
+    }
+
+    // Secondary archetype animation (flags.w: 1.0 = Skywing hover bob, 2.0 = Burrower bore-drill spin)
+    if (in.flags.w > 1.5) {
+        let spin = t * 11.0 + in.inst_pos_yaw.x * 0.5;
+        let sc_s = cos(spin);
+        let ss_s = sin(spin);
+        let dx = anim_p.x - 0.38;
+        let dy = anim_p.y - 0.88;
+        anim_p.x = 0.38 + dx * sc_s - dy * ss_s;
+        anim_p.y = 0.88 + dx * ss_s + dy * sc_s;
+        anim_n = normalize(vec3<f32>(
+            anim_n.x * sc_s - anim_n.y * ss_s,
+            anim_n.x * ss_s + anim_n.y * sc_s,
+            anim_n.z
+        ));
+    } else if (in.flags.w > 0.5) {
+        anim_p.y += -sin(phase) * 0.08;
+    }
+
+    let lp = anim_p * sc;
     let wp = vec3<f32>(
         lp.x * c + lp.z * s,
         lp.y,
@@ -56,9 +97,9 @@ fn vs_main(in: VsIn) -> VsOut {
     ) + in.inst_pos_yaw.xyz;
 
     let wn = normalize(vec3<f32>(
-        in.normal.x * c + in.normal.z * s,
-        in.normal.y,
-        -in.normal.x * s + in.normal.z * c
+        anim_n.x * c + anim_n.z * s,
+        anim_n.y,
+        -anim_n.x * s + anim_n.z * c
     ));
 
     let base_col = mix(in.color_rough.rgb, in.color_rough.rgb * in.inst_faction_scale.rgb, in.flags.x);
@@ -140,7 +181,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let style_id = i32(round(u.sun_col.w));
 
     let lin_albedo = pow(clamp(in.albedo_rough.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
-    if (in.emissive > 0.5) {
+    if (in.emissive > 0.90) {
         let ndv_orb = max(dot(n, v), 0.0);
         let core = mix(vec3<f32>(1.0, 0.98, 0.92), lin_albedo, 0.55);
         let orb_hdr = core * (2.6 + 2.2 * pow(ndv_orb, 1.6)) + lin_albedo * 1.4;
@@ -178,8 +219,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let spec = pow(ndh, shininess) * spec_w * ndl * (0.25 + 0.75 * shadow);
     let rim = pow(1.0 - ndv, 3.2) * (u.sky_horizon.rgb * 0.28 * ao + bounce * 0.48);
 
+    let accent_glow = lin_albedo * (in.emissive * 3.4);
     let hdr = lin_albedo * (u.sun_col.rgb * ndl * shadow + ambient + bounce)
-        + u.sun_col.rgb * spec + rim;
+        + u.sun_col.rgb * spec + rim + accent_glow;
 
     return vec4<f32>(hdr, 1.0);
 }

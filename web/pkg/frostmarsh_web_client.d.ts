@@ -12,9 +12,10 @@ export class FrostmarshApp {
      */
     apply_brick3d_raw(bx: number, by: number, depth: number, density_rgba: Uint8Array, albedo_rgba: Uint8Array): number;
     /**
-     * Apply a live `0x02` multiplayer JSON entity & telemetry frame from WebSocket!
-     * Updates live multiplayer hero figurines, glowing projectiles, and telemetry HUD.
-     * Returns total active rendered entities (`players + projectiles`).
+     * Apply a live `0x02` multiplayer JSON entity, actuator beam, & evolution frame from WebSocket!
+     * Updates live 5-archetype hero figurines, glowing projectiles, diagonal beam orb-streams,
+     * world evolution stats, and telemetry HUD.
+     * Returns total active rendered entities (`players + projectiles + beams`).
      */
     apply_live_entities_json(json_str: string): number;
     clear_keys(): void;
@@ -88,11 +89,11 @@ export interface InitOutput {
     readonly frostmarshapp_toggle_capsule_mode: (a: number) => number;
     readonly frostmarshapp_toggle_pixel_style: (a: number) => number;
     readonly frostmarshapp_zoom_wheel: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_6593: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6614: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_821: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_821_22: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_821_23: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6603: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6624: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_831: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_831_22: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_831_23: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

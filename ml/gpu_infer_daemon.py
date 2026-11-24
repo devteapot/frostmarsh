@@ -541,11 +541,12 @@ class _SparseWorldDTAdapter:
         self.host_out_np = self.host_out.numpy()
         self.host_in_u8 = self.host_in_np.view(np.uint8).ravel()
         self.host_out_bytes = memoryview(self.host_out_np).cast("B")
+        sp_thresh = 0.22 if getattr(runner_cls, "__name__", "") == "SparseWorld3DV5Runner" else 0.42
         self.runner = runner_cls(
             model_dt,
             device=device,
             use_fp16=use_fp16,
-            sparse_threshold=(0.42 if use_sparse else 0.0),
+            sparse_threshold=(sp_thresh if use_sparse else 0.0),
         )
 
     def infer_from_host_in(self) -> tuple[memoryview, torch.Tensor, torch.Tensor, float, int]:
@@ -2232,8 +2233,12 @@ def main() -> None:
     parser.add_argument(
         "--world-model-v5",
         type=Path,
-        default=_SCRIPT_DIR / "world_model_3d_v5.pt",
-        help="Optional conservation-distilled WorldModel3D-v5 checkpoint (auto-overrides op=8/op=9 with 16x16x8 3D sparse bricks!)",
+        default=(
+            _SCRIPT_DIR / "world_model_3d_v6.pt"
+            if (_SCRIPT_DIR / "world_model_3d_v6.pt").is_file()
+            else _SCRIPT_DIR / "world_model_3d_v5.pt"
+        ),
+        help="Optional conservation-distilled WorldModel3D-v6/v5 checkpoint (auto-overrides op=8/op=9 with 16x16x8 3D sparse bricks!)",
     )
     parser.add_argument(
         "--system2-slm",

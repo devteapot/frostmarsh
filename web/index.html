@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Frostmarsh 3D — Wave 12C WebGPU Neural Style Swap + Live WS Multiplayer</title>
+  <title>Frostmarsh 3D — Wave 14D WebGPU 5-Archetypes + Live Beams + Evolving World</title>
   <style>
     :root {
       --bg: #080c14;
@@ -249,6 +249,32 @@
       color: #e9fff4;
     }
 
+    .btn.ws-live-only {
+      display: none;
+    }
+
+    #hud-ws.ws-connected .btn.ws-live-only {
+      display: inline-flex;
+    }
+
+    .btn.flash-ping {
+      background: rgba(86, 185, 255, 0.36);
+      border-color: var(--accent);
+      box-shadow: 0 0 12px rgba(86, 185, 255, 0.45);
+    }
+
+    .evo-row-hidden {
+      display: none;
+    }
+
+    .stat-val.evo-val {
+      color: var(--accent-amber);
+    }
+
+    .stat-val.arch-val {
+      color: var(--accent);
+    }
+
     .kbd {
       font-family: var(--mono);
       font-size: 10px;
@@ -382,6 +408,15 @@
       <span class="stat-label">Live WS</span>
       <span id="stat-ws" class="stat-val">Offline</span>
 
+      <span class="stat-label">Archetypes</span>
+      <span id="stat-archetypes" class="stat-val arch-val">5 classes</span>
+
+      <span id="lbl-evo-epoch" class="stat-label evo-row-hidden">Evo Epoch</span>
+      <span id="stat-evo-epoch" class="stat-val evo-val evo-row-hidden">--</span>
+
+      <span id="lbl-evo-world" class="stat-label evo-row-hidden">World Evo</span>
+      <span id="stat-evo-world" class="stat-val evo-row-hidden">--</span>
+
       <span class="stat-label">Camera XYZ</span>
       <span id="stat-cam" class="stat-val">--</span>
 
@@ -428,6 +463,12 @@
       <button id="btn-ws" class="btn" title="Connect to Live Binary WebSocket Multiplayer Stream (0x01 Brick3D + 0x02 Entities)">
         <span id="lbl-ws">Connect Live (WS)</span>
       </button>
+      <button id="btn-ws-biome" class="btn ws-live-only active-violet" title="Cycle Live Server Biome over WebSocket (F7)">
+        <span class="kbd">F7</span> Biome
+      </button>
+      <button id="btn-ws-evo" class="btn ws-live-only active-amber" title="Cycle Live Evolving-World Simulation Speed over WebSocket (F9)">
+        <span class="kbd">F9</span> Evo Speed
+      </button>
     </div>
   </div>
 
@@ -442,6 +483,8 @@
     <span><span class="kbd">T</span> Pixel-2×SS</span>
     <span><span class="kbd">C</span> Capsule + Cutaway</span>
     <span><span class="kbd">Z</span> Depth 16..32</span>
+    <span><span class="kbd">F7</span> WS Biome</span>
+    <span><span class="kbd">F9</span> WS Evo Speed</span>
     <span><span class="kbd">Drop .bin</span> FM3D</span>
   </div>
 
@@ -474,6 +517,11 @@
     const statStyle = document.getElementById("stat-style");
     const statWalk = document.getElementById("stat-walk");
     const statWs = document.getElementById("stat-ws");
+    const statArchetypes = document.getElementById("stat-archetypes");
+    const lblEvoEpoch = document.getElementById("lbl-evo-epoch");
+    const statEvoEpoch = document.getElementById("stat-evo-epoch");
+    const lblEvoWorld = document.getElementById("lbl-evo-world");
+    const statEvoWorld = document.getElementById("stat-evo-world");
     const statCam = document.getElementById("stat-cam");
     const statSource = document.getElementById("stat-source");
 
@@ -490,10 +538,13 @@
     const btnVolume = document.getElementById("btn-volume");
     const lblVolume = document.getElementById("lbl-volume");
 
+    const hudWs = document.getElementById("hud-ws");
     const wsDot = document.getElementById("ws-dot");
     const wsUrlInput = document.getElementById("ws-url");
     const btnWs = document.getElementById("btn-ws");
     const lblWs = document.getElementById("lbl-ws");
+    const btnWsBiome = document.getElementById("btn-ws-biome");
+    const btnWsEvo = document.getElementById("btn-ws-evo");
 
     const STYLE_LABELS = ["NORDIC", "VOLCANIC", "ARCANE", "EMERALD"];
     const DEPTH_PRESETS = [16, 24, 32];
@@ -675,7 +726,9 @@
       function setWsUi(state, label) {
         wsStateText = label;
         wsDot.className = `ws-dot ${state}`;
-        if (state === "connected") {
+        const isConnected = state === "connected";
+        hudWs.classList.toggle("ws-connected", isConnected);
+        if (isConnected) {
           lblWs.textContent = "Disconnect WS";
           btnWs.classList.add("active-green");
         } else if (state === "connecting") {
@@ -684,6 +737,21 @@
         } else {
           lblWs.textContent = "Connect Live (WS)";
           btnWs.classList.remove("active-green");
+        }
+      }
+
+      function sendWsCommand(cmdType, btnEl) {
+        if (!liveWs || liveWs.readyState !== WebSocket.OPEN) return false;
+        try {
+          liveWs.send(JSON.stringify({ type: cmdType }));
+          if (btnEl) {
+            btnEl.classList.add("flash-ping");
+            setTimeout(() => btnEl.classList.remove("flash-ping"), 220);
+          }
+          return true;
+        } catch (err) {
+          console.warn("WS command send failed:", err);
+          return false;
         }
       }
 
@@ -772,6 +840,9 @@
         }
       });
 
+      btnWsBiome.addEventListener("click", () => sendWsCommand("cycle_biome", btnWsBiome));
+      btnWsEvo.addEventListener("click", () => sendWsCommand("cycle_evo", btnWsEvo));
+
       wsUrlInput.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
           connectWs(wsUrlInput.value);
@@ -808,6 +879,13 @@
           else if (e.code === "KeyC") updateCapsuleButtons(app.toggle_capsule_mode());
           else if (e.code === "KeyZ") cycleDepthPreset();
           else if (e.code === "KeyV") toggleVolumeSource();
+          else if (e.code === "F7") {
+            e.preventDefault();
+            sendWsCommand("cycle_biome", btnWsBiome);
+          } else if (e.code === "F9") {
+            e.preventDefault();
+            sendWsCommand("cycle_evo", btnWsEvo);
+          }
         }
       });
 
@@ -910,9 +988,25 @@
             const brkInfo = s.live_bricks_rx > 0
               ? ` · ${s.live_bricks_rx} brk (${s.last_brick_ms.toFixed(2)}ms)`
               : "";
-            statWs.textContent = `${s.live_players}H/${s.live_projectiles}P${brkInfo}`;
+            const beamInfo = s.live_beams > 0 ? `/${s.live_beams}B` : "";
+            const statusSuffix = s.live_status && s.live_status !== "Offline" ? ` · ${s.live_status}` : "";
+            statWs.textContent = `${s.live_players}H/${s.live_projectiles}P${beamInfo}${brkInfo}${statusSuffix}`;
           } else {
             statWs.textContent = wsStateText;
+          }
+          const ac = s.archetype_counts || [0, 0, 0, 0, 0];
+          statArchetypes.textContent = `${s.archetype_types || 0}/5 · S${ac[0]} W${ac[1]} T${ac[2]} E${ac[3]} B${ac[4]}`;
+          statArchetypes.title = `Strider: ${ac[0]}, Skywing: ${ac[1]}, Tidekin: ${ac[2]}, Emberstalker: ${ac[3]}, Burrower: ${ac[4]}`;
+
+          const showEvo = Boolean(s.evo_active);
+          lblEvoEpoch.classList.toggle("evo-row-hidden", !showEvo);
+          statEvoEpoch.classList.toggle("evo-row-hidden", !showEvo);
+          lblEvoWorld.classList.toggle("evo-row-hidden", !showEvo);
+          statEvoWorld.classList.toggle("evo-row-hidden", !showEvo);
+          if (showEvo) {
+            statEvoEpoch.textContent = `Epoch ${s.evo_epoch} · Ero ${s.evo_erosion}`;
+            statEvoWorld.textContent = `Bas ${s.evo_basalt} · Tree ${s.evo_trees} · Gla ${s.evo_glaciers}`;
+            statEvoWorld.title = `Basalt: ${s.evo_basalt}, Trees: ${s.evo_trees}, Glaciers: ${s.evo_glaciers}, Erosion: ${s.evo_erosion}`;
           }
           statCam.textContent = `${s.cam_x.toFixed(1)}, ${s.cam_y.toFixed(1)}, ${s.cam_z.toFixed(1)}`;
           statSource.textContent = `${s.volume_source}`;

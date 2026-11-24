@@ -30,7 +30,7 @@ mod z16_world;
 use crate::audio::{SfxKind, SpatialAudioEngine};
 use crate::camera::MobaCamera;
 use crate::hud::{build_hud, HudConfig};
-use crate::mesh_gen::StaticMeshBank;
+use crate::mesh_gen::{StaticMeshBank, CLASS_BURROWER};
 use crate::net::QuicClientHandle;
 use crate::neural_style::NUM_Z16_STYLES;
 use crate::renderer::{z16_style_label, Approach4Renderer, Atmosphere, RenderStyle};
@@ -328,6 +328,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         sim_time,
         0,
         None,
+        true,
     );
 
     // Benchmark 4 modes (with full HUD active!)
@@ -368,6 +369,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 audio_muted: true,
                 audio_available: false,
                 cave_enclosure: 0.0,
+                show_squad_links: true,
             },
         );
         let (p50, p99, mean) = renderer.benchmark_gpu(
@@ -432,6 +434,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             audio_muted: true,
             audio_available: false,
             cave_enclosure: 0.0,
+            show_squad_links: true,
         },
     );
     let (rgba_main, _, _) = renderer.render_to_rgba(
@@ -533,6 +536,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             sim_time,
             *slice_mode,
             None,
+            true,
         );
         let hb = if *with_hud {
             Some(build_hud(
@@ -561,6 +565,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     audio_muted: true,
                     audio_available: false,
                     cave_enclosure: 0.0,
+                    show_squad_links: true,
                 },
             ))
         } else {
@@ -634,7 +639,9 @@ fn hero_class_base_speed(class_id: u8) -> f32 {
         CLASS_WARDEN => 15.5,    // Strider (Heavy Walker / Squad Anchor)
         CLASS_ALCHEMIST => 16.0, // Skywing (3D Flyer / Thermal Glider)
         CLASS_RANGER => 18.8,    // Tidekin (Amphibious Swimmer / Diver)
-        _ => 19.2,               // Emberstalker (Solo Cavern Climber / Raider)
+        3 => 19.2,               // Emberstalker (Solo Cavern Climber / Raider)
+        CLASS_BURROWER => 16.4,  // Burrower (Subterranean Crystal-Plated Golem)
+        _ => 19.2,
     }
 }
 
@@ -840,6 +847,7 @@ struct InteractiveApp {
     layer_slice_mode: u8,
     show_hud: bool,
     show_telemetry: bool,
+    show_squad_links: bool,
     brain_inspector_on: bool,
     brain_selected_idx: Option<usize>,
     selected_element: u8,
@@ -926,6 +934,7 @@ impl InteractiveApp {
             layer_slice_mode: 0,
             show_hud: true,
             show_telemetry: true,
+            show_squad_links: true,
             brain_inspector_on: true,
             brain_selected_idx: None,
             selected_element: 0,
@@ -1628,13 +1637,18 @@ impl InteractiveApp {
                         // Instant 0 ms local predicted volumetric actuator beam + crisp audio response!
                         let tx = (hero_gx + dx).clamp(2.0, (self.world.grid_w.saturating_sub(3)) as f32);
                         let ty = (hero_gy + dy).clamp(2.0, (self.world.grid_h.saturating_sub(3)) as f32);
+                        let tz1 = if self.z16_active {
+                            self.z16_world.sample_surface_y(tx, ty)
+                        } else {
+                            hero_gz
+                        };
                         let local_pulse = ActuatorPulseSnap {
                             x0: hero_gx,
                             y0: hero_gy,
                             z0: hero_gz,
                             x1: tx,
                             y1: ty,
-                            z1: hero_gz,
+                            z1: tz1,
                             thermal_flux,
                             sp_water,
                             sp_oil,
@@ -1725,6 +1739,7 @@ impl InteractiveApp {
             sim_time,
             self.layer_slice_mode,
             aim_reticle,
+            self.show_squad_links,
         );
         let hud_batch = build_hud(
             out_w as f32,
@@ -1752,6 +1767,7 @@ impl InteractiveApp {
                 audio_muted: self.audio_muted,
                 audio_available: self.audio.is_some(),
                 cave_enclosure: self.cave_enclosure_ema,
+                show_squad_links: self.show_squad_links,
             },
         );
 
@@ -2038,6 +2054,13 @@ impl ApplicationHandler for InteractiveApp {
                                     );
                                 }
                                 KeyCode::KeyL => self.layer_slice_mode = (self.layer_slice_mode + 1) % 3,
+                                KeyCode::KeyG => {
+                                    self.show_squad_links = !self.show_squad_links;
+                                    println!(
+                                        "[Unified] Squad Cohesion Tether Arcs -> {} [G]",
+                                        if self.show_squad_links { "ON" } else { "OFF" }
+                                    );
+                                }
                                 KeyCode::KeyH => self.show_hud = !self.show_hud,
                                 KeyCode::KeyU => {
                                     if let Some(ref audio) = self.audio {
@@ -2065,6 +2088,13 @@ impl ApplicationHandler for InteractiveApp {
                                 KeyCode::F8 => {
                                     if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::SelectClass { class_id: 3 });
+                                    }
+                                }
+                                KeyCode::F10 => {
+                                    if let Some(ref q) = self.quic {
+                                        q.send_reliable_detached(ClientReliable::SelectClass {
+                                            class_id: CLASS_BURROWER,
+                                        });
                                     }
                                 }
                                 KeyCode::KeyM => {

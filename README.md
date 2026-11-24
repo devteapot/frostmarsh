@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Live 40-Player 4-Archetype Evolving True-3D World — Striders, Winged Skywings, Swimming Tidekins, Solo Emberstalkers, WorldModel3D-v5 & 163 FPS Metal](models/unified_iter12_40bots_evolving/unified_live_1080p_hud.png)
+![Frostmarsh Live 60-Player 5-Archetype Evolving True-3D World — Striders, Skywings, Tidekins, Solo Emberstalkers, Tunnel-Carving Burrowers, WorldModel3D-v6 & 147 FPS Metal](models/unified_iter14_60bots_5arch/unified_live_1080p_hud.png)
 
 ---
 
@@ -101,15 +101,21 @@
     - **`Tidekin` (`class 2`, Amphibious Swimmer/Diver):** Bioluminescent dorsal fin + aqua wake, **`2.0×` hydrodynamic water speed**, zero chill drag, 3D submerged diving & breach-leap!
     - **`Emberstalker` (`class 3`, Solo Cavern Climber, `F8` select):** Dark hooded twin-blade raider, **`3.5m` vertical cliff/cave wall-climbing**, **Smoke Veil** stealth/speed boost, autonomous solo flanking vs. coordinated 3–4 player squads executing cross-class elemental combos!
   - **Live 7-Model Stack + 40 Simultaneous Players on Spark GB10 → Metal:** Running `WorldModel3D-v5` (`proj_active_pct = 6.92%`) + True-3D `ActuatorPolicyNetV3` (`ml/actuator_policy_v3.py`, `294.3K` params, zero-copy 5D trilinear `Z_world_3d` crops, `op=10` & transparent `op=7` upgrade, `100.0%` WR vs Flat-2D Ablation & `95.8%` vs Random-3D in [ACTUATOR_V3_TOURNAMENT.json](models/ACTUATOR_V3_TOURNAMENT.json)) + `Qwen2.5-1.5B` + `SparseEcoRunner` + `LiveAcousticEngine` + `BotPolicyNetV2` with **40 live heterogeneous bots in `7.65 ms`** at **`163.3 FPS` @ 1080p Pixel-2×SS / `176.3 FPS` Clean-3D / `165.0 FPS` @ 4K Pixel-2×SS** (`mass_error = 0`, `energy_error = 0`).
-  - **Live Zero-Dependency RFC 6455 WebSocket Bridge (`--ws-bind 0.0.0.0:4434`) & Upgraded WebGPU/WASM Browser Client (`web/`):** Pure-Tokio `ws_bridge.rs` (`4/4` tests) streams real `0x01` `Z=16..32` volumetric bricks + `15 Hz` `0x02` live entity JSON directly to `crates/frostmarsh-web-client` (`5/5` tests, `0` warnings under `-D warnings`, 4-style `Y`-key shaders, `C`-key cave cutaway, `Z=16/24/32` depth toggle).
+  - **Live Zero-Dependency RFC 6455 WebSocket Bridge (`--ws-bind 0.0.0.0:4434`) & Upgraded WebGPU/WASM Browser Client (`web/`):** Pure-Tokio `ws_bridge.rs` (`5/5` tests) streams real `0x01` `Z=16..32` volumetric bricks + `15 Hz` `0x02` live entity/beam/evolution JSON directly to `crates/frostmarsh-web-client` (`6/6` tests, `0` warnings under `-D warnings`, 5 GPU-animated archetypes, live diagonal 3D beams, 4-style `Y`-key shaders, `C`-key cave cutaway, `Z=16/24/32` depth toggle, and live `Biome (F7)` / `Evo Speed (F9)` WebSocket controls).
+- **Iterations 14–15 — Active-Face Distilled `WorldModel3D-v6`, `100.0%` Champion `ActuatorPolicyNetV3` (`24W–0L` Sweep), 5th Archetype `Burrower` (Conservative Tunnel-Carving), Living World Epochs & Live 60-Player `op=10` Stack:**
+  - **Active-Face Conservation-Distilled `WorldModel3D-v6` (`ml/train_world_3d_v6.py`, `world_model_3d_v6.pt`, [WORLD_3D_V6_METRICS.json](models/WORLD_3D_V6_METRICS.json), `158.4K` params, Colab `RTX PRO 6000 Blackwell`):** Variance-normalized active-face horizontal distillation warm-started from `v5` boosts unseen 5-biome **`horiz_flux_r2`** from `0.4114` → **`0.7521`** (`+0.3407`, peaking at `0.875` in Geothermal Basin & `0.838` in Nordic Viaduct), **`horiz_rxn_r2`** `12.1×` (`0.0395` → **`0.4787`**, peaking at `0.886` in Nordic Viaduct), and **`vert_water/steam/smoke_r2`** to **`0.9906 / 0.9720 / 0.9855`** (`0.9884 / 0.9855 / 0.9833` at unseen `Z=32`), with **bit-exact `0.0` FP32 `16×16×8` sparse-vs-dense parity** and `7.71%` (`Z=16`) / `7.34%` (`Z=32`) conservation firewall (`5.3×` lower than `WorldModelDT`).
+  - **Triton-Fused `SparseWorld3DV5Runner` (`2.5×` Live Spark GB10 Speedup):** `torch.compile(mode="reduce-overhead")` cuts live `256×256×16` (`1.05M` voxels) neural world inference on Spark GB10 from `165–194 ms` → **`76.8–78.1 ms`** (inside the `100 ms` 10 Hz real-time budget!).
+  - **Champion `ActuatorPolicyNetV3` (`ml/train_actuator_rl_v3.py`, `actuator_policy_v3_rl.pt`, [ACTUATOR_V3_TOURNAMENT.json](models/ACTUATOR_V3_TOURNAMENT.json), `294.3K` params, ZERO Hardcoded Spell Buttons, Colab `RTX PRO 6000 Blackwell`):** 12-step pure-spatial warmstart + 120-iteration pure-physics PPO league sweeps **`100.0%` WR (`24W–0L`, `+800 Elo`, `12/12` West & `12/12` East)** against **`Scripted-3D` (`+264.88` score diff)**, **`Flat-2D Ablation` (`+154.50`)**, AND **`Random-3D` (`+222.94`)**, autonomously executing **`70.2`** pressure blasts, **`30.1`** diagonal 3D vertical hits, **`15.9`** autonomous `0.15×` Stasis Domes, **`14.1`** Oil→Ignition squad combos, **`13.8`** bridge drops, **`7.7`** Tidekin aquatic ambushes, and **`1.4–4.2`** Skywing thermal updraft soars per match!
+  - **5th Physical Archetype `Burrower` (`class 4`, `F10` select, `160 HP`), Live `op=10` Diagonal 3D Beams, Autonomous Bot Stasis Domes, `G`-Key Squad Links & Living World Epochs (`14/14` `field-core` tests, `mass_err = 0`, `energy_err = 0`):** Crystal-plated subterranean golem with twin spiral drill-gauntlets and conservative 3D tunnel-carving (`VolumeField::carve_tunnel_3d` — `6,236` live tunnels / `17.2M` mass displaced with `mass_err = 0`, `energy_err = 0`), full-3D diagonal actuator beams (`z0 → z1`), cross-archetype combo callouts (`TUNNEL AMBUSH!`, `AERIAL OIL-IGNITION!`, `SUBMERGED GEYSER!`, `STASIS RESCUE!`), and live **Living World Epochs** (`EPOCH I: PRISTINE` → `EPOCH II: VOLCANIC FORGE` → `EPOCH III: VERDANT REGROWTH` → `EPOCH IV: GLACIAL AGE`). Live on Spark GB10 with **60 simultaneous bots (`12` of each archetype) in `2.47 ms`** → Apple M4 Pro Metal at **`146.9 FPS` @ 1080p Pixel-2×SS / `157.3 FPS` Clean-3D / `146.7 FPS` @ 4K Pixel-2×SS**!
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
 | World Scale & Mode | Render Mode | Resolution | p50 Frame Time | FPS |
 |---|---|---|---:|---:|
+| **`256×256×16` (60P 5-Archetype `WorldModel3D-v6`)** | **Surface-Nets + 4KB SRAM WGSL + Pixel-2xSS** | **1920×1080** | **`6.81 ms`** | **146.9 FPS** |
+| **`256×256×16` (60P 5-Archetype `WorldModel3D-v6`)** | **Surface-Nets + 4KB SRAM WGSL + Clean 3D** | **1920×1080** | **`6.36 ms`** | **157.3 FPS** |
+| **`256×256×16` (60P 5-Archetype `WorldModel3D-v6`)** | **Surface-Nets + 4KB SRAM WGSL + Pixel-2xSS** | **3840×2160 (4K)** | **`6.82 ms`** | **146.7 FPS** |
 | **`256×256×16` (40P 4-Archetype Evolving)** | **Surface-Nets + 4KB SRAM WGSL + Pixel-2xSS** | **1920×1080** | **`6.13 ms`** | **163.3 FPS** |
-| **`256×256×16` (40P 4-Archetype Evolving)** | **Surface-Nets + 4KB SRAM WGSL + Clean 3D** | **1920×1080** | **`5.67 ms`** | **176.3 FPS** |
-| **`256×256×16` (40P 4-Archetype Evolving)** | **Surface-Nets + 4KB SRAM WGSL + Pixel-2xSS** | **3840×2160 (4K)** | **`6.06 ms`** | **165.0 FPS** |
 | **`256×256×32` (2.10M vox Glacier Gorge)** | **Surface-Nets + 4KB SRAM WGSL + Pixel-2xSS** | **3840×2160 (4K)** | **`6.25 ms`** | **159.9 FPS** |
 | **`256×256×32` (2.10M vox Sinkhole Caverns)** | **Surface-Nets (`313.6K` tris) + Pixel-2xSS** | **1920×1080** | **`9.03 ms`** | **110.7 FPS** |
 | **`256×256×32` (2.10M vox Volcanic Caldera)** | **Surface-Nets (`226.2K` tris) + Pixel-2xSS** | **3840×2160 (4K)** | **`9.52 ms`** | **105.1 FPS** |
@@ -119,17 +125,17 @@
 
 ## Visual Showcase
 
-| Live 2.1M-Voxel (`256×256×32`) Volcanic Caldera + Cloud Condensation (`105 FPS` @ 4K) | Live 2.1M-Voxel (`256×256×32`) Sinkhole Caverns (`313K` tris, `111 FPS`) |
+| `WorldModel3D-v6` (Active-Face Distilled, `0.991` Water R², `0.0` Sparse Parity) | Champion `ActuatorPolicyNetV3` (`100.0%` `24W–0L` Sweep Across All 3 Tournaments) |
 |---|---|
-| ![Live Z=32 Volcanic Caldera](models/unified_iter11_z32_volcanic/unified_live_1080p_hud.png) | ![Live Z=32 Sinkhole Caverns](models/unified_iter11_z32_sinkhole/unified_live_1080p_hud.png) |
+| ![WorldModel3D-v6 Benchmarks](models/world_3d_v6_viz.png) | ![ActuatorPolicyNetV3 RL Tournament](models/actuator_v3_viz.png) |
 
-| Live 2.1M-Voxel (`256×256×32`) Glacier Gorge (`160 FPS` @ 4K) | Live 40-Player 4-Archetype 4-Style WGSL Orbit (`163 FPS`) |
+| Live 60-Player 5-Archetype 4-Style WGSL Orbit (`WorldModel3D-v6`, `147 FPS`) | Live 2.1M-Voxel (`256×256×32`) Volcanic Caldera + Cloud Condensation (`105 FPS` @ 4K) |
 |---|---|
-| ![Live Z=32 Glacier Gorge](models/unified_iter11_z32_glacier/unified_live_1080p_hud.png) | ![Live 40P 4-Style Orbit](models/unified_iter12_40bots_evolving/unified_orbit_4view.png) |
+| ![Live 60P 5-Archetype 4-Style Orbit](models/unified_iter14_60bots_5arch/unified_orbit_4view.png) | ![Live Z=32 Volcanic Caldera](models/unified_iter11_z32_volcanic/unified_live_1080p_hud.png) |
 
-| `WorldModel3D-v5` (5 Biomes, `7.0×` Lower Firewall, `4.19M`-Vox Sparse Bricks) | `ActuatorPolicyNetV3` (True 3D `Z=16` 4-Archetype RL & Emergent Tactics) |
+| Live 2.1M-Voxel (`256×256×32`) Glacier Gorge (`160 FPS` @ 4K) | Live 2.1M-Voxel (`256×256×32`) Sinkhole Caverns (`313K` tris, `111 FPS`) |
 |---|---|
-| ![WorldModel3D-v5 Benchmarks](models/world_3d_v5_viz.png) | ![ActuatorPolicyNetV3 RL Tournament](models/actuator_v3_viz.png) |
+| ![Live Z=32 Glacier Gorge](models/unified_iter11_z32_glacier/unified_live_1080p_hud.png) | ![Live Z=32 Sinkhole Caverns](models/unified_iter11_z32_sinkhole/unified_live_1080p_hud.png) |
 
 | Live True 3D `256×256×16` Multiplayer 4-View Orbit + Live `Y`-Key Client Style Swap | Client-Side WGSL `NeuralMaterialHead(Z_world)`: Stylized True 3D `Z=16` (`0.94 ms` Decode) |
 |---|---|
@@ -188,7 +194,8 @@ FROSTMARSH_SERVER=127.0.0.1:4433 ./play_frostmarsh.sh
 | `1` / `2` / `3` | Select element: **1: Fire**, **2: Frost**, **3: Oil** |
 | `Space` | Dash |
 | `E` / `R` | Class signature ability & Ultimate |
-| `F1` / `F2` / `F3` / `F8` | Switch physical archetype (**Strider** Walker, **Skywing** Flyer, **Tidekin** Swimmer, **Emberstalker** Solo Climber) |
+| `F1` / `F2` / `F3` / `F8` / `F10` | Switch physical archetype (**Strider** Walker, **Skywing** Flyer, **Tidekin** Swimmer, **Emberstalker** Solo Climber, **Burrower** Tunnel-Carver) |
+| **`G`** | **Toggle Squad Cohesion Tether Arcs between teammates** |
 | **`F7`** | **Cycle Live 3D Biome (`Nordic Viaduct` → `Volcanic Caldera` → `Sinkhole Caverns` → `Glacier Gorge` → `Geothermal Basin`)** |
 | **`F9`** | **Cycle Evolving World Speed (`1× → 4× → 12×` basalt forging, forest regrowth, glacial expansion & erosion)** |
 | **`P`** | **Live hot-toggle `PHYSICS-NATIVE` continuous actuators ↔ `CLASSIC` named spells** |

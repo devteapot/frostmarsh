@@ -1498,6 +1498,12 @@ class SparseWorld3DV5Runner:
         self._wm = copy.deepcopy(world_model).to(device=self.device, dtype=self.compute_dtype).eval()
         for p in self._wm.parameters():
             p.requires_grad_(False)
+        self._wm_dense: Any = self._wm
+        if self.device.type == "cuda" and self.use_fp16 and hasattr(torch, "compile"):
+            try:
+                self._wm_dense = torch.compile(self._wm, mode="reduce-overhead")
+            except Exception:
+                self._wm_dense = self._wm
 
         self._last_horiz: torch.Tensor | None = None
         self._last_z_flux_pad: torch.Tensor | None = None
@@ -1678,8 +1684,11 @@ class SparseWorld3DV5Runner:
                 self._last_dt = dt_cur.clone()
                 return self._last_horiz, self._last_z_flux_pad[:-1], self._last_z, active_frac
 
-        # Dense fallback / initial cache population
-        horiz, z_flux, z_world = self._wm(x_cur, local_dt=dt_cur, return_z_flux=True, return_latent=True)
+        # Dense fallback / initial cache population (uses Triton-fused CUDA Graph when compiled!)
+        horiz, z_flux, z_world = self._wm_dense(x_cur, local_dt=dt_cur, return_z_flux=True, return_latent=True)
+        horiz = horiz.clone()
+        z_flux = z_flux.clone()
+        z_world = z_world.clone()
         self._last_horiz = horiz.contiguous()
         zf_pad = horiz.new_zeros((L, self._wm.z_flux_ch, H, W))
         if L > 1:

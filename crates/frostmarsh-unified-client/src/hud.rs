@@ -10,8 +10,8 @@
 
 use crate::camera::CameraMatrices;
 use crate::mesh_gen::{
-    archetype_color, archetype_is_solo, archetype_tag, CLASS_EMBERSTALKER, CLASS_SKYWING,
-    CLASS_STRIDER, CLASS_TIDEKIN,
+    archetype_color, archetype_is_solo, archetype_tag, CLASS_BURROWER, CLASS_EMBERSTALKER,
+    CLASS_SKYWING, CLASS_STRIDER, CLASS_TIDEKIN,
 };
 use crate::net::LiveEntityState;
 use crate::world_bridge::LiveApproach4World;
@@ -49,6 +49,7 @@ pub struct HudConfig<'a> {
     pub audio_muted: bool,
     pub audio_available: bool,
     pub cave_enclosure: f32,
+    pub show_squad_links: bool,
 }
 
 pub struct HudBatch {
@@ -736,8 +737,18 @@ pub fn build_hud(
                 let bot_snap = ent.players.iter().find(|p| p.id == brain.bot_id);
                 let team_accent = if brain.team == 0 { west_col } else { east_col };
                 let layer_tag = bot_snap
-                    .map(|p| if p.z >= 1.55 { "L2" } else { "L1" })
-                    .unwrap_or("L1");
+                    .map(|p| {
+                        if cfg.z16_active {
+                            format!("Z{:.0}", p.z)
+                        } else if p.z >= 1.55 {
+                            "L2".to_string()
+                        } else if p.z < 0.55 {
+                            "L0".to_string()
+                        } else {
+                            "L1".to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "L1".to_string());
                 let raw_name = bot_snap
                     .map(|p| p.name.as_str())
                     .unwrap_or_else(|| archetype_tag(brain.class_id));
@@ -1044,17 +1055,18 @@ pub fn build_hud(
                 &l6,
             );
             b.text_shadow(tx + 10.0 * ui, ty + 130.0 * ui, sc, l7_col, &l7);
-            let mut arch_counts = [0usize; 4];
+            let mut arch_counts = [0usize; 5];
             for p in &ent.players {
-                arch_counts[(p.class_id as usize).min(3)] += 1;
+                arch_counts[(p.class_id as usize).min(4)] += 1;
             }
             let l9 = format!(
-                "P:{:02} STR:{} SKY:{} TID:{} STK:{} [F4]",
+                "P:{:02} STR:{} SKY:{} TID:{} STK:{} BRW:{} [F4]",
                 ent.players.len(),
                 arch_counts[0],
                 arch_counts[1],
                 arch_counts[2],
                 arch_counts[3],
+                arch_counts[4],
             );
             b.text_shadow(tx + 10.0 * ui, ty + 150.0 * ui, sc, l8_col, &l8);
             b.text_shadow(tx + 10.0 * ui, ty + 170.0 * ui, sc, [0.76, 0.88, 1.0, 1.0], &l9);
@@ -1116,6 +1128,8 @@ pub fn build_hud(
             format!("Z:{:.1}M", p.z)
         } else if p.class_id == CLASS_SKYWING && p.z >= 1.35 {
             "AIR".to_string()
+        } else if p.class_id == CLASS_BURROWER && p.z < 0.75 {
+            "DEEP".to_string()
         } else if p.z >= 1.55 {
             "L2".to_string()
         } else {
@@ -1178,14 +1192,14 @@ pub fn build_hud(
         // Controls hint bar at bottom
         let hint_bar = if cfg.z16_active {
             if phys_native {
-                format!("1-3 MAT [/] R={:.1} Y STYLE F1-F3/F8 ARCH F4 TELEM", cfg.focus_radius)
+                format!("1-3 MAT [/] R={:.1}  Y STYLE  G:SQD  F1-F3/F8/F10 ARCH  F4", cfg.focus_radius)
             } else {
-                "1-3 ELEM  Y STYLE  F1-F3/F8 ARCH  F4 TELEM  F7 BIOME".to_string()
+                "1-3 ELEM  Y STYLE  G:SQD  F1-F3/F8/F10 ARCH  F4 TELEM  F7 BIOME".to_string()
             }
         } else if phys_native {
-            format!("1-3 MAT [/] R={:.1} J DOME K TIME F1-F3/F8 ARCH F4", cfg.focus_radius)
+            format!("1-3 MAT [/] R={:.1}  J DOME  K TIME  G:SQD  F1-F3/F8/F10 ARCH", cfg.focus_radius)
         } else {
-            "1-3 ELEM  J DOME  K TIME  F1-F3/F8 ARCH  F4 TELEM  CHAT".to_string()
+            "1-3 ELEM  J DOME  K TIME  G:SQD  F1-F3/F8/F10 ARCH  F4 TELEM".to_string()
         };
         b.text(
             bar_x,
@@ -1224,6 +1238,7 @@ pub fn build_hud(
                 CLASS_SKYWING => "UPDRAFT",
                 CLASS_TIDEKIN => "SURGE",
                 CLASS_EMBERSTALKER => "SHADOW",
+                CLASS_BURROWER => "TUNNEL",
                 _ => "SPRINT",
             };
             let r_lbl = match p.class_id {
@@ -1231,6 +1246,7 @@ pub fn build_hud(
                 CLASS_SKYWING => "METEOR",
                 CLASS_TIDEKIN => "TIDAL",
                 CLASS_EMBERSTALKER => "BLADES",
+                CLASS_BURROWER => "QUAKE",
                 _ => "SURGE",
             };
             [
@@ -1412,6 +1428,27 @@ pub fn build_hud(
             b.rect(cursor_x, py, tab_w, pill_h, [0.06, 0.05, 0.14, 0.72]);
             b.rect_outline(cursor_x, py, tab_w, pill_h, 1.0 * ui, panel_border);
             b.text(cursor_x + 7.0 * ui, py + 6.0 * ui, sc, text_dim, tab_lbl);
+        }
+
+        let (sqd_lbl, sqd_col) = if cfg.show_squad_links {
+            ("G:SQD ON", [0.36, 0.88, 1.00, 1.0])
+        } else {
+            ("G:SQD OFF", text_dim)
+        };
+        let sqd_w = HudBatch::text_width(sqd_lbl, sc) + 14.0 * ui;
+        let sqd_x = cursor_x - sqd_w - 8.0 * ui;
+        if sqd_x > hx + hud_w + 8.0 * ui {
+            b.rect(sqd_x, py, sqd_w, pill_h, [0.06, 0.05, 0.14, 0.82]);
+            b.rect_outline(
+                sqd_x,
+                py,
+                sqd_w,
+                pill_h,
+                if cfg.show_squad_links { 1.2 * ui } else { 1.0 * ui },
+                if cfg.show_squad_links { sqd_col } else { panel_border },
+            );
+            b.text_shadow(sqd_x + 7.0 * ui, py + 6.0 * ui, sc, sqd_col, sqd_lbl);
+            cursor_x = sqd_x;
         }
 
         if cfg.z16_active {

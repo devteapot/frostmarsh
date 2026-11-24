@@ -22,6 +22,7 @@ pub const CLASS_STRIDER: u8 = 0;
 pub const CLASS_SKYWING: u8 = 1;
 pub const CLASS_TIDEKIN: u8 = 2;
 pub const CLASS_EMBERSTALKER: u8 = 3; // Solo Cavern Climber & Raider
+pub const CLASS_BURROWER: u8 = 4; // Terramole: Conservative Subterranean Tunnel-Carver
 
 pub const STATUS_BURNING: u8 = 1 << 0;
 pub const STATUS_CHILLED: u8 = 1 << 1;
@@ -459,5 +460,6 @@ mod tests {
         assert_eq!(CLASS_ALCHEMIST, CLASS_SKYWING);
         assert_eq!(CLASS_RANGER, CLASS_TIDEKIN);
         assert_eq!(CLASS_EMBERSTALKER, 3);
+        assert_eq!(CLASS_BURROWER, 4);
     }
 }

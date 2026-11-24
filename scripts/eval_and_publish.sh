@@ -77,11 +77,13 @@ cp models/unified_iter11_z32_volcanic/unified_metrics.json "$STAGE_DIR/metrics/u
 cp models/unified_iter11_z32_glacier/unified_metrics.json "$STAGE_DIR/metrics/unified_z32_glacier_metrics.json" 2>/dev/null || true
 cp models/unified_iter11_z32_sinkhole/unified_metrics.json "$STAGE_DIR/metrics/unified_z32_sinkhole_metrics.json" 2>/dev/null || true
 cp models/unified_iter12_40bots_evolving/unified_metrics.json "$STAGE_DIR/metrics/unified_40bots_evolving_metrics.json" 2>/dev/null || true
-cp models/unified_iter10_z16/unified_live_1080p_hud.png models/unified_iter10_z16/unified_orbit_4view.png models/stylized_3d_z16_showcase.png models/render_3d_headtohead_viz.png models/neural_e2e_z16_metal.png models/neural_field_3d_viz.png models/world_dt_structures_viz.png models/actuator_emergence_viz.png models/world_3d_v5_viz.png models/actuator_v3_viz.png "$STAGE_DIR/assets/" 2>/dev/null || true
+cp models/unified_iter14_60bots_5arch/unified_metrics.json "$STAGE_DIR/metrics/unified_60bots_5arch_metrics.json" 2>/dev/null || true
+cp models/unified_iter10_z16/unified_live_1080p_hud.png models/unified_iter10_z16/unified_orbit_4view.png models/stylized_3d_z16_showcase.png models/render_3d_headtohead_viz.png models/neural_e2e_z16_metal.png models/neural_field_3d_viz.png models/world_dt_structures_viz.png models/actuator_emergence_viz.png models/world_3d_v5_viz.png models/world_3d_v6_viz.png models/actuator_v3_viz.png "$STAGE_DIR/assets/" 2>/dev/null || true
 cp models/unified_iter11_z32_volcanic/unified_live_1080p_hud.png "$STAGE_DIR/assets/live_z32_volcanic_1080p.png" 2>/dev/null || true
 cp models/unified_iter11_z32_glacier/unified_live_1080p_hud.png "$STAGE_DIR/assets/live_z32_glacier_1080p.png" 2>/dev/null || true
 cp models/unified_iter11_z32_sinkhole/unified_live_1080p_hud.png "$STAGE_DIR/assets/live_z32_sinkhole_1080p.png" 2>/dev/null || true
 cp models/unified_iter12_40bots_evolving/unified_live_1080p_hud.png "$STAGE_DIR/assets/live_40bots_evolving_1080p.png" 2>/dev/null || true
+cp models/unified_iter14_60bots_5arch/unified_live_1080p_hud.png "$STAGE_DIR/assets/live_60bots_5arch_1080p.png" 2>/dev/null || true
 
 if [ "$MODE" = "dry-run" ]; then
   echo "[DRY-RUN] Staged files in $STAGE_DIR:"

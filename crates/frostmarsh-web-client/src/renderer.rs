@@ -3,7 +3,7 @@
 //! + 3D Parametric Hero Knights + Stylized `Pixel-2×SS` ↔ `Clean-3D` Resolve Renderer.
 
 use crate::camera::Camera3D;
-use crate::hero_mesh::{HeroInstance, HeroMesh, HeroVertex};
+use crate::hero_mesh::{HeroInstance, HeroMesh, HeroVertex, NUM_ARCHETYPES};
 use crate::surface_nets_3d::{SurfaceNetsWorld, SurfaceVertex};
 use crate::volume::{
     BrickOccupancy3D, BrickPatchResult, OccupancySubregion, WorldVolume3D, BRICK_SIZE,
@@ -94,6 +94,16 @@ struct PostUniforms {
 }
 
 #[cfg(target_arch = "wasm32")]
+struct ArchetypeGpuBucket {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    index_count: u32,
+    inst_buf: wgpu::Buffer,
+    inst_cap: usize,
+    inst_count: u32,
+}
+
+#[cfg(target_arch = "wasm32")]
 pub struct WebRenderer {
     pub adapter_name: String,
     pub adapter_backend: String,
@@ -136,12 +146,7 @@ pub struct WebRenderer {
     pub sn_index_count: u32,
     pub sn_vertex_count: u32,
 
-    hero_vbuf: wgpu::Buffer,
-    hero_ibuf: wgpu::Buffer,
-    hero_index_count: u32,
-    hero_inst_buf: wgpu::Buffer,
-    hero_inst_cap: usize,
-    hero_inst_count: u32,
+    archetypes: [ArchetypeGpuBucket; NUM_ARCHETYPES],
 
     orb_vbuf: wgpu::Buffer,
     orb_ibuf: wgpu::Buffer,
@@ -262,8 +267,8 @@ impl WebRenderer {
         volume: &WorldVolume3D,
         bricks: &BrickOccupancy3D,
         sn_world: &SurfaceNetsWorld,
-        hero_mesh: &HeroMesh,
-        hero_instances: &[HeroInstance],
+        archetype_meshes: &[HeroMesh; NUM_ARCHETYPES],
+        archetype_instances: &[Vec<HeroInstance>; NUM_ARCHETYPES],
         orb_mesh: &HeroMesh,
     ) -> Result<Self, String> {
         let w = width.clamp(1, 4096);
@@ -783,33 +788,49 @@ impl WebRenderer {
             queue.write_buffer(&sn_ibuf, 0, bytemuck::cast_slice(&sn_idxs));
         }
 
-        // Upload Hero Knight geometry & instances
-        let hero_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("hero_vbuf"),
-            size: (hero_mesh.vertices.len() * std::mem::size_of::<HeroVertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        // Upload 5 distinct 3D Archetype meshes & dynamic instance buckets
+        let archetypes: [ArchetypeGpuBucket; NUM_ARCHETYPES] = std::array::from_fn(|cls| {
+            let mesh = &archetype_meshes[cls];
+            let insts = &archetype_instances[cls];
+            let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("archetype_vbuf"),
+                size: (mesh.vertices.len().max(1) * std::mem::size_of::<HeroVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let ibuf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("archetype_ibuf"),
+                size: (mesh.indices.len().max(1) * std::mem::size_of::<u32>()) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let inst_cap = insts.len().max(32);
+            let inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("archetype_inst_buf"),
+                size: (inst_cap * std::mem::size_of::<HeroInstance>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            if !mesh.vertices.is_empty() {
+                queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&mesh.vertices));
+            }
+            if !mesh.indices.is_empty() {
+                queue.write_buffer(&ibuf, 0, bytemuck::cast_slice(&mesh.indices));
+            }
+            if !insts.is_empty() {
+                queue.write_buffer(&inst_buf, 0, bytemuck::cast_slice(insts));
+            }
+            ArchetypeGpuBucket {
+                vbuf,
+                ibuf,
+                index_count: mesh.indices.len() as u32,
+                inst_buf,
+                inst_cap,
+                inst_count: insts.len() as u32,
+            }
         });
-        let hero_ibuf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("hero_ibuf"),
-            size: (hero_mesh.indices.len() * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let hero_inst_cap = hero_instances.len().max(64);
-        let hero_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("hero_inst_buf"),
-            size: (hero_inst_cap * std::mem::size_of::<HeroInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&hero_vbuf, 0, bytemuck::cast_slice(&hero_mesh.vertices));
-        queue.write_buffer(&hero_ibuf, 0, bytemuck::cast_slice(&hero_mesh.indices));
-        if !hero_instances.is_empty() {
-            queue.write_buffer(&hero_inst_buf, 0, bytemuck::cast_slice(hero_instances));
-        }
 
-        // Upload Projectile Orb geometry & dynamic instance buffer
+        // Upload Projectile / Beam Orb geometry & dynamic instance buffer
         let orb_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orb_vbuf"),
             size: (orb_mesh.vertices.len() * std::mem::size_of::<HeroVertex>()) as u64,
@@ -822,7 +843,7 @@ impl WebRenderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let proj_inst_cap = 64usize;
+        let proj_inst_cap = 256usize;
         let proj_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("proj_inst_buf"),
             size: (proj_inst_cap * std::mem::size_of::<HeroInstance>()) as u64,
@@ -906,12 +927,7 @@ impl WebRenderer {
             sn_ibuf_cap,
             sn_index_count: sn_idxs.len() as u32,
             sn_vertex_count: sn_verts.len() as u32,
-            hero_vbuf,
-            hero_ibuf,
-            hero_index_count: hero_mesh.indices.len() as u32,
-            hero_inst_buf,
-            hero_inst_cap,
-            hero_inst_count: hero_instances.len() as u32,
+            archetypes,
             orb_vbuf,
             orb_ibuf,
             orb_index_count: orb_mesh.indices.len() as u32,
@@ -1098,25 +1114,35 @@ impl WebRenderer {
         self.upload_surface_nets_buffers(sn_world);
     }
 
-    /// Update live multiplayer hero figurines and glowing projectile orb instances on the GPU.
-    pub fn update_entities(&mut self, heroes: &[HeroInstance], projectiles: &[HeroInstance]) {
-        if heroes.len() > self.hero_inst_cap {
-            self.hero_inst_cap = (heroes.len() * 2).max(64);
-            self.hero_inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("hero_inst_buf"),
-                size: (self.hero_inst_cap * std::mem::size_of::<HeroInstance>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+    /// Update live multiplayer 5-archetype hero figurines and glowing projectile/beam orb instances on the GPU.
+    pub fn update_entities(
+        &mut self,
+        heroes_by_archetype: &[Vec<HeroInstance>; NUM_ARCHETYPES],
+        orbs: &[HeroInstance],
+    ) {
+        for (bucket, insts) in self.archetypes.iter_mut().zip(heroes_by_archetype.iter()) {
+            if insts.len() > bucket.inst_cap {
+                bucket.inst_cap = (insts.len() * 2).max(32);
+                bucket.inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("archetype_inst_buf"),
+                    size: (bucket.inst_cap * std::mem::size_of::<HeroInstance>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if !insts.is_empty() {
+                self.queue
+                    .write_buffer(&bucket.inst_buf, 0, bytemuck::cast_slice(insts));
+            }
+            bucket.inst_count = insts.len() as u32;
         }
-        if !heroes.is_empty() {
-            self.queue
-                .write_buffer(&self.hero_inst_buf, 0, bytemuck::cast_slice(heroes));
-        }
-        self.hero_inst_count = heroes.len() as u32;
+        self.update_orb_instances(orbs);
+    }
 
-        if projectiles.len() > self.proj_inst_cap {
-            self.proj_inst_cap = (projectiles.len() * 2).max(64);
+    /// Update only the glowing projectile + diagonal beam orb-stream instances on the GPU.
+    pub fn update_orb_instances(&mut self, orbs: &[HeroInstance]) {
+        if orbs.len() > self.proj_inst_cap {
+            self.proj_inst_cap = (orbs.len() * 2).max(256);
             self.proj_inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("proj_inst_buf"),
                 size: (self.proj_inst_cap * std::mem::size_of::<HeroInstance>()) as u64,
@@ -1124,11 +1150,11 @@ impl WebRenderer {
                 mapped_at_creation: false,
             });
         }
-        if !projectiles.is_empty() {
+        if !orbs.is_empty() {
             self.queue
-                .write_buffer(&self.proj_inst_buf, 0, bytemuck::cast_slice(projectiles));
+                .write_buffer(&self.proj_inst_buf, 0, bytemuck::cast_slice(orbs));
         }
-        self.proj_inst_count = projectiles.len() as u32;
+        self.proj_inst_count = orbs.len() as u32;
     }
 
     fn rebuild_bind_groups(&mut self) {
@@ -1299,22 +1325,24 @@ impl WebRenderer {
                 rp.draw_indexed(0..self.sn_index_count, 0, 0..1);
             }
 
-            if self.hero_inst_count > 0 {
+            let any_archetype = self.archetypes.iter().any(|b| b.inst_count > 0);
+            if any_archetype || self.proj_inst_count > 0 {
                 rp.set_pipeline(&self.pipe_hero);
                 rp.set_bind_group(0, &self.bg_vol, &[]);
-                rp.set_vertex_buffer(0, self.hero_vbuf.slice(..));
-                rp.set_vertex_buffer(1, self.hero_inst_buf.slice(..));
-                rp.set_index_buffer(self.hero_ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                rp.draw_indexed(0..self.hero_index_count, 0, 0..self.hero_inst_count);
-            }
-
-            if self.proj_inst_count > 0 {
-                rp.set_pipeline(&self.pipe_hero);
-                rp.set_bind_group(0, &self.bg_vol, &[]);
-                rp.set_vertex_buffer(0, self.orb_vbuf.slice(..));
-                rp.set_vertex_buffer(1, self.proj_inst_buf.slice(..));
-                rp.set_index_buffer(self.orb_ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                rp.draw_indexed(0..self.orb_index_count, 0, 0..self.proj_inst_count);
+                for bucket in &self.archetypes {
+                    if bucket.inst_count > 0 && bucket.index_count > 0 {
+                        rp.set_vertex_buffer(0, bucket.vbuf.slice(..));
+                        rp.set_vertex_buffer(1, bucket.inst_buf.slice(..));
+                        rp.set_index_buffer(bucket.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..bucket.index_count, 0, 0..bucket.inst_count);
+                    }
+                }
+                if self.proj_inst_count > 0 {
+                    rp.set_vertex_buffer(0, self.orb_vbuf.slice(..));
+                    rp.set_vertex_buffer(1, self.proj_inst_buf.slice(..));
+                    rp.set_index_buffer(self.orb_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..self.orb_index_count, 0, 0..self.proj_inst_count);
+                }
             }
         }
 

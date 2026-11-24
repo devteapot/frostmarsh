@@ -113,6 +113,8 @@ pub struct LiveWorldState {
     pub received_z16_bricks: Vec<bool>,
     pub dirty_z16_mask: Vec<bool>,
     pub dirty_z16_bricks: Vec<(usize, usize)>,
+    pub dirty_z16_subbrick_mask: Vec<bool>,
+    pub dirty_z16_subbricks: Vec<(usize, usize, usize)>,
     pub has_z16_bricks: bool,
     pub bricks_3d_rx: u64,
     pub bricks_3d_delta_rx: u64,
@@ -134,6 +136,7 @@ impl LiveWorldState {
         let d = depth.max(1);
         let cx = chunks_for_dim(width);
         let cy = chunks_for_dim(height);
+        let cz = chunks_for_dim(d);
         let z16_bytes = if d >= 16 { width * height * d * 4 } else { 0 };
         Self {
             width,
@@ -150,6 +153,8 @@ impl LiveWorldState {
             received_z16_bricks: vec![false; cx * cy],
             dirty_z16_mask: vec![false; cx * cy],
             dirty_z16_bricks: Vec::new(),
+            dirty_z16_subbrick_mask: vec![false; cx * cy * cz],
+            dirty_z16_subbricks: Vec::new(),
             has_z16_bricks: d >= 16,
             bricks_3d_rx: 0,
             bricks_3d_delta_rx: 0,
@@ -187,6 +192,9 @@ impl LiveWorldState {
         self.received_z16_bricks = vec![false; self.chunks_x * self.chunks_y];
         self.dirty_z16_mask = vec![false; self.chunks_x * self.chunks_y];
         self.dirty_z16_bricks.clear();
+        let cz = chunks_for_dim(d);
+        self.dirty_z16_subbrick_mask = vec![false; self.chunks_x * self.chunks_y * cz];
+        self.dirty_z16_subbricks.clear();
         self.has_z16_bricks = d >= 16;
     }
 
@@ -208,6 +216,18 @@ impl LiveWorldState {
             let bi = by * self.chunks_x + bx;
             if bi < self.dirty_z16_mask.len() {
                 self.dirty_z16_mask[bi] = false;
+            }
+        }
+        out
+    }
+
+    pub fn take_dirty_z16_subbricks(&mut self) -> Vec<(usize, usize, usize)> {
+        let out = std::mem::take(&mut self.dirty_z16_subbricks);
+        let cz = chunks_for_dim(self.depth);
+        for &(bx, by, bz) in &out {
+            let sbi = (by * self.chunks_x + bx) * cz + bz;
+            if sbi < self.dirty_z16_subbrick_mask.len() {
+                self.dirty_z16_subbrick_mask[sbi] = false;
             }
         }
         out
@@ -391,6 +411,177 @@ impl LiveWorldState {
         if bi < self.dirty_z16_mask.len() && !self.dirty_z16_mask[bi] {
             self.dirty_z16_mask[bi] = true;
             self.dirty_z16_bricks.push((bx_u, by_u));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_subbrick3d(
+        &mut self,
+        raw_len: u64,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_density_mat: &[u8],
+        lz4_albedo_thermal: &[u8],
+    ) {
+        let td = total_depth as usize;
+        let sd = sub_depth as usize;
+        let bx_u = bx as usize;
+        let by_u = by as usize;
+        let bz_u = bz as usize;
+        if td == 0 || sd == 0 || bx_u >= self.chunks_x || by_u >= self.chunks_y {
+            return;
+        }
+        if td != self.depth {
+            if (16..=64).contains(&td) {
+                self.resize_if_needed(self.width, self.height, td);
+            } else {
+                return;
+            }
+        }
+        let z0 = bz_u * CHUNK_SIZE;
+        if z0 >= td {
+            return;
+        }
+        let expected_bytes = CHUNK_SIZE * CHUNK_SIZE * sd * 4;
+        let Some((dm_raw, at_raw)) = decode_subbrick3d_lz4(lz4_density_mat, lz4_albedo_thermal) else {
+            return;
+        };
+        if dm_raw.len() != expected_bytes || at_raw.len() != expected_bytes {
+            return;
+        }
+
+        let w = self.width;
+        let h = self.height;
+        let d = self.depth;
+        let total_bytes = w * h * d * 4;
+        if self.z16_density_mat.len() != total_bytes {
+            self.z16_density_mat = vec![0u8; total_bytes];
+            self.z16_albedo_thermal = vec![0u8; total_bytes];
+        }
+
+        let x0 = bx_u * CHUNK_SIZE;
+        let y0 = by_u * CHUNK_SIZE;
+        let copy_w = CHUNK_SIZE.min(w.saturating_sub(x0));
+        let copy_h = CHUNK_SIZE.min(h.saturating_sub(y0));
+        let copy_d = sd.min(d.saturating_sub(z0));
+        let row_bytes = copy_w * 4;
+
+        for dz in 0..copy_d {
+            let gz = z0 + dz;
+            for dy in 0..copy_h {
+                let gy = y0 + dy;
+                let src = ((dz * CHUNK_SIZE + dy) * CHUNK_SIZE) * 4;
+                let dst = ((gy * d + gz) * w + x0) * 4;
+                self.z16_density_mat[dst..dst + row_bytes]
+                    .copy_from_slice(&dm_raw[src..src + row_bytes]);
+                self.z16_albedo_thermal[dst..dst + row_bytes]
+                    .copy_from_slice(&at_raw[src..src + row_bytes]);
+            }
+        }
+
+        self.bytes_rx += raw_len;
+        self.bricks_3d_rx += 1;
+        self.latest_field_tick = self.latest_field_tick.max(tick);
+        self.has_z16_bricks = true;
+
+        let bi = by_u * self.chunks_x + bx_u;
+        if bi < self.received_z16_bricks.len() {
+            self.received_z16_bricks[bi] = true;
+        }
+        let cz = chunks_for_dim(d);
+        let sbi = bi * cz + bz_u;
+        if sbi < self.dirty_z16_subbrick_mask.len() && !self.dirty_z16_subbrick_mask[sbi] {
+            self.dirty_z16_subbrick_mask[sbi] = true;
+            self.dirty_z16_subbricks.push((bx_u, by_u, bz_u));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_subbrick3d_delta(
+        &mut self,
+        raw_len: u64,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_deltas: &[u8],
+    ) {
+        let td = total_depth as usize;
+        let sd = sub_depth as usize;
+        let bx_u = bx as usize;
+        let by_u = by as usize;
+        let bz_u = bz as usize;
+        if td == 0 || sd == 0 || bx_u >= self.chunks_x || by_u >= self.chunks_y {
+            return;
+        }
+        if td != self.depth {
+            if (16..=64).contains(&td) {
+                self.resize_if_needed(self.width, self.height, td);
+            } else {
+                return;
+            }
+        }
+        let z0 = bz_u * CHUNK_SIZE;
+        if z0 >= td {
+            return;
+        }
+        let Ok(patches) = decode_brick3d_delta_voxels(lz4_deltas) else {
+            return;
+        };
+
+        let w = self.width;
+        let h = self.height;
+        let d = self.depth;
+        let total_bytes = w * h * d * 4;
+        if self.z16_density_mat.len() != total_bytes {
+            self.z16_density_mat = vec![0u8; total_bytes];
+            self.z16_albedo_thermal = vec![0u8; total_bytes];
+        }
+
+        let x0 = bx_u * CHUNK_SIZE;
+        let y0 = by_u * CHUNK_SIZE;
+        let total_sub_voxels = CHUNK_SIZE * CHUNK_SIZE * sd;
+        for (idx, dm, at) in patches {
+            let v = idx as usize;
+            if v >= total_sub_voxels {
+                continue;
+            }
+            let dz = v / (CHUNK_SIZE * CHUNK_SIZE);
+            let rem = v % (CHUNK_SIZE * CHUNK_SIZE);
+            let dy = rem / CHUNK_SIZE;
+            let dx = rem % CHUNK_SIZE;
+            let gx = x0 + dx;
+            let gy = y0 + dy;
+            let gz = z0 + dz;
+            if gx >= w || gy >= h || gz >= d {
+                continue;
+            }
+            let dst = ((gy * d + gz) * w + gx) * 4;
+            self.z16_density_mat[dst..dst + 4].copy_from_slice(&dm);
+            self.z16_albedo_thermal[dst..dst + 4].copy_from_slice(&at);
+        }
+
+        self.bytes_rx += raw_len;
+        self.bricks_3d_rx += 1;
+        self.bricks_3d_delta_rx += 1;
+        self.latest_field_tick = self.latest_field_tick.max(tick);
+        self.has_z16_bricks = true;
+
+        let bi = by_u * self.chunks_x + bx_u;
+        if bi < self.received_z16_bricks.len() {
+            self.received_z16_bricks[bi] = true;
+        }
+        let cz = chunks_for_dim(d);
+        let sbi = bi * cz + bz_u;
+        if sbi < self.dirty_z16_subbrick_mask.len() && !self.dirty_z16_subbrick_mask[sbi] {
+            self.dirty_z16_subbrick_mask[sbi] = true;
+            self.dirty_z16_subbricks.push((bx_u, by_u, bz_u));
         }
     }
 
@@ -619,6 +810,50 @@ impl QuicClientHandle {
                                     let mut st = st_rel.lock().unwrap();
                                     st.apply_brick3d_delta(raw_len, bx, by, depth, tick, &lz4_deltas);
                                 }
+                                ServerDatagram::VolumetricSubBrick3D {
+                                    bx,
+                                    by,
+                                    bz,
+                                    total_depth,
+                                    sub_depth,
+                                    tick,
+                                    lz4_density_mat,
+                                    lz4_albedo_thermal,
+                                } => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    st.apply_subbrick3d(
+                                        raw_len,
+                                        bx,
+                                        by,
+                                        bz,
+                                        total_depth,
+                                        sub_depth,
+                                        tick,
+                                        &lz4_density_mat,
+                                        &lz4_albedo_thermal,
+                                    );
+                                }
+                                ServerDatagram::VolumetricSubBrick3DDelta {
+                                    bx,
+                                    by,
+                                    bz,
+                                    total_depth,
+                                    sub_depth,
+                                    tick,
+                                    lz4_deltas,
+                                } => {
+                                    let mut st = st_rel.lock().unwrap();
+                                    st.apply_subbrick3d_delta(
+                                        raw_len,
+                                        bx,
+                                        by,
+                                        bz,
+                                        total_depth,
+                                        sub_depth,
+                                        tick,
+                                        &lz4_deltas,
+                                    );
+                                }
                             }
                         }
                     } else if let Some(ServerReliable::Welcome {
@@ -722,6 +957,50 @@ impl QuicClientHandle {
                     } => {
                         let mut st = st_dg.lock().unwrap();
                         st.apply_brick3d_delta(raw_len, bx, by, depth, tick, &lz4_deltas);
+                    }
+                    ServerDatagram::VolumetricSubBrick3D {
+                        bx,
+                        by,
+                        bz,
+                        total_depth,
+                        sub_depth,
+                        tick,
+                        lz4_density_mat,
+                        lz4_albedo_thermal,
+                    } => {
+                        let mut st = st_dg.lock().unwrap();
+                        st.apply_subbrick3d(
+                            raw_len,
+                            bx,
+                            by,
+                            bz,
+                            total_depth,
+                            sub_depth,
+                            tick,
+                            &lz4_density_mat,
+                            &lz4_albedo_thermal,
+                        );
+                    }
+                    ServerDatagram::VolumetricSubBrick3DDelta {
+                        bx,
+                        by,
+                        bz,
+                        total_depth,
+                        sub_depth,
+                        tick,
+                        lz4_deltas,
+                    } => {
+                        let mut st = st_dg.lock().unwrap();
+                        st.apply_subbrick3d_delta(
+                            raw_len,
+                            bx,
+                            by,
+                            bz,
+                            total_depth,
+                            sub_depth,
+                            tick,
+                            &lz4_deltas,
+                        );
                     }
                 }
             }

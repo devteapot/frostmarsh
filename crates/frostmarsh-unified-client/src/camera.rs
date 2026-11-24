@@ -26,9 +26,21 @@ impl CameraPreset {
         }
     }
 
-    /// Returns `(dist, pitch_rad, fov_y_rad)` tuned for true-3D Z16 or L4 arenas.
+    /// Returns `(dist, pitch_rad, fov_y_rad)` tuned for true-3D `Z=16..64` or L4 arenas.
+    #[allow(dead_code)]
     pub fn params(self, z16_active: bool) -> (f32, f32, f32) {
-        if z16_active {
+        self.params_for_depth(z16_active, 16)
+    }
+
+    /// Returns `(dist, pitch_rad, fov_y_rad)` scaled smoothly for `Z=16/32` AND tall 3-strata `Z=64` worlds!
+    pub fn params_for_depth(self, z16_active: bool, depth: usize) -> (f32, f32, f32) {
+        if z16_active && depth >= 48 {
+            match self {
+                Self::Tactical => (88.0, 0.34, 42.0_f32.to_radians()),
+                Self::ActionCloseUp => (28.0, 0.30, 42.0_f32.to_radians()),
+                Self::Overview => (138.0, 0.42, 44.0_f32.to_radians()),
+            }
+        } else if z16_active {
             match self {
                 Self::Tactical => (40.0, 0.56, 38.0_f32.to_radians()),
                 Self::ActionCloseUp => (24.0, 0.32, 40.0_f32.to_radians()),
@@ -113,18 +125,18 @@ impl MobaCamera {
             (p, rt_h / (2.0 * half_h))
         } else {
             let near = (self.dist * 0.04).max(0.5);
-            let far = self.dist * 6.0 + 220.0;
+            let far = self.dist * 6.0 + 340.0;
             let p = Mat4::perspective_rh(self.fov_y, aspect, near, far);
             (p, (rt_h * 0.5) / (self.fov_y * 0.5).tan())
         };
 
         let vp = proj * view;
 
-        // 2048px texel-snapped directional shadow frustum covering the visible Frostmarsh arena
-        let sh_extent = (self.dist * 1.15).clamp(36.0, 82.0);
+        // 2048px texel-snapped directional shadow frustum covering the visible Frostmarsh arena (up to Z=64!)
+        let sh_extent = (self.dist * 1.15).clamp(36.0, 128.0);
         let sun_n = sun_dir.normalize_or(Vec3::Y);
         let light_up = if sun_n.y.abs() > 0.95 { Vec3::Z } else { Vec3::Y };
-        let raw_light_view = Mat4::look_at_rh(rel_target + sun_n * 110.0, rel_target, light_up);
+        let raw_light_view = Mat4::look_at_rh(rel_target + sun_n * 140.0, rel_target, light_up);
         let texel_world = (sh_extent * 2.0) / 2048.0;
         let ls_origin = raw_light_view.transform_point3(Vec3::ZERO);
         let snap_x = (ls_origin.x / texel_world).round() * texel_world - ls_origin.x;
@@ -135,7 +147,7 @@ impl MobaCamera {
             -sh_extent + snap_y,
             sh_extent + snap_y,
             5.0,
-            260.0,
+            380.0,
         );
         let light_vp = light_proj * raw_light_view;
 

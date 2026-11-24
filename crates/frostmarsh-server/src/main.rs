@@ -59,10 +59,10 @@ struct Args {
     /// Horizontal square grid dimension (128, 256, or 512)
     #[arg(long, default_value_t = 256)]
     size: usize,
-    /// Number of physically coupled 3D vertical strata (1..=32; 16..=32 enables isotropic 3D volumetric biomes!)
+    /// Number of physically coupled 3D vertical strata (1..=64; 16..=64 enables isotropic 3D volumetric biomes, 64 = 3-strata vertical world!)
     #[arg(long, default_value_t = 4)]
     layers: usize,
-    /// 3D Biome preset (0=Nordic Viaduct, 1=Volcanic Caldera, 2=Sinkhole Caverns, 3=Glacier Gorge, 4=Geothermal Mist Basin)
+    /// 3D Biome preset (0=Nordic Viaduct, 1=Volcanic Caldera, 2=Sinkhole Caverns, 3=Glacier Gorge, 4=Geothermal Mist Basin, 5=Sky-Isles & Abyss)
     #[arg(long, default_value_t = 0)]
     biome: u8,
     /// Deterministic 3D world generation seed
@@ -986,6 +986,7 @@ struct ShrineEntity {
     name: String,
     x: f32,
     y: f32,
+    z: f32,
     progress: f32,
     owner: i8,
 }
@@ -1200,6 +1201,8 @@ struct ClientPeer {
     macro_cursor: usize,
     brick_shadow: HashMap<(u16, u16), RawBrickArc>,
     pending_bricks: HashSet<(u16, u16)>,
+    subbrick_shadow: HashMap<(u16, u16, u16), RawBrickArc>,
+    pending_subbricks: HashSet<(u16, u16, u16)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1241,6 +1244,7 @@ struct GameState {
     match_elapsed_offset_secs: u64,
     persistent_players: HashMap<String, persistence::PersistentPlayerRecord>,
     brick_raw_cache: HashMap<(u16, u16), RawBrickArc>,
+    subbrick_raw_cache: HashMap<(u16, u16, u16), (u8, RawBrickArc)>,
     volume: VolumeField,
     eco: EcosystemState,
     sim_mode: String,
@@ -1322,12 +1326,56 @@ impl GameState {
     }
 
     fn surf_layer(&self) -> usize {
-        if self.grid_d >= 16 {
+        if self.grid_d >= 48 {
+            ((self.grid_d as f32) * 0.45)
+                .round()
+                .clamp(1.0, (self.grid_d - 1) as f32) as usize
+        } else if self.grid_d >= 16 {
             ((4.0 * (self.grid_d as f32 / 16.0)).round() as usize).min(self.grid_d - 1)
         } else if self.grid_d >= 2 {
             1
         } else {
             0
+        }
+    }
+
+    #[inline]
+    fn subbricks_z(&self) -> u16 {
+        ((self.grid_d + CHUNK_SIZE - 1) / CHUNK_SIZE).max(1) as u16
+    }
+
+    fn snap_shrines_z(&mut self) {
+        if self.grid_d >= 48 {
+            let max_top = (self.grid_d as f32 - 2.0).max(40.0);
+            let targets: Vec<(usize, f32)> = self
+                .shrines
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let scan_z = if s.name.contains("ABYSSAL") {
+                        10.0
+                    } else if s.name.contains("VIADUCT") {
+                        35.0
+                    } else {
+                        max_top
+                    };
+                    (i, self.find_z16_surface_z(s.x, s.y, scan_z))
+                })
+                .collect();
+            for (i, z) in targets {
+                self.shrines[i].z = z;
+            }
+        } else if self.is_z16() {
+            let top_scan = (self.grid_d as f32 - 2.0).max(12.0);
+            let targets: Vec<(usize, f32)> = self
+                .shrines
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, self.find_z16_surface_z(s.x, s.y, top_scan)))
+                .collect();
+            for (i, z) in targets {
+                self.shrines[i].z = z;
+            }
         }
     }
 
@@ -1357,14 +1405,22 @@ impl GameState {
         fallback_z.unwrap_or(1.5)
     }
 
-    fn build_shrines(w: usize, h: usize) -> Vec<ShrineEntity> {
+    fn build_shrines(w: usize, h: usize, d: usize) -> Vec<ShrineEntity> {
         let wf = w as f32;
         let hf = h as f32;
-        vec![
-            ShrineEntity { id: 0, name: "NORTH GLACIER".into(), x: wf * 0.50, y: hf * 0.18, progress: -0.35, owner: 0 },
-            ShrineEntity { id: 1, name: "CENTRAL SPIRE".into(), x: wf * 0.50, y: hf * 0.50, progress: 0.0, owner: 0 },
-            ShrineEntity { id: 2, name: "SOUTH CALDERA".into(), x: wf * 0.50, y: hf * 0.82, progress: 0.35, owner: 0 },
-        ]
+        if d >= 48 {
+            vec![
+                ShrineEntity { id: 0, name: "ABYSSAL HEART".into(), x: wf * 0.50, y: hf * 0.64, z: 6.0, progress: -0.35, owner: 0 },
+                ShrineEntity { id: 1, name: "CENTRAL VIADUCT".into(), x: wf * 0.50, y: hf * 0.50, z: 30.0, progress: 0.0, owner: 0 },
+                ShrineEntity { id: 2, name: "SKY CITADEL".into(), x: wf * 0.50, y: hf * 0.45, z: 50.0, progress: 0.35, owner: 0 },
+            ]
+        } else {
+            vec![
+                ShrineEntity { id: 0, name: "NORTH GLACIER".into(), x: wf * 0.50, y: hf * 0.18, z: 0.0, progress: -0.35, owner: 0 },
+                ShrineEntity { id: 1, name: "CENTRAL SPIRE".into(), x: wf * 0.50, y: hf * 0.50, z: 0.0, progress: 0.0, owner: 0 },
+                ShrineEntity { id: 2, name: "SOUTH CALDERA".into(), x: wf * 0.50, y: hf * 0.82, z: 0.0, progress: 0.35, owner: 0 },
+            ]
+        }
     }
 
     fn new(
@@ -1379,14 +1435,14 @@ impl GameState {
     ) -> Self {
         let grid_w = (size / CHUNK_SIZE).max(4) * CHUNK_SIZE;
         let grid_h = grid_w;
-        let grid_d = layers.clamp(1, 32);
+        let grid_d = layers.clamp(1, 64);
         let biome_id = biome % NUM_BIOMES;
         let chunks_x = chunks_for_dim(grid_w);
         let chunks_y = chunks_for_dim(grid_h);
         let volume = VolumeField::new_biome_3d(grid_w, grid_h, grid_d, biome_id, seed);
         let init_epoch = volume.evolution_epoch_name();
         let eco = EcosystemState::new(grid_w, grid_h);
-        let shrines = Self::build_shrines(grid_w, grid_h);
+        let shrines = Self::build_shrines(grid_w, grid_h, grid_d);
         let use_cuda = backend_name == "cuda-rpc";
 
         let mut gs = Self {
@@ -1403,6 +1459,7 @@ impl GameState {
             match_elapsed_offset_secs: 0,
             persistent_players: HashMap::new(),
             brick_raw_cache: HashMap::new(),
+            subbrick_raw_cache: HashMap::new(),
             hazard_layers: vec![vec![1u8; grid_w * grid_h]; grid_d],
             volume,
             eco,
@@ -1476,6 +1533,7 @@ impl GameState {
             tps_window_ticks: 0,
             measured_tps: 30.0,
         };
+        gs.snap_shrines_z();
         gs.refresh_hazard_grids();
         let capped_bots = bot_count.min(64);
         let squad_size = if capped_bots >= 24 { 4usize } else { 3usize };
@@ -1873,6 +1931,41 @@ impl GameState {
     fn spawn_point(&self, team: u8, salt: u32) -> (f32, f32, f32) {
         let wf = self.grid_w as f32;
         let hf = self.grid_h as f32;
+        if self.grid_d >= 48 {
+            let top_scan = (self.grid_d as f32 - 2.0).max(46.0);
+            let off = ((salt % 7) as f32 - 3.0) * (hf * 0.012);
+            let (sx, sy, scan_z) = match salt % 3 {
+                0 => {
+                    // Stratum 1: Abyssal Caverns (around Shrine 0 / cavern ledges)
+                    let x_f = if team == 0 {
+                        0.43 + (salt % 3) as f32 * 0.025
+                    } else {
+                        0.57 - (salt % 3) as f32 * 0.025
+                    };
+                    (wf * x_f, hf * 0.64 + off * 0.4, 10.0)
+                }
+                1 => {
+                    // Stratum 2: Surface Viaduct & Pine Highlands
+                    if team == 0 {
+                        (wf * (0.24 + (salt % 3) as f32 * 0.025), hf * 0.50 + off, 35.0)
+                    } else {
+                        (wf * (0.76 - (salt % 3) as f32 * 0.025), hf * 0.50 + off, 35.0)
+                    }
+                }
+                _ => {
+                    // Stratum 3: Floating Sky-Islands
+                    let (ix, iy) = match (team, (salt / 3) % 2) {
+                        (0, 0) => (0.36, 0.50),
+                        (0, _) => (0.49, 0.46),
+                        (1, 0) => (0.64, 0.50),
+                        _ => (0.50, 0.63),
+                    };
+                    (wf * ix, hf * iy, top_scan)
+                }
+            };
+            let sz = self.find_z16_surface_z(sx, sy, scan_z);
+            return (sx, sy, sz);
+        }
         if self.is_z16() {
             let z_scale = (self.grid_d as f32 / 16.0).clamp(1.0, 2.0);
             let top_scan = (self.grid_d as f32 - 2.2).max(12.5);
@@ -1927,7 +2020,9 @@ impl GameState {
         let (x, y, mut z) = self.spawn_point(team % 2, id);
         if cls == CLASS_SKYWING {
             // Skywings launch slightly aloft for immediate 3D flight!
-            z = (z + if self.is_z16() { 2.5 } else { 0.8 }).min((self.grid_d as f32 - 2.0).max(1.5));
+            let sky_ceil = (self.grid_d as f32 - if self.grid_d >= 48 { 3.0 } else { 2.0 }).max(1.5);
+            let boost = if self.grid_d >= 48 { 3.5 } else if self.is_z16() { 2.5 } else { 0.8 };
+            z = (z + boost).min(sky_ceil);
         }
         let (mhp, mmp, mst, _) = PlayerEntity::class_stats(cls, 1);
         self.players.insert(
@@ -3370,9 +3465,10 @@ impl GameState {
         let shrine_list: Vec<(f32, f32, i8)> =
             self.shrines.iter().map(|s| (s.x, s.y, s.owner)).collect();
         let mut breaches: Vec<(u32, u8, f32, f32, f32)> = Vec::new();
+        let burrow_z_cap = if self.grid_d >= 48 { 20.0 } else { 5.2 };
         for br in snaps.iter().filter(|p| p.class_id == CLASS_BURROWER) {
             let underground =
-                br.in_tunnel || (is_z16 && br.z <= 5.2) || tick <= br.burrow_ambush_until;
+                br.in_tunnel || (is_z16 && br.z <= burrow_z_cap) || tick <= br.burrow_ambush_until;
             if !underground {
                 continue;
             }
@@ -3507,7 +3603,8 @@ impl GameState {
         self.pending_basalt_quenches.clear();
         self.eco.reset();
         self.refresh_hazard_grids();
-        self.shrines = GameState::build_shrines(w, h);
+        self.shrines = GameState::build_shrines(w, h, d);
+        self.snap_shrines_z();
         self.score_west = 0;
         self.score_east = 0;
         self.match_phase = MATCH_PHASE_ACTIVE;
@@ -3586,8 +3683,11 @@ impl GameState {
             peer.needs_full_sync = true;
             peer.brick_shadow.clear();
             peer.pending_bricks.clear();
+            peer.subbrick_shadow.clear();
+            peer.pending_subbricks.clear();
         }
         self.brick_raw_cache.clear();
+        self.subbrick_raw_cache.clear();
         if let Some(ref ws) = self.ws_bridge {
             ws.queue_full_sync_all();
         }
@@ -3614,6 +3714,8 @@ impl GameState {
             self.tunnel_mass_displaced = 0;
             self.eco.reset();
             self.refresh_hazard_grids();
+            self.shrines = GameState::build_shrines(self.grid_w, self.grid_h, self.grid_d);
+            self.snap_shrines_z();
             self.projectiles.clear();
             self.rafts.clear();
             self.time_domes.clear();
@@ -3642,8 +3744,11 @@ impl GameState {
             peer.needs_full_sync = true;
             peer.brick_shadow.clear();
             peer.pending_bricks.clear();
+            peer.subbrick_shadow.clear();
+            peer.pending_subbricks.clear();
         }
         self.brick_raw_cache.clear();
+        self.subbrick_raw_cache.clear();
         if let Some(ref ws) = self.ws_bridge {
             ws.queue_full_sync_all();
         }
@@ -3798,6 +3903,9 @@ impl GameState {
                 let need = if p.team == 0 { s.progress > -0.8 } else { s.progress < 0.8 };
                 feats[tb] = ((s.x - p.x) / 100.0).clamp(-1.0, 1.0);
                 feats[tb + 1] = ((s.y - p.y) / 100.0).clamp(-1.0, 1.0);
+                if self.grid_d >= 48 {
+                    feats[tb + 2] = (((s.z - p.z) * z_band_scale) / 2.0).clamp(-1.0, 1.0);
+                }
                 feats[tb + 3] = if need { 1.0 } else { 0.0 };
                 feats[tb + 4] = s.progress;
                 feats[tb + 11] = 1.0;
@@ -4181,7 +4289,7 @@ impl GameState {
         let gw = self.grid_w as f32;
         let gh = self.grid_h as f32;
         let is_z16 = self.is_z16();
-        let max_fly_z = (self.grid_d as f32 - 2.0).max(2.6);
+        let max_fly_z = (self.grid_d as f32 - if self.grid_d >= 48 { 3.0 } else { 2.0 }).max(2.6);
         let tick = self.sim_tick;
 
         struct BotSnap {
@@ -4493,8 +4601,16 @@ impl GameState {
             // --- 3. 3D Vertical Flight / Diving Intent per Archetype ---
             let desired_vz = match class_id {
                 CLASS_SKYWING => {
-                    // Soar smoothly above chasms/bridges (cruise ~5.5-8.5m above floor on Z16, ~2.5 on L4)
-                    let target_alt = if is_z16 {
+                    // Soar smoothly above chasms/bridges (cruise ~5.5-8.5m on Z16, 34-56m across Viaduct & Sky-Islands on Z64!)
+                    let target_alt = if self.grid_d >= 48 {
+                        let band = match bid % 3 {
+                            0 => self.grid_d as f32 * 0.56, // Viaduct / Surface canyon airspace (~36m)
+                            1 => self.grid_d as f32 * 0.78, // Floating Sky-Islands airspace (~50m)
+                            _ => self.grid_d as f32 * 0.88, // Upper Sky-Citadel / Cloud Deck (~56m)
+                        };
+                        let wave = ((tick as f32 * 0.03 + bid as f32).sin()) * 4.5;
+                        (band + wave).clamp(8.0, max_fly_z)
+                    } else if is_z16 {
                         let base_cruise = (self.grid_d as f32 * 0.58)
                             + ((tick as f32 * 0.04 + bid as f32).sin()) * 2.2;
                         base_cruise.clamp(5.5, max_fly_z)
@@ -4519,8 +4635,17 @@ impl GameState {
                     }
                 }
                 CLASS_BURROWER => {
-                    // Wave 17C: Burrowers actively path underground (z = 2..4) toward enemy-held shrines
-                    if is_z16 {
+                    // Wave 17C / 26B: Burrowers actively path underground (z = 2..4 on Z16, z = 2..20m Abyssal Caverns on Z64!)
+                    if self.grid_d >= 48 {
+                        let target_sub_z = 6.0 + ((bid % 5) as f32) * 2.8; // 6..17.2m within z=2..20m cavern range
+                        if mz > 20.0 {
+                            ((target_sub_z - mz) * 2.0).clamp(-5.0, 0.0)
+                        } else if mz < 2.2 {
+                            ((target_sub_z - mz) * 1.8).clamp(0.0, 3.5)
+                        } else {
+                            0.0
+                        }
+                    } else if is_z16 {
                         let target_sub_z = 3.0f32;
                         if mz > 4.2 {
                             ((target_sub_z - mz) * 2.2).clamp(-4.0, 0.0)
@@ -4908,7 +5033,14 @@ impl GameState {
             // Detect Thermal Updraft column (`T > 340 K` = `34_000 cK`) beneath winged bodies
             let mut thermal_updraft_ck = 0i64;
             if morph.wing_lift > 0.30 {
-                let z_lo = cur_layer.saturating_sub(if is_z16 { 6 } else { 2 });
+                let updraft_span = if self.grid_d >= 48 {
+                    18
+                } else if is_z16 {
+                    6
+                } else {
+                    2
+                };
+                let z_lo = cur_layer.saturating_sub(updraft_span);
                 for zs in z_lo..=cur_layer {
                     let t_s = self.volume.layers[zs].cell_temp_ck(idx_c);
                     if t_s > thermal_updraft_ck {
@@ -4966,7 +5098,7 @@ impl GameState {
 
             let (fx, fy, fz);
             if is_z16 {
-                let max_alt = (self.grid_d as f32 - 2.0).max(2.0);
+                let max_alt = (self.grid_d as f32 - if self.grid_d >= 48 { 3.0 } else { 2.0 }).max(2.0);
                 let eff_grav = 18.0 * grav_g;
                 let low_g_lift = (1.0 / grav_g).sqrt().clamp(0.65, 1.85);
                 // 1. Winged flight / low-G aerodynamic glide coupled to BodyMorphology.wing_lift × world_laws.gravity_g
@@ -5216,7 +5348,12 @@ impl GameState {
             let critter_here = (self.sample_hazard(fx, fy, surf_l) >> 5) & 0x07;
             let near_friendly_shrine = {
                 let want = if team == 0 { -1 } else { 1 };
-                self.shrines.iter().any(|s| s.owner == want && (s.x - fx).hypot(s.y - fy) < 18.0)
+                let check_z = self.grid_d >= 48;
+                self.shrines.iter().any(|s| {
+                    s.owner == want
+                        && (s.x - fx).hypot(s.y - fy) < 18.0
+                        && (!check_z || (s.z - fz).abs() <= 12.0)
+                })
             };
             let regen_mul = 1.0
                 + if critter_here >= 2 { 0.45 } else { 0.0 }
@@ -5229,9 +5366,10 @@ impl GameState {
                 kb_res *= 0.30;
             }
             let local_temp_hot = self.volume.layers[cur_layer].cell_temp_ck(idx_c) > 39_000 || phys.temp_c > 116.85;
+            let tunnel_z_cap = if self.grid_d >= 48 { 20.0 } else { 5.5 };
             let in_tunnel_now = is_z16
                 && self.volume.measure_vertical_clearance_3d((fx, fy, fz)) < 5.0
-                && fz <= 5.5;
+                && fz <= tunnel_z_cap;
             let airborne_now = if is_z16 {
                 fz > surf_z + 2.5
                     && self
@@ -5510,14 +5648,15 @@ impl GameState {
             self.apply_damage(Some(owner), vid, dmg, tag, elem);
         }
 
-        // 3 Capturable Shrines
-        let player_positions: Vec<(u32, u8, f32, f32)> =
-            self.players.values().map(|p| (p.id, p.team, p.x, p.y)).collect();
+        // 3 Capturable Shrines (3-strata 3D vertical proximity enforced when grid_d >= 48!)
+        let check_shrine_z = self.grid_d >= 48;
+        let player_positions: Vec<(u32, u8, f32, f32, f32)> =
+            self.players.values().map(|p| (p.id, p.team, p.x, p.y, p.z)).collect();
         let mut shrine_events = Vec::new();
         for s in &mut self.shrines {
             let (mut w_cnt, mut e_cnt) = (0i32, 0i32);
-            for &(_, team, px, py) in &player_positions {
-                if (px - s.x).hypot(py - s.y) <= 13.0 {
+            for &(_, team, px, py, pz) in &player_positions {
+                if (px - s.x).hypot(py - s.y) <= 13.0 && (!check_shrine_z || (pz - s.z).abs() <= 10.0) {
                     if team == 0 { w_cnt += 1; } else { e_cnt += 1; }
                 }
             }
@@ -5528,39 +5667,39 @@ impl GameState {
             let prev = s.owner;
             if s.progress <= -0.95 && s.owner != -1 {
                 s.owner = -1;
-                shrine_events.push((s.x, s.y, 0u8, format!("WEST CAP: {}", s.name)));
+                shrine_events.push((s.x, s.y, s.z, 0u8, format!("WEST CAP: {}", s.name)));
             } else if s.progress >= 0.95 && s.owner != 1 {
                 s.owner = 1;
-                shrine_events.push((s.x, s.y, 1u8, format!("EAST CAP: {}", s.name)));
+                shrine_events.push((s.x, s.y, s.z, 1u8, format!("EAST CAP: {}", s.name)));
             } else if prev != 0 && s.progress.abs() < 0.2 {
                 s.owner = 0;
             }
         }
-        for (sx, sy, team, lbl) in shrine_events {
+        for (sx, sy, sz, team, lbl) in shrine_events {
             if team == 0 { self.score_west = self.score_west.saturating_add(25); }
             else { self.score_east = self.score_east.saturating_add(25); }
             for p in self.players.values_mut() {
-                if p.team == team && (p.x - sx).hypot(p.y - sy) <= 14.0 {
+                if p.team == team && (p.x - sx).hypot(p.y - sy) <= 14.0 && (!check_shrine_z || (p.z - sz).abs() <= 12.0) {
                     p.score = p.score.saturating_add(25);
                 }
             }
             self.push_event(3, sx, sy, 25, team, lbl);
         }
         if tick % 60 == 0 {
-            let owned: Vec<(f32, f32, u8)> = self
+            let owned: Vec<(f32, f32, f32, u8)> = self
                 .shrines
                 .iter()
                 .filter_map(|s| {
-                    if s.owner == -1 { Some((s.x, s.y, 0u8)) }
-                    else if s.owner == 1 { Some((s.x, s.y, 1u8)) }
+                    if s.owner == -1 { Some((s.x, s.y, s.z, 0u8)) }
+                    else if s.owner == 1 { Some((s.x, s.y, s.z, 1u8)) }
                     else { None }
                 })
                 .collect();
-            for (sx, sy, team) in owned {
+            for (sx, sy, sz, team) in owned {
                 if team == 0 { self.score_west = self.score_west.saturating_add(2); }
                 else { self.score_east = self.score_east.saturating_add(2); }
                 for p in self.players.values_mut() {
-                    if p.team == team && (p.x - sx).hypot(p.y - sy) <= 18.0 {
+                    if p.team == team && (p.x - sx).hypot(p.y - sy) <= 18.0 && (!check_shrine_z || (p.z - sz).abs() <= 12.0) {
                         p.score = p.score.saturating_add(2);
                     }
                 }
@@ -6194,11 +6333,12 @@ impl GameState {
         self.chunks_y = chunks_for_dim(h);
         self.hazard_layers = vec![vec![1u8; w * h]; d];
         self.eco = EcosystemState::new(w, h);
-        self.shrines = GameState::build_shrines(w, h);
+        self.shrines = GameState::build_shrines(w, h, d);
         self.last_epoch_name = restored.evolution_epoch_name();
         self.mass_error = restored.mass_error();
         self.energy_error = restored.energy_error();
         self.volume = restored;
+        self.snap_shrines_z();
         self.persistent_players = payload.players;
         self.match_elapsed_offset_secs = payload.match_elapsed_secs;
         self.match_start_instant = Instant::now();
@@ -6214,10 +6354,13 @@ impl GameState {
         self.tunnels_carved = payload.tunnels_carved;
         self.tunnel_mass_displaced = payload.tunnel_mass_displaced;
         self.brick_raw_cache.clear();
+        self.subbrick_raw_cache.clear();
         for peer in self.peers.values_mut() {
             peer.needs_full_sync = true;
             peer.brick_shadow.clear();
             peer.pending_bricks.clear();
+            peer.subbrick_shadow.clear();
+            peer.pending_subbricks.clear();
         }
         if let Some(ref ws) = self.ws_bridge {
             ws.queue_full_sync_all();
@@ -6253,6 +6396,41 @@ impl GameState {
         let raw = Arc::new(self.volume.encode_3d_brick_16(bx as usize, by as usize));
         self.brick_raw_cache.insert((bx, by), raw.clone());
         raw
+    }
+
+    fn encode_subbrick3d_from_raw(
+        &self,
+        bx: u16,
+        by: u16,
+        bz: u16,
+        sub_depth: u8,
+        dm: &[u8],
+        at: &[u8],
+    ) -> Bytes {
+        let (lz4_density_mat, lz4_albedo_thermal) = encode_subbrick3d_lz4(dm, at);
+        let pkt = ServerDatagram::VolumetricSubBrick3D {
+            bx,
+            by,
+            bz,
+            total_depth: self.grid_d as u16,
+            sub_depth,
+            tick: self.volume.tick,
+            lz4_density_mat,
+            lz4_albedo_thermal,
+        };
+        Bytes::from(encode_server_datagram(&pkt))
+    }
+
+    fn get_or_encode_raw_subbrick(&mut self, bx: u16, by: u16, bz: u16) -> (u8, RawBrickArc) {
+        if let Some((sd, arc)) = self.subbrick_raw_cache.get(&(bx, by, bz)) {
+            return (*sd, arc.clone());
+        }
+        let (dm, at, sd) =
+            self.volume
+                .encode_3d_subbrick_16(bx as usize, by as usize, bz as usize);
+        let raw = Arc::new((dm, at));
+        self.subbrick_raw_cache.insert((bx, by, bz), (sd, raw.clone()));
+        (sd, raw)
     }
 
     fn send_packet_datagram_or_uni(rt_handle: &tokio::runtime::Handle, conn: &Connection, raw: Bytes) {
@@ -6306,9 +6484,10 @@ impl GameState {
         }
 
         let is_z16 = self.is_z16();
+        let use_cubic_subbricks = self.grid_d > 32;
         let mut dirty_xy: Vec<(u16, u16)> = Vec::new();
         let mut dirty_xy_set: HashSet<(u16, u16)> = HashSet::new();
-        if ws_opt.is_some() || is_z16 {
+        if ws_opt.is_some() || (is_z16 && !use_cubic_subbricks) {
             for &(_layer, cx, cy) in dirty {
                 if dirty_xy_set.insert((cx, cy)) {
                     dirty_xy.push((cx, cy));
@@ -6317,6 +6496,23 @@ impl GameState {
             for &(bx, by) in &dirty_xy {
                 let raw = Arc::new(self.volume.encode_3d_brick_16(bx as usize, by as usize));
                 self.brick_raw_cache.insert((bx, by), raw);
+            }
+        }
+        let mut dirty_xyz: Vec<(u16, u16, u16)> = Vec::new();
+        if use_cubic_subbricks && has_quic {
+            let mut dirty_xyz_set: HashSet<(u16, u16, u16)> = HashSet::new();
+            for &(layer, cx, cy) in dirty {
+                let bz = (layer as usize / CHUNK_SIZE) as u16;
+                if dirty_xyz_set.insert((cx, cy, bz)) {
+                    dirty_xyz.push((cx, cy, bz));
+                }
+            }
+            for &(bx, by, bz) in &dirty_xyz {
+                let (dm, at, sd) =
+                    self.volume
+                        .encode_3d_subbrick_16(bx as usize, by as usize, bz as usize);
+                self.subbrick_raw_cache
+                    .insert((bx, by, bz), (sd, Arc::new((dm, at))));
             }
         }
 
@@ -6343,8 +6539,9 @@ impl GameState {
         let grid_d_u16 = self.grid_d as u16;
         let cx_dim = self.chunks_x;
         let cy_dim = self.chunks_y;
+        let bz_dim = self.subbricks_z();
 
-        // Pre-encode dirty 2D chunks for L=4 mode (Z=16 raw bricks already refreshed above!)
+        // Pre-encode dirty 2D chunks for L=4 mode (Z=16..64 raw bricks already refreshed above!)
         let mut dirty_map: HashMap<(u8, u16, u16), Bytes> = HashMap::with_capacity(dirty.len());
         if !is_z16 {
             for &(layer, cx, cy) in dirty {
@@ -6355,8 +6552,32 @@ impl GameState {
         let any_full = self.peers.values().any(|p| p.needs_full_sync);
         let mut full_pkts: Vec<Bytes> = Vec::new();
         let mut full_bricks: Vec<((u16, u16), RawBrickArc, Bytes)> = Vec::new();
+        let mut full_subbricks: Vec<((u16, u16, u16), RawBrickArc, Bytes)> = Vec::new();
+        let mut full_empty_sky_shadows: Vec<((u16, u16, u16), RawBrickArc)> = Vec::new();
+        let mut total_subbricks = 0usize;
+        let mut skipped_subbricks = 0usize;
         if any_full {
-            if is_z16 {
+            if use_cubic_subbricks {
+                total_subbricks = total_2d * (bz_dim as usize);
+                full_subbricks.reserve(total_subbricks / 2);
+                for bz in 0..bz_dim {
+                    for by in 0..(cy_dim as u16) {
+                        for bx in 0..(cx_dim as u16) {
+                            let (sd, raw) = self.get_or_encode_raw_subbrick(bx, by, bz);
+                            if is_subbrick_skippable(&raw.0, &raw.1) {
+                                skipped_subbricks += 1;
+                                if is_subbrick_empty_sky(&raw.0, &raw.1) {
+                                    full_empty_sky_shadows.push(((bx, by, bz), raw));
+                                }
+                                continue;
+                            }
+                            let pkt =
+                                self.encode_subbrick3d_from_raw(bx, by, bz, sd, &raw.0, &raw.1);
+                            full_subbricks.push(((bx, by, bz), raw, pkt));
+                        }
+                    }
+                }
+            } else if is_z16 {
                 full_bricks.reserve(total_2d);
                 for by in 0..(cy_dim as u16) {
                     for bx in 0..(cx_dim as u16) {
@@ -6400,7 +6621,7 @@ impl GameState {
             })
             .collect();
 
-        // L=4 macro sweep cache (Z=16 uses per-peer shadow delta bricks + Concentric AOI Rate Rings!)
+        // L=4 macro sweep cache (Z=16..64 uses per-peer shadow delta bricks + Concentric AOI Rate Rings!)
         let mut macro_cache: HashMap<(u16, u16), Bytes> = HashMap::new();
         if !is_z16 && aoi_r > 0 {
             let cursors: Vec<usize> = self
@@ -6422,8 +6643,9 @@ impl GameState {
             }
         }
 
-        // Lazy cache for full-brick fallback packets during incremental delta ticks
+        // Lazy caches for full-brick fallback packets during incremental delta ticks
         let mut fallback_full_cache: HashMap<(u16, u16), Bytes> = HashMap::new();
+        let mut fallback_subbrick_cache: HashMap<(u16, u16, u16), Bytes> = HashMap::new();
         let grid_d_u8 = self.grid_d as u8;
 
         let mut total_peer_bytes = 0u64;
@@ -6437,7 +6659,35 @@ impl GameState {
                 peer.needs_full_sync = false;
                 peer.pending_bricks.clear();
                 peer.brick_shadow.clear();
-                if is_z16 {
+                peer.pending_subbricks.clear();
+                peer.subbrick_shadow.clear();
+                if use_cubic_subbricks {
+                    for ((bx, by, bz), raw_arc) in &full_empty_sky_shadows {
+                        peer.subbrick_shadow.insert((*bx, *by, *bz), raw_arc.clone());
+                    }
+                    let mut batch_pkts = Vec::with_capacity(full_subbricks.len());
+                    for ((bx, by, bz), raw_arc, pkt) in &full_subbricks {
+                        peer.subbrick_shadow.insert((*bx, *by, *bz), raw_arc.clone());
+                        peer_b += pkt.len() as u64;
+                        sent_cnt = sent_cnt.saturating_add(1);
+                        batch_pkts.push(pkt.clone());
+                    }
+                    let skipped_pct = if total_subbricks > 0 {
+                        (skipped_subbricks as f32 * 100.0) / (total_subbricks as f32)
+                    } else {
+                        0.0
+                    };
+                    log::info!(
+                        "Full Z={} cubic sync: sent {} / {} sub-bricks, skipped {:.1}% sky/bedrock! (player {}, {:.1} KB)",
+                        self.grid_d,
+                        full_subbricks.len(),
+                        total_subbricks,
+                        skipped_pct,
+                        pid,
+                        peer_b as f32 / 1024.0
+                    );
+                    Self::send_packets_batched(&rt_handle, peer.conn.clone(), batch_pkts);
+                } else if is_z16 {
                     let mut batch_pkts = Vec::with_capacity(full_bricks.len());
                     for ((bx, by), raw_arc, pkt) in &full_bricks {
                         peer.brick_shadow.insert((*bx, *by), raw_arc.clone());
@@ -6466,7 +6716,150 @@ impl GameState {
                     .copied()
                     .unwrap_or(((cx_dim / 2) as i32, (cy_dim / 2) as i32));
 
-                if is_z16 {
+                if use_cubic_subbricks {
+                    for &(bx, by, bz) in &dirty_xyz {
+                        peer.pending_subbricks.insert((bx, by, bz));
+                    }
+
+                    let mut due_subbricks: Vec<(i32, (u16, u16, u16), AoiRing)> = Vec::new();
+                    peer.pending_subbricks.retain(|&(bx, by, bz)| {
+                        let ring = classify_aoi_ring(bx as i32, by as i32, pcx, pcy);
+                        if aoi_ring_due(ring, field_tick, bx, by) {
+                            let dx = bx as i32 - pcx;
+                            let dy = by as i32 - pcy;
+                            due_subbricks.push((dx * dx + dy * dy, (bx, by, bz), ring));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    let tie_salt = (field_tick as u16).wrapping_mul(17);
+                    due_subbricks.sort_by_key(|&(d2, (bx, by, bz), _)| {
+                        let rot = bx
+                            .wrapping_add(by.wrapping_mul(7))
+                            .wrapping_add(bz.wrapping_mul(13))
+                            .wrapping_add(tie_salt);
+                        (d2, bz, rot)
+                    });
+
+                    let mut sub_out: Vec<Bytes> = Vec::with_capacity(due_subbricks.len());
+                    let mut budget_hit = false;
+                    for &(_, (bx, by, bz), ring) in &due_subbricks {
+                        if budget_hit {
+                            peer.pending_subbricks.insert((bx, by, bz));
+                            continue;
+                        }
+                        let Some((sub_depth, cur_arc)) = self.subbrick_raw_cache.get(&(bx, by, bz))
+                        else {
+                            continue;
+                        };
+                        let sub_depth = *sub_depth;
+                        let deadzone = aoi_ring_deadzone(ring);
+                        match peer.subbrick_shadow.get(&(bx, by, bz)) {
+                            Some(prev_arc) if Arc::ptr_eq(prev_arc, cur_arc) => {}
+                            Some(prev_arc) => {
+                                match encode_brick3d_delta(
+                                    &prev_arc.0,
+                                    &prev_arc.1,
+                                    &cur_arc.0,
+                                    &cur_arc.1,
+                                    deadzone,
+                                ) {
+                                    None => {}
+                                    Some(lz4_deltas)
+                                        if !is_brick3d_delta_full_signal(&lz4_deltas) =>
+                                    {
+                                        let pkt = ServerDatagram::VolumetricSubBrick3DDelta {
+                                            bx,
+                                            by,
+                                            bz,
+                                            total_depth: grid_d_u16,
+                                            sub_depth,
+                                            tick: field_tick,
+                                            lz4_deltas,
+                                        };
+                                        let raw_pkt = Bytes::from(encode_server_datagram(&pkt));
+                                        peer_b += raw_pkt.len() as u64;
+                                        sent_cnt = sent_cnt.saturating_add(1);
+                                        sub_out.push(raw_pkt);
+                                        peer.subbrick_shadow
+                                            .insert((bx, by, bz), cur_arc.clone());
+                                        if peer_b >= MAX_PEER_BRICK_BYTES_PER_TICK {
+                                            budget_hit = true;
+                                        }
+                                    }
+                                    Some(_) => {
+                                        let raw_pkt = fallback_subbrick_cache
+                                            .entry((bx, by, bz))
+                                            .or_insert_with(|| {
+                                                let (lz4_density_mat, lz4_albedo_thermal) =
+                                                    encode_subbrick3d_lz4(&cur_arc.0, &cur_arc.1);
+                                                let pkt = ServerDatagram::VolumetricSubBrick3D {
+                                                    bx,
+                                                    by,
+                                                    bz,
+                                                    total_depth: grid_d_u16,
+                                                    sub_depth,
+                                                    tick: field_tick,
+                                                    lz4_density_mat,
+                                                    lz4_albedo_thermal,
+                                                };
+                                                Bytes::from(encode_server_datagram(&pkt))
+                                            })
+                                            .clone();
+                                        peer_b += raw_pkt.len() as u64;
+                                        sent_cnt = sent_cnt.saturating_add(1);
+                                        sub_out.push(raw_pkt);
+                                        peer.subbrick_shadow
+                                            .insert((bx, by, bz), cur_arc.clone());
+                                        if peer_b >= MAX_PEER_BRICK_BYTES_PER_TICK {
+                                            budget_hit = true;
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                if is_subbrick_skippable(&cur_arc.0, &cur_arc.1) {
+                                    if is_subbrick_empty_sky(&cur_arc.0, &cur_arc.1) {
+                                        peer.subbrick_shadow
+                                            .insert((bx, by, bz), cur_arc.clone());
+                                    }
+                                    continue;
+                                }
+                                let raw_pkt = fallback_subbrick_cache
+                                    .entry((bx, by, bz))
+                                    .or_insert_with(|| {
+                                        let (lz4_density_mat, lz4_albedo_thermal) =
+                                            encode_subbrick3d_lz4(&cur_arc.0, &cur_arc.1);
+                                        let pkt = ServerDatagram::VolumetricSubBrick3D {
+                                            bx,
+                                            by,
+                                            bz,
+                                            total_depth: grid_d_u16,
+                                            sub_depth,
+                                            tick: field_tick,
+                                            lz4_density_mat,
+                                            lz4_albedo_thermal,
+                                        };
+                                        Bytes::from(encode_server_datagram(&pkt))
+                                    })
+                                    .clone();
+                                peer_b += raw_pkt.len() as u64;
+                                sent_cnt = sent_cnt.saturating_add(1);
+                                sub_out.push(raw_pkt);
+                                peer.subbrick_shadow
+                                    .insert((bx, by, bz), cur_arc.clone());
+                                if peer_b >= MAX_PEER_BRICK_BYTES_PER_TICK {
+                                    budget_hit = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if !sub_out.is_empty() {
+                        Self::send_packets_batched(&rt_handle, peer.conn.clone(), sub_out);
+                    }
+                } else if is_z16 {
                     // Queue dirty bricks into peer's pending set
                     for &(bx, by) in &dirty_xy {
                         peer.pending_bricks.insert((bx, by));
@@ -7017,7 +7410,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     gs.volume.layers[sl].critter_density.fill(0);
                 }
-                gs.refresh_hazard_grids();
+                gs.snap_shrines_z();
+        gs.refresh_hazard_grids();
                 gs.backend_name = active_backend;
                 gs.infer_ms_last = reported_ms;
                 gs.eco_infer_ms = eco_ms;
@@ -7149,6 +7543,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         macro_cursor: 0,
                         brick_shadow: HashMap::new(),
                         pending_bricks: HashSet::new(),
+                        subbrick_shadow: HashMap::new(),
+                        pending_subbricks: HashSet::new(),
                     },
                 );
                 (pid, gs.grid_w as u16, gs.grid_h as u16, gs.grid_d as u8)
@@ -7893,5 +8289,97 @@ mod tests {
         assert_eq!(rp.kills, 4);
         assert_eq!(rp.xp, 65);
         assert!((rp.x - 30.0).abs() < 2.0);
+    }
+
+    #[tokio::test]
+    async fn test_wave26b_z64_three_strata_shrines_and_cubic_subbricks() {
+        let mut gs = GameState::new(
+            "refsim".to_string(),
+            "127.0.0.1:14440".to_string(),
+            64,
+            64,
+            field_core::BIOME_SKY_ABYSS,
+            42,
+            15,
+            4,
+        );
+        assert_eq!(gs.grid_d, 64);
+        assert_eq!(gs.biome_id, field_core::BIOME_SKY_ABYSS);
+        assert_eq!(gs.shrines.len(), 3);
+        assert_eq!(gs.shrines[0].name, "ABYSSAL HEART");
+        assert_eq!(gs.shrines[1].name, "CENTRAL VIADUCT");
+        assert_eq!(gs.shrines[2].name, "SKY CITADEL");
+        assert!(
+            gs.shrines[0].z < 18.0,
+            "Shrine 0 ABYSSAL HEART should sit in Stratum 1 (<18m), got {:.1}",
+            gs.shrines[0].z
+        );
+        assert!(
+            gs.shrines[1].z >= 20.0 && gs.shrines[1].z <= 36.0,
+            "Shrine 1 CENTRAL VIADUCT should sit in Stratum 2 (20..36m), got {:.1}",
+            gs.shrines[1].z
+        );
+        assert!(
+            gs.shrines[2].z >= 38.0,
+            "Shrine 2 SKY CITADEL should sit in Stratum 3 (>=38m), got {:.1}",
+            gs.shrines[2].z
+        );
+
+        // Bots must distribute across all 3 strata (Abyss <18m, Surface 18..38m, Sky >=38m)
+        let mut strata_seen = [0usize; 3];
+        for p in gs.players.values() {
+            if p.z < 18.0 {
+                strata_seen[0] += 1;
+            } else if p.z < 38.0 {
+                strata_seen[1] += 1;
+            } else {
+                strata_seen[2] += 1;
+            }
+            if p.class_id == CLASS_SKYWING {
+                assert!(p.z <= 61.5, "Skywing spawn altitude should respect Z=64 ceiling");
+            }
+        }
+        assert!(
+            strata_seen[0] > 0 && strata_seen[1] > 0 && strata_seen[2] > 0,
+            "Z=64 bots must spawn across all 3 vertical strata, got {:?}",
+            strata_seen
+        );
+
+        // Cubic 16x16x16 sub-brick encoding & sky/bedrock skip ratio > 40%
+        let bz_dim = gs.subbricks_z();
+        assert_eq!(bz_dim, 4);
+        let mut total = 0usize;
+        let mut skipped = 0usize;
+        for bz in 0..bz_dim {
+            for by in 0..(gs.chunks_y as u16) {
+                for bx in 0..(gs.chunks_x as u16) {
+                    total += 1;
+                    let (sd, raw) = gs.get_or_encode_raw_subbrick(bx, by, bz);
+                    assert_eq!(sd, 16);
+                    if is_subbrick_skippable(&raw.0, &raw.1) {
+                        skipped += 1;
+                    } else {
+                        let bytes = gs.encode_subbrick3d_from_raw(bx, by, bz, sd, &raw.0, &raw.1);
+                        assert!(!bytes.is_empty());
+                    }
+                }
+            }
+        }
+        let skip_pct = (skipped as f32 * 100.0) / (total as f32);
+        assert!(
+            skip_pct > 40.0,
+            "Z=64 cubic sub-brick skip ratio should exceed 40%, got {:.1}% ({}/{})",
+            skip_pct,
+            skipped,
+            total
+        );
+
+        // Step combat + physics and verify exact conservation
+        gs.step_bots();
+        gs.tick_combat_30hz();
+        let raws = gs.volume.refsim_raw_outputs_all();
+        let st = gs.volume.step_3d(&raws);
+        assert_eq!(st.mass_error, 0);
+        assert_eq!(st.energy_error, 0);
     }
 }

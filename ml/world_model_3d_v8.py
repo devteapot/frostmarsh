@@ -165,11 +165,13 @@ def normalize_world_laws(
     batch_size: int = 1,
     dtype: torch.dtype = torch.float32,
     device: torch.device | str = "cpu",
+    num_layers: int | None = None,
 ) -> torch.Tensor:
     """
-    Normalize `world_laws` into either:
-      - Global `[B, 6]` tensor (from `None`, 6-float sequence, `[6]`, or `[B, 6]`), OR
-      - Spatial `[B, 6, H, W]` tensor (from `[6, H, W]` or `[B, 6, H, W]`).
+    Normalize `world_laws` into one of three canonical shapes:
+      - Global `[B, 6]` tensor (from `None`, 6-float sequence, `[6]`, or `[B, 6]`),
+      - 2D Horizontal Spatial `[B, 6, H, W]` tensor (from `[6, H, W]` or `[B, 6, H, W]`), OR
+      - 3D Volumetric Altitude-Varying `[B, 6, L, H, W]` tensor (from `[6, L, H, W]` or `[B, 6, L, H, W]`).
     """
     dev = device if isinstance(device, torch.device) else torch.device(device)
     if world_laws is None:
@@ -188,11 +190,31 @@ def normalize_world_laws(
                 raise ValueError(f"Expected spatial world_laws shape [6, H, W], got {tuple(t.shape)}")
             t = t.unsqueeze(0)
         elif t.ndim == 4:
+            if t.shape[0] == LAW_DIM and t.shape[1] != LAW_DIM:
+                # Unambiguous 3D volumetric [6, L, H, W] -> [1, 6, L, H, W]
+                t = t.unsqueeze(0)
+            elif t.shape[1] == LAW_DIM and t.shape[0] != LAW_DIM:
+                # Unambiguous 2D spatial [B, 6, H, W]
+                pass
+            elif t.shape[0] == LAW_DIM and t.shape[1] == LAW_DIM:
+                # Disambiguate [6, L=6, H, W] vs [B=6, 6, H, W]
+                if num_layers is not None and t.shape[1] == num_layers and batch_size == 1:
+                    t = t.unsqueeze(0)
+                elif batch_size == LAW_DIM:
+                    pass
+                else:
+                    t = t.unsqueeze(0)
+            else:
+                raise ValueError(
+                    f"Expected 4D world_laws shape [B, 6, H, W] or [6, L, H, W], got {tuple(t.shape)}"
+                )
+        elif t.ndim == 5:
             if t.shape[1] != LAW_DIM:
-                raise ValueError(f"Expected spatial world_laws shape [B, 6, H, W], got {tuple(t.shape)}")
+                raise ValueError(f"Expected 3D volumetric world_laws shape [B, 6, L, H, W], got {tuple(t.shape)}")
         else:
             raise ValueError(
-                f"Expected world_laws shape [6], [B, 6], [6, H, W], or [B, 6, H, W], got {tuple(t.shape)}"
+                "Expected world_laws shape [6], [B, 6], [6, H, W], [B, 6, H, W], "
+                f"[6, L, H, W], or [B, 6, L, H, W], got {tuple(t.shape)}"
             )
     else:
         if len(world_laws) != LAW_DIM:
@@ -202,8 +224,10 @@ def normalize_world_laws(
     if t.shape[0] == 1 and batch_size > 1:
         if t.ndim == 2:
             t = t.expand(batch_size, LAW_DIM)
-        else:
+        elif t.ndim == 4:
             t = t.expand(batch_size, LAW_DIM, t.shape[2], t.shape[3])
+        else:
+            t = t.expand(batch_size, LAW_DIM, t.shape[2], t.shape[3], t.shape[4])
     elif t.shape[0] != batch_size:
         raise ValueError(f"world_laws batch {t.shape[0]} incompatible with batch_size={batch_size}")
     return t
@@ -214,11 +238,13 @@ def encode_law_features(
     batch_size: int | None = None,
     dtype: torch.dtype = torch.float32,
     device: torch.device | str = "cpu",
+    num_layers: int | None = None,
 ) -> torch.Tensor:
     """
     Encode 6-float `theta_world` into 12 smooth physical basis features:
-      - `[B, 12]` for global `world_laws` (`None`, sequence, `[6]`, `[B, 6]`), OR
-      - `[B, 12, H, W]` for spatial 2D `world_laws` (`[6, H, W]`, `[1, 6, H, W]`, `[B, 6, H, W]`).
+      - `[B, 12]` for global `world_laws` (`None`, sequence, `[6]`, `[B, 6]`),
+      - `[B, 12, H, W]` for 2D spatial `world_laws` (`[6, H, W]`, `[1, 6, H, W]`, `[B, 6, H, W]`), OR
+      - `[B, 12, L, H, W]` for 3D volumetric `world_laws` (`[6, L, H, W]`, `[1, 6, L, H, W]`, `[B, 6, L, H, W]`).
     EVERY feature is IDENTICALLY `0.0` at `DEFAULT_WORLD_LAWS = (1.0, 0.0, 1.0, 1.0, 1.0, 1.0)`!
     """
     if isinstance(world_laws, torch.Tensor):
@@ -230,12 +256,20 @@ def encode_law_features(
             bsz = batch_size
         elif world_laws.ndim in (1, 3):
             bsz = 1
+        elif world_laws.ndim == 4 and world_laws.shape[0] == LAW_DIM and (
+            world_laws.shape[1] != LAW_DIM or (num_layers is not None and world_laws.shape[1] == num_layers)
+        ):
+            bsz = 1
         else:
             bsz = int(world_laws.shape[0])
-        t = normalize_world_laws(world_laws, batch_size=bsz, dtype=torch.float32, device=dev)
+        t = normalize_world_laws(
+            world_laws, batch_size=bsz, dtype=torch.float32, device=dev, num_layers=num_layers
+        )
     else:
         bsz = batch_size if batch_size is not None else 1
-        t = normalize_world_laws(world_laws, batch_size=bsz, dtype=torch.float32, device=device)
+        t = normalize_world_laws(
+            world_laws, batch_size=bsz, dtype=torch.float32, device=device, num_layers=num_layers
+        )
 
     g = t[:, LAW_GRAVITY : LAW_GRAVITY + 1].clamp(0.10, 3.0)
     dT = t[:, LAW_AMBIENT_TEMP_SHIFT : LAW_AMBIENT_TEMP_SHIFT + 1].clamp(-10000.0, 10000.0)
@@ -1030,14 +1064,19 @@ class WorldModel3DV8(WorldModel3DV5):
         B: int,
         dtype: torch.dtype,
         device: torch.device,
+        num_layers: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute `(law_dt, law_h_bias, law_h_scale, law_z_scale)` with ZERO extra parameters:
           - Global `world_laws` (`[6]` / `[B, 6]`): returns `[B, C]` (exact bit-for-bit v8 path).
-          - Spatial `world_laws` (`[6, H, W]` / `[B, 6, H, W]`): applies the exact same
+          - 2D Spatial `world_laws` (`[6, H, W]` / `[B, 6, H, W]`): applies the exact same
             `law_mlp` & projection weights as `1x1` convolutions to return `[B, C, H, W]`.
+          - 3D Volumetric `world_laws` (`[6, L, H, W]` / `[B, 6, L, H, W]`): runs the exact same
+            `1x1` conv weights over `[B*L, 12, H, W]` to return per-`(z, y, x)` `[B, C, L, H, W]`.
         """
-        law_f = encode_law_features(world_laws, batch_size=B, dtype=dtype, device=device)
+        law_f = encode_law_features(
+            world_laws, batch_size=B, dtype=dtype, device=device, num_layers=num_layers
+        )
         if law_f.ndim == 2:
             lh = self.law_mlp(law_f)  # [B, law_hidden]
             law_dt = self.law_to_dt(lh)  # [B, dt_dim]
@@ -1046,19 +1085,96 @@ class WorldModel3DV8(WorldModel3DV5):
             law_z_scale = torch.exp(self.law_z_logscale(lh).clamp(-2.2, 2.2))  # [B, z_flux_ch]
             return law_dt, law_h_bias, law_h_scale, law_z_scale
 
-        # Spatial [B, 12, H, W]: run existing linear weights directly as 1x1 convs (0 extra params!)
         w0 = self.law_mlp[0].weight[:, :, None, None]
         w2 = self.law_mlp[2].weight[:, :, None, None]
-        lh = F.gelu(F.conv2d(F.gelu(F.conv2d(law_f, w0)), w2))  # [B, law_hidden, H, W]
-        law_dt = F.conv2d(lh, self.law_to_dt.weight[:, :, None, None])  # [B, dt_dim, H, W]
-        law_h_bias = F.conv2d(lh, self.law_h_mod.weight[:, :, None, None])  # [B, width, H, W]
-        law_h_scale = torch.exp(
-            F.conv2d(lh, self.law_h_logscale.weight[:, :, None, None]).clamp(-2.2, 2.2)
-        )  # [B, out_ch, H, W]
-        law_z_scale = torch.exp(
-            F.conv2d(lh, self.law_z_logscale.weight[:, :, None, None]).clamp(-2.2, 2.2)
-        )  # [B, z_flux_ch, H, W]
+
+        if law_f.ndim == 4:
+            # 2D Spatial [B, 12, H, W]: run existing linear weights directly as 1x1 convs (0 extra params!)
+            lh = F.gelu(F.conv2d(F.gelu(F.conv2d(law_f, w0)), w2))  # [B, law_hidden, H, W]
+            law_dt = F.conv2d(lh, self.law_to_dt.weight[:, :, None, None])  # [B, dt_dim, H, W]
+            law_h_bias = F.conv2d(lh, self.law_h_mod.weight[:, :, None, None])  # [B, width, H, W]
+            law_h_scale = torch.exp(
+                F.conv2d(lh, self.law_h_logscale.weight[:, :, None, None]).clamp(-2.2, 2.2)
+            )  # [B, out_ch, H, W]
+            law_z_scale = torch.exp(
+                F.conv2d(lh, self.law_z_logscale.weight[:, :, None, None]).clamp(-2.2, 2.2)
+            )  # [B, z_flux_ch, H, W]
+            return law_dt, law_h_bias, law_h_scale, law_z_scale
+
+        # 3D Volumetric [B, 12, L, H, W]: run existing linear weights over [B*L, 12, H, W] (0 extra params!)
+        _, _, L_law, H_law, W_law = law_f.shape
+        law_f_2d = law_f.transpose(1, 2).reshape(B * L_law, self.law_feat_dim, H_law, W_law)
+        lh = F.gelu(F.conv2d(F.gelu(F.conv2d(law_f_2d, w0)), w2))  # [B*L, law_hidden, H, W]
+        law_dt = (
+            F.conv2d(lh, self.law_to_dt.weight[:, :, None, None])
+            .view(B, L_law, self.dt_dim, H_law, W_law)
+            .transpose(1, 2)
+        )
+        law_h_bias = (
+            F.conv2d(lh, self.law_h_mod.weight[:, :, None, None])
+            .view(B, L_law, self.width, H_law, W_law)
+            .transpose(1, 2)
+        )
+        law_h_scale = (
+            torch.exp(F.conv2d(lh, self.law_h_logscale.weight[:, :, None, None]).clamp(-2.2, 2.2))
+            .view(B, L_law, self.out_ch, H_law, W_law)
+            .transpose(1, 2)
+        )
+        law_z_scale = (
+            torch.exp(F.conv2d(lh, self.law_z_logscale.weight[:, :, None, None]).clamp(-2.2, 2.2))
+            .view(B, L_law, self.z_flux_ch, H_law, W_law)
+            .transpose(1, 2)
+        )
         return law_dt, law_h_bias, law_h_scale, law_z_scale
+
+    def compute_z_flux_interfaces(
+        self,
+        x_lo: torch.Tensor,
+        x_hi: torch.Tensor,
+        z_lo: torch.Tensor,
+        z_hi: torch.Tensor,
+        dt_lo: torch.Tensor,
+        dt_hi: torch.Tensor,
+        world_laws_lo: WorldLawsLike = None,
+        world_laws_hi: WorldLawsLike = None,
+    ) -> torch.Tensor:
+        """
+        Evaluate the exact staggered `1x1` vertical interface flux head on paired `(lo, hi)` slices:
+          `x_lo, x_hi`: `[N, C_in, H, W]`, `z_lo, z_hi`: `[N, width, H, W]`, `dt_lo, dt_hi`: `[N, 1, H, W]`.
+        Used for exact vertical slab-seam stitching with `HALO_Z = 3` (zero extra input halo!).
+        Returns `[N, z_flux_ch, H, W]`.
+        """
+        N, _, H, W = x_lo.shape
+        dt_z = torch.minimum(dt_lo, dt_hi)
+        if world_laws_hi is None:
+            world_laws_hi = world_laws_lo
+
+        law_dt_lo, _, _, law_zs_lo = self._compute_law_mods(
+            world_laws_lo, B=N, dtype=x_lo.dtype, device=x_lo.device
+        )
+        law_dt_hi, _, _, law_zs_hi = self._compute_law_mods(
+            world_laws_hi, B=N, dtype=x_lo.dtype, device=x_lo.device
+        )
+        if law_dt_lo.ndim == 2:
+            law_dt_z = (0.5 * (law_dt_lo + law_dt_hi)).view(N, self.dt_dim, 1, 1)
+            law_zs = (0.5 * (law_zs_lo + law_zs_hi)).view(N, self.z_flux_ch, 1, 1)
+        elif law_dt_lo.ndim == 4:
+            law_dt_z = 0.5 * (law_dt_lo + law_dt_hi)
+            law_zs = 0.5 * (law_zs_lo + law_zs_hi)
+        else:
+            law_dt_z = 0.5 * (law_dt_lo[:, :, 0] + law_dt_hi[:, :, 0])
+            law_zs = 0.5 * (law_zs_lo[:, :, 0] + law_zs_hi[:, :, 0])
+
+        dt_z_emb = self.dt_mlp(encode_dt_features(dt_z)) + law_dt_z
+        vh = F.gelu(
+            self.v_x_lo(x_lo)
+            + self.v_x_hi(x_hi)
+            + self.v_z_lo(z_lo)
+            + self.v_z_hi(z_hi)
+            + self.dt_z_mod(dt_z_emb)
+        )
+        vh = F.gelu(self.v_mid(vh))
+        return (self.v_out(vh) * self.z_out_scale) * law_zs * dt_z
 
     def forward(
         self,
@@ -1070,7 +1186,8 @@ class WorldModel3DV8(WorldModel3DV5):
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         Dense 3D isotropic forward pass supporting 4D `[L, 18|19, H, W]` or 5D `[B, L, 18|19, H, W]`,
-        with either global `[6]`/`[B, 6]` OR spatial 2D `[6, H, W]`/`[B, 6, H, W]` `world_laws`.
+        with global `[6]`/`[B, 6]`, 2D spatial `[6, H, W]`/`[B, 6, H, W]`, OR 3D volumetric
+        altitude-varying `[6, L, H, W]`/`[B, 6, L, H, W]` `world_laws`.
         Default returns `(out_horiz [L, 17, H, W], out_z_flux [L-1, 5, H, W], z_world [L, 48, H, W])`.
         """
         x5, dt5, is_4d = self._split_state_and_dt(state, local_dt)
@@ -1078,12 +1195,22 @@ class WorldModel3DV8(WorldModel3DV5):
         x_2d = x5.reshape(B * L, C_in, H, W)
         dt_2d = dt5.reshape(B * L, 1, H, W)
 
-        # World-Law conditioning embeddings (exact 0 / 1.0 at DEFAULT_WORLD_LAWS!)
+        # World-Law conditioning embeddings (exact 0 / 1.0 at DEFAULT_WORLD_LAWS across all 3 shapes!)
         law_dt, law_h_bias, law_h_scale, law_z_scale = self._compute_law_mods(
-            world_laws, B=B, dtype=x5.dtype, device=x5.device
+            world_laws, B=B, dtype=x5.dtype, device=x5.device, num_layers=L
         )
+        is_vol_laws = law_dt.ndim == 5
         is_spatial_laws = law_dt.ndim == 4
-        if is_spatial_laws:
+        if is_vol_laws:
+            if law_dt.shape[2] != L or law_dt.shape[3] != H or law_dt.shape[4] != W:
+                raise ValueError(
+                    f"3D volumetric world_laws {(law_dt.shape[2], law_dt.shape[3], law_dt.shape[4])} "
+                    f"does not match state {(L, H, W)}"
+                )
+            law_dt_bl = law_dt.transpose(1, 2).reshape(B * L, self.dt_dim, H, W)
+            law_hb_bl = law_h_bias.transpose(1, 2).reshape(B * L, self.width, H, W)
+            law_hs_bl = law_h_scale.transpose(1, 2).reshape(B * L, self.out_ch, H, W)
+        elif is_spatial_laws:
             if law_dt.shape[2] != H or law_dt.shape[3] != W:
                 raise ValueError(
                     f"Spatial world_laws {(law_dt.shape[2], law_dt.shape[3])} does not match state {(H, W)}"
@@ -1136,7 +1263,14 @@ class WorldModel3DV8(WorldModel3DV5):
                 z_lo = z_5d[:, :-1].reshape(B * (L - 1), self.width, H, W)
                 z_hi = z_5d[:, 1:].reshape(B * (L - 1), self.width, H, W)
                 dt_z = torch.minimum(dt5[:, :-1], dt5[:, 1:])
-                if is_spatial_laws:
+                if is_vol_laws:
+                    law_dt_z = (
+                        (0.5 * (law_dt[:, :, :-1] + law_dt[:, :, 1:]))
+                        .transpose(1, 2)
+                        .reshape(B * (L - 1), self.dt_dim, H, W)
+                    )
+                    law_zs_5d = (0.5 * (law_z_scale[:, :, :-1] + law_z_scale[:, :, 1:])).transpose(1, 2)
+                elif is_spatial_laws:
                     law_dt_z = (
                         law_dt.unsqueeze(1)
                         .expand(B, L - 1, self.dt_dim, H, W)
@@ -1198,16 +1332,55 @@ def _shrinking_halo_3d_brick_core_v8(
     brick_size: tuple[int, int, int] = (8, 16, 16),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Exact shrinking-halo 3D brick forward for `WorldModel3DV8` under arbitrary global `[6]`
-    OR per-brick spatial `[K, 6, Hp, Wp]` `world_laws`!
+    Exact shrinking-halo 3D brick forward for `WorldModel3DV8` under:
+      - global `[6]` / `[1, 6]` `world_laws`,
+      - per-brick 2D spatial `[K, 6, Hp, Wp]` `world_laws`, OR
+      - per-brick 3D volumetric altitude-varying `[K, 6, Zp, Hp, Wp]` `world_laws`!
     """
     K, C_in, Zp, Hp, Wp = patches_x.shape
     Bz, By, Bx = brick_size
     hz = wm.halo_z
     hxy = wm.halo_xy
 
-    if world_laws_in.ndim == 4:
-        # Spatial per-brick law patches `[K, 6, Hp, Wp]`: compute post-stem `[K, C, Hp-2, Wp-2]`
+    if world_laws_in.ndim == 5:
+        # 3D volumetric per-brick law patches `[K, 6, Zp, Hp, Wp]`:
+        # Run `law_mlp` on `[K*Zp, 12, Hc, Wc]` ONLY for `law_dt`, then slice `lh` to the core
+        # `[Bz, By, Bx]` / `[Bz+1, By, Bx]` BEFORE projecting `law_h_mod`/`logscale` (~5.5x less FLOPs & VRAM!).
+        law_f = encode_law_features(
+            world_laws_in[:, :, :, 1:-1, 1:-1],
+            batch_size=K,
+            dtype=patches_x.dtype,
+            device=patches_x.device,
+        )  # [K, 12, Zp, Hc, Wc]
+        Hc_l, Wc_l = Hp - 2, Wp - 2
+        w0 = wm.law_mlp[0].weight[:, :, None, None]
+        w2 = wm.law_mlp[2].weight[:, :, None, None]
+        law_f_2d = law_f.transpose(1, 2).reshape(K * Zp, wm.law_feat_dim, Hc_l, Wc_l)
+        lh_2d = F.gelu(F.conv2d(F.gelu(F.conv2d(law_f_2d, w0)), w2))  # [K*Zp, law_hidden, Hc, Wc]
+        law_dt = (
+            F.conv2d(lh_2d, wm.law_to_dt.weight[:, :, None, None])
+            .view(K, Zp, wm.dt_dim, Hc_l, Wc_l)
+            .transpose(1, 2)
+        )
+        lh_5d = lh_2d.view(K, Zp, wm.law_hidden, Hc_l, Wc_l).transpose(1, 2)
+        s_off = hxy - 1
+        sl = slice(s_off, -s_off) if s_off > 0 else slice(None)
+        law_dt_5d = law_dt  # [K, dt_dim, Zp, Hc, Wc]
+        law_dt_if = law_dt[:, :, hz : hz + Bz + 1, sl, sl]  # [K, dt_dim, Bz+1, By, Bx]
+        law_dt_2d = (0.5 * (law_dt_if[:, :, :-1] + law_dt_if[:, :, 1:])).transpose(1, 2).reshape(
+            K * Bz, wm.dt_dim, By, Bx
+        )
+        lh_core_2d = lh_5d[:, :, hz : hz + Bz, sl, sl].transpose(1, 2).reshape(K * Bz, wm.law_hidden, By, Bx)
+        law_hb_2d = F.conv2d(lh_core_2d, wm.law_h_mod.weight[:, :, None, None])
+        law_hs_2d = torch.exp(F.conv2d(lh_core_2d, wm.law_h_logscale.weight[:, :, None, None]).clamp(-2.2, 2.2))
+        lh_if_2d = lh_5d[:, :, hz : hz + Bz + 1, sl, sl].transpose(1, 2).reshape(K * (Bz + 1), wm.law_hidden, By, Bx)
+        law_zs_if = (
+            torch.exp(F.conv2d(lh_if_2d, wm.law_z_logscale.weight[:, :, None, None]).clamp(-2.2, 2.2))
+            .view(K, Bz + 1, wm.z_flux_ch, By, Bx)
+        )
+        law_zs_5d = 0.5 * (law_zs_if[:, :-1] + law_zs_if[:, 1:])  # [K, Bz, z_flux_ch, By, Bx]
+    elif world_laws_in.ndim == 4:
+        # 2D spatial per-brick law patches `[K, 6, Hp, Wp]`: compute post-stem `[K, C, Hp-2, Wp-2]`
         law_dt, law_h_bias, law_h_scale, law_z_scale = wm._compute_law_mods(
             world_laws_in[:, :, 1:-1, 1:-1], B=K, dtype=patches_x.dtype, device=patches_x.device
         )
@@ -1382,10 +1555,11 @@ class _CompiledBrickModuleV8(nn.Module):
 class SparseWorld3DV8Runner:
     """
     Production True 3D `16x16x8` Sparse Active-Brick Runner for `WorldModel3DV8`.
-    Supports BOTH:
-      - Global `[6]` / `[1, 6]` dynamic `world_laws` (zero-recompile CUDA graphs, exact v8 path), AND
-      - Spatial 2D `[6, H, W]` / `[1, 6, H, W]` `world_laws` fields (extracting exact matching
-        `(Hp, Wp)` law crops for each active `16x16x8` brick alongside `local_dt`!).
+    Supports ALL THREE World-Law conditioning modes:
+      - Global `[6]` / `[1, 6]` dynamic `world_laws` (zero-recompile CUDA graphs, exact v8 path),
+      - 2D Spatial `[6, H, W]` / `[1, 6, H, W]` `world_laws` fields (`[K, 6, Hp, Wp]` brick crops), AND
+      - 3D Volumetric altitude-varying `[6, L, H, W]` / `[1, 6, L, H, W]` `world_laws` fields
+        (extracting exact matching `[K, 6, Zp, Hp, Wp]` brick crops for each active `16x16x8` brick!).
     Maintains exact FP32 `<= 1e-6` dense-vs-sparse parity with `activity_eps=0.0`!
     """
 
@@ -1424,25 +1598,41 @@ class SparseWorld3DV8Runner:
             p.requires_grad_(False)
         self._wm_dense: Any = self._wm
         self._wm_dense_spatial: Any = self._wm
+        self._wm_dense_vol: Any = self._wm
         self._brick_mod: Any = _CompiledBrickModuleV8(self._wm, (self.brick_z, self.brick_xy, self.brick_xy)).eval()
         self._brick_mod_spatial: Any = _CompiledBrickModuleV8(
             self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
         ).eval()
+        self._brick_mod_vol: Any = _CompiledBrickModuleV8(
+            self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
+        ).eval()
         if self.device.type == "cuda" and self.use_fp16 and hasattr(torch, "compile"):
+            # When `max_bricks_per_batch > 0` (large Z=64/128 or multi-region worlds), use
+            # `mode="default"` (fused Triton kernels, ZERO static CUDAGraph pool VRAM bloat!)
+            # so peak VRAM stays strictly < 2.5 GB at Z=64 and < 3.5 GB at Z=128!
+            compile_mode = "default" if self.max_bricks_per_batch > 0 else "reduce-overhead"
             try:
-                self._wm_dense = torch.compile(self._wm, mode="reduce-overhead")
+                self._wm_dense = torch.compile(self._wm, mode=compile_mode)
             except Exception:
                 self._wm_dense = self._wm
             try:
-                self._wm_dense_spatial = torch.compile(self._wm, mode="reduce-overhead")
+                self._wm_dense_spatial = torch.compile(self._wm, mode=compile_mode)
             except Exception:
                 self._wm_dense_spatial = self._wm
             try:
-                self._brick_mod = torch.compile(self._brick_mod, mode="reduce-overhead")
+                self._wm_dense_vol = torch.compile(self._wm, mode=compile_mode)
+            except Exception:
+                self._wm_dense_vol = self._wm
+            try:
+                self._brick_mod = torch.compile(self._brick_mod, mode=compile_mode)
             except Exception:
                 pass
             try:
-                self._brick_mod_spatial = torch.compile(self._brick_mod_spatial, mode="reduce-overhead")
+                self._brick_mod_spatial = torch.compile(self._brick_mod_spatial, mode=compile_mode)
+            except Exception:
+                pass
+            try:
+                self._brick_mod_vol = torch.compile(self._brick_mod_vol, mode=compile_mode)
             except Exception:
                 pass
 
@@ -1464,6 +1654,7 @@ class SparseWorld3DV8Runner:
         self._last_laws: torch.Tensor | None = None
         self._last_laws_tuple: tuple[float, ...] | None = None
         self._last_spatial_laws: torch.Tensor | None = None
+        self._last_law_mode: str | None = None
 
     def reset(self) -> None:
         self._last_horiz = None
@@ -1474,35 +1665,58 @@ class SparseWorld3DV8Runner:
         self._last_laws = None
         self._last_laws_tuple = None
         self._last_spatial_laws = None
+        self._last_law_mode = None
 
     def _prepare_world_laws(
-        self, world_laws: WorldLawsLike, H: int, W: int
-    ) -> tuple[torch.Tensor, bool, bool]:
+        self, world_laws: WorldLawsLike, L: int, H: int, W: int
+    ) -> tuple[torch.Tensor, str, bool]:
         """
         Prepare `world_laws` on `self.device`.
-        Returns `(laws_tensor, is_spatial, force_dense)`:
-          - Global `[6]` / `[1, 6]` / sequence / `None`: updates persistent `self._static_laws` (`[6]`)
-            with zero GPU-CPU sync for CPU/Python inputs, returning `is_spatial=False`.
-          - Spatial `[6, H, W]` / `[1, 6, H, W]`: returns `[6, H, W]` float32 tensor with `is_spatial=True`
-            (triggers `force_dense=True` only on mode switch or shape change; localized law edits are
-            tracked per-brick in `active_brick_mask`).
+        Returns `(laws_tensor, law_mode, force_dense)` where `law_mode` is one of:
+          - `"global"`     : `[6]` tensor (zero GPU-CPU sync for CPU/Python inputs)
+          - `"spatial_2d"` : `[6, H, W]` float32 tensor
+          - `"spatial_3d"` : `[6, L, H, W]` float32 tensor
         """
-        if isinstance(world_laws, torch.Tensor) and world_laws.ndim in (3, 4):
+        if isinstance(world_laws, torch.Tensor) and world_laws.ndim in (3, 4, 5):
             t = world_laws.detach()
-            if t.ndim == 4:
+            if t.ndim == 5:
                 if t.shape[0] != 1 or t.shape[1] != LAW_DIM:
-                    raise ValueError(f"Expected spatial world_laws [1, {LAW_DIM}, H, W], got {tuple(t.shape)}")
+                    raise ValueError(f"Expected 3D world_laws [1, {LAW_DIM}, L, H, W], got {tuple(t.shape)}")
                 t = t.squeeze(0)
+                law_mode = "spatial_3d"
+            elif t.ndim == 4:
+                if t.shape[0] == 1 and t.shape[1] == LAW_DIM and t.shape[2] == H and t.shape[3] == W:
+                    t = t.squeeze(0)
+                    law_mode = "spatial_2d"
+                elif t.shape[0] == LAW_DIM and t.shape[1] == L and t.shape[2] == H and t.shape[3] == W:
+                    law_mode = "spatial_3d"
+                else:
+                    raise ValueError(
+                        f"Expected 4D world_laws [1, {LAW_DIM}, {H}, {W}] or [{LAW_DIM}, {L}, {H}, {W}], "
+                        f"got {tuple(t.shape)}"
+                    )
             else:
                 if t.shape[0] != LAW_DIM:
                     raise ValueError(f"Expected spatial world_laws [{LAW_DIM}, H, W], got {tuple(t.shape)}")
-            if t.shape[1] != H or t.shape[2] != W:
-                raise ValueError(f"Spatial world_laws {(t.shape[1], t.shape[2])} does not match state {(H, W)}")
-            t_dev = t.to(device=self.device, dtype=torch.float32, non_blocking=(self.device.type == "cuda"))
-            force_dense = self._last_spatial_laws is None or self._last_spatial_laws.shape != t_dev.shape
-            return t_dev, True, force_dense
+                law_mode = "spatial_2d"
 
-        was_spatial = self._last_spatial_laws is not None
+            if law_mode == "spatial_2d" and (t.shape[1] != H or t.shape[2] != W):
+                raise ValueError(f"Spatial world_laws {(t.shape[1], t.shape[2])} does not match state {(H, W)}")
+            if law_mode == "spatial_3d" and (t.shape[1] != L or t.shape[2] != H or t.shape[3] != W):
+                raise ValueError(
+                    f"3D volumetric world_laws {(t.shape[1], t.shape[2], t.shape[3])} does not match state {(L, H, W)}"
+                )
+            t_dev = t.to(device=self.device, dtype=self.compute_dtype, non_blocking=(self.device.type == "cuda"))
+            force_dense = (
+                self._last_law_mode != law_mode
+                or self._last_spatial_laws is None
+                or self._last_spatial_laws.shape != t_dev.shape
+            )
+            return t_dev, law_mode, force_dense
+
+        was_spatial = self._last_spatial_laws is not None or (
+            self._last_law_mode is not None and self._last_law_mode != "global"
+        )
         if was_spatial:
             self._last_spatial_laws = None
 
@@ -1514,7 +1728,7 @@ class SparseWorld3DV8Runner:
                 self._static_laws.copy_(self._host_laws, non_blocking=(self.device.type == "cuda"))
                 self._last_laws_tuple = tup
                 self._last_laws = self._static_laws.clone()
-            return self._static_laws, False, changed
+            return self._static_laws, "global", changed
 
         if isinstance(world_laws, torch.Tensor):
             if world_laws.device.type == "cpu":
@@ -1528,7 +1742,7 @@ class SparseWorld3DV8Runner:
                     self._static_laws.copy_(self._host_laws, non_blocking=(self.device.type == "cuda"))
                     self._last_laws_tuple = tup
                     self._last_laws = self._static_laws.clone()
-                return self._static_laws, False, changed
+                return self._static_laws, "global", changed
 
             flat_dev = world_laws.detach().to(device=self.device, dtype=torch.float32).reshape(-1)
             if flat_dev.numel() != LAW_DIM:
@@ -1538,7 +1752,7 @@ class SparseWorld3DV8Runner:
                 self._static_laws.copy_(flat_dev)
                 self._last_laws = flat_dev.clone()
                 self._last_laws_tuple = None
-            return self._static_laws, False, changed
+            return self._static_laws, "global", changed
 
         if len(world_laws) != LAW_DIM:
             raise ValueError(f"Expected {LAW_DIM} floats for world_laws, got {len(world_laws)}")
@@ -1549,7 +1763,7 @@ class SparseWorld3DV8Runner:
             self._static_laws.copy_(self._host_laws, non_blocking=(self.device.type == "cuda"))
             self._last_laws_tuple = tup
             self._last_laws = self._static_laws.clone()
-        return self._static_laws, False, changed
+        return self._static_laws, "global", changed
 
     def _normalize_dt(self, local_dt: torch.Tensor | float | None, L: int, H: int, W: int) -> torch.Tensor:
         if local_dt is None:
@@ -1604,7 +1818,9 @@ class SparseWorld3DV8Runner:
                 and self._last_spatial_laws.shape == spatial_laws.shape
             ):
                 law_diff = (spatial_laws - self._last_spatial_laws).abs().amax(dim=0) > 0.0
-                diff_vox = torch.maximum(diff_vox, law_diff.unsqueeze(0).expand_as(diff_vox).to(dtype=self.compute_dtype))
+                if law_diff.ndim == 2:
+                    law_diff = law_diff.unsqueeze(0).expand_as(diff_vox)
+                diff_vox = torch.maximum(diff_vox, law_diff.to(dtype=self.compute_dtype))
         else:
             eps = self.activity_eps
             d_sp = (x_cur[:, :10] - ref[:, :10]).abs().amax(dim=1) > eps
@@ -1620,10 +1836,114 @@ class SparseWorld3DV8Runner:
                 and self._last_spatial_laws.shape == spatial_laws.shape
             ):
                 law_diff = (spatial_laws - self._last_spatial_laws).abs().amax(dim=0) > 1e-4
-                diff_vox = torch.maximum(diff_vox, law_diff.unsqueeze(0).expand_as(diff_vox).to(dtype=self.compute_dtype))
+                if law_diff.ndim == 2:
+                    law_diff = law_diff.unsqueeze(0).expand_as(diff_vox)
+                diff_vox = torch.maximum(diff_vox, law_diff.to(dtype=self.compute_dtype))
 
         pooled = F.max_pool3d(diff_vox.unsqueeze(0).unsqueeze(0), (Bz, By, Bx), (Bz, By, Bx))
         return pooled[0, 0] > 0.5
+
+    def _run_brick_module(
+        self,
+        law_mode: str,
+        px_c: torch.Tensor,
+        pdt_c: torch.Tensor,
+        plaw_c: torch.Tensor,
+        mz0_c: torch.Tensor,
+        mz1_c: torch.Tensor,
+        my0_c: torch.Tensor,
+        my1_c: torch.Tensor,
+        mx0_c: torch.Tensor,
+        mx1_c: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if law_mode == "spatial_3d":
+            try:
+                return self._brick_mod_vol(px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c)
+            except Exception:
+                self._brick_mod_vol = _CompiledBrickModuleV8(
+                    self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
+                ).eval()
+                return self._brick_mod_vol(px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c)
+        if law_mode == "spatial_2d":
+            try:
+                return self._brick_mod_spatial(px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c)
+            except Exception:
+                self._brick_mod_spatial = _CompiledBrickModuleV8(
+                    self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
+                ).eval()
+                return self._brick_mod_spatial(px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c)
+        try:
+            return self._brick_mod(px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c)
+        except Exception:
+            self._brick_mod = _CompiledBrickModuleV8(
+                self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
+            ).eval()
+            return self._brick_mod(px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c)
+
+    def _run_dense_vertical_slabs_inplace(
+        self,
+        x_cur: torch.Tensor,
+        dt_cur: torch.Tensor,
+        laws_cur: torch.Tensor,
+        law_mode: str,
+        slab_l: int = 8,
+    ) -> None:
+        """
+        Exact `HALO_Z = 3` vertically-slabbed dense forward pass writing directly IN-PLACE
+        into `self._last_horiz`, `self._last_z_flux_pad`, and `self._last_z`!
+        Produces bit-exact monolithic outputs while capping peak VRAM at `< 1.6 GB` for `Z=64`
+        (zero `torch.cat` / double-buffer spikes even across law switches!).
+        """
+        L, _, H, W = x_cur.shape
+        hz = self.halo_z
+        num_slabs = L // slab_l
+
+        # Reuse existing cache buffers in-place when shapes match (zero double-allocation!)
+        if self._last_horiz is None or self._last_horiz.shape != (L, self._wm.out_ch, H, W):
+            self._last_horiz = x_cur.new_empty((L, self._wm.out_ch, H, W))
+        if self._last_z_flux_pad is None or self._last_z_flux_pad.shape != (L, self._wm.z_flux_ch, H, W):
+            self._last_z_flux_pad = x_cur.new_zeros((L, self._wm.z_flux_ch, H, W))
+        else:
+            self._last_z_flux_pad[-1].zero_()
+        if self._last_z is None or self._last_z.shape != (L, self._wm.width, H, W):
+            self._last_z = x_cur.new_empty((L, self._wm.width, H, W))
+
+        for s in range(num_slabs):
+            z0 = s * slab_l
+            z1 = z0 + slab_l
+            zs = max(0, z0 - hz)
+            ze = min(L, z1 + hz)
+            lo_trim = z0 - zs
+            hi_end = lo_trim + slab_l
+
+            x_s = x_cur[zs:ze]
+            dt_s = dt_cur[zs:ze]
+            law_s = laws_cur[:, zs:ze] if law_mode == "spatial_3d" else laws_cur
+            oh, ozf, oz = self._wm(x_s, local_dt=dt_s, world_laws=law_s, return_z_flux=True, return_latent=True)
+            self._last_horiz[z0:z1].copy_(oh[lo_trim:hi_end])
+            self._last_z[z0:z1].copy_(oz[lo_trim:hi_end])
+            self._last_z_flux_pad[z0 : z1 - 1].copy_(ozf[lo_trim : hi_end - 1])
+            del oh, ozf, oz
+
+        for s in range(num_slabs - 1):
+            z_seam = (s + 1) * slab_l - 1
+            x_lo = x_cur[z_seam : z_seam + 1]
+            x_hi = x_cur[z_seam + 1 : z_seam + 2]
+            z_lo = self._last_z[z_seam : z_seam + 1]
+            z_hi = self._last_z[z_seam + 1 : z_seam + 2]
+            dt_lo = dt_cur[z_seam : z_seam + 1]
+            dt_hi = dt_cur[z_seam + 1 : z_seam + 2]
+            if law_mode == "spatial_3d":
+                law_lo = laws_cur[:, z_seam : z_seam + 1].transpose(0, 1).contiguous()
+                law_hi = laws_cur[:, z_seam + 1 : z_seam + 2].transpose(0, 1).contiguous()
+            else:
+                law_lo = laws_cur
+                law_hi = laws_cur
+            seam_zf = self._wm.compute_z_flux_interfaces(
+                x_lo, x_hi, z_lo, z_hi, dt_lo, dt_hi, world_laws_lo=law_lo, world_laws_hi=law_hi
+            )
+            self._last_z_flux_pad[z_seam : z_seam + 1].copy_(seam_zf)
+            del seam_zf
 
     @torch.inference_mode()
     def step(
@@ -1641,7 +1961,8 @@ class SparseWorld3DV8Runner:
         x_cur = x.to(device=self.device, dtype=self.compute_dtype, non_blocking=(self.device.type == "cuda"))
         L, C, H, W = x_cur.shape
         dt_cur = self._normalize_dt(local_dt, L, H, W)
-        laws_cur, is_spatial_laws, laws_changed = self._prepare_world_laws(world_laws, H, W)
+        laws_cur, law_mode, laws_changed = self._prepare_world_laws(world_laws, L, H, W)
+        is_spatial_laws = law_mode != "global"
         Bz, By, Bx = self.brick_z, self.brick_xy, self.brick_xy
 
         need_dense = (
@@ -1688,6 +2009,7 @@ class SparseWorld3DV8Runner:
                     self._last_dt = dt_cur.clone()
                 if is_spatial_laws and self._last_spatial_laws is not None:
                     self._last_spatial_laws.copy_(laws_cur)
+                self._last_law_mode = law_mode
                 return self._last_horiz, self._last_z_flux_pad[:-1], self._last_z, 0.0
 
             if active_frac < self.sparse_threshold:
@@ -1697,18 +2019,30 @@ class SparseWorld3DV8Runner:
                 dt_5d = dt_cur.transpose(0, 1).unsqueeze(0)
                 pad3 = (self.halo_xy, self.halo_xy, self.halo_xy, self.halo_xy, self.halo_z, self.halo_z + 1)
                 x_pad = F.pad(x_5d, pad3, mode="replicate")[0]
-                dt_pad = F.pad(dt_5d, pad3, mode="replicate")[0]
-
                 ux = x_pad.unfold(1, self.patch_z, Bz).unfold(2, self.patch_xy, By).unfold(3, self.patch_xy, Bx)
-                udt = dt_pad.unfold(1, self.patch_z, Bz).unfold(2, self.patch_xy, By).unfold(3, self.patch_xy, Bx)
                 patches_x = ux.permute(1, 2, 3, 0, 4, 5, 6)[tz, ty, tx].contiguous()
-                patches_dt = udt.permute(1, 2, 3, 0, 4, 5, 6)[tz, ty, tx].contiguous()
+                del ux, x_pad, x_5d
 
-                if is_spatial_laws:
+                dt_pad = F.pad(dt_5d, pad3, mode="replicate")[0]
+                udt = dt_pad.unfold(1, self.patch_z, Bz).unfold(2, self.patch_xy, By).unfold(3, self.patch_xy, Bx)
+                patches_dt = udt.permute(1, 2, 3, 0, 4, 5, 6)[tz, ty, tx].contiguous()
+                del udt, dt_pad, dt_5d
+
+                if law_mode == "spatial_3d":
+                    laws_pad = F.pad(laws_cur.unsqueeze(0), pad3, mode="replicate")[0]  # [6, L+2hz+1, H+2h, W+2h]
+                    ulaw = (
+                        laws_pad.unfold(1, self.patch_z, Bz)
+                        .unfold(2, self.patch_xy, By)
+                        .unfold(3, self.patch_xy, Bx)
+                    )  # [6, nz, ny, nx, Zp, Hp, Wp]
+                    patches_laws: torch.Tensor | None = ulaw.permute(1, 2, 3, 0, 4, 5, 6)[tz, ty, tx].contiguous()
+                    del ulaw, laws_pad
+                elif law_mode == "spatial_2d":
                     pad2 = (self.halo_xy, self.halo_xy, self.halo_xy, self.halo_xy)
                     laws_pad = F.pad(laws_cur.unsqueeze(0), pad2, mode="replicate")[0]  # [6, H+2h, W+2h]
                     ulaw = laws_pad.unfold(1, self.patch_xy, By).unfold(2, self.patch_xy, Bx)  # [6, ny, nx, Hp, Wp]
                     patches_laws = ulaw.permute(1, 2, 0, 3, 4)[ty, tx].contiguous()  # [k, 6, Hp, Wp]
+                    del ulaw, laws_pad
                 else:
                     patches_laws = None
 
@@ -1724,17 +2058,28 @@ class SparseWorld3DV8Runner:
                     )
                     coords_run = torch.cat([coords, coords.new_zeros((n_ex, 3))], dim=0)
                     if patches_laws is not None:
-                        def_law = torch.tensor(
-                            DEFAULT_WORLD_LAWS, dtype=patches_laws.dtype, device=patches_laws.device
-                        ).view(1, LAW_DIM, 1, 1).expand(n_ex, LAW_DIM, self.patch_xy, self.patch_xy)
+                        if law_mode == "spatial_3d":
+                            def_law = (
+                                torch.tensor(DEFAULT_WORLD_LAWS, dtype=patches_laws.dtype, device=patches_laws.device)
+                                .view(1, LAW_DIM, 1, 1, 1)
+                                .expand(n_ex, LAW_DIM, self.patch_z, self.patch_xy, self.patch_xy)
+                            )
+                        else:
+                            def_law = (
+                                torch.tensor(DEFAULT_WORLD_LAWS, dtype=patches_laws.dtype, device=patches_laws.device)
+                                .view(1, LAW_DIM, 1, 1)
+                                .expand(n_ex, LAW_DIM, self.patch_xy, self.patch_xy)
+                            )
                         laws_run = torch.cat([patches_laws, def_law], dim=0)
                     else:
                         laws_run = laws_cur
+                    del patches_x, patches_dt, patches_laws
                 else:
                     patches_x_run = patches_x
                     patches_dt_run = patches_dt
                     coords_run = coords
                     laws_run = patches_laws if patches_laws is not None else laws_cur
+                    del patches_x, patches_dt, patches_laws
 
                 k_r = int(coords_run.shape[0])
                 rtz, rty, rtx = coords_run[:, 0], coords_run[:, 1], coords_run[:, 2]
@@ -1745,14 +2090,21 @@ class SparseWorld3DV8Runner:
                 m_x0 = (rtx == 0).view(k_r, 1, 1, 1, 1)
                 m_x1 = (rtx == (nx - 1)).view(k_r, 1, 1, 1, 1)
 
+                out_ch = self._last_horiz.shape[1]
+                zf_ch = self._last_z_flux_pad.shape[1]
+                z_ch = self._last_z.shape[1]
+                horiz_grid = self._last_horiz.view(nz, Bz, out_ch, ny, By, nx, Bx).permute(0, 3, 5, 1, 2, 4, 6)
+                zflux_grid = self._last_z_flux_pad.view(nz, Bz, zf_ch, ny, By, nx, Bx).permute(0, 3, 5, 1, 2, 4, 6)
+                zlat_grid = self._last_z.view(nz, Bz, z_ch, ny, By, nx, Bx).permute(0, 3, 5, 1, 2, 4, 6)
+
                 if self.max_bricks_per_batch > 0 and k_r > self.max_bricks_per_batch:
                     mb = self.max_bricks_per_batch
-                    yh_chunks: list[torch.Tensor] = []
-                    yzf_chunks: list[torch.Tensor] = []
-                    yz_chunks: list[torch.Tensor] = []
                     for s0 in range(0, k_r, mb):
                         s1 = min(s0 + mb, k_r)
-                        cur_n = s1 - s0
+                        valid_end = min(s1, k)
+                        if valid_end <= s0:
+                            break
+                        valid_n = valid_end - s0
                         px_c = patches_x_run[s0:s1]
                         pdt_c = patches_dt_run[s0:s1]
                         plaw_c = laws_run[s0:s1] if is_spatial_laws else laws_run
@@ -1762,103 +2114,73 @@ class SparseWorld3DV8Runner:
                         my1_c = m_y1[s0:s1]
                         mx0_c = m_x0[s0:s1]
                         mx1_c = m_x1[s0:s1]
-                        if cur_n < mb:
-                            pad_n = mb - cur_n
-                            px_c = torch.cat([px_c, px_c.new_zeros((pad_n,) + px_c.shape[1:])], dim=0)
-                            pdt_c = torch.cat([pdt_c, pdt_c.new_ones((pad_n,) + pdt_c.shape[1:])], dim=0)
-                            if is_spatial_laws:
-                                plaw_c = torch.cat([plaw_c, plaw_c[:1].expand((pad_n,) + plaw_c.shape[1:])], dim=0)
-                            zbool = mz0_c.new_zeros((pad_n, 1, 1, 1, 1))
-                            mz0_c = torch.cat([mz0_c, zbool], dim=0)
-                            mz1_c = torch.cat([mz1_c, zbool], dim=0)
-                            my0_c = torch.cat([my0_c, zbool], dim=0)
-                            my1_c = torch.cat([my1_c, zbool], dim=0)
-                            mx0_c = torch.cat([mx0_c, zbool], dim=0)
-                            mx1_c = torch.cat([mx1_c, zbool], dim=0)
-                        if self.device.type == "cuda" and hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                            torch.compiler.cudagraph_mark_step_begin()
-                        if is_spatial_laws:
-                            try:
-                                ch, czf, cz = self._brick_mod_spatial(
-                                    px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c
-                                )
-                            except Exception:
-                                self._brick_mod_spatial = _CompiledBrickModuleV8(
-                                    self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
-                                ).eval()
-                                ch, czf, cz = self._brick_mod_spatial(
-                                    px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c
-                                )
-                        else:
-                            try:
-                                ch, czf, cz = self._brick_mod(
-                                    px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c
-                                )
-                            except Exception:
-                                self._brick_mod = _CompiledBrickModuleV8(
-                                    self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
-                                ).eval()
-                                ch, czf, cz = self._brick_mod(
-                                    px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c
-                                )
-                        yh_chunks.append(ch[:cur_n].clone())
-                        yzf_chunks.append(czf[:cur_n].clone())
-                        yz_chunks.append(cz[:cur_n].clone())
-                    y_horiz = torch.cat(yh_chunks, dim=0)
-                    y_z_flux = torch.cat(yzf_chunks, dim=0)
-                    y_z = torch.cat(yz_chunks, dim=0)
+                        ch, czf, cz = self._run_brick_module(
+                            law_mode, px_c, pdt_c, plaw_c, mz0_c, mz1_c, my0_c, my1_c, mx0_c, mx1_c
+                        )
+                        tz_c, ty_c, tx_c = tz[s0:valid_end], ty[s0:valid_end], tx[s0:valid_end]
+                        horiz_grid[tz_c, ty_c, tx_c] = ch[:valid_n]
+                        zflux_grid[tz_c, ty_c, tx_c] = czf[:valid_n]
+                        zlat_grid[tz_c, ty_c, tx_c] = cz[:valid_n]
+                        del ch, czf, cz
                 else:
-                    if self.device.type == "cuda" and hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                    if self.max_bricks_per_batch == 0 and self.device.type == "cuda" and hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                         torch.compiler.cudagraph_mark_step_begin()
-                    if is_spatial_laws:
-                        try:
-                            y_horiz, y_z_flux, y_z = self._brick_mod_spatial(
-                                patches_x_run, patches_dt_run, laws_run, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1
-                            )
-                        except Exception:
-                            self._brick_mod_spatial = _CompiledBrickModuleV8(
-                                self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
-                            ).eval()
-                            y_horiz, y_z_flux, y_z = self._brick_mod_spatial(
-                                patches_x_run, patches_dt_run, laws_run, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1
-                            )
-                    else:
-                        try:
-                            y_horiz, y_z_flux, y_z = self._brick_mod(
-                                patches_x_run, patches_dt_run, laws_run, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1
-                            )
-                        except Exception:
-                            self._brick_mod = _CompiledBrickModuleV8(
-                                self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
-                            ).eval()
-                            y_horiz, y_z_flux, y_z = self._brick_mod(
-                                patches_x_run, patches_dt_run, laws_run, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1
-                            )
-                if k_pad > k:
-                    y_horiz = y_horiz[:k]
-                    y_z_flux = y_z_flux[:k]
-                    y_z = y_z[:k]
+                    y_horiz, y_z_flux, y_z = self._run_brick_module(
+                        law_mode, patches_x_run, patches_dt_run, laws_run, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1
+                    )
+                    if k_pad > k:
+                        y_horiz = y_horiz[:k]
+                        y_z_flux = y_z_flux[:k]
+                        y_z = y_z[:k]
+                    horiz_grid[tz, ty, tx] = y_horiz
+                    zflux_grid[tz, ty, tx] = y_z_flux
+                    zlat_grid[tz, ty, tx] = y_z
 
-                out_ch = self._last_horiz.shape[1]
-                zf_ch = self._last_z_flux_pad.shape[1]
-                z_ch = self._last_z.shape[1]
-
-                self._last_horiz.view(nz, Bz, out_ch, ny, By, nx, Bx).permute(0, 3, 5, 1, 2, 4, 6)[tz, ty, tx] = y_horiz
-                self._last_z_flux_pad.view(nz, Bz, zf_ch, ny, By, nx, Bx).permute(0, 3, 5, 1, 2, 4, 6)[tz, ty, tx] = y_z_flux
-                self._last_z.view(nz, Bz, z_ch, ny, By, nx, Bx).permute(0, 3, 5, 1, 2, 4, 6)[tz, ty, tx] = y_z
-
-                self._last_x.copy_(x_cur)
+                if self._last_x is not x_cur:
+                    self._last_x.copy_(x_cur)
                 if self._last_dt is not None and self._last_dt.shape == dt_cur.shape:
                     self._last_dt.copy_(dt_cur)
                 else:
                     self._last_dt = dt_cur.clone()
-                if is_spatial_laws and self._last_spatial_laws is not None:
+                if is_spatial_laws and self._last_spatial_laws is not None and self._last_spatial_laws is not laws_cur:
                     self._last_spatial_laws.copy_(laws_cur)
+                self._last_law_mode = law_mode
                 return self._last_horiz, self._last_z_flux_pad[:-1], self._last_z, active_frac
 
+        if self.max_bricks_per_batch > 0 and L >= 32 and (L % 8 == 0) and (L * H * W) >= (32 * 256 * 256):
+            slab_l = 16 if (L % 16 == 0) else 8
+            self._run_dense_vertical_slabs_inplace(x_cur, dt_cur, laws_cur, law_mode, slab_l=slab_l)
+            if self._last_x is not None and self._last_x.shape == x_cur.shape:
+                if self._last_x is not x_cur:
+                    self._last_x.copy_(x_cur)
+            else:
+                self._last_x = x_cur.clone()
+            if self._last_dt is not None and self._last_dt.shape == dt_cur.shape:
+                self._last_dt.copy_(dt_cur)
+            else:
+                self._last_dt = dt_cur.clone()
+            self._last_law_mode = law_mode
+            if is_spatial_laws:
+                if self._last_spatial_laws is not None and self._last_spatial_laws.shape == laws_cur.shape:
+                    if self._last_spatial_laws is not laws_cur:
+                        self._last_spatial_laws.copy_(laws_cur)
+                else:
+                    self._last_spatial_laws = laws_cur.clone()
+            assert self._last_horiz is not None and self._last_z_flux_pad is not None and self._last_z is not None
+            return self._last_horiz, self._last_z_flux_pad[:-1], self._last_z, 1.0
         if self.device.type == "cuda" and hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
             torch.compiler.cudagraph_mark_step_begin()
-        if is_spatial_laws:
+        if law_mode == "spatial_3d":
+            try:
+                horiz, z_flux, z_world = self._wm_dense_vol(
+                    x_cur, local_dt=dt_cur, world_laws=laws_cur, return_z_flux=True, return_latent=True
+                )
+            except Exception:
+                self._wm_dense_vol = self._wm
+                horiz, z_flux, z_world = self._wm_dense_vol(
+                    x_cur, local_dt=dt_cur, world_laws=laws_cur, return_z_flux=True, return_latent=True
+                )
+        elif law_mode == "spatial_2d":
             try:
                 horiz, z_flux, z_world = self._wm_dense_spatial(
                     x_cur, local_dt=dt_cur, world_laws=laws_cur, return_z_flux=True, return_latent=True
@@ -1889,6 +2211,7 @@ class SparseWorld3DV8Runner:
         self._last_z = z_world.contiguous()
         self._last_x = x_cur.clone()
         self._last_dt = dt_cur.clone()
+        self._last_law_mode = law_mode
         if is_spatial_laws:
             self._last_spatial_laws = laws_cur.clone()
         return self._last_horiz, self._last_z_flux_pad[:-1], self._last_z, 1.0

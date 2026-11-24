@@ -224,7 +224,15 @@ fn compute_sun_shadow_3d(p: vec3<f32>, n: vec3<f32>, rel_pos: vec3<f32>) -> f32 
     }
     let dims = z16.vol_dims.xyz;
     let origin = p + n * 0.42;
-    let taps = array<f32, 6>(0.95, 2.15, 4.0, 6.8, 11.2, 16.8);
+    let tap_scale = clamp(dims.y / 16.0, 1.0, 2.5);
+    let taps = array<f32, 6>(
+        0.95,
+        2.15,
+        4.0 * mix(1.0, tap_scale, 0.35),
+        6.8 * mix(1.0, tap_scale, 0.65),
+        11.2 * tap_scale,
+        16.8 * tap_scale,
+    );
 
     var vis = 1.0;
     for (var i = 0; i < 6; i = i + 1) {
@@ -353,7 +361,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let luma_s = dot(alb_srgb, vec3<f32>(0.299, 0.587, 0.114));
     let steep = smoothstep(0.76, 0.30, abs(n_base.y));
-    let bridge_band = smoothstep(3.2, 4.4, p.y) * smoothstep(9.6 * d_scale, 7.6 * d_scale, p.y);
+    let bridge_band = smoothstep(0.20, 0.28, h_norm) * smoothstep(0.62, 0.50, h_norm);
     // Detect neutral grey/slate stonework vs green turf/brown wood
     let sat_rg = abs(alb_srgb.r - alb_srgb.g) + abs(alb_srgb.g - alb_srgb.b);
     let is_stone_like = smoothstep(0.28, 0.10, sat_rg) * (1.0 - is_green_turf);
@@ -406,19 +414,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         alb_srgb = clamp(alb_srgb * (1.0 + (grain - plank_seam * 0.22) * wood_deck), vec3<f32>(0.0), vec3<f32>(1.0));
     }
 
-    // (3) Snow-Dusted Upward-Facing Alpine Ledges (`N.y > 0.72`) + Crystalline Sparkle!
-    // Keeps lowland tundra/moss & bridge decks richly textured while dusting high alpine ridges & ledges!
-    let overhead_rock = sample_density(p + vec3<f32>(0.0, 2.6, 0.0)).r
-                      + sample_density(p + vec3<f32>(0.0, 4.8, 0.0)).r;
+    // (3) Snow-Dusted Upward-Facing Alpine Ledges (`N.y > 0.72`, normalized `p.y > vol_dims.y * 0.45`) + Sparkle!
+    // Keeps lowland tundra/moss & bridge decks richly textured while dusting alpine ridges & Floating Sky-Islands!
+    let roof_step = clamp(d_scale, 1.0, 3.0);
+    let overhead_rock = sample_density(p + vec3<f32>(0.0, 2.6 * roof_step, 0.0)).r
+                      + sample_density(p + vec3<f32>(0.0, 4.8 * roof_step, 0.0)).r
+                      + select(0.0, sample_density(p + vec3<f32>(0.0, 8.5, 0.0)).r, z16.vol_dims.y >= 48.0);
     let exposed_sky = 1.0 - smoothstep(0.30, 0.90, overhead_rock);
     if (style_id == 0) {
         let snow_ledge = smoothstep(0.72, 0.88, n_base.y)
-                       * smoothstep(0.48, 0.72, h_norm + (macro_n - 0.5) * 0.22)
+                       * smoothstep(0.45, 0.68, h_norm + (macro_n - 0.5) * 0.18)
                        * exposed_sky
                        * (1.0 - is_bridge_deck * 0.92)
                        * (1.0 - wood_deck * 0.92)
                        * (1.0 - smoothstep(0.16, 0.40, glow));
-        let high_snow = smoothstep(0.64, 0.84, luma_s) * smoothstep(0.46, 0.64, h_norm) * smoothstep(0.55, 0.82, n_base.y);
+        let high_snow = smoothstep(0.64, 0.84, luma_s) * smoothstep(0.45, 0.64, h_norm) * smoothstep(0.55, 0.82, n_base.y);
         let snow_w = clamp(max(snow_ledge * 0.62, high_snow * 0.72), 0.0, 1.0);
         if (snow_w > 0.04) {
             let speck = hash2(floor(p.xz * 7.2) + floor(p.y * 4.5));
@@ -428,7 +438,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             rough = mix(rough, 0.28, snow_w * 0.45);
         }
     } else {
-        let snow_w = smoothstep(0.60, 0.80, luma_s) * smoothstep(0.48, 0.62, h_norm) * smoothstep(0.40, 0.80, n_base.y);
+        let snow_w = smoothstep(0.60, 0.80, luma_s) * smoothstep(0.45, 0.62, h_norm) * smoothstep(0.40, 0.80, n_base.y);
         if (snow_w > 0.05) {
             let speck = hash2(floor(p.xz * 6.5) + floor(p.y * 4.0));
             let sparkle = step(0.91, speck) * 0.22 * snow_w;
@@ -450,8 +460,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let crack_n = triplanar_fbm(p + vec3<f32>(0.0, -sim_t * 0.16, 0.0), n_base, 1.55);
         let crack_sharp = 1.0 - smoothstep(0.015, 0.085, abs(crack_n - 0.50));
         let pulse = 0.82 + 0.18 * sin(sim_t * 3.4 + p.x * 0.5 + p.z * 0.5);
-        let hot_fissure = smoothstep(0.52, 0.72, raw_thermal);
-        let crack_boost = select(0.0, crack_sharp * 0.45 * smoothstep(0.42, 0.12, h_norm), style_id == 1);
+        let hot_fissure = smoothstep(0.56, 0.78, raw_thermal);
+        let crack_boost = select(0.0, crack_sharp * 0.24 * smoothstep(0.32, 0.08, h_norm), style_id == 1);
         if (hot_fissure > 0.02) {
             // Charred obsidian edge framing glowing molten veins
             let char_rim = smoothstep(0.14, 0.06, abs(crack_n - 0.50)) * (1.0 - crack_sharp);
@@ -513,8 +523,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let direct = u.sun_col.rgb * light_scalar * 1.02;
     let bounce_emit = compute_emissive_bounce_3d(p, n_base, style_id);
 
-    // Subterranean vaulted cavern lighting + Cool Turquoise / Amethyst Crystal Shimmer (`p.y < 6.0` enclosed)!
-    let in_cave = smoothstep(0.38, 1.10, overhead_rock) * smoothstep(6.2 * d_scale, 2.2 * d_scale, p.y);
+    // Subterranean vaulted cavern lighting + Cool Turquoise / Amethyst Crystal Shimmer (`p.y < vol_dims.y * 0.28`)!
+    let in_cave = smoothstep(0.32, 1.05, overhead_rock)
+                * smoothstep(z16.vol_dims.y * 0.28, z16.vol_dims.y * 0.10, p.y);
     var cave_lit = vec3<f32>(0.0);
     if (in_cave > 0.02) {
         let cave_albedo = max(albedo, vec3<f32>(0.085, 0.095, 0.125));
@@ -539,7 +550,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         cave_lit = (cave_albedo * (magma_glow_amb + cavern_rim + bounce_emit * 2.2) + crystal_emit * 1.15) * in_cave;
     }
 
-    var hdr = albedo * (direct + ambient * 0.78 + bounce_emit) + cave_lit + magma_emit + u.sun_col.rgb * spec;
+    // Upper Sky-Island cloud-lit mist & underside sky-bounce illumination (`p.y > vol_dims.y * 0.62`, Z>=48)
+    var sky_island_lit = vec3<f32>(0.0);
+    if (z16.vol_dims.y >= 48.0 && h_norm > 0.58) {
+        let sky_w_alt = smoothstep(0.58, 0.82, h_norm);
+        let underside = max(-n.y, 0.0) * 0.55 + pow(1.0 - ndv, 2.2) * 0.38;
+        let mist_col = mix(z16.sky_horizon.rgb, z16.sky_top.rgb * 1.35 + u.sun_col.rgb * 0.32, 0.45);
+        sky_island_lit = albedo * mist_col * (0.20 + underside * 0.58) * sky_w_alt;
+    }
+
+    var hdr = albedo * (direct + ambient * 0.78 + bounce_emit) + cave_lit + sky_island_lit + magma_emit + u.sun_col.rgb * spec;
 
     // 8 dynamic point lights (live wildfires, spells, shrines, golden relic, time domes)
     for (var i: u32 = 0u; i < 8u; i = i + 1u) {
@@ -592,8 +612,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         hdr += rim_col * cutaway_rim * 0.65;
     }
 
-    // Distance atmospheric perspective fog matching the active style sky
-    let fog_t = clamp((hit_t - 68.0) / 190.0, 0.0, 0.68);
+    // Distance atmospheric perspective fog matching the active style sky (scaled for tall Z=64 vistas!)
+    let fog_start = 68.0 * clamp(z16.vol_dims.y / 24.0, 1.0, 2.2);
+    let fog_span = 190.0 * clamp(z16.vol_dims.y / 24.0, 1.0, 2.0);
+    let fog_t = clamp((hit_t - fog_start) / fog_span, 0.0, 0.64);
     let fog_col = eval_sky(vec3<f32>(rd.x, max(rd.y, 0.04), rd.z));
     hdr = mix(hdr, fog_col, fog_t * fog_t * (1.0 - clamp(glow, 0.0, 0.85)));
 

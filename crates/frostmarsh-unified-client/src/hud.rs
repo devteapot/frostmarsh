@@ -333,7 +333,21 @@ pub fn build_hud(
         // Shrine world labels
         for s in &ent.shrines {
             let (wx, wz) = grid_to_xz(s.x, s.y);
-            let gy = sample_g_y(s.x, s.y);
+            let gy = if let Some(z16w) = z16 {
+                if z16w.depth >= 48 {
+                    if s.name.contains("ABYSSAL") {
+                        z16w.sample_surface_y_near(s.x, s.y, 10.0)
+                    } else if s.name.contains("VIADUCT") {
+                        z16w.sample_surface_y_near(s.x, s.y, 35.0)
+                    } else {
+                        z16w.sample_surface_y(s.x, s.y)
+                    }
+                } else {
+                    z16w.sample_surface_y(s.x, s.y)
+                }
+            } else {
+                sample_g_y(s.x, s.y)
+            };
             let rel = Vec3::new(wx, gy + 5.8, wz) - mats.origin;
             if let Some((sx, sy)) = project_world(rel, mats, sw, sh) {
                 let bw = 72.0 * ui;

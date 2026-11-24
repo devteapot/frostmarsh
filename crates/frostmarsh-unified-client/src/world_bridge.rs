@@ -1406,7 +1406,8 @@ pub fn assemble_live_frame(
     show_squad_links: bool,
 ) -> AssembledFrame {
     let origin = mats.origin;
-    let cull_rad = (cam_dist * 1.95 + 42.0).max(96.0);
+    let z_depth = z16.map(|z| z.depth).unwrap_or(world.grid_d);
+    let cull_rad = (cam_dist * 1.95 + if z_depth >= 48 { 88.0 } else { 42.0 }).max(if z_depth >= 48 { 160.0 } else { 96.0 });
     let cull_r2 = cull_rad * cull_rad;
 
     let mut terrain_verts = Vec::with_capacity(if z16.is_some() { 0 } else { 48_000 });
@@ -1425,6 +1426,20 @@ pub fn assemble_live_frame(
     };
     let sample_g_y = |gx: f32, gy: f32| -> f32 {
         if let Some(z16w) = z16 {
+            z16w.sample_surface_y(gx, gy)
+        } else {
+            world.sample_ground_y(gx, gy)
+        }
+    };
+    let sample_shrine_y = |gx: f32, gy: f32, name: &str| -> f32 {
+        if let Some(z16w) = z16 {
+            if z16w.depth >= 48 {
+                if name.contains("ABYSSAL") {
+                    return z16w.sample_surface_y_near(gx, gy, 10.0);
+                } else if name.contains("VIADUCT") {
+                    return z16w.sample_surface_y_near(gx, gy, 35.0);
+                }
+            }
             z16w.sample_surface_y(gx, gy)
         } else {
             world.sample_ground_y(gx, gy)
@@ -1588,7 +1603,7 @@ pub fn assemble_live_frame(
         // 3 Capturable Elemental Shrines
         for s in &ent.shrines {
             let (wx, wz) = grid_to_xz(s.x, s.y);
-            let gy = sample_g_y(s.x, s.y);
+            let gy = sample_shrine_y(s.x, s.y, &s.name);
             let rel = Vec3::new(wx, gy - 0.05, wz) - origin;
             let scol = if s.progress < -0.15 {
                 let t = (-s.progress).clamp(0.0, 1.0);
@@ -1949,7 +1964,8 @@ pub fn assemble_live_frame(
 
                     // Visible rising helical Thermal Updraft column under soaring Skywings!
                     if soaring_high || airborne {
-                        let col_h = (gy - ground_y).clamp(1.4, 7.5);
+                        let max_col_h = if z_depth >= 48 { 18.0 } else { 7.5 };
+                        let col_h = (gy - ground_y).clamp(1.4, max_col_h);
                         for k in 0..3 {
                             let t_cyc = (sim_time * 1.30 + phase * 0.37 + k as f32 * 0.333).fract();
                             let th_y = ground_y + 0.35 + t_cyc * col_h;
@@ -2588,7 +2604,9 @@ pub fn assemble_live_frame(
         let h2 = hash2i(m * 19 + 5, 733);
         let drift_x = (h0 * 76.0 + sim_time * (2.6 + h2 * 2.4)).rem_euclid(76.0) - 38.0;
         let drift_z = (h1 * 76.0 + sim_time * (1.2 + h0 * 1.5)).rem_euclid(76.0) - 38.0;
-        let fall_y = (14.0 - (h2 * 14.0 + sim_time * (1.4 + h1 * 1.2)).rem_euclid(14.0)) + 1.2;
+        let mote_span_y = if z_depth >= 48 { 28.0 } else { 14.0 };
+        let base_y = (cam_target.y - mote_span_y * 0.4).max(1.2);
+        let fall_y = (mote_span_y - (h2 * mote_span_y + sim_time * (1.4 + h1 * 1.2)).rem_euclid(mote_span_y)) + base_y;
         let rel = Vec3::new(cam_target.x + drift_x, fall_y, cam_target.z + drift_z) - origin;
         vol_splats.push(VolSplat {
             pos_rad: [rel.x, rel.y, rel.z, if weather_kind == 1 { 0.28 } else { 0.20 }],

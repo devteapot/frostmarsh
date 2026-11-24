@@ -652,13 +652,20 @@ impl WsBridge {
         let cx_mid = (self.chunks_x as f32) * 0.5 - 0.5;
         let cy_mid = (self.chunks_y as f32) * 0.5 - 0.5;
         let depth_u8 = depth.min(u8::MAX as u16) as u8;
+        // Scale initial full-brick pacing smoothly when depth > 32 (e.g. Z=64 -> 128 KB/column)
+        // so browser clients never experience sudden initial bandwidth spikes.
+        let effective_initial_per_peer = if depth > 32 {
+            (max_initial_per_peer / ((depth as usize) / 16).max(1)).max(2)
+        } else {
+            max_initial_per_peer
+        };
 
         for (&pid, peer) in peers.iter_mut() {
             let mut is_dead = false;
 
             // 1. Stream paced initial full-sync 0x01 bricks (center-outward)
             let mut sent_init = 0usize;
-            while sent_init < max_initial_per_peer {
+            while sent_init < effective_initial_per_peer {
                 let Some((bx, by)) = peer.pending_initial_bricks.pop_front() else {
                     break;
                 };

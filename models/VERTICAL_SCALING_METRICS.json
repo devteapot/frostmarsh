@@ -1,0 +1,312 @@
+{
+  "wave": "26A",
+  "title": "Vertical Scaling GPU/ML: 3D Altitude-Varying World Laws, HALO_Z=3 Sharding & Z=16..128 GPU Scaling",
+  "checkpoint": "/home/gooning/.t3/scratch/frostmarsh-ml/world_model_3d_v8.pt",
+  "world_model_params": 164622,
+  "parity": {
+    "halo_z": 3,
+    "default_law_features_max_abs": {
+      "global_1d": 0.0,
+      "spatial_2d": 0.0,
+      "volumetric_3d": 0.0
+    },
+    "global_vs_uniform_3d_max_abs": 0.0,
+    "spatial_2d_vs_uniform_3d_max_abs": 0.0,
+    "vertical_sharding_64x64x64_4x16": {
+      "grid_shape": [
+        64,
+        64,
+        64
+      ],
+      "num_slabs": 4,
+      "slab_layers": 16,
+      "halo_z": 3,
+      "fp32": {
+        "max_abs_diff_horiz": 3.814697265625e-06,
+        "max_abs_diff_z_flux": 5.960464477539063e-08,
+        "max_abs_diff_z_world_3d": 3.5762786865234375e-07,
+        "max_rel_diff_horiz": 9.692712892442195e-08,
+        "max_rel_diff_z_flux": 1.3954245146504225e-07,
+        "max_rel_diff_z_world_3d": 6.53396616973676e-08,
+        "max_rel_diff_all": 1.3954245146504225e-07,
+        "passed_1e6_rel_gate": true
+      },
+      "fp64_exact": {
+        "max_abs_diff_horiz": 3.552713678800501e-15,
+        "max_abs_diff_z_flux": 5.551115123125783e-17,
+        "max_abs_diff_z_world_3d": 4.440892098500626e-16,
+        "max_abs_diff_all": 3.552713678800501e-15,
+        "passed_1e13_algebraic_gate": true
+      }
+    },
+    "vertical_sharding_128x48x48_4x32": {
+      "grid_shape": [
+        128,
+        48,
+        48
+      ],
+      "num_slabs": 4,
+      "slab_layers": 32,
+      "halo_z": 3,
+      "fp32": {
+        "max_abs_diff_horiz": 7.62939453125e-06,
+        "max_abs_diff_z_flux": 1.1920928955078125e-07,
+        "max_abs_diff_z_world_3d": 4.76837158203125e-07,
+        "max_rel_diff_horiz": 1.8085493200894473e-07,
+        "max_rel_diff_z_flux": 2.546184768098902e-07,
+        "max_rel_diff_z_world_3d": 8.776836384059264e-08,
+        "max_rel_diff_all": 2.546184768098902e-07,
+        "passed_1e6_rel_gate": true
+      },
+      "fp64_exact": {
+        "max_abs_diff_horiz": 1.5785983631388945e-15,
+        "max_abs_diff_z_flux": 2.7755575615628914e-17,
+        "max_abs_diff_z_world_3d": 4.440892098500626e-16,
+        "max_abs_diff_all": 1.5785983631388945e-15,
+        "passed_1e13_algebraic_gate": true
+      }
+    },
+    "sparse_runner_3d_laws_64x64x64_fp32": {
+      "grid_shape": [
+        64,
+        64,
+        64
+      ],
+      "active_brick_frac": 0.2109,
+      "max_abs_diff_horiz": 2.86102294921875e-06,
+      "max_abs_diff_z_flux": 1.1920928955078125e-07,
+      "max_abs_diff_z_world_3d": 4.76837158203125e-07,
+      "max_rel_diff_all": 1.1920928955078125e-07,
+      "passed_1e6_rel_gate": true
+    }
+  },
+  "gpu_benchmark": {
+    "device": "NVIDIA GB10",
+    "dtype": "fp16",
+    "grid_xy": [
+      256,
+      256
+    ],
+    "max_bricks_per_batch": 192,
+    "model_params": 164622,
+    "depths": {
+      "Z=16": {
+        "L": 16,
+        "H": 256,
+        "W": 256,
+        "world_voxels": 1048576,
+        "voxels_millions": 1.05,
+        "max_bricks_per_batch": 192,
+        "brick_stats": {
+          "total_bricks": 512,
+          "active_bricks": 158,
+          "skipped_bricks": 354,
+          "empty_sky_bricks": 21,
+          "deep_bedrock_bricks": 104,
+          "quiescent_terrain_bricks": 231,
+          "active_pct": 30.86,
+          "skip_pct": 69.14,
+          "sky_plus_bedrock_pct": 24.41
+        },
+        "dense": {
+          "mode": "monolith",
+          "p50_ms": 86.969,
+          "p95_ms": 102.819,
+          "mean_ms": 90.59,
+          "hz_p50": 11.5,
+          "peak_vram_mb": 1123.13
+        },
+        "sparse": {
+          "p50_ms": 85.798,
+          "p95_ms": 131.374,
+          "mean_ms": 97.813,
+          "hz_p50": 11.66,
+          "peak_vram_mb": 1334.1,
+          "speedup_vs_dense": 1.01,
+          "within_10hz_budget": true,
+          "within_3_5gb_vram_budget": true
+        }
+      },
+      "Z=32": {
+        "L": 32,
+        "H": 256,
+        "W": 256,
+        "world_voxels": 2097152,
+        "voxels_millions": 2.1,
+        "max_bricks_per_batch": 192,
+        "brick_stats": {
+          "total_bricks": 1024,
+          "active_bricks": 187,
+          "skipped_bricks": 837,
+          "empty_sky_bricks": 125,
+          "deep_bedrock_bricks": 295,
+          "quiescent_terrain_bricks": 420,
+          "active_pct": 18.26,
+          "skip_pct": 81.74,
+          "sky_plus_bedrock_pct": 41.02
+        },
+        "dense": {
+          "mode": "monolith",
+          "p50_ms": 172.593,
+          "p95_ms": 254.898,
+          "mean_ms": 179.818,
+          "hz_p50": 5.79,
+          "peak_vram_mb": 2233.13
+        },
+        "sparse": {
+          "p50_ms": 109.463,
+          "p95_ms": 152.868,
+          "mean_ms": 116.905,
+          "hz_p50": 9.14,
+          "peak_vram_mb": 1867.5,
+          "speedup_vs_dense": 1.58,
+          "within_10hz_budget": false,
+          "within_3_5gb_vram_budget": true
+        }
+      },
+      "Z=64": {
+        "L": 64,
+        "H": 256,
+        "W": 256,
+        "world_voxels": 4194304,
+        "voxels_millions": 4.19,
+        "max_bricks_per_batch": 192,
+        "brick_stats": {
+          "total_bricks": 2048,
+          "active_bricks": 260,
+          "skipped_bricks": 1788,
+          "empty_sky_bricks": 617,
+          "deep_bedrock_bricks": 654,
+          "quiescent_terrain_bricks": 520,
+          "active_pct": 12.7,
+          "skip_pct": 87.3,
+          "sky_plus_bedrock_pct": 62.06
+        },
+        "dense": {
+          "mode": "4x16_vertical_slabs_halo_z3",
+          "p50_ms": 479.712,
+          "p95_ms": 556.379,
+          "mean_ms": 490.398,
+          "hz_p50": 2.08,
+          "peak_vram_mb": 2103.04
+        },
+        "sparse": {
+          "p50_ms": 163.461,
+          "p95_ms": 244.64,
+          "mean_ms": 175.734,
+          "hz_p50": 6.12,
+          "peak_vram_mb": 2374.81,
+          "speedup_vs_dense": 2.93,
+          "within_10hz_budget": false,
+          "within_3_5gb_vram_budget": true
+        }
+      },
+      "Z=128": {
+        "L": 128,
+        "H": 256,
+        "W": 256,
+        "world_voxels": 8388608,
+        "voxels_millions": 8.39,
+        "max_bricks_per_batch": 192,
+        "brick_stats": {
+          "total_bricks": 4096,
+          "active_bricks": 382,
+          "skipped_bricks": 3714,
+          "empty_sky_bricks": 1167,
+          "deep_bedrock_bricks": 1470,
+          "quiescent_terrain_bricks": 1078,
+          "active_pct": 9.33,
+          "skip_pct": 90.67,
+          "sky_plus_bedrock_pct": 64.38
+        },
+        "dense": {
+          "mode": "8x16_vertical_slabs_halo_z3",
+          "p50_ms": 1027.741,
+          "p95_ms": 1071.557,
+          "mean_ms": 1013.422,
+          "hz_p50": 0.97,
+          "peak_vram_mb": 2753.16
+        },
+        "sparse": {
+          "p50_ms": 220.786,
+          "p95_ms": 288.709,
+          "mean_ms": 228.538,
+          "hz_p50": 4.53,
+          "peak_vram_mb": 3396.65,
+          "speedup_vs_dense": 4.65,
+          "within_10hz_budget": false,
+          "within_3_5gb_vram_budget": true
+        }
+      }
+    },
+    "vertical_halo_bandwidth": {
+      "Z=64_4x16_slabs": {
+        "grid_shape": [
+          64,
+          256,
+          256
+        ],
+        "num_slabs": 4,
+        "num_seams": 3,
+        "halo_z": 3,
+        "total_halo_voxels_per_tick": 1179648,
+        "mean_active_seam_voxel_pct": 1.63,
+        "raw_fp16_18ch_kb_per_tick": 41472.0,
+        "zlib_full_18ch_kb_per_tick": 424.6,
+        "zlib_delta_18ch_kb_per_tick": 277.86,
+        "raw_fp16_11ch_kb_per_tick": 25344.0,
+        "zlib_full_11ch_kb_per_tick": 252.67,
+        "zlib_delta_11ch_kb_per_tick": 166.32,
+        "zlib_delta_18ch_mb_per_sec_at_10hz": 2.713,
+        "zlib_delta_11ch_mb_per_sec_at_10hz": 1.624,
+        "seam_latent_1slice_raw_fp16_kb": 18432.0
+      },
+      "Z=128_4x32_slabs": {
+        "grid_shape": [
+          128,
+          256,
+          256
+        ],
+        "num_slabs": 4,
+        "num_seams": 3,
+        "halo_z": 3,
+        "total_halo_voxels_per_tick": 1179648,
+        "mean_active_seam_voxel_pct": 0.99,
+        "raw_fp16_18ch_kb_per_tick": 41472.0,
+        "zlib_full_18ch_kb_per_tick": 387.42,
+        "zlib_delta_18ch_kb_per_tick": 244.96,
+        "raw_fp16_11ch_kb_per_tick": 25344.0,
+        "zlib_full_11ch_kb_per_tick": 229.88,
+        "zlib_delta_11ch_kb_per_tick": 149.34,
+        "zlib_delta_18ch_mb_per_sec_at_10hz": 2.392,
+        "zlib_delta_11ch_mb_per_sec_at_10hz": 1.458,
+        "seam_latent_1slice_raw_fp16_kb": 18432.0
+      }
+    }
+  },
+  "daemon_z64_readiness": {
+    "grid_shape": [
+      64,
+      256,
+      256
+    ],
+    "max_bricks_per_batch": 192,
+    "op11_dense_step0_ms": 1222.876,
+    "op11_sparse_step1_ms": 36.681,
+    "op11_sparse_step1_active_frac": 0.0039,
+    "op9_step_ms": 995.576,
+    "op11_peak_vram_mb": 2332.55,
+    "op11_under_2_5gb_vram": true,
+    "op10_actuator_v3_60bots_ms": 5.266,
+    "op10_out_shape": [
+      60,
+      28
+    ],
+    "op6_pool_4strata_ms": 4.21,
+    "op6_total_ms": 42.152,
+    "op6_status": "live_acoustic_engine_ok",
+    "op6_bubbles_or_replies": 8,
+    "combined_peak_vram_mb": 2332.55,
+    "passed": true
+  }
+}

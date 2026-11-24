@@ -374,6 +374,28 @@ pub enum ServerDatagram {
         tick: u64,
         lz4_deltas: Vec<u8>,
     },
+    /// 10 Hz LZ4-compressed `16×16×sub_depth` cubic 3D sub-brick (`bz = 0..total_depth.div_ceil(16)`),
+    /// streamed when `total_depth > 32` (e.g. `Z=64`) while skipping pure empty sky & deep bedrock cubes!
+    VolumetricSubBrick3D {
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_density_mat: Vec<u8>,
+        lz4_albedo_thermal: Vec<u8>,
+    },
+    /// 10 Hz sparse temporal delta for a `16×16×sub_depth` cubic 3D sub-brick (`(u16 idx, dm[4], at[4])` × N, LZ4).
+    VolumetricSubBrick3DDelta {
+        bx: u16,
+        by: u16,
+        bz: u16,
+        total_depth: u16,
+        sub_depth: u8,
+        tick: u64,
+        lz4_deltas: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -418,6 +440,89 @@ pub fn decode_brick3d_lz4(payload: &Brick3DPayload) -> Option<(Vec<u8>, Vec<u8>)
     let density_mat = lz4_flex::decompress_size_prepended(&payload.density_mat_lz4).ok()?;
     let albedo_thermal = lz4_flex::decompress_size_prepended(&payload.albedo_thermal_lz4).ok()?;
     Some((density_mat, albedo_thermal))
+}
+
+/// Compress raw Z-major `[sub_depth][16][16][4]` cubic sub-brick buffers with LZ4.
+pub fn encode_subbrick3d_lz4(density_mat_raw: &[u8], albedo_thermal_raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    (
+        lz4_flex::compress_prepend_size(density_mat_raw),
+        lz4_flex::compress_prepend_size(albedo_thermal_raw),
+    )
+}
+
+/// Decompress `VolumetricSubBrick3D` LZ4 buffers back into raw `(density_mat, albedo_thermal)` RGBA8 bytes.
+pub fn decode_subbrick3d_lz4(
+    lz4_density_mat: &[u8],
+    lz4_albedo_thermal: &[u8],
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let density_mat = lz4_flex::decompress_size_prepended(lz4_density_mat).ok()?;
+    let albedo_thermal = lz4_flex::decompress_size_prepended(lz4_albedo_thermal).ok()?;
+    Some((density_mat, albedo_thermal))
+}
+
+/// Returns `true` if a `16×16×sub_depth` cubic sub-brick is **pure empty sky**:
+/// every voxel has `solid_density == 0`, `fluid_density == 0`, `gas_density == 0`, and `thermal_glow == 0`.
+pub fn is_subbrick_empty_sky(density_rgba: &[u8], albedo_rgba: &[u8]) -> bool {
+    if density_rgba.is_empty() || density_rgba.len() != albedo_rgba.len() || density_rgba.len() % 4 != 0 {
+        return false;
+    }
+    for (dm, at) in density_rgba.chunks_exact(4).zip(albedo_rgba.chunks_exact(4)) {
+        if dm[0] != 0 || dm[1] != 0 || dm[2] != 0 || at[3] != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Returns `true` if a `16×16×sub_depth` cubic sub-brick is **pure uniform opaque solid interior**:
+/// every voxel has `solid_density >= 245`, `fluid_density == 0`, `gas_density == 0`, and
+/// uniform material & thermal spread (`<= 4` across roughness, RGB albedo, and thermal glow).
+pub fn is_subbrick_uniform_solid(density_rgba: &[u8], albedo_rgba: &[u8]) -> bool {
+    if density_rgba.is_empty() || density_rgba.len() != albedo_rgba.len() || density_rgba.len() % 4 != 0 {
+        return false;
+    }
+    let mut min_rough = u8::MAX;
+    let mut max_rough = 0u8;
+    let mut min_r = u8::MAX;
+    let mut max_r = 0u8;
+    let mut min_g = u8::MAX;
+    let mut max_g = 0u8;
+    let mut min_b = u8::MAX;
+    let mut max_b = 0u8;
+    let mut min_t = u8::MAX;
+    let mut max_t = 0u8;
+
+    for (dm, at) in density_rgba.chunks_exact(4).zip(albedo_rgba.chunks_exact(4)) {
+        if dm[0] < 245 || dm[1] != 0 || dm[2] != 0 {
+            return false;
+        }
+        min_rough = min_rough.min(dm[3]);
+        max_rough = max_rough.max(dm[3]);
+        min_r = min_r.min(at[0]);
+        max_r = max_r.max(at[0]);
+        min_g = min_g.min(at[1]);
+        max_g = max_g.max(at[1]);
+        min_b = min_b.min(at[2]);
+        max_b = max_b.max(at[2]);
+        min_t = min_t.min(at[3]);
+        max_t = max_t.max(at[3]);
+        if max_rough - min_rough > 4
+            || max_r - min_r > 4
+            || max_g - min_g > 4
+            || max_b - min_b > 4
+            || max_t - min_t > 4
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Returns `true` if a `16×16×sub_depth` cubic sub-brick is either **pure empty sky** OR
+/// **pure uniform opaque solid interior**, allowing server & client to completely skip sky & deep bedrock cubes.
+pub fn is_subbrick_skippable(density_rgba: &[u8], albedo_rgba: &[u8]) -> bool {
+    is_subbrick_empty_sky(density_rgba, albedo_rgba)
+        || is_subbrick_uniform_solid(density_rgba, albedo_rgba)
 }
 
 /// Default per-channel visual deadzone for temporal 3D brick delta encoding (suppresses sub-4K jitter).
@@ -806,5 +911,142 @@ mod tests {
             is_brick3d_delta_full_signal(&huge_res),
             ">=35% change must signal full-brick fallback"
         );
+    }
+
+    #[test]
+    fn test_subbrick3d_cubic_roundtrip_and_sky_bedrock_skip() {
+        let sub_depth = 16u8;
+        let total_depth = 64u16;
+        let voxels = CHUNK_SIZE * CHUNK_SIZE * (sub_depth as usize);
+        let byte_len = voxels * 4;
+
+        // 1. Pure empty sky cube -> skippable!
+        let mut sky_dm = vec![0u8; byte_len];
+        let mut sky_at = vec![0u8; byte_len];
+        for i in 0..voxels {
+            sky_dm[i * 4 + 3] = 217; // default air roughness from VolumeField
+            sky_at[i * 4] = 92;
+            sky_at[i * 4 + 1] = 102;
+            sky_at[i * 4 + 2] = 112;
+        }
+        assert!(is_subbrick_empty_sky(&sky_dm, &sky_at));
+        assert!(is_subbrick_skippable(&sky_dm, &sky_at));
+
+        // Adding a cloud (gas) or waterfall (fluid) voxel makes sky non-skippable
+        let mut cloud_dm = sky_dm.clone();
+        cloud_dm[100 * 4 + 2] = 64;
+        assert!(!is_subbrick_skippable(&cloud_dm, &sky_at));
+        let mut wf_dm = sky_dm.clone();
+        wf_dm[100 * 4 + 1] = 180;
+        assert!(!is_subbrick_skippable(&wf_dm, &sky_at));
+
+        // 2. Pure uniform solid bedrock cube -> skippable!
+        let mut bed_dm = vec![0u8; byte_len];
+        let mut bed_at = vec![0u8; byte_len];
+        for i in 0..voxels {
+            bed_dm[i * 4] = 250 + (i % 6) as u8; // >= 245
+            bed_dm[i * 4 + 3] = 204 + (i % 3) as u8; // spread <= 4
+            bed_at[i * 4] = 90 + (i % 4) as u8;
+            bed_at[i * 4 + 1] = 94 + (i % 4) as u8;
+            bed_at[i * 4 + 2] = 104 + (i % 4) as u8;
+            bed_at[i * 4 + 3] = (i % 3) as u8; // thermal spread <= 4
+        }
+        assert!(is_subbrick_uniform_solid(&bed_dm, &bed_at));
+        assert!(is_subbrick_skippable(&bed_dm, &bed_at));
+
+        // Thermal hotspot (> 4 spread) or carved cavern void makes solid cube non-skippable
+        let mut hot_bed_at = bed_at.clone();
+        hot_bed_at[50 * 4 + 3] = 120;
+        assert!(!is_subbrick_skippable(&bed_dm, &hot_bed_at));
+        let mut carved_dm = bed_dm.clone();
+        carved_dm[50 * 4] = 0;
+        assert!(!is_subbrick_skippable(&carved_dm, &bed_at));
+
+        // 3. Full VolumetricSubBrick3D LZ4 + datagram roundtrip (e.g. Floating Sky-Island bz=3)
+        let mut island_dm = sky_dm.clone();
+        let mut island_at = sky_at.clone();
+        for z in 2..8 {
+            for dy in 3..13 {
+                for dx in 3..13 {
+                    let o = ((z * CHUNK_SIZE + dy) * CHUNK_SIZE + dx) * 4;
+                    island_dm[o..o + 4].copy_from_slice(&[255, 0, 0, 200]);
+                    island_at[o..o + 4].copy_from_slice(&[72, 118, 66, 0]);
+                }
+            }
+        }
+        assert!(!is_subbrick_skippable(&island_dm, &island_at));
+        let (lz4_dm, lz4_at) = encode_subbrick3d_lz4(&island_dm, &island_at);
+        let pkt = ServerDatagram::VolumetricSubBrick3D {
+            bx: 7,
+            by: 9,
+            bz: 3,
+            total_depth,
+            sub_depth,
+            tick: 123,
+            lz4_density_mat: lz4_dm,
+            lz4_albedo_thermal: lz4_at,
+        };
+        let wire = encode_server_datagram(&pkt);
+        match decode_server_datagram(&wire).expect("decode VolumetricSubBrick3D") {
+            ServerDatagram::VolumetricSubBrick3D {
+                bx,
+                by,
+                bz,
+                total_depth: td,
+                sub_depth: sd,
+                tick,
+                lz4_density_mat,
+                lz4_albedo_thermal,
+            } => {
+                assert_eq!((bx, by, bz, td, sd, tick), (7, 9, 3, 64, 16, 123));
+                let (dm2, at2) =
+                    decode_subbrick3d_lz4(&lz4_density_mat, &lz4_albedo_thermal).expect("decode lz4");
+                assert_eq!(dm2, island_dm);
+                assert_eq!(at2, island_at);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+
+        // 4. Incremental VolumetricSubBrick3DDelta roundtrip on Z=64 cubic sub-brick
+        let mut next_dm = island_dm.clone();
+        let mut next_at = island_at.clone();
+        for k in 0..16usize {
+            let o = (100 + k * 13) * 4;
+            next_dm[o..o + 4].copy_from_slice(&[0, 220, 40, 24]);
+            next_at[o..o + 4].copy_from_slice(&[40, 150, 220, 0]);
+        }
+        let lz4_deltas = encode_brick3d_delta(&island_dm, &island_at, &next_dm, &next_at, 4)
+            .expect("subbrick delta");
+        assert!(!is_brick3d_delta_full_signal(&lz4_deltas));
+        let delta_wire = encode_server_datagram(&ServerDatagram::VolumetricSubBrick3DDelta {
+            bx: 7,
+            by: 9,
+            bz: 3,
+            total_depth,
+            sub_depth,
+            tick: 124,
+            lz4_deltas,
+        });
+        let mut recon_dm = island_dm.clone();
+        let mut recon_at = island_at.clone();
+        match decode_server_datagram(&delta_wire).expect("decode VolumetricSubBrick3DDelta") {
+            ServerDatagram::VolumetricSubBrick3DDelta {
+                bx,
+                by,
+                bz,
+                total_depth: td,
+                sub_depth: sd,
+                tick,
+                lz4_deltas,
+            } => {
+                assert_eq!((bx, by, bz, td, sd, tick), (7, 9, 3, 64, 16, 124));
+                let patched =
+                    apply_brick3d_delta(&mut recon_dm, &mut recon_at, &lz4_deltas).expect("apply");
+                assert_eq!(patched, 16);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+        assert_eq!(recon_dm, next_dm);
+        assert_eq!(recon_at, next_at);
     }
 }

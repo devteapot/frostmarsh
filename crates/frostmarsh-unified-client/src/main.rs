@@ -193,13 +193,19 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut world = LiveApproach4World::new(gw, gh, gd);
     let mut z16_world = if z16_active { Some(Z16World::new(gw, gh, gd)) } else { None };
 
-    // Full initial 3D volumetric build (either true 3D Z=16 Surface-Nets OR L4 layered A+)
+    // Full initial 3D volumetric build (either true 3D Z=16..64 Surface-Nets OR L4 layered A+)
     let full_sync_build_ms = if let Some(ref mut z16w) = z16_world {
         let mut st = quic.state.lock().unwrap();
-        let dirty_z16 = st.take_dirty_z16_bricks();
-        let (rebuilt, ms) = z16w.apply_dirty_bricks(&st.z16_density_mat, &st.z16_albedo_thermal, &dirty_z16);
+        let (rebuilt, ms) = if st.depth > 32 {
+            let dirty_subs = st.take_dirty_z16_subbricks();
+            z16w.apply_dirty_subbricks(&st.z16_density_mat, &st.z16_albedo_thermal, &dirty_subs)
+        } else {
+            let dirty_z16 = st.take_dirty_z16_bricks();
+            z16w.apply_dirty_bricks(&st.z16_density_mat, &st.z16_albedo_thermal, &dirty_z16)
+        };
         println!(
-            "[Unified] Z=16 Initial Surface-Nets: {} bricks, {} tris in {:.2}ms (bytes_rx={})",
+            "[Unified] Z={} Initial Surface-Nets: {} active bricks/sub-bricks, {} tris in {:.2}ms (bytes_rx={})",
+            st.depth,
             rebuilt,
             z16w.total_triangles(),
             ms,
@@ -237,11 +243,29 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(ref mut z16w) = z16_world {
             let mut st = quic.state.lock().unwrap();
-            let dirty_z16 = st.take_dirty_z16_bricks();
-            if !dirty_z16.is_empty() {
-                let (cnt, ms) = z16w.apply_dirty_bricks(&st.z16_density_mat, &st.z16_albedo_thermal, &dirty_z16);
-                if cnt > 0 {
-                    dirty_samples.push(ms);
+            if st.depth > 32 {
+                let dirty_subs = st.take_dirty_z16_subbricks();
+                if !dirty_subs.is_empty() {
+                    let (cnt, ms) = z16w.apply_dirty_subbricks(
+                        &st.z16_density_mat,
+                        &st.z16_albedo_thermal,
+                        &dirty_subs,
+                    );
+                    if cnt > 0 {
+                        dirty_samples.push(ms);
+                    }
+                }
+            } else {
+                let dirty_z16 = st.take_dirty_z16_bricks();
+                if !dirty_z16.is_empty() {
+                    let (cnt, ms) = z16w.apply_dirty_bricks(
+                        &st.z16_density_mat,
+                        &st.z16_albedo_thermal,
+                        &dirty_z16,
+                    );
+                    if cnt > 0 {
+                        dirty_samples.push(ms);
+                    }
                 }
             }
         } else {
@@ -291,10 +315,21 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Heroic 3D Volumetric Vista:
+    // - Z=64 mode: grand 3-strata framing capturing Floating Sky-Islands + 28m plunging waterfalls +
+    //   Surface Viaduct + Abyssal Chasm simultaneously!
     // - Z=16..32 mode: frames the 3-Span Arched Stone & Timber Bridge, river canyon, North alpine waterfall,
     //   SW cave massif, Hard-Z sculpted pines, and live multiplayer heroes!
     // - L4 mode: frames Layer 2 Highland Plateaus, Plunging 3D Waterfalls, Stone Sky-Arch & Central Spire!
-    let cam_main = if z16_active {
+    let cam_main = if z16_active && gd >= 48 {
+        MobaCamera {
+            target: Vec3::new(0.0, gd as f32 * 0.44, 0.0),
+            yaw: 0.52,
+            pitch: 0.28,
+            dist: (gw as f32 * 0.52).clamp(96.0, 138.0),
+            fov_y: 44.0_f32.to_radians(),
+            ortho: false,
+        }
+    } else if z16_active {
         let target_y = (gd as f32 * 0.35).clamp(5.6, 11.5);
         MobaCamera {
             target: Vec3::new(0.0, target_y, -4.0),
@@ -455,12 +490,15 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Capture 2: 2×2 Live WGSL 4-Style Neural Compute Showcase (960×540 per panel -> 1920×1080)
     let views: [(MobaCamera, RenderStyle, bool, u8, u32); 4] = if z16_active {
-        let base_d = (gw as f32 * 0.44).clamp(46.0, 92.0);
-        let ty = (gd as f32 * 0.35).clamp(5.6, 11.5);
+        let (base_d, ty, base_pitch, base_fov) = if gd >= 48 {
+            ((gw as f32 * 0.50).clamp(92.0, 134.0), gd as f32 * 0.44, 0.34, 44.0_f32.to_radians())
+        } else {
+            ((gw as f32 * 0.44).clamp(46.0, 92.0), (gd as f32 * 0.35).clamp(5.6, 11.5), 0.42, 38.0_f32.to_radians())
+        };
         [
             // Top-left: Style 0 — NORDIC (PIXEL-2XSS) + Full HUD
             (
-                MobaCamera { target: Vec3::new(0.0, ty, -4.0), yaw: 0.46, pitch: 0.42, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
+                MobaCamera { target: Vec3::new(0.0, ty, -4.0), yaw: 0.48, pitch: base_pitch, dist: base_d, fov_y: base_fov, ortho: false },
                 RenderStyle::pixel_art(1),
                 true,
                 0u8,
@@ -468,7 +506,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             ),
             // Top-right: Style 1 — VOLCANIC EMBER (PIXEL-2XSS)
             (
-                MobaCamera { target: Vec3::new(0.0, ty, -4.0), yaw: -0.52, pitch: 0.40, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
+                MobaCamera { target: Vec3::new(0.0, ty, -4.0), yaw: -0.52, pitch: base_pitch, dist: base_d, fov_y: base_fov, ortho: false },
                 RenderStyle::pixel_art(1),
                 false,
                 0u8,
@@ -476,15 +514,15 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             ),
             // Bottom-left: Style 2 — ARCANE THERMAL (CLEAN-3D)
             (
-                MobaCamera { target: Vec3::new(0.0, ty, -4.0), yaw: 0.58, pitch: 0.44, dist: base_d, fov_y: 38.0_f32.to_radians(), ortho: false },
+                MobaCamera { target: Vec3::new(0.0, ty, -4.0), yaw: 0.62, pitch: (base_pitch + 0.04).min(0.48), dist: base_d, fov_y: base_fov, ortho: false },
                 RenderStyle::clean_3d(),
                 false,
                 0u8,
                 2u32,
             ),
-            // Bottom-right: Style 3 — EMERALD CAVERN (Low dramatic angle under the 3-Span Arch!)
+            // Bottom-right: Style 3 — EMERALD CAVERN (Low dramatic angle framing Viaduct arches & Abyssal Chasm!)
             (
-                MobaCamera { target: Vec3::new(-4.0, (gd as f32 * 0.28).clamp(4.6, 9.0), 0.0), yaw: 0.34, pitch: 0.24, dist: base_d * 0.56, fov_y: 36.0_f32.to_radians(), ortho: false },
+                MobaCamera { target: Vec3::new(-4.0, (gd as f32 * 0.28).clamp(4.6, 22.0), 0.0), yaw: 0.34, pitch: 0.22, dist: base_d * 0.54, fov_y: 38.0_f32.to_radians(), ortho: false },
                 RenderStyle::pixel_art(1),
                 false,
                 0u8,
@@ -1141,7 +1179,8 @@ impl InteractiveApp {
             }
         }
         if self.camera_preset_easing {
-            let (tgt_dist, tgt_pitch, tgt_fov) = self.camera_preset.params(self.z16_active);
+            let (tgt_dist, tgt_pitch, tgt_fov) =
+                self.camera_preset.params_for_depth(self.z16_active, self.z16_world.depth);
             let ease = 1.0 - (-9.5 * dt).exp();
             self.camera.dist += (tgt_dist - self.camera.dist) * ease;
             self.camera.pitch += (tgt_pitch - self.camera.pitch) * ease;
@@ -1157,7 +1196,7 @@ impl InteractiveApp {
             }
         }
 
-        // Pull latest 3D volumetric dirty bricks (Z=16) OR A+ dirty chunks (L4) + entities from QUIC
+        // Pull latest 3D volumetric dirty bricks/sub-bricks (Z=16..64) OR A+ dirty chunks (L4) + entities from QUIC
         let (mut entities, rtt_ms) = if let Some(ref quic) = self.quic {
             let mut st = quic.state.lock().unwrap();
             let gw = st.width;
@@ -1168,20 +1207,36 @@ impl InteractiveApp {
             self.world.resize_if_needed(gw, gh, gd);
             if gd >= 16 || st.has_z16_bricks {
                 self.z16_active = true;
+                self.z16_world.resize_if_needed(gw, gh, gd);
                 if !self.z16_cam_framed {
-                    // Heroic auto-framing for Z=16..32 caves, arched bridges & towering 32m mountains
-                    self.camera.dist = 36.0;
-                    self.camera.pitch = 0.58;
+                    // Heroic auto-framing for Z=16..32 caves/bridges AND Z=64 3-strata Sky-Islands!
+                    let (d0, p0, f0) = self.camera_preset.params_for_depth(true, gd);
+                    self.camera.dist = if gd >= 48 { d0 } else { 36.0 };
+                    self.camera.pitch = if gd >= 48 { p0 } else { 0.58 };
+                    self.camera.fov_y = f0;
+                    if gd >= 48 {
+                        self.camera.target.y = gd as f32 * 0.45;
+                    }
                     self.z16_cam_framed = true;
                 }
-                self.z16_world.resize_if_needed(gw, gh, gd);
-                let dirty_z16 = st.take_dirty_z16_bricks();
-                if !dirty_z16.is_empty() {
-                    self.z16_world.apply_dirty_bricks(
-                        &st.z16_density_mat,
-                        &st.z16_albedo_thermal,
-                        &dirty_z16,
-                    );
+                if gd > 32 {
+                    let dirty_subs = st.take_dirty_z16_subbricks();
+                    if !dirty_subs.is_empty() {
+                        self.z16_world.apply_dirty_subbricks(
+                            &st.z16_density_mat,
+                            &st.z16_albedo_thermal,
+                            &dirty_subs,
+                        );
+                    }
+                } else {
+                    let dirty_z16 = st.take_dirty_z16_bricks();
+                    if !dirty_z16.is_empty() {
+                        self.z16_world.apply_dirty_bricks(
+                            &st.z16_density_mat,
+                            &st.z16_albedo_thermal,
+                            &dirty_z16,
+                        );
+                    }
                 }
             } else {
                 self.z16_active = false;
@@ -2081,7 +2136,12 @@ impl ApplicationHandler for InteractiveApp {
                     MouseScrollDelta::LineDelta(_, y) => y * 4.5,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.08,
                 };
-                self.camera.dist = (self.camera.dist - dy).clamp(14.0, 180.0);
+                let max_zoom = if self.z16_active && self.z16_world.depth >= 48 {
+                    240.0
+                } else {
+                    180.0
+                };
+                self.camera.dist = (self.camera.dist - dy).clamp(14.0, max_zoom);
                 self.camera_preset_easing = false;
             }
             WindowEvent::KeyboardInput { event, .. } => {

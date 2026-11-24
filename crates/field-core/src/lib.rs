@@ -36,7 +36,9 @@ pub const BIOME_VOLCANIC_CALDERA: u8 = 1;
 pub const BIOME_SINKHOLE_CAVERNS: u8 = 2;
 pub const BIOME_GLACIER_GORGE: u8 = 3;
 pub const BIOME_GEOTHERMAL_BASIN: u8 = 4;
-pub const NUM_BIOMES: u8 = 5;
+pub const BIOME_SKY_ABYSS: u8 = 5;
+pub const BIOME_COUNT: u8 = 6;
+pub const NUM_BIOMES: u8 = BIOME_COUNT;
 
 pub const fn biome_name(id: u8) -> &'static str {
     match id % NUM_BIOMES {
@@ -45,6 +47,7 @@ pub const fn biome_name(id: u8) -> &'static str {
         BIOME_SINKHOLE_CAVERNS => "Sinkhole Caverns",
         BIOME_GLACIER_GORGE => "Glacier Gorge",
         BIOME_GEOTHERMAL_BASIN => "Geothermal Mist Basin",
+        BIOME_SKY_ABYSS => "Sky-Isles & Abyss",
         _ => "Nordic Viaduct",
     }
 }
@@ -2383,6 +2386,59 @@ impl VolumeField {
                         }
                     }
                 }
+                BIOME_SKY_ABYSS => {
+                    // Replenish the Floating Sky-Island plunging waterfall springs (Stratum 3)
+                    // + Abyssal geothermal steam vents (Stratum 1), strictly faucet-accounted!
+                    let z_scale_64 = self.depth as f32 / 64.0;
+                    let z_sky_spring = ((49.0 * z_scale_64).round() as usize).clamp(4, self.depth - 2);
+                    let ls_top = &mut self.layers[z_sky_spring];
+                    for &(sx_n, sy_n) in &[(0.50f32, 0.405f32), (0.385f32, 0.375f32), (0.615f32, 0.375f32)] {
+                        let cx = (sx_n * wf) as usize;
+                        let cy = (sy_n * hf) as usize;
+                        let r = (w / 48).clamp(1, 3);
+                        for y in cy.saturating_sub(r)..=(cy + r).min(h - 3) {
+                            for x in cx.saturating_sub(r)..=(cx + r).min(w - 3) {
+                                let idx = y * w + x;
+                                let cur = ls_top.mass[SP_WATER][idx];
+                                if cur < 980 && ls_top.mass[SP_ROCK][idx] < 500 {
+                                    let room = H_CAP.saturating_sub(ls_top.cell_volume(idx)) as u16;
+                                    let add = (980 - cur).min(120).min(room);
+                                    if add > 0 {
+                                        ls_top.mass[SP_WATER][idx] += add;
+                                        let e_add = (add as i64) * SPECIES[SP_WATER].c * 28_000;
+                                        ls_top.energy[idx] += e_add;
+                                        ls_top.faucet_mass[SP_WATER] += add as i64;
+                                        ls_top.faucet_energy += e_add;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let z_abyss_vent = ((4.0 * z_scale_64).round() as usize).clamp(2, self.depth - 3);
+                    let ls_bot = &mut self.layers[z_abyss_vent];
+                    for &(vx_n, vy_n) in &[(0.42f32, 0.56f32), (0.58f32, 0.56f32)] {
+                        let cx = (vx_n * wf) as usize;
+                        let cy = (vy_n * hf) as usize;
+                        let r = (w / 64).clamp(1, 2);
+                        for y in cy.saturating_sub(r)..=(cy + r).min(h - 3) {
+                            for x in cx.saturating_sub(r)..=(cx + r).min(w - 3) {
+                                let idx = y * w + x;
+                                if ls_bot.mass[SP_ROCK][idx] < 400 && ls_bot.mass[SP_STEAM][idx] < 320 {
+                                    let room = H_CAP.saturating_sub(ls_bot.cell_volume(idx)) as u16;
+                                    let add = (320 - ls_bot.mass[SP_STEAM][idx]).min(65).min(room);
+                                    if add > 0 {
+                                        ls_bot.mass[SP_STEAM][idx] += add;
+                                        let e_th = (add as i64) * SPECIES[SP_STEAM].c * 43_000;
+                                        let e_chem = (add as i64) * SPECIES[SP_STEAM].u0;
+                                        ls_bot.energy[idx] += e_th;
+                                        ls_bot.faucet_mass[SP_STEAM] += add as i64;
+                                        ls_bot.faucet_energy += e_th + e_chem;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {
                     // BIOME_GEOTHERMAL_BASIN: boiling hot spring feeds dense rising steam -> closed 3D hydrologic rain cycle!
                     let z_steam = ((4.0 * z_scale).round() as usize).clamp(2, self.depth - 3);
@@ -2992,6 +3048,20 @@ impl VolumeField {
         let cond_scale = laws.thermal_cond.clamp(0.25, 4.0);
 
         for z in 0..(self.depth - 1) {
+            // 3D Altitude-Coupled Gravity (`depth >= 48`): softly scale effective gravity to 0.45g
+            // above `0.65 * depth` so high-altitude Sky-Island waterfalls & plumes hang buoyantly!
+            let high_alt_buoyant = self.depth >= 48 && (z as f32) >= 0.65 * (self.depth as f32);
+            let z_grav_fall_frac = if high_alt_buoyant {
+                (grav_fall_frac * 0.45).clamp(0.05, 0.85)
+            } else {
+                grav_fall_frac
+            };
+            let z_buoy_rise_frac = if high_alt_buoyant {
+                (buoy_rise_frac * 1.25).clamp(0.10, 0.85)
+            } else {
+                buoy_rise_frac
+            };
+            let use_std_grav = standard_laws && !high_alt_buoyant;
             let (lo_slice, hi_slice) = self.layers.split_at_mut(z + 1);
             let lo = &mut lo_slice[z];
             let hi = &mut hi_slice[0];
@@ -3010,10 +3080,10 @@ impl VolumeField {
                         let avail = hi.mass[sp][idx];
                         if avail > grav_min_mass {
                             let room = H_CAP.saturating_sub(lo.cell_volume(idx)) as u16;
-                            let q = if standard_laws {
+                            let q = if use_std_grav {
                                 ((avail / 3).max(1)).min(room)
                             } else {
-                                ((avail as f32 * grav_fall_frac).round() as u16)
+                                ((avail as f32 * z_grav_fall_frac).round() as u16)
                                     .max(1)
                                     .min(avail)
                                     .min(room)
@@ -3039,10 +3109,10 @@ impl VolumeField {
                         let avail = lo.mass[sp][idx];
                         if avail > 12 {
                             let room = H_CAP.saturating_sub(hi.cell_volume(idx)) as u16;
-                            let q = if standard_laws {
+                            let q = if use_std_grav {
                                 ((avail / 3).max(1)).min(room)
                             } else {
-                                ((avail as f32 * buoy_rise_frac).round() as u16)
+                                ((avail as f32 * z_buoy_rise_frac).round() as u16)
                                     .max(1)
                                     .min(avail)
                                     .min(room)
@@ -3780,6 +3850,68 @@ impl VolumeField {
         }
     }
 
+    /// 3D Altitude-Coupled Conservation-Exact Ambient Relaxation (`depth >= 48`):
+    /// - Below `0.25 * depth` (geothermal abyss): gently warms cool subterranean rock/fluids toward `330 K`.
+    /// - Above `0.72 * depth` (freezing stratosphere): gently chills high-altitude sky/cloud layers toward `266 K`.
+    /// Strictly accounted in `faucet_energy` so `mass_error() == 0 && energy_error() == 0` ALWAYS holds!
+    fn apply_altitude_ambient_relaxation_3d(&mut self) {
+        if self.depth < 48 {
+            return;
+        }
+        let d = self.depth;
+        let z_abyss_hi = ((d as f32) * 0.25).floor() as usize;
+        let z_strato_lo = ((d as f32) * 0.72).ceil() as usize;
+        let len = self.width * self.height;
+        let stride = 4usize;
+        let phase = (self.tick as usize) % stride;
+
+        // Warm geothermal abyss (`z < 0.25 * depth`)
+        for z in 1..z_abyss_hi.min(d) {
+            let f = &mut self.layers[z];
+            let mut idx = phase;
+            while idx < len {
+                let c = f.cell_heat_capacity(idx);
+                if c > 0 {
+                    let t = f.cell_temp_ck(idx);
+                    if t < 33_000 {
+                        let step_ck = ((33_000 - t) / 16).max(60).min(33_000 - t);
+                        let e_cur = f.energy[idx];
+                        let e_next = (e_cur + step_ck * c).clamp(c * T_MIN, c * T_MAX);
+                        let delta = e_next - e_cur;
+                        if delta != 0 {
+                            f.energy[idx] = e_next;
+                            f.faucet_energy += delta;
+                        }
+                    }
+                }
+                idx += stride;
+            }
+        }
+
+        // Crisp freezing stratosphere (`z >= 0.72 * depth`)
+        for z in z_strato_lo..d {
+            let f = &mut self.layers[z];
+            let mut idx = phase;
+            while idx < len {
+                let c = f.cell_heat_capacity(idx);
+                if c > 0 {
+                    let t = f.cell_temp_ck(idx);
+                    if t > 26_600 {
+                        let step_ck = ((t - 26_600) / 16).max(60).min(t - 26_600);
+                        let e_cur = f.energy[idx];
+                        let e_next = (e_cur - step_ck * c).clamp(c * T_MIN, c * T_MAX);
+                        let delta = e_next - e_cur;
+                        if delta != 0 {
+                            f.energy[idx] = e_next;
+                            f.faucet_energy += delta;
+                        }
+                    }
+                }
+                idx += stride;
+            }
+        }
+    }
+
     /// Apply all `L` horizontal layer steps + either neural `WorldModel3D` v4 vertical interface fluxes
     /// (`Some(z_flux_f32)` of layout `[depth - 1, 5, H, W]`) or analytic `step_vertical_exchange_3d` (`None`),
     /// then re-hash dirty chunks and report exact 3D mass & energy conservation errors.
@@ -3837,6 +3969,7 @@ impl VolumeField {
             }
         }
         self.apply_world_law_ambient_relaxation_3d();
+        self.apply_altitude_ambient_relaxation_3d();
         let (grav, buoy) = if let Some(zf) = z_flux_f32 {
             self.apply_neural_3d_vertical_fluxes(zf)
         } else {
@@ -4107,6 +4240,7 @@ impl VolumeField {
             BIOME_VOLCANIC_CALDERA => self.init_biome_volcanic_caldera(seed_ox, seed_oy, seed_phase),
             BIOME_SINKHOLE_CAVERNS => self.init_biome_sinkhole_caverns(seed_ox, seed_oy, seed_phase),
             BIOME_GLACIER_GORGE => self.init_biome_glacier_gorge(seed_ox, seed_oy, seed_phase),
+            BIOME_SKY_ABYSS => self.init_sky_abyss_vertical(seed_ox, seed_oy, seed_phase),
             _ => self.init_biome_geothermal_basin(seed_ox, seed_oy, seed_phase),
         }
 
@@ -5407,6 +5541,417 @@ impl VolumeField {
         }
     }
 
+    /// Biome 5 (`BIOME_SKY_ABYSS` — "Sky-Isles & Abyss"): 3-Strata Stacked `Z=64` Vertical World
+    /// (designed natively for `depth >= 48`, e.g., `256×256×64`, and gracefully scaling to `Z=16/32`):
+    /// - **Stratum 1 (`z = 0..18m`):** Bedrock floor (`z = 0..2`), sprawling vaulted basalt caverns
+    ///   (`z = 3..15m`) with glowing subterranean lava/oil rivers (`T ~ 660 K`), steam vents, basalt
+    ///   pillars, Abyssal Heart shrine island (`z ~ 6m`), and a deep central sinkhole shaft!
+    /// - **Stratum 2 (`z = 18..38m`):** Dramatic cliff-walled alpine canyon with a turquoise river
+    ///   (`z = 21..25m`) pouring into the central abyssal sinkhole, a 3-span carved stone/timber
+    ///   viaduct crossing at `z = 29m`, and lush pine-forested highlands (`z = 26..31m`).
+    /// - **Stratum 3 (`z = 38..63m`):** 4 dramatic suspended rocky Floating Sky-Islands (`z = 42..53m` —
+    ///   central Sky-Citadel + 3 flanking islands with tapering undersides and overhanging sky-bridges!),
+    ///   giant `28m` plunging waterfalls pouring off the island rims straight down into the gorge & chasm,
+    ///   and a living high-altitude Cloud Condensation Deck (`z = 56..62m`)!
+    fn init_sky_abyss_vertical(&mut self, seed_ox: f32, seed_oy: f32, seed_phase: f32) {
+        let w = self.width;
+        let h = self.height;
+        let d = self.depth;
+        let wf = w as f32;
+        let hf = h as f32;
+        let z_scale_64 = d as f32 / 64.0;
+        let band_scale = (1.0 / z_scale_64.max(0.25)).min(2.5);
+
+        // Precompute 2D Surface Gorge + Pine Highlands heightfield (in Z=64 metric altitude `zm`)
+        let mut surf_h = vec![28.0f32; w * h];
+        let mut cav_noise = vec![0.0f32; w * h];
+        for y in 0..h {
+            let ny = (y as f32 + 0.5) / hf;
+            let river_cx = 0.50 + 0.032 * ((ny - 0.50) * std::f32::consts::TAU * 1.1 + seed_phase * 0.25).sin();
+            for x in 0..w {
+                let nx = (x as f32 + 0.5) / wf;
+                let idx = y * w + x;
+                let n_big = z16_fbm2(nx * 5.0 + seed_ox, ny * 5.0 + seed_oy);
+                let n_med = z16_fbm2(nx * 12.0 - 4.3 + seed_ox, ny * 12.0 + 7.7 + seed_oy);
+                cav_noise[idx] = n_big;
+
+                let dist_r = (nx - river_cx).abs();
+                let canyon_t = z16_smoothstep(0.052, 0.145, dist_r);
+                // Riverbed ~20.4m, steep canyon walls climbing to lush Pine Highlands at ~26.5..30.6m
+                let mut gh = 20.4 + canyon_t * 8.4 + n_big * 1.45 + n_med * 0.45;
+
+                // Level smooth West & East viaduct abutments at ny ~ 0.50
+                let y_bridge = 1.0 - z16_smoothstep(0.030, 0.085, (ny - 0.50).abs());
+                let w_abut = (1.0 - z16_smoothstep(0.025, 0.085, (nx - 0.275).abs())) * y_bridge;
+                let e_abut = (1.0 - z16_smoothstep(0.025, 0.085, (nx - 0.725).abs())) * y_bridge;
+                gh = gh * (1.0 - w_abut) + 28.6 * w_abut;
+                gh = gh * (1.0 - e_abut) + 28.6 * e_abut;
+
+                // Spawn clearings on West & East highlands
+                let sp_w = 1.0 - z16_smoothstep(0.04, 0.09, (nx - 0.16).hypot(ny - 0.50));
+                let sp_e = 1.0 - z16_smoothstep(0.04, 0.09, (nx - 0.84).hypot(ny - 0.50));
+                gh = gh * (1.0 - sp_w) + 27.6 * sp_w;
+                gh = gh * (1.0 - sp_e) + 27.6 * sp_e;
+
+                // Keep highlands strictly below z=31.2m so bz=2 above highlands is pure empty sky!
+                surf_h[idx] = gh.clamp(20.0, 30.8);
+            }
+        }
+
+        // 4 Floating Sky-Islands concentrated in the dramatic central amphitheater (so outer sky cubes stay 100% empty sky!):
+        // (nx, ny, radius_n, top_zm, taper_depth_m)
+        let islands: [(f32, f32, f32, f32, f32); 4] = [
+            (0.50, 0.50, 0.104, 50.2, 8.8), // Central Sky-Citadel (Shrine 2 at z ~ 50m!)
+            (0.35, 0.35, 0.072, 48.0, 7.6), // NW Sky-Isle
+            (0.65, 0.35, 0.072, 48.5, 7.8), // NE Sky-Isle
+            (0.50, 0.67, 0.070, 47.0, 7.2), // South Sky-Isle
+        ];
+        // Overhanging Sky-Bridges linking Central Sky-Citadel to the 3 flanking islands
+        let sky_bridges: [(f32, f32, f32, f32, f32); 3] = [
+            (0.50, 0.50, 0.35, 0.35, 48.4),
+            (0.50, 0.50, 0.65, 0.35, 48.7),
+            (0.50, 0.50, 0.50, 0.67, 47.8),
+        ];
+        // Giant 28m plunging waterfall spill points: (nx, ny, top_zm, bot_zm, spill_dx, spill_dy)
+        let waterfalls: [(f32, f32, f32, f32, f32, f32); 3] = [
+            (0.50, 0.405, 49.4, 21.0, 0.0, -0.014), // Central Citadel plunging straight into abyssal sinkhole!
+            (0.385, 0.375, 47.4, 21.2, 0.014, 0.008), // NW Sky-Isle cascade into canyon!
+            (0.615, 0.375, 47.8, 21.2, -0.014, 0.008), // NE Sky-Isle cascade into canyon!
+        ];
+        // Abyssal cavern basalt support pillars
+        let cav_pillars: [(f32, f32, f32); 4] = [
+            (0.38, 0.39, 0.024),
+            (0.62, 0.39, 0.024),
+            (0.38, 0.61, 0.024),
+            (0.62, 0.61, 0.024),
+        ];
+        // High-altitude Cloud Condensation Deck clusters (z = 56..62m), hovering above the floating archipelago
+        let clouds: [(f32, f32, f32, f32); 4] = [
+            (0.36, 0.34, 0.068, 59.0),
+            (0.64, 0.34, 0.068, 59.5),
+            (0.36, 0.66, 0.066, 58.5),
+            (0.64, 0.66, 0.066, 59.0),
+        ];
+
+        // Bridge geometry (Stratum 2 Surface Viaduct at ny = 0.50, zm ~ 29.2m)
+        let bridge_cy = 0.50 * hf;
+        let bridge_hw_y = (hf * 0.032).clamp(3.2, 6.0);
+        let bridge_x0 = 0.275 * wf;
+        let bridge_x1 = 0.725 * wf;
+        let bridge_cx = 0.50 * wf;
+        let bridge_half_span = 0.225 * wf;
+
+        for y in 0..h {
+            let wy = y as f32 + 0.5;
+            let ny = wy / hf;
+            let river_cx = 0.50 + 0.032 * ((ny - 0.50) * std::f32::consts::TAU * 1.1 + seed_phase * 0.25).sin();
+            let lava_cx = 0.50 + 0.065 * ((ny - 0.50) * std::f32::consts::TAU * 1.3 - seed_phase * 0.3).sin();
+            let river_slope = ((1.0 - ny) * 5.0) as u8;
+
+            for x in 0..w {
+                let wx = x as f32 + 0.5;
+                let nx = wx / wf;
+                let idx = y * w + x;
+                let gh = surf_h[idx];
+                let n_big = cav_noise[idx];
+                let dist_r = (nx - river_cx).abs();
+                let dist_lava = (nx - lava_cx).abs();
+                let is_perimeter = x < 2 || x + 2 >= w || y < 2 || y + 2 >= h;
+
+                // Abyssal cavern radial field (interior vault `nx, ny in ~[0.27..0.73]`, leaving outer border pure uniform bedrock!)
+                let cav_r = (((nx - 0.50) / 0.205).powi(2) + ((ny - 0.50) / 0.205).powi(2)).sqrt()
+                    + n_big * 0.03;
+                let cav_ceil = (15.2 - 5.0 * cav_r * cav_r).clamp(2.6, 15.4);
+                let cav_floor = 2.6 + (n_big * 0.5 + 0.5) * 0.55;
+                // Raised dry basalt sanctuary platform for Shrine 0 (ABYSSAL HEART) at (0.50, 0.64)
+                let d_abyss_shrine = (nx - 0.50).hypot(ny - 0.64);
+                let on_abyss_shrine_pad = d_abyss_shrine < 0.062;
+                let shrine_floor = if on_abyss_shrine_pad {
+                    let t = (1.0 - d_abyss_shrine / 0.062).clamp(0.0, 1.0);
+                    cav_floor.max(5.5 * (0.65 + 0.35 * t))
+                } else {
+                    cav_floor
+                };
+
+                // Central Abyssal Sinkhole shaft at (0.50, 0.38) connecting Surface Gorge to Abyssal Cavern!
+                let d_sink = (nx - 0.50).hypot(ny - 0.38);
+                let sink_r = 0.056 + n_big * 0.008;
+
+                let h_tree = ((x.wrapping_mul(73_856_093)) ^ (y.wrapping_mul(19_349_663))) % 1000;
+
+                for z in 0..d {
+                    let zm = (z as f32 + 0.5) / z_scale_64;
+                    let f = &mut self.layers[z];
+                    f.elevation[idx] = ((z * 28 / d.max(1)).min(28) as u8)
+                        .saturating_add(if (20.0..=25.0).contains(&zm) { river_slope } else { 0 });
+
+                    // Solid indestructible bedrock base (`z = 0..=2` at Z=64)
+                    if z == 0 || zm <= 2.5 {
+                        f.mass[SP_ROCK][idx] = 1200;
+                        f.set_cell_temp(idx, T_AMB);
+                        continue;
+                    }
+                    // Outer bedrock cliffs up to Stratum 2 height (`zm <= 30.8`), keeping Stratum 3 pure empty sky!
+                    if is_perimeter && zm <= 30.8 {
+                        f.mass[SP_ROCK][idx] = 1200;
+                        f.set_cell_temp(idx, T_AMB);
+                        continue;
+                    }
+
+                    let mut sdf = zm - gh; // < 0 inside solid ground below surface highlands/gorge
+                    let mut mat_kind = 0u8; // 0=terrain, 1=viaduct rock, 2=viaduct wood, 3=sky rock, 4=sky grass/top, 5=sky snow, 6=lava bed, 7=pine wood/plant
+
+                    // --- Stratum 1: Vaulted Abyssal Cavern & Central Sinkhole Shaft ---
+                    let mut inside_abyss_air = false;
+                    if zm < 25.5 {
+                        // Carve vaulted abyssal cavern (`cav_r < 1.0`, `zm in [shrine_floor .. cav_ceil]`)
+                        if cav_r < 1.0 && zm > shrine_floor && zm < cav_ceil {
+                            let d_floor = shrine_floor - zm;
+                            let d_ceil = zm - cav_ceil;
+                            let d_wall = (cav_r - 1.0) * 14.0;
+                            let cav_sdf = d_floor.max(d_ceil).max(d_wall);
+                            if cav_sdf < 0.0 {
+                                sdf = sdf.max(-cav_sdf);
+                                inside_abyss_air = true;
+                            }
+                        }
+                        // Carve Central Sinkhole Shaft linking Surface Gorge (`zm ~ 24m`) -> Abyssal Cavern (`zm ~ 4m`)!
+                        if d_sink < sink_r + 0.015 && zm > 3.6 && zm < 25.0 {
+                            let sink_sdf = (d_sink - sink_r) * wf;
+                            if sink_sdf < 0.0 {
+                                sdf = sdf.max(-sink_sdf);
+                                inside_abyss_air = true;
+                            }
+                        }
+                        // Add back the 4 vaulted basalt pillars inside the abyssal cavern
+                        if zm <= cav_ceil + 1.5 {
+                            for &(px, py, pr) in &cav_pillars {
+                                let dp = ((nx - px).hypot(ny - py) - pr) * wf;
+                                if dp < sdf {
+                                    sdf = dp;
+                                    mat_kind = 1;
+                                    inside_abyss_air = false;
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Stratum 2: Monumental 3-Span Arched Stone & Timber Viaduct (`zm ~ 29.2m`) ---
+                    let dy_b = (wy - bridge_cy).abs();
+                    if wx >= bridge_x0 - 1.5
+                        && wx <= bridge_x1 + 1.5
+                        && dy_b <= bridge_hw_y + 1.5
+                        && (20.0..=31.2).contains(&zm)
+                    {
+                        let u = ((wx - bridge_cx) / bridge_half_span).clamp(-1.0, 1.0);
+                        let deck_top = 29.3 - 0.65 * u * u;
+                        let prism_x = (wx - bridge_cx).abs() - bridge_half_span;
+                        let prism_y = dy_b - bridge_hw_y;
+                        let prism_z = (zm - deck_top).max(20.0 - zm);
+                        let mut bridge_sdf = prism_x.max(prism_y).max(prism_z);
+
+                        // 3 tall open arches spanning the alpine river gorge
+                        let arches: [(f32, f32, f32, f32); 3] = [
+                            (0.382 * wf, 0.048 * wf, 23.2, 4.4),
+                            (0.500 * wf, 0.052 * wf, 23.0, 4.8),
+                            (0.618 * wf, 0.048 * wf, 23.2, 4.4),
+                        ];
+                        for &(ax, rx, spring_z, rz) in &arches {
+                            let adx = (wx - ax) / rx.max(1.0);
+                            let adz = (zm - spring_z).max(0.0) / rz;
+                            let arch_r = (adx * adx + adz * adz).sqrt();
+                            let open_sdf = (arch_r - 1.0) * rx.min(rz);
+                            let rect_open = (wx - ax).abs() - rx;
+                            let hole_sdf = if zm < spring_z { rect_open } else { open_sdf };
+                            bridge_sdf = bridge_sdf.max(-hole_sdf);
+                        }
+
+                        // Stone parapets along north & south edges of viaduct
+                        let para_y = (dy_b - (bridge_hw_y - 0.45)).abs() - 0.45;
+                        let para_x = (wx - bridge_cx).abs() - (bridge_half_span - 0.6);
+                        let para_z = (zm - (deck_top + 0.85)).max((deck_top - 0.3) - zm);
+                        bridge_sdf = bridge_sdf.min(para_x.max(para_y).max(para_z));
+
+                        if bridge_sdf < sdf {
+                            sdf = bridge_sdf;
+                            if dy_b < bridge_hw_y - 1.1 && zm > deck_top - 1.3 && zm <= deck_top + 0.25 {
+                                mat_kind = 2; // timber deck
+                            } else {
+                                mat_kind = 1; // carved stone arches & parapets
+                            }
+                        }
+                    }
+
+                    // --- Stratum 3: 4 Floating Sky-Islands + Overhanging Sky-Bridges (`zm = 38..54m`) ---
+                    if (38.0..=54.5).contains(&zm) {
+                        for &(ix_n, iy_n, rad_n, top_zm, taper_m) in &islands {
+                            let rn = (nx - ix_n).hypot(ny - iy_n) / rad_n;
+                            if rn < 1.12 {
+                                let top_cap = top_zm - 1.15 * rn * rn + n_big * 0.55;
+                                let bot_taper = (top_zm - taper_m)
+                                    + taper_m * rn.powf(1.30)
+                                    + n_big * 0.85;
+                                if top_cap > bot_taper - 0.6 {
+                                    let d_top = zm - top_cap;
+                                    let d_bot = bot_taper - zm;
+                                    let d_rad = (rn - 1.0) * (rad_n * wf);
+                                    let isl_sdf = d_top.max(d_bot).max(d_rad);
+                                    if isl_sdf < sdf {
+                                        sdf = isl_sdf;
+                                        if zm >= top_cap - 1.35 {
+                                            mat_kind = if rn > 0.72 { 5 } else { 4 };
+                                        } else {
+                                            mat_kind = 3;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Overhanging arched Sky-Bridges linking Central Citadel to flanking Sky-Islands
+                        for &(ax_n, ay_n, bx_n, by_n, mid_zm) in &sky_bridges {
+                            let abx = bx_n - ax_n;
+                            let aby = by_n - ay_n;
+                            let len2 = (abx * abx + aby * aby).max(1e-6);
+                            let t = (((nx - ax_n) * abx + (ny - ay_n) * aby) / len2).clamp(0.0, 1.0);
+                            if (0.18..=0.82).contains(&t) {
+                                let cx = ax_n + abx * t;
+                                let cy = ay_n + aby * t;
+                                let lat = (nx - cx).hypot(ny - cy) * wf;
+                                let arch_z = mid_zm + (t * std::f32::consts::PI).sin() * 1.1;
+                                let sb_sdf = (lat - 2.2)
+                                    .max(zm - (arch_z + 0.75))
+                                    .max((arch_z - 0.85) - zm);
+                                if sb_sdf < sdf {
+                                    sdf = sb_sdf;
+                                    mat_kind = if lat < 1.4 { 2 } else { 1 };
+                                }
+                            }
+                        }
+                    }
+
+                    // Convert SDF to exact conserved solid mass
+                    let band = 0.62 * band_scale;
+                    let solid_d = z16_sdf_to_density(sdf, band);
+                    let solid_m = (solid_d * (C_NOM as f32)).round() as u16;
+                    let mut cell_temp = if zm > 46.0 { 27_100 } else { T_AMB };
+
+                    // Geothermal glowing cavern bed right under the subterranean lava river
+                    if zm >= 2.5 && zm <= 3.6 && cav_r < 0.86 && dist_lava < 0.048 && !on_abyss_shrine_pad {
+                        mat_kind = 6;
+                    }
+
+                    if solid_m >= 15 {
+                        match mat_kind {
+                            1 | 3 => f.mass[SP_ROCK][idx] = solid_m,
+                            2 => f.mass[SP_WOOD][idx] = solid_m,
+                            4 => {
+                                // Lush mossy/pine Sky-Island crown
+                                f.mass[SP_SOIL][idx] = solid_m;
+                                if h_tree < 180 {
+                                    f.mass[SP_PLANT][idx] = 280;
+                                }
+                            }
+                            5 => {
+                                // Frost-rimmed alpine ledge on Sky-Island edges
+                                f.mass[SP_ICE][idx] = solid_m;
+                                cell_temp = 26_600;
+                            }
+                            6 => {
+                                f.mass[SP_ROCK][idx] = solid_m.max(960);
+                                cell_temp = 66_000; // Glowing abyssal magma bed (~660 K)
+                            }
+                            _ => {
+                                if zm < gh - 1.6 || zm < 19.5 {
+                                    f.mass[SP_ROCK][idx] = solid_m;
+                                } else {
+                                    f.mass[SP_SOIL][idx] = solid_m;
+                                    // Lush pine-forested surface highlands (z = 26..31m)
+                                    if zm >= 26.0 && dist_r > 0.12 && h_tree < 260 {
+                                        if h_tree < 90 {
+                                            f.mass[SP_WOOD][idx] = 320;
+                                        }
+                                        f.mass[SP_PLANT][idx] = 300;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Fluids & Gases Across All 3 Strata ---
+                    if solid_d < 0.45 {
+                        // 1. Abyssal Subterranean Lava/Oil Rivers (`zm = 2.8..4.6m`, T ~ 660 K) + Steam Vents
+                        if inside_abyss_air && zm <= 4.7 && cav_r < 0.86 && !on_abyss_shrine_pad && dist_lava < 0.042 {
+                            f.mass[SP_OIL][idx] = 560;
+                            f.flow_s[idx] = 70;
+                            cell_temp = 66_000;
+                        } else if inside_abyss_air && (4.6..=8.6).contains(&zm) {
+                            let v1 = (nx - 0.42).hypot(ny - 0.56);
+                            let v2 = (nx - 0.58).hypot(ny - 0.56);
+                            let vs = (nx - 0.50).hypot(ny - 0.38);
+                            if v1 < 0.024 || v2 < 0.024 || vs < 0.048 {
+                                f.mass[SP_STEAM][idx] = 240;
+                                cell_temp = 41_000;
+                            }
+                        }
+
+                        // 2. Surface Canyon Turquoise River (`zm = 20.8..24.4m`) pouring into Central Abyssal Sinkhole!
+                        if (20.6..=24.4).contains(&zm) && dist_r < 0.056 {
+                            f.mass[SP_WATER][idx] = 1080;
+                            f.flow_s[idx] = 130;
+                            cell_temp = 28_400;
+                        } else if (4.8..21.0).contains(&zm) && d_sink < 0.036 {
+                            // Water cascading straight down the central sinkhole into the abyssal chasm!
+                            f.mass[SP_WATER][idx] = 740;
+                            f.flow_s[idx] = 85;
+                            cell_temp = 28_500;
+                        }
+
+                        // 3. Giant 28m Plunging Waterfalls pouring off the Floating Sky-Island rims!
+                        for &(wx_n, wy_n, top_zm, bot_zm, sdx, sdy) in &waterfalls {
+                            if zm >= bot_zm && zm <= top_zm + 0.6 {
+                                let drop_t = ((top_zm - zm) / (top_zm - bot_zm).max(1.0)).clamp(0.0, 1.0);
+                                let cur_x = wx_n + sdx * drop_t.sqrt();
+                                let cur_y = wy_n + sdy * drop_t.sqrt();
+                                let wf_r = 0.017 + 0.008 * drop_t;
+                                if (nx - cur_x).hypot(ny - cur_y) < wf_r {
+                                    f.mass[SP_WATER][idx] = 880;
+                                    f.flow_s[idx] = 95;
+                                    cell_temp = 28_000;
+                                }
+                            } else if zm >= bot_zm - 0.5 && zm <= bot_zm + 3.8 {
+                                // Plunge-pool waterfall mist at base of 28m fall
+                                let mist_d = (nx - (wx_n + sdx)).hypot(ny - (wy_n + sdy));
+                                if mist_d < 0.036 {
+                                    f.mass[SP_STEAM][idx] = (220.0 * (1.0 - mist_d / 0.036)) as u16;
+                                    cell_temp = 37_500;
+                                }
+                            }
+                        }
+
+                        // 4. High-Altitude Cloud Condensation Deck (`zm = 56..62m`)
+                        if (56.0..=62.5).contains(&zm) {
+                            for &(cx_n, cy_n, cr_n, cz_m) in &clouds {
+                                let h_d = (nx - cx_n).hypot(ny - cy_n) / cr_n;
+                                let v_d = (zm - cz_m).abs() / 2.2;
+                                let c_r = (h_d * h_d + v_d * v_d).sqrt() + n_big * 0.14;
+                                if c_r < 1.0 {
+                                    let steam_m = (145.0 * (1.0 - c_r)).round() as u16;
+                                    if steam_m >= 24 {
+                                        f.mass[SP_STEAM][idx] = f.mass[SP_STEAM][idx].max(steam_m);
+                                        cell_temp = 38_500;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    f.set_cell_temp(idx, cell_temp.clamp(T_MIN, T_MAX));
+                }
+            }
+        }
+    }
+
     /// Physical per-voxel solid density in `[0.0, 1.0]` computed directly from conserved solid species masses.
     /// Shared 1:1 by `encode_3d_brick_16` (GPU rendering) and `sample_solid_density_3d` (3D capsule physics).
     #[inline]
@@ -5492,12 +6037,31 @@ impl VolumeField {
     /// - `albedo_thermal`: `[albedo_r, albedo_g, albedo_b, blackbody_temp_glow]`
     /// Zero client species heuristics: derived purely from exact physical masses & temperatures.
     pub fn encode_3d_brick_16(&self, bx: usize, by: usize) -> (Vec<u8>, Vec<u8>) {
-        let d = self.depth;
-        let total_bytes = d * CHUNK_SIZE * CHUNK_SIZE * 4;
+        let (dm, at, _) = self.encode_3d_brick_z_range(bx, by, 0, self.depth);
+        (dm, at)
+    }
+
+    /// Encode a true `16 × 16 × sub_depth` cubic 3D sub-brick `(bx, by, bz)` covering vertical
+    /// layers `[bz * 16 .. (bz * 16 + 16).min(depth)]`, returning `(density_mat, albedo_thermal, sub_depth)`.
+    pub fn encode_3d_subbrick_16(&self, bx: usize, by: usize, bz: usize) -> (Vec<u8>, Vec<u8>, u8) {
+        let z0 = bz * CHUNK_SIZE;
+        let z1 = (z0 + CHUNK_SIZE).min(self.depth);
+        self.encode_3d_brick_z_range(bx, by, z0, z1)
+    }
+
+    fn encode_3d_brick_z_range(
+        &self,
+        bx: usize,
+        by: usize,
+        z0: usize,
+        z1: usize,
+    ) -> (Vec<u8>, Vec<u8>, u8) {
+        let sub_d = z1.saturating_sub(z0);
+        let total_bytes = sub_d * CHUNK_SIZE * CHUNK_SIZE * 4;
         let mut density_mat = vec![0u8; total_bytes];
         let mut albedo_thermal = vec![0u8; total_bytes];
-        if self.width == 0 || self.height == 0 || d == 0 {
-            return (density_mat, albedo_thermal);
+        if self.width == 0 || self.height == 0 || sub_d == 0 {
+            return (density_mat, albedo_thermal, 0);
         }
 
         // Physical species base linear albedos & matte roughness values
@@ -5530,7 +6094,7 @@ impl VolumeField {
         let y0 = by * CHUNK_SIZE;
         let mut out_i = 0usize;
 
-        for z in 0..d {
+        for z in z0..z1 {
             let f = &self.layers[z];
             for dy in 0..CHUNK_SIZE {
                 let gy = (y0 + dy).min(self.height - 1);
@@ -5606,7 +6170,7 @@ impl VolumeField {
             }
         }
 
-        (density_mat, albedo_thermal)
+        (density_mat, albedo_thermal, sub_d as u8)
     }
 
     /// Measure maximum solid penetration (in meters) across a vertical 3D capsule shell at foot base `pos`.
@@ -5677,7 +6241,12 @@ impl VolumeField {
         let max_z = (self.depth as f32 - height - 0.1).max(0.5);
 
         for _ in 0..substeps {
-            vz -= gravity * sub_dt;
+            let alt_grav_scale = if self.depth >= 48 && pz >= 0.65 * (self.depth as f32) {
+                0.45
+            } else {
+                1.0
+            };
+            vz -= gravity * alt_grav_scale * sub_dt;
             px = (px + vx * sub_dt).clamp(min_x, max_x);
             py = (py + vy * sub_dt).clamp(min_y, max_y);
             pz = (pz + vz * sub_dt).clamp(0.5, max_z);
@@ -6902,5 +7471,130 @@ mod tests {
             assert_eq!(st.mass_error, 0, "post-reload mass_error at tick {}", tick);
             assert_eq!(st.energy_error, 0, "post-reload energy_error at tick {}", tick);
         }
+    }
+
+    #[test]
+    fn test_vertical_z64_three_strata_conservation_and_cubic_bricks() {
+        assert_eq!(BIOME_SKY_ABYSS, 5);
+        assert_eq!(BIOME_COUNT, 6);
+        assert_eq!(NUM_BIOMES, 6);
+        assert_eq!(biome_name(BIOME_SKY_ABYSS), "Sky-Isles & Abyss");
+
+        // Build a 64×64×64 3-strata Sky-Isles & Abyss world (4×4×4 = 64 cubic 16×16×16 sub-bricks)
+        let mut vf = VolumeField::new_biome_3d(64, 64, 64, BIOME_SKY_ABYSS, 1);
+        assert_eq!((vf.width, vf.height, vf.depth, vf.biome_id), (64, 64, 64, BIOME_SKY_ABYSS));
+        assert_eq!(vf.mass_error(), 0);
+        assert_eq!(vf.energy_error(), 0);
+
+        // 1. Verify Stratum 3: Real Floating Sky-Island solid voxels at z >= 44 (Central Sky-Citadel!)
+        let sky_island_solid = (44..52).any(|z| vf.sample_solid_density_3d(32.0, 32.0, z as f32 + 0.5) >= 0.5);
+        assert!(
+            sky_island_solid,
+            "Z=64 Sky-Isles & Abyss must have real Floating Sky-Island solid voxels at z >= 44"
+        );
+        // Open sky gap between Surface Viaduct (z~29) and Sky-Citadel underside (z~41)
+        assert!(
+            vf.sample_solid_density_3d(32.0, 32.0, 35.0) < 0.2,
+            "Z=64 must have open sky gap at z=35m between Viaduct and Sky-Citadel"
+        );
+
+        // 2. Verify Stratum 2: Real Surface Viaduct solid deck at z ~ 28..29m with open gorge air underneath!
+        let viaduct_solid = (27..=30).any(|z| vf.sample_solid_density_3d(32.0, 32.0, z as f32 + 0.5) >= 0.5);
+        assert!(
+            viaduct_solid,
+            "Z=64 Sky-Isles & Abyss must have real Surface Viaduct solid deck at z ~ 28m"
+        );
+        assert!(
+            vf.sample_solid_density_3d(32.0, 32.0, 24.0) < 0.2,
+            "Z=64 Surface Viaduct must have open arch air underneath at z ~ 24m"
+        );
+
+        // 3. Verify Stratum 1: Real Abyssal Cavern void at z ~ 8m with bedrock floor below!
+        assert!(
+            vf.sample_solid_density_3d(32.0, 32.0, 8.0) < 0.2,
+            "Z=64 Sky-Isles & Abyss must have real Abyssal Cavern void at z ~ 8m"
+        );
+        assert!(
+            vf.sample_solid_density_3d(32.0, 32.0, 1.0) >= 0.5,
+            "Z=64 Abyssal Cavern must rest on solid bedrock at z=1m"
+        );
+
+        // 4. Measure cubic 16×16×16 sub-brick sky/bedrock skip rate (> 40%!)
+        let is_skippable = |dm: &[u8], at: &[u8]| -> bool {
+            let empty_sky = dm
+                .chunks_exact(4)
+                .zip(at.chunks_exact(4))
+                .all(|(d, a)| d[0] == 0 && d[1] == 0 && d[2] == 0 && a[3] == 0);
+            if empty_sky {
+                return true;
+            }
+            let (mut min_r, mut max_r) = (u8::MAX, 0u8);
+            let (mut min_g, mut max_g) = (u8::MAX, 0u8);
+            let (mut min_b, mut max_b) = (u8::MAX, 0u8);
+            let (mut min_t, mut max_t) = (u8::MAX, 0u8);
+            let (mut min_rg, mut max_rg) = (u8::MAX, 0u8);
+            for (d, a) in dm.chunks_exact(4).zip(at.chunks_exact(4)) {
+                if d[0] < 245 || d[1] != 0 || d[2] != 0 {
+                    return false;
+                }
+                min_rg = min_rg.min(d[3]);
+                max_rg = max_rg.max(d[3]);
+                min_r = min_r.min(a[0]);
+                max_r = max_r.max(a[0]);
+                min_g = min_g.min(a[1]);
+                max_g = max_g.max(a[1]);
+                min_b = min_b.min(a[2]);
+                max_b = max_b.max(a[2]);
+                min_t = min_t.min(a[3]);
+                max_t = max_t.max(a[3]);
+                if max_rg - min_rg > 4
+                    || max_r - min_r > 4
+                    || max_g - min_g > 4
+                    || max_b - min_b > 4
+                    || max_t - min_t > 4
+                {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let bx_n = vf.width / CHUNK_SIZE;
+        let by_n = vf.height / CHUNK_SIZE;
+        let bz_n = vf.depth.div_ceil(CHUNK_SIZE);
+        let mut total_sub = 0usize;
+        let mut skipped_sub = 0usize;
+        for bz in 0..bz_n {
+            for by in 0..by_n {
+                for bx in 0..bx_n {
+                    let (dm, at, sd) = vf.encode_3d_subbrick_16(bx, by, bz);
+                    assert_eq!(sd, 16);
+                    assert_eq!(dm.len(), 16 * 16 * 16 * 4);
+                    total_sub += 1;
+                    if is_skippable(&dm, &at) {
+                        skipped_sub += 1;
+                    }
+                }
+            }
+        }
+        let skip_pct = (skipped_sub as f64 / total_sub as f64) * 100.0;
+        assert!(
+            skip_pct > 40.0,
+            "Z=64 cubic sub-brick sky/bedrock skip rate must be > 40%, got {:.1}% ({}/{})",
+            skip_pct,
+            skipped_sub,
+            total_sub
+        );
+
+        // 5. Run 10 full 3D ticks with altitude-coupled gravity & ambient relaxation -> exact 0 error!
+        for tick in 0..10 {
+            vf.apply_weather_and_springs_3d((tick % 4) as u8, tick);
+            let raws = vf.refsim_raw_outputs_all();
+            let st = vf.step_3d(&raws);
+            assert_eq!(st.mass_error, 0, "Z=64 mass_error != 0 at tick {}", tick);
+            assert_eq!(st.energy_error, 0, "Z=64 energy_error != 0 at tick {}", tick);
+        }
+        assert_eq!(vf.mass_error(), 0);
+        assert_eq!(vf.energy_error(), 0);
     }
 }

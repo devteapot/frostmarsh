@@ -203,7 +203,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let style_id = i32(round(z16.vol_dims.w));
     let sim_t = z16.sky_top.w;
 
-    var t_depth_max = 280.0;
+    var t_depth_max = 460.0;
     let has_geo = depth < 0.99999;
     if (has_geo) {
         let surf_h = z16.inv_vp * vec4<f32>(ndc, depth, 1.0);
@@ -243,7 +243,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var trans = vec3<f32>(1.0);
     var in_fluid = false;
 
-    for (var b_iter = 0; b_iter < 96; b_iter = b_iter + 1) {
+    for (var b_iter = 0; b_iter < 144; b_iter = b_iter + 1) {
         if (bc.x < 0 || bc.y < 0 || bc.z < 0 || bc.x >= bdims.x || bc.y >= bdims.y || bc.z >= bdims.z) {
             break;
         }
@@ -257,10 +257,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 let p = ro + rd * cur_t;
                 let dm = sample_density(p);
 
-                // --- Fluid volume: living glacial fjord river, shorelines & plunging 3D waterfalls ---
-                if (occ.g > 0.02 && dm.g > 0.12) {
+                // --- Fluid volume: living glacial fjord river, abyssal lava & plunging 3D waterfalls ---
+                let sky_cloud_condense = dims.y >= 48.0 && p.y > dims.y * 0.82 && dm.g < 0.36;
+                if (occ.g > 0.02 && dm.g > 0.12 && !sky_cloud_condense) {
                     let at = sample_albedo(p); // Pre-styled by `neural_style_z16.wgsl`!
-                    let is_waterfall = p.y > 4.2 && p.y < max(dims.y - 2.0, 10.2);
+                    // Physically detect plunging waterfalls (open air below, not a river sitting on bedrock!)
+                    let bed_deep = sample_density(p - vec3<f32>(0.0, 3.2, 0.0)).r;
+                    let is_waterfall = p.y > dims.y * 0.22 && p.y < dims.y - 2.0
+                        && (bed_deep < 0.22 || (dims.y <= 32.0 && p.y > dims.y * 0.24));
+                    let is_abyss_magma = dims.y >= 48.0 && p.y < dims.y * 0.26 && at.a > 0.28;
+                    let in_cloud_band = dims.y >= 48.0 && p.y > dims.y * 0.80;
                     var surf_shore = 0.0;
                     var surf_bed = 0.0;
 
@@ -307,18 +313,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     var fluid_rgb = at.rgb;
                     var fluid_glow = at.a;
                     var extra_foam = 0.0;
-                    if (style_id == 1) {
+                    if (style_id == 1 && !in_cloud_band) {
                         let lava_pulse = 0.72 + 0.28 * sin(p.x * 0.7 + p.z * 0.9 - sim_t * 2.4);
-                        fluid_rgb = mix(fluid_rgb, vec3<f32>(1.00, 0.76, 0.18), lava_pulse * select(0.28, 0.62, is_waterfall));
-                        fluid_glow = max(fluid_glow, 0.72 + select(0.0, 0.22, is_waterfall));
-                    } else if (style_id == 2) {
+                        fluid_rgb = mix(fluid_rgb, vec3<f32>(0.96, 0.36, 0.06), lava_pulse * select(0.32, 0.56, is_waterfall));
+                        fluid_glow = min(max(fluid_glow, 0.44 + select(0.0, 0.14, is_waterfall)), 0.62);
+                    } else if (style_id == 2 && !in_cloud_band) {
                         let arc_pulse = 0.70 + 0.30 * sin(p.z * 1.1 - p.y * 1.4 - sim_t * 3.0);
                         fluid_rgb = mix(fluid_rgb, vec3<f32>(0.68, 0.28, 1.00), arc_pulse * 0.32);
-                        fluid_glow = max(fluid_glow, 0.54 + select(0.0, 0.26, is_waterfall));
-                    } else if (style_id == 3) {
+                        fluid_glow = min(max(fluid_glow, 0.42 + select(0.0, 0.16, is_waterfall)), 0.62);
+                    } else if (style_id == 3 && !in_cloud_band) {
                         let jade_pulse = 0.70 + 0.30 * sin(p.y * 2.2 - sim_t * 3.2 + p.x * 0.9);
-                        fluid_rgb = mix(fluid_rgb, vec3<f32>(0.36, 1.00, 0.76), jade_pulse * select(0.25, 0.55, is_waterfall));
-                        fluid_glow = max(fluid_glow, 0.36 + select(0.0, 0.22, is_waterfall));
+                        fluid_rgb = mix(vec3<f32>(0.06, 0.42, 0.36), vec3<f32>(0.22, 0.88, 0.68), jade_pulse * select(0.32, 0.52, is_waterfall));
+                        fluid_glow = min(max(fluid_glow * 0.55, 0.18 + select(0.0, 0.12, is_waterfall)), 0.38);
+                    } else if (in_cloud_band) {
+                        fluid_rgb = vec3<f32>(0.72, 0.78, 0.86);
+                        fluid_glow = 0.0;
+                    } else if (is_abyss_magma) {
+                        // Glowing subterranean Abyssal Magma & Oil Rivers (`p.y < dims.y * 0.28`)!
+                        let lava_pulse = 0.76 + 0.24 * sin(p.x * 0.65 + p.z * 0.85 - sim_t * 2.2);
+                        fluid_rgb = mix(vec3<f32>(0.96, 0.34, 0.06), vec3<f32>(1.00, 0.82, 0.24), lava_pulse * 0.58);
+                        fluid_glow = max(fluid_glow, 0.68);
                     } else {
                         // Nordic glacial river: deep sapphire channel -> turquoise shallows + animated ripple caustics
                         let c1 = vnoise2(p.xz * 1.15 - vec2<f32>(0.0, sim_t * 1.55));
@@ -362,24 +376,40 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     in_fluid = false;
                 }
 
-                // --- Gas volume: luminous wildfire flames, lava core, rising ember sparks & smoke/steam ---
+                // --- Gas volume: luminous wildfire flames, lava core, rising ember sparks & wispy clouds/steam ---
                 if (occ.b > 0.01 && dm.b > 0.015) {
                     let at = sample_albedo(p);
-                    let is_hot_fire = at.a > 0.06;
+                    let cloud_deck = select(0.0, smoothstep(dims.y * 0.74, dims.y * 0.88, p.y), dims.y >= 48.0);
+                    let fire_thresh = select(0.08, 0.28, style_id == 1);
+                    let is_hot_fire = at.a > fire_thresh && cloud_deck < 0.15;
                     var turb = 1.0;
                     if (is_hot_fire) {
                         let fn0 = vnoise2(vec2<f32>(p.x + p.z, p.y * 1.4 - sim_t * 3.8) * 1.25);
                         turb = 0.72 + 0.56 * fn0;
+                    } else if (cloud_deck > 0.02) {
+                        // Sculpt soft wispy drifting stratospheric clouds instead of blocky voxel curtains
+                        let c_wisp = vnoise2(p.xz * 0.14 + vec2<f32>(sim_t * 0.08, -sim_t * 0.05)) * 0.65
+                                   + vnoise2(p.xz * 0.34 - vec2<f32>(sim_t * 0.12, p.y * 0.25)) * 0.35;
+                        turb = smoothstep(0.28, 0.78, c_wisp) * 0.32;
+                    } else if (dims.y >= 48.0) {
+                        // Keep tall Z=64 valley steam/mist airy and readable without blowing out the gorge
+                        turb = 0.38;
                     }
-                    let ext = dm.b * 0.80 * turb * dt;
+                    let ext = dm.b * 0.72 * turb * dt;
                     let step_t = exp(-ext);
                     let sun_vis = 0.55 + 0.45 * clamp(p.y / max(dims.y - 2.0, 1.0), 0.0, 1.0);
-                    let lin_g = srgb_to_linear(at.rgb);
-                    let scatter = lin_g * (u.sun_col.rgb * 0.62 * sun_vis + z16.sky_horizon.rgb * 0.42);
+                    let cloud_tint = select(
+                        vec3<f32>(0.86, 0.92, 1.00),
+                        vec3<f32>(0.42, 0.30, 0.28),
+                        style_id == 1,
+                    );
+                    let lin_g = mix(srgb_to_linear(at.rgb), cloud_tint, cloud_deck * 0.78);
+                    let cloud_boost = 1.0 + cloud_deck * select(0.25, 0.05, style_id == 1);
+                    let scatter = lin_g * (u.sun_col.rgb * 0.60 * sun_vis + z16.sky_horizon.rgb * 0.40) * cloud_boost;
                     var emit = vec3<f32>(0.0);
                     if (is_hot_fire) {
                         let core_temp = clamp(at.a * (0.85 + 0.35 * turb), 0.0, 1.0);
-                        emit = blackbody_ramp(core_temp, lin_g, style_id) * 2.25;
+                        emit = blackbody_ramp(core_temp, lin_g, style_id) * select(2.15, 1.45, style_id == 1);
                         // Animated rising ember sparks inside hot wildfire/lava plumes!
                         let spark_p = floor(p * 1.85 + vec3<f32>(sin(sim_t * 1.7 + p.y) * 0.4, -sim_t * 5.2, cos(sim_t * 1.4 + p.x) * 0.4));
                         let spark = step(0.955, hash3(spark_p));

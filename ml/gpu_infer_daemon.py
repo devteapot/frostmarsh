@@ -497,6 +497,7 @@ class _SparseWorld3DAdapter:
             use_fp16=use_fp16,
             sparse_threshold=(0.30 if use_sparse else 0.0),
             activity_eps=5e-4,
+            max_bricks_per_batch=192,
         )
 
     def infer_from_host_in(self) -> tuple[memoryview, torch.Tensor, torch.Tensor, float, int]:
@@ -568,13 +569,16 @@ class _SparseWorldDTAdapter:
         self.host_in_u8 = self.host_in_np.view(np.uint8).ravel()
         self.host_in_v8_u8 = self.host_in_v8_np.view(np.uint8).ravel()
         self.host_out_bytes = memoryview(self.host_out_np).cast("B")
+        sparse_thr = (0.65 if batch >= 32 else 0.30) if use_sparse else 0.0
+        act_eps = 4e-3 if batch >= 32 else 2e-3
         self.runner = _call_with_accepted_kwargs(
             runner_cls,
             model_dt,
             device=device,
             use_fp16=use_fp16,
-            sparse_threshold=(0.30 if use_sparse else 0.0),
-            activity_eps=2e-3,
+            sparse_threshold=sparse_thr,
+            activity_eps=act_eps,
+            max_bricks_per_batch=192,
         )
         step_params = inspect.signature(self.runner.step).parameters
         self._accepts_world_laws = (
@@ -2159,7 +2163,7 @@ class GPUInferDaemon:
                         or width == 0
                         or payload_bytes != expected_bytes
                     ):
-                        if 0 < payload_bytes <= 512 * 1024 * 1024:
+                        if 0 < payload_bytes <= 1024 * 1024 * 1024:
                             _recv_exact(conn, memoryview(bytearray(payload_bytes)))
                         self._send_error(conn, STATUS_BAD_REQUEST, height, width)
                         continue
@@ -2191,7 +2195,7 @@ class GPUInferDaemon:
                         or width == 0
                         or payload_bytes != expected_bytes
                     ):
-                        if 0 < payload_bytes <= 512 * 1024 * 1024:
+                        if 0 < payload_bytes <= 1024 * 1024 * 1024:
                             _recv_exact(conn, memoryview(bytearray(payload_bytes)))
                         self._send_error(conn, STATUS_BAD_REQUEST, height, width)
                         continue
@@ -2223,7 +2227,7 @@ class GPUInferDaemon:
                         or width == 0
                         or payload_bytes != expected_bytes
                     ):
-                        if 0 < payload_bytes <= 512 * 1024 * 1024:
+                        if 0 < payload_bytes <= 1024 * 1024 * 1024:
                             _recv_exact(conn, memoryview(bytearray(payload_bytes)))
                         self._send_error(conn, STATUS_BAD_REQUEST, height, width)
                         continue

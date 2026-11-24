@@ -78,8 +78,9 @@ fn hash1(n: u32) -> f32 {
 pub struct Z16World {
     pub width: usize,  // X (e.g. 128 or 256)
     pub height: usize, // Z north-south (e.g. 128 or 256)
-    pub depth: usize,  // Y altitude (16)
+    pub depth: usize,  // Y altitude (16, 32, or 64)
     pub bricks_x: usize,
+    pub bricks_y: usize,
     pub bricks_z: usize,
 
     /// GPU-ready `[iz][iy][ix][4]` RGBA8: `(solid_density, fluid_density, gas_density, roughness)`
@@ -93,8 +94,11 @@ pub struct Z16World {
     pub occ_bz: usize,
     pub occ_data: Vec<u8>,
 
-    /// Per-`16×16` column Surface-Nets vertex/index caches
-    pub brick_meshes: Vec<BrickMesh>,
+    /// Per-`16×16×16` cubic sub-brick classification (`0 = empty sky`, `1 = uniform solid`, `2 = active/mixed`)
+    /// indexed `(bz * bricks_y + by) * bricks_x + bx` so Surface-Nets skips pure sky & bedrock cubes!
+    pub subbrick_state: Vec<u8>,
+    /// Per-`16×16×16` cubic sub-brick Surface-Nets vertex/index caches
+    pub subbrick_meshes: Vec<BrickMesh>,
     pub flat_verts: Vec<SurfaceVertex>,
     pub flat_idxs: Vec<u32>,
 
@@ -120,16 +124,19 @@ impl Z16World {
         let h = height.max(16);
         let d = depth.max(2);
         let bricks_x = chunks_for_dim(w);
+        let bricks_y = chunks_for_dim(d);
         let bricks_z = chunks_for_dim(h);
         let occ_bx = w.div_ceil(OCC_BRICK_SIZE);
         let occ_by = d.div_ceil(OCC_BRICK_SIZE);
         let occ_bz = h.div_ceil(OCC_BRICK_SIZE);
         let n_bricks = bricks_x * bricks_z;
+        let n_subbricks = bricks_x * bricks_y * bricks_z;
         Self {
             width: w,
             height: h,
             depth: d,
             bricks_x,
+            bricks_y,
             bricks_z,
             density_mat: vec![0u8; w * d * h * 4],
             albedo_thermal: vec![0u8; w * d * h * 4],
@@ -137,7 +144,8 @@ impl Z16World {
             occ_by,
             occ_bz,
             occ_data: vec![0u8; occ_bx * occ_by * occ_bz * 4],
-            brick_meshes: vec![BrickMesh::default(); n_bricks],
+            subbrick_state: vec![0u8; n_subbricks],
+            subbrick_meshes: vec![BrickMesh::default(); n_subbricks],
             flat_verts: Vec::new(),
             flat_idxs: Vec::new(),
             brick_pines: vec![Vec::new(); n_bricks],
@@ -178,8 +186,133 @@ impl Z16World {
         self.flat_idxs.len() / 3
     }
 
+    #[allow(dead_code)]
     pub fn non_empty_bricks(&self) -> usize {
-        self.brick_meshes.iter().filter(|b| !b.indices.is_empty()).count()
+        self.subbrick_meshes.iter().filter(|b| !b.indices.is_empty()).count()
+    }
+
+    #[inline]
+    fn subbrick_index(&self, bx: usize, by: usize, bz: usize) -> usize {
+        (bz * self.bricks_y + by) * self.bricks_x + bx
+    }
+
+    /// Classify cubic sub-brick `(bx, by_alt, bz_north)` in staging buffers:
+    /// `0` = pure empty sky, `1` = pure uniform opaque solid interior, `2` = active/mixed.
+    fn classify_subbrick_in_buffer(&self, bx: usize, by: usize, bz: usize) -> u8 {
+        let x0 = bx * SN_BRICK_SIZE;
+        let y0 = by * SN_BRICK_SIZE;
+        let z0 = bz * SN_BRICK_SIZE;
+        let x1 = (x0 + SN_BRICK_SIZE).min(self.width);
+        let y1 = (y0 + SN_BRICK_SIZE).min(self.depth);
+        let z1 = (z0 + SN_BRICK_SIZE).min(self.height);
+        if x0 >= x1 || y0 >= y1 || z0 >= z1 {
+            return 0;
+        }
+        let mut all_sky = true;
+        let mut all_solid = true;
+        let (mut min_rg, mut max_rg) = (u8::MAX, 0u8);
+        let (mut min_r, mut max_r) = (u8::MAX, 0u8);
+        let (mut min_g, mut max_g) = (u8::MAX, 0u8);
+        let (mut min_b, mut max_b) = (u8::MAX, 0u8);
+        let (mut min_t, mut max_t) = (u8::MAX, 0u8);
+
+        for iz in z0..z1 {
+            for iy in y0..y1 {
+                let row = (iz * self.depth + iy) * self.width * 4;
+                for ix in x0..x1 {
+                    let o = row + ix * 4;
+                    let s = self.density_mat[o];
+                    let f = self.density_mat[o + 1];
+                    let g = self.density_mat[o + 2];
+                    let rg = self.density_mat[o + 3];
+                    let r = self.albedo_thermal[o];
+                    let ag = self.albedo_thermal[o + 1];
+                    let b = self.albedo_thermal[o + 2];
+                    let t = self.albedo_thermal[o + 3];
+                    if s != 0 || f != 0 || g != 0 || t != 0 {
+                        all_sky = false;
+                    }
+                    if all_solid {
+                        if s < 245 || f != 0 || g != 0 {
+                            all_solid = false;
+                        } else {
+                            min_rg = min_rg.min(rg);
+                            max_rg = max_rg.max(rg);
+                            min_r = min_r.min(r);
+                            max_r = max_r.max(r);
+                            min_g = min_g.min(ag);
+                            max_g = max_g.max(ag);
+                            min_b = min_b.min(b);
+                            max_b = max_b.max(b);
+                            min_t = min_t.min(t);
+                            max_t = max_t.max(t);
+                            if max_rg - min_rg > 4
+                                || max_r - min_r > 4
+                                || max_g - min_g > 4
+                                || max_b - min_b > 4
+                                || max_t - min_t > 4
+                            {
+                                all_solid = false;
+                            }
+                        }
+                    }
+                    if !all_sky && !all_solid {
+                        return 2;
+                    }
+                }
+            }
+        }
+        if all_sky {
+            0
+        } else if all_solid {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Returns `true` when sub-brick `(bx, by_alt, bz_north)` and all its immediate `±1` cubic
+    /// neighbors are uniformly empty sky (`0`) OR uniformly opaque solid bedrock (`1`), so Surface-Nets
+    /// can skip the entire `16×16×16` cube in O(1) with zero triangles!
+    fn can_skip_subbrick_surface_nets(&self, bx: usize, by: usize, bz: usize) -> bool {
+        let center = self.subbrick_state[self.subbrick_index(bx, by, bz)];
+        if center == 2 {
+            return false;
+        }
+        for dz in -1i32..=1 {
+            let nz = bz as i32 + dz;
+            if nz < 0 || (nz as usize) >= self.bricks_z {
+                continue;
+            }
+            for dy in -1i32..=1 {
+                let ny = by as i32 + dy;
+                if ny < 0 || (ny as usize) >= self.bricks_y {
+                    continue;
+                }
+                for dx in -1i32..=1 {
+                    let nx = bx as i32 + dx;
+                    if nx < 0 || (nx as usize) >= self.bricks_x {
+                        continue;
+                    }
+                    if self.subbrick_state[self.subbrick_index(nx as usize, ny as usize, nz as usize)]
+                        != center
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn rebuild_subbrick_mesh(&mut self, bx: usize, by: usize, bz: usize) {
+        let si = self.subbrick_index(bx, by, bz);
+        if self.can_skip_subbrick_surface_nets(bx, by, bz) {
+            self.subbrick_meshes[si] = BrickMesh::default();
+        } else {
+            self.subbrick_meshes[si] =
+                extract_subbrick(&self.density_mat, self.width, self.depth, self.height, bx, by, bz);
+        }
     }
 
     /// Incrementally copy dirty `16×16×D` bricks from `LiveWorldState`, update `8×8×8` occupancy,
@@ -254,7 +387,16 @@ impl Z16World {
         }
         self.gpu_occ_dirty = true;
 
-        // 3. Collect dirty Surface-Nets bricks + seam neighbors (1-cell -X/-Z halo & +1 corner sharing)
+        // 2b. Re-classify all vertical cubic sub-bricks for dirty columns BEFORE Surface-Nets neighborhood check
+        for &(bx, bz) in &unique_dirty {
+            for by in 0..self.bricks_y {
+                let st = self.classify_subbrick_in_buffer(bx, by, bz);
+                let si = self.subbrick_index(bx, by, bz);
+                self.subbrick_state[si] = st;
+            }
+        }
+
+        // 3. Collect dirty Surface-Nets columns + seam neighbors (1-cell -X/-Z halo & +1 corner sharing)
         let mut mesh_dirty_set: HashSet<(usize, usize)> = HashSet::with_capacity(unique_dirty.len() * 4);
         for &(bx, bz) in &unique_dirty {
             for dz in -1i32..=1 {
@@ -268,11 +410,12 @@ impl Z16World {
             }
         }
 
-        // Rebuild only affected 16×16×16 Surface-Nets bricks (~31 µs each!)
+        // Rebuild only affected active 16×16×16 cubic Surface-Nets sub-bricks (skipping sky & bedrock cubes!)
         let mut rebuilt = 0usize;
         for &(bx, bz) in &mesh_dirty_set {
-            let mesh = extract_brick(&self.density_mat, w, d, h, bx, bz);
-            self.brick_meshes[bz * bx_max + bx] = mesh;
+            for by in 0..self.bricks_y {
+                self.rebuild_subbrick_mesh(bx, by, bz);
+            }
             rebuilt += 1;
         }
         self.flatten_mesh_buffers();
@@ -286,6 +429,321 @@ impl Z16World {
         self.minimap_dirty = true;
 
         (rebuilt, t0.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    /// Incrementally copy dirty `16×16×16` cubic sub-bricks `(bx, by_north, bz_alt)` from `LiveWorldState`
+    /// into `Z16World`, skipping pure sky & pure solid bedrock cubes completely in Surface-Nets!
+    pub fn apply_dirty_subbricks(
+        &mut self,
+        src_density_mat: &[u8],
+        src_albedo_thermal: &[u8],
+        dirty_subbricks: &[(usize, usize, usize)],
+    ) -> (usize, f64) {
+        if dirty_subbricks.is_empty() {
+            return (0, 0.0);
+        }
+        let expected = self.width * self.depth * self.height * 4;
+        if src_density_mat.len() != expected || src_albedo_thermal.len() != expected {
+            return (0, 0.0);
+        }
+
+        let t0 = Instant::now();
+        let w = self.width;
+        let h = self.height;
+        let d = self.depth;
+        let bx_max = self.bricks_x;
+        let by_max = self.bricks_y;
+        let bz_max = self.bricks_z;
+
+        let mut unique_subs: Vec<(usize, usize, usize)> = Vec::with_capacity(dirty_subbricks.len());
+        let mut seen_sub = HashSet::with_capacity(dirty_subbricks.len() * 2);
+        let mut unique_cols: Vec<(usize, usize)> = Vec::new();
+        let mut seen_col = HashSet::new();
+
+        for &(bx, bz_north, by_alt) in dirty_subbricks {
+            if bx >= bx_max || bz_north >= bz_max || by_alt >= by_max {
+                continue;
+            }
+            if !seen_sub.insert((bx, by_alt, bz_north)) {
+                continue;
+            }
+            unique_subs.push((bx, by_alt, bz_north));
+            if seen_col.insert((bx, bz_north)) {
+                unique_cols.push((bx, bz_north));
+            }
+
+            let x0 = bx * SN_BRICK_SIZE;
+            let y0 = by_alt * SN_BRICK_SIZE;
+            let z0 = bz_north * SN_BRICK_SIZE;
+            let cw = SN_BRICK_SIZE.min(w - x0);
+            let cd = SN_BRICK_SIZE.min(d - y0);
+            let ch = SN_BRICK_SIZE.min(h - z0);
+            let row_bytes = cw * 4;
+
+            for dz in 0..ch {
+                let iz = z0 + dz;
+                for dy in 0..cd {
+                    let iy = y0 + dy;
+                    let off = ((iz * d + iy) * w + x0) * 4;
+                    self.density_mat[off..off + row_bytes]
+                        .copy_from_slice(&src_density_mat[off..off + row_bytes]);
+                    self.albedo_thermal[off..off + row_bytes]
+                        .copy_from_slice(&src_albedo_thermal[off..off + row_bytes]);
+                }
+            }
+        }
+
+        if unique_subs.is_empty() {
+            return (0, 0.0);
+        }
+
+        // Queue GPU 3D texture upload
+        if unique_cols.len() >= (bx_max * bz_max) / 4 {
+            self.gpu_tex_full_dirty = true;
+            self.gpu_dirty_bricks.clear();
+        } else if !self.gpu_tex_full_dirty {
+            for &c in &unique_cols {
+                if !self.gpu_dirty_bricks.contains(&c) {
+                    self.gpu_dirty_bricks.push(c);
+                }
+            }
+        }
+
+        // Update coarse 8×8×8 occupancy only for affected sub-bricks (or full rebuild on initial sync)
+        if unique_subs.len() >= (bx_max * by_max * bz_max) / 4 {
+            self.rebuild_all_occupancy();
+        } else {
+            self.update_occupancy_for_subbricks(&unique_subs);
+        }
+        self.gpu_occ_dirty = true;
+
+        // Classify updated cubic sub-bricks
+        for &(bx, by, bz) in &unique_subs {
+            let st = self.classify_subbrick_in_buffer(bx, by, bz);
+            let si = self.subbrick_index(bx, by, bz);
+            self.subbrick_state[si] = st;
+        }
+
+        // Collect dirty 3D sub-bricks + seam neighbors, skipping pure sky & pure solid bedrock cubes!
+        let mut mesh_dirty_set: HashSet<(usize, usize, usize)> =
+            HashSet::with_capacity(unique_subs.len() * 4);
+        for &(bx, by, bz) in &unique_subs {
+            for dz in -1i32..=1 {
+                let nz = bz as i32 + dz;
+                if nz < 0 || (nz as usize) >= bz_max {
+                    continue;
+                }
+                for dy in -1i32..=1 {
+                    let ny = by as i32 + dy;
+                    if ny < 0 || (ny as usize) >= by_max {
+                        continue;
+                    }
+                    for dx in -1i32..=1 {
+                        let nx = bx as i32 + dx;
+                        if nx < 0 || (nx as usize) >= bx_max {
+                            continue;
+                        }
+                        mesh_dirty_set.insert((nx as usize, ny as usize, nz as usize));
+                    }
+                }
+            }
+        }
+
+        let mut rebuilt = 0usize;
+        for &(bx, by, bz) in &mesh_dirty_set {
+            if !self.can_skip_subbrick_surface_nets(bx, by, bz) {
+                rebuilt += 1;
+            }
+            self.rebuild_subbrick_mesh(bx, by, bz);
+        }
+        self.flatten_mesh_buffers();
+        self.gpu_mesh_dirty = true;
+
+        for &(bx, bz) in &unique_cols {
+            self.update_minimap_brick(bx, bz);
+            self.rebuild_pines_and_hotspots_brick(bx, bz);
+        }
+        self.minimap_dirty = true;
+
+        (rebuilt, t0.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    /// Directly patch a full `VolumetricSubBrick3D` (`16×16×sub_depth` at `[bz*16 .. bz*16+sub_depth]`)
+    /// into `Z16World`, updating occupancy, sub-brick active tracking, and Surface-Nets.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn apply_subbrick3d(
+        &mut self,
+        bx: usize,
+        by: usize,
+        bz: usize,
+        total_depth: usize,
+        sub_depth: usize,
+        dm_raw: &[u8],
+        at_raw: &[u8],
+    ) -> Result<usize, String> {
+        if total_depth >= 16 && total_depth != self.depth {
+            self.resize_if_needed(self.width, self.height, total_depth);
+        }
+        let bz_north = by;
+        let by_alt = bz;
+        if bx >= self.bricks_x || bz_north >= self.bricks_z || by_alt >= self.bricks_y {
+            return Err(format!("subbrick ({}, {}, {}) out of bounds", bx, by, bz));
+        }
+        let expected = SN_BRICK_SIZE * SN_BRICK_SIZE * sub_depth * 4;
+        if dm_raw.len() != expected || at_raw.len() != expected {
+            return Err(format!(
+                "subbrick length mismatch: got dm={} at={}, expected {}",
+                dm_raw.len(),
+                at_raw.len(),
+                expected
+            ));
+        }
+        let w = self.width;
+        let h = self.height;
+        let d = self.depth;
+        let x0 = bx * SN_BRICK_SIZE;
+        let z0 = bz_north * SN_BRICK_SIZE;
+        let y0 = by_alt * SN_BRICK_SIZE;
+        let copy_w = SN_BRICK_SIZE.min(w.saturating_sub(x0));
+        let copy_h = SN_BRICK_SIZE.min(h.saturating_sub(z0));
+        let copy_d = sub_depth.min(d.saturating_sub(y0));
+        let row_bytes = copy_w * 4;
+
+        for dy in 0..copy_d {
+            let iy = y0 + dy;
+            for dz in 0..copy_h {
+                let iz = z0 + dz;
+                let src = ((dy * SN_BRICK_SIZE + dz) * SN_BRICK_SIZE) * 4;
+                let dst = ((iz * d + iy) * w + x0) * 4;
+                self.density_mat[dst..dst + row_bytes]
+                    .copy_from_slice(&dm_raw[src..src + row_bytes]);
+                self.albedo_thermal[dst..dst + row_bytes]
+                    .copy_from_slice(&at_raw[src..src + row_bytes]);
+            }
+        }
+
+        let st = self.classify_subbrick_in_buffer(bx, by_alt, bz_north);
+        let si = self.subbrick_index(bx, by_alt, bz_north);
+        self.subbrick_state[si] = st;
+        if !self.gpu_tex_full_dirty && !self.gpu_dirty_bricks.contains(&(bx, bz_north)) {
+            self.gpu_dirty_bricks.push((bx, bz_north));
+        }
+        self.update_occupancy_for_subbricks(&[(bx, by_alt, bz_north)]);
+        self.gpu_occ_dirty = true;
+        for dz in -1i32..=1 {
+            let nz = bz_north as i32 + dz;
+            if nz < 0 || (nz as usize) >= self.bricks_z {
+                continue;
+            }
+            for dy in -1i32..=1 {
+                let ny = by_alt as i32 + dy;
+                if ny < 0 || (ny as usize) >= self.bricks_y {
+                    continue;
+                }
+                for dx in -1i32..=1 {
+                    let nx = bx as i32 + dx;
+                    if nx < 0 || (nx as usize) >= self.bricks_x {
+                        continue;
+                    }
+                    self.rebuild_subbrick_mesh(nx as usize, ny as usize, nz as usize);
+                }
+            }
+        }
+        self.flatten_mesh_buffers();
+        self.gpu_mesh_dirty = true;
+        self.update_minimap_brick(bx, bz_north);
+        self.rebuild_pines_and_hotspots_brick(bx, bz_north);
+        self.minimap_dirty = true;
+        Ok(copy_w * copy_h * copy_d)
+    }
+
+    /// Directly patch a sparse `VolumetricSubBrick3DDelta` payload into `[bz*16 .. bz*16+sub_depth]`
+    /// of `Z16World`, updating only the affected cubic sub-brick & its seam neighbors.
+    #[allow(dead_code)]
+    pub fn apply_subbrick3d_delta(
+        &mut self,
+        bx: usize,
+        by: usize,
+        bz: usize,
+        total_depth: usize,
+        sub_depth: usize,
+        lz4_deltas: &[u8],
+    ) -> Result<usize, String> {
+        if total_depth >= 16 && total_depth != self.depth {
+            self.resize_if_needed(self.width, self.height, total_depth);
+        }
+        let bz_north = by;
+        let by_alt = bz;
+        if bx >= self.bricks_x || bz_north >= self.bricks_z || by_alt >= self.bricks_y {
+            return Err(format!("subbrick ({}, {}, {}) out of bounds", bx, by, bz));
+        }
+        let patches = frostmarsh_proto::decode_brick3d_delta_voxels(lz4_deltas)?;
+        if patches.is_empty() {
+            return Ok(0);
+        }
+        let w = self.width;
+        let h = self.height;
+        let d = self.depth;
+        let x0 = bx * SN_BRICK_SIZE;
+        let z0 = bz_north * SN_BRICK_SIZE;
+        let y0 = by_alt * SN_BRICK_SIZE;
+        let total_sub_voxels = SN_BRICK_SIZE * SN_BRICK_SIZE * sub_depth;
+        let mut applied = 0usize;
+        for (idx, dm, at) in patches {
+            let v = idx as usize;
+            if v >= total_sub_voxels {
+                continue;
+            }
+            let dy = v / (SN_BRICK_SIZE * SN_BRICK_SIZE);
+            let rem = v % (SN_BRICK_SIZE * SN_BRICK_SIZE);
+            let dz = rem / SN_BRICK_SIZE;
+            let dx = rem % SN_BRICK_SIZE;
+            let ix = x0 + dx;
+            let iy = y0 + dy;
+            let iz = z0 + dz;
+            if ix >= w || iz >= h || iy >= d {
+                continue;
+            }
+            let dst = ((iz * d + iy) * w + ix) * 4;
+            self.density_mat[dst..dst + 4].copy_from_slice(&dm);
+            self.albedo_thermal[dst..dst + 4].copy_from_slice(&at);
+            applied += 1;
+        }
+        if applied > 0 {
+            let st = self.classify_subbrick_in_buffer(bx, by_alt, bz_north);
+            let si = self.subbrick_index(bx, by_alt, bz_north);
+            self.subbrick_state[si] = st;
+            if !self.gpu_tex_full_dirty && !self.gpu_dirty_bricks.contains(&(bx, bz_north)) {
+                self.gpu_dirty_bricks.push((bx, bz_north));
+            }
+            self.update_occupancy_for_subbricks(&[(bx, by_alt, bz_north)]);
+            self.gpu_occ_dirty = true;
+            for dz in -1i32..=1 {
+                let nz = bz_north as i32 + dz;
+                if nz < 0 || (nz as usize) >= self.bricks_z {
+                    continue;
+                }
+                for dy in -1i32..=1 {
+                    let ny = by_alt as i32 + dy;
+                    if ny < 0 || (ny as usize) >= self.bricks_y {
+                        continue;
+                    }
+                    for dx in -1i32..=1 {
+                        let nx = bx as i32 + dx;
+                        if nx < 0 || (nx as usize) >= self.bricks_x {
+                            continue;
+                        }
+                        self.rebuild_subbrick_mesh(nx as usize, ny as usize, nz as usize);
+                    }
+                }
+            }
+            self.flatten_mesh_buffers();
+            self.gpu_mesh_dirty = true;
+            self.update_minimap_brick(bx, bz_north);
+            self.rebuild_pines_and_hotspots_brick(bx, bz_north);
+            self.minimap_dirty = true;
+        }
+        Ok(applied)
     }
 
     /// Directly patch a `VolumetricBrick3DDelta` payload into `Z16World`'s GPU-ordered staging buffers,
@@ -332,6 +790,11 @@ impl Z16World {
             applied += 1;
         }
         if applied > 0 {
+            for by in 0..self.bricks_y {
+                let st = self.classify_subbrick_in_buffer(bx, by, bz);
+                let si = self.subbrick_index(bx, by, bz);
+                self.subbrick_state[si] = st;
+            }
             if !self.gpu_tex_full_dirty && !self.gpu_dirty_bricks.contains(&(bx, bz)) {
                 self.gpu_dirty_bricks.push((bx, bz));
             }
@@ -348,8 +811,9 @@ impl Z16World {
                     {
                         let nbx = nx as usize;
                         let nbz = nz as usize;
-                        let mesh = extract_brick(&self.density_mat, w, d, h, nbx, nbz);
-                        self.brick_meshes[nbz * self.bricks_x + nbx] = mesh;
+                        for by in 0..self.bricks_y {
+                            self.rebuild_subbrick_mesh(nbx, by, nbz);
+                        }
                     }
                 }
             }
@@ -363,13 +827,16 @@ impl Z16World {
     }
 
     fn flatten_mesh_buffers(&mut self) {
-        let v_tot: usize = self.brick_meshes.iter().map(|b| b.vertices.len()).sum();
-        let i_tot: usize = self.brick_meshes.iter().map(|b| b.indices.len()).sum();
+        let v_tot: usize = self.subbrick_meshes.iter().map(|b| b.vertices.len()).sum();
+        let i_tot: usize = self.subbrick_meshes.iter().map(|b| b.indices.len()).sum();
         self.flat_verts.clear();
         self.flat_idxs.clear();
         self.flat_verts.reserve(v_tot);
         self.flat_idxs.reserve(i_tot);
-        for b in &self.brick_meshes {
+        for b in &self.subbrick_meshes {
+            if b.indices.is_empty() {
+                continue;
+            }
             let base = self.flat_verts.len() as u32;
             self.flat_verts.extend_from_slice(&b.vertices);
             self.flat_idxs.extend(b.indices.iter().map(|&idx| idx + base));
@@ -405,6 +872,30 @@ impl Z16World {
             for oy in 0..self.occ_by {
                 self.recompute_occ_cell(ox, oy, oz);
             }
+        }
+    }
+
+    fn update_occupancy_for_subbricks(&mut self, dirty_subs: &[(usize, usize, usize)]) {
+        let mut occ_cells: HashSet<(usize, usize, usize)> =
+            HashSet::with_capacity(dirty_subs.len() * 12);
+        let ratio = SN_BRICK_SIZE / OCC_BRICK_SIZE; // 2
+        for &(bx, by, bz) in dirty_subs {
+            let ox0 = (bx * ratio).saturating_sub(1);
+            let ox1 = ((bx + 1) * ratio + 1).min(self.occ_bx);
+            let oy0 = (by * ratio).saturating_sub(1);
+            let oy1 = ((by + 1) * ratio + 1).min(self.occ_by);
+            let oz0 = (bz * ratio).saturating_sub(1);
+            let oz1 = ((bz + 1) * ratio + 1).min(self.occ_bz);
+            for oz in oz0..oz1 {
+                for oy in oy0..oy1 {
+                    for ox in ox0..ox1 {
+                        occ_cells.insert((ox, oy, oz));
+                    }
+                }
+            }
+        }
+        for &(ox, oy, oz) in &occ_cells {
+            self.recompute_occ_cell(ox, oy, oz);
         }
     }
 
@@ -522,6 +1013,29 @@ impl Z16World {
     pub fn sample_surface_y(&self, gx: f32, gy: f32) -> f32 {
         let ix = (gx.floor() as i32).clamp(0, (self.width - 1) as i32) as usize;
         let iz = (gy.floor() as i32).clamp(0, (self.height - 1) as i32) as usize;
+        self.find_column_surface_y(ix, iz).unwrap_or(1.5)
+    }
+
+    /// Stratum-aware surface lookup scanning downward from `hint_z` (so Abyssal Cavern & Viaduct
+    /// shrines underneath Sky-Islands land cleanly on their own stratum's floor!).
+    pub fn sample_surface_y_near(&self, gx: f32, gy: f32, hint_z: f32) -> f32 {
+        let ix = (gx.floor() as i32).clamp(0, (self.width - 1) as i32) as usize;
+        let iz = (gy.floor() as i32).clamp(0, (self.height - 1) as i32) as usize;
+        let start_y = (hint_z.floor() as i32).clamp(1, (self.depth - 1) as i32) as usize;
+        for iy in (1..=start_y).rev() {
+            let d_cur = self.solid_f32(ix, iy, iz);
+            if d_cur >= ISO {
+                let d_above = if iy + 1 < self.depth {
+                    self.solid_f32(ix, iy + 1, iz)
+                } else {
+                    0.0
+                };
+                if d_above < ISO {
+                    let frac = ((d_cur - ISO) / (d_cur - d_above).max(1e-3)).clamp(0.0, 1.0);
+                    return iy as f32 + 0.5 + frac;
+                }
+            }
+        }
         self.find_column_surface_y(ix, iz).unwrap_or(1.5)
     }
 
@@ -910,7 +1424,12 @@ impl Z16World {
         let max_z = (self.depth as f32 - height - 0.1).max(0.5);
 
         for _ in 0..substeps {
-            vz -= GRAVITY * sub_dt;
+            let alt_grav_scale = if self.depth >= 48 && pz >= 0.65 * (self.depth as f32) {
+                0.45
+            } else {
+                1.0
+            };
+            vz -= GRAVITY * alt_grav_scale * sub_dt;
             px = (px + vx * sub_dt).clamp(min_x, max_x);
             py = (py + vy * sub_dt).clamp(min_y, max_y);
             pz = (pz + vz * sub_dt).clamp(0.5, max_z);
@@ -1023,25 +1542,36 @@ fn capsule_shell_samples_3d(pos: (f32, f32, f32), radius: f32, height: f32) -> [
     ]
 }
 
-/// Extract one `16×16×D` watertight Smooth Surface-Nets brick `(bx, bz)` with a 1-cell negative halo
-/// so cross-brick seams are 100% seamless and outward-facing CCW.
-fn extract_brick(dm: &[u8], w: usize, d: usize, h: usize, bx: usize, bz: usize) -> BrickMesh {
+/// Extract one `16×16×16` cubic watertight Smooth Surface-Nets sub-brick `(bx, by, bz)` with a
+/// 1-cell negative halo along X, Y, and Z so cross-brick seams are 100% seamless and outward-facing CCW.
+fn extract_subbrick(
+    dm: &[u8],
+    w: usize,
+    d: usize,
+    h: usize,
+    bx: usize,
+    by: usize,
+    bz: usize,
+) -> BrickMesh {
     let cell_w = w - 1;
     let cell_d = d - 1;
     let cell_h = h - 1;
 
     let ox = bx * SN_BRICK_SIZE;
+    let oy = by * SN_BRICK_SIZE;
     let oz = bz * SN_BRICK_SIZE;
     let x_end = (ox + SN_BRICK_SIZE).min(cell_w);
+    let y_end = (oy + SN_BRICK_SIZE).min(cell_d);
     let z_end = (oz + SN_BRICK_SIZE).min(cell_h);
-    if ox >= x_end || oz >= z_end || cell_d == 0 {
+    if ox >= x_end || oy >= y_end || oz >= z_end {
         return BrickMesh::default();
     }
 
     let gx0 = ox.saturating_sub(1);
+    let gy0 = oy.saturating_sub(1);
     let gz0 = oz.saturating_sub(1);
     let gw = x_end - gx0;
-    let gd = cell_d;
+    let gd = y_end - gy0;
     let gh = z_end - gz0;
 
     let mut cell_vid = vec![u32::MAX; gw * gd * gh];
@@ -1056,7 +1586,8 @@ fn extract_brick(dm: &[u8], w: usize, d: usize, h: usize, bx: usize, bz: usize) 
     // Pass 1: Place one smooth dual vertex per sign-change cell at the average edge-crossing point.
     for z in gz0..z_end {
         let lz = z - gz0;
-        for y in 0..gd {
+        for y in gy0..y_end {
+            let ly = y - gy0;
             for x in gx0..x_end {
                 let lx = x - gx0;
                 let c = [
@@ -1105,7 +1636,7 @@ fn extract_brick(dm: &[u8], w: usize, d: usize, h: usize, bx: usize, bz: usize) 
 
                 let vid = vertices.len() as u32;
                 vertices.push(SurfaceVertex { pos: [vx, vy, vz] });
-                cell_vid[(lz * gd + y) * gw + lx] = vid;
+                cell_vid[(lz * gd + ly) * gw + lx] = vid;
             }
         }
     }
@@ -1115,7 +1646,7 @@ fn extract_brick(dm: &[u8], w: usize, d: usize, h: usize, bx: usize, bz: usize) 
     }
 
     let get_vid = |x: usize, y: usize, z: usize| -> u32 {
-        cell_vid[((z - gz0) * gd + y) * gw + (x - gx0)]
+        cell_vid[((z - gz0) * gd + (y - gy0)) * gw + (x - gx0)]
     };
 
     #[inline]
@@ -1132,7 +1663,7 @@ fn extract_brick(dm: &[u8], w: usize, d: usize, h: usize, bx: usize, bz: usize) 
 
     // Pass 2: Connect adjacent sign-change cells around each bipolar minimal edge into CCW quads.
     for z in oz..z_end {
-        for y in 0..gd {
+        for y in oy..y_end {
             for x in ox..x_end {
                 let s0 = sample_raw(dm, w, d, x, y, z) >= ISO;
 
@@ -1277,5 +1808,50 @@ mod tests {
         let off = world.byte_index(16 + 5, 3, 5);
         assert_eq!(&world.density_mat[off..off + 4], &[240, 0, 0, 180]);
         assert_eq!(&world.albedo_thermal[off..off + 4], &[255, 130, 30, 220]);
+    }
+
+    #[test]
+    fn test_z64_cubic_subbrick_apply_delta_and_skip_empty() {
+        let (w, h, d) = (32usize, 32usize, 64usize);
+        let mut world = Z16World::new(w, h, d);
+        assert_eq!((world.bricks_x, world.bricks_y, world.bricks_z), (2, 4, 2));
+        assert!(world.can_skip_subbrick_surface_nets(0, 3, 0));
+
+        // Patch a floating Sky-Island cube into bz = 3 (z = 48..63) at (bx=1, by=1)
+        let sub_bytes = SN_BRICK_SIZE * SN_BRICK_SIZE * SN_BRICK_SIZE * 4;
+        let mut sub_dm = vec![0u8; sub_bytes];
+        let mut sub_at = vec![0u8; sub_bytes];
+        for dz in 2..6 {
+            for dy in 4..12 {
+                for dx in 4..12 {
+                    let o = ((dz * SN_BRICK_SIZE + dy) * SN_BRICK_SIZE + dx) * 4;
+                    sub_dm[o..o + 4].copy_from_slice(&[250, 0, 0, 200]);
+                    sub_at[o..o + 4].copy_from_slice(&[82, 128, 76, 0]);
+                }
+            }
+        }
+        world
+            .apply_subbrick3d(1, 1, 3, 64, 16, &sub_dm, &sub_at)
+            .expect("apply_subbrick3d");
+        assert!(world.total_triangles() > 100);
+        let max_y = world.flat_verts.iter().map(|v| v.pos[1]).fold(0.0f32, f32::max);
+        assert!(max_y > 52.0, "Z=64 Sky-Island subbrick must emit mesh above 52m, got {max_y}");
+        // Unpatched bz=0 cube far below remains empty sky -> skipped!
+        assert!(world.can_skip_subbrick_surface_nets(0, 0, 0));
+
+        // Patch a sparse VolumetricSubBrick3DDelta into bz=3 and verify exact voxel update
+        let mut next_dm = sub_dm.clone();
+        let mut next_at = sub_at.clone();
+        let o = ((3 * SN_BRICK_SIZE + 6) * SN_BRICK_SIZE + 6) * 4;
+        next_dm[o..o + 4].copy_from_slice(&[255, 0, 0, 120]);
+        next_at[o..o + 4].copy_from_slice(&[255, 160, 40, 230]);
+        let lz4 = frostmarsh_proto::encode_brick3d_delta(&sub_dm, &sub_at, &next_dm, &next_at, 4)
+            .expect("delta");
+        let patched = world
+            .apply_subbrick3d_delta(1, 1, 3, 64, 16, &lz4)
+            .expect("apply_subbrick3d_delta");
+        assert_eq!(patched, 1);
+        let g_off = world.byte_index(16 + 6, 48 + 3, 16 + 6);
+        assert_eq!(&world.albedo_thermal[g_off..g_off + 4], &[255, 160, 40, 230]);
     }
 }

@@ -4,7 +4,7 @@
 
 > **Model Checkpoints (`.pt` & `.onnx`)** are hosted on Hugging Face Hub: **[`carlid/frostmarsh-neural-world`](https://huggingface.co/carlid/frostmarsh-neural-world)** — pull them into `models/` with `./scripts/download_models.sh`.
 
-![Frostmarsh Wave 17-19 Live 60-Player Stylized True-3D World — WorldModel3D-v7, 3D Voxel Sun Shadows, Living Water, Snow Pines, Runic Shrine Monolith, Rim-Lit 5 Archetypes & 135-149 FPS Metal](models/unified_iter17_polished/unified_live_1080p_hud.png)
+![Frostmarsh Waves 26-27 Live 4.19M-Voxel Z=64 3-Strata Sky-Isles & Abyss — Floating Sky-Islands, 28m Plunging Waterfalls, Surface Viaduct, Abyssal Magma Caverns, 16x16x16 Cubic Bricks & 104-110 FPS Metal](models/unified_iter27_z64_sky_abyss/unified_live_1080p_hud.png)
 
 ---
 
@@ -125,11 +125,18 @@
   - **WebSocket `0x03` Delta-Brick Compression + WebGPU WASM Receiver (`ws_bridge.rs`, `crates/frostmarsh-web-client`, `web/pkg/`, `13/13` server + `8/8` WebGPU tests, `0` warnings):** Zero-dependency `0x03` delta binary frames cut partial `16×16×16` brick payloads **`33.8–66.9×`** (`490–970 B` vs `32,778 B`), send `0 B` on sub-deadzone (`<= 5/255`) jitter, prioritize compact deltas ahead of full fallbacks under a `20 KB/tick` per-client cap, and patch directly into WebGPU 3D textures.
   - **Single-Model Multi-Region Ghost-Halo Sharding & Spatial `world_laws[6, H, W]` (`ml/world_model_3d_v8.py`, `ml/multi_region_sharding.py`, [MULTI_REGION_SHARD_METRICS.json](models/MULTI_REGION_SHARD_METRICS.json), [multi_region_shard_viz.png](models/multi_region_shard_viz.png)):** Promoted `WorldModel3D-v8` to accept continuous 2D spatial `world_laws[6, H, W]` fields with **0 extra parameters and 0 retraining**, smoothly blending Freeze-Out ↔ Nordic ↔ Rising Flood ↔ Low-G Magma over `32m` borders. With `HALO_XY = 6`, `2×2` sharded inference matches a full monolith to **`2.22e-15` (FP64)** / **`1.19e-07` (`z_flux`) & `9.54e-07` (`Z_world_3d`, FP32)**! One shared `330 KB` FP16 model simulates **`4,194,304` voxels (`512×512×16`) at `10.63 Hz` (`94.03 ms` p50, `3.58×` vs dense, `1.96 GB` VRAM)** on Spark GB10 with **`91.7 KB/tick`** compressed inter-shard halos.
   - **Exact Cross-Shard Conservation & Toroidal Client Clipmap (`crates/field-core/src/sharding.rs`, `19/19` `field-core` tests, `0` warnings):** Proves `global_mass_error == 0 && global_energy_error == 0` across both synchronous `2×2` cross-border rivers/fires and asynchronous `10 Hz / 2 Hz` `BorderFluxEscrow` (zero lockstep stalls), alongside `16m` hysteresis authority handoff and toroidal `RollingClipmap256` (`93.75%` brick retention across shard crossings).
+- **Iterations 26–27 — Vertical World Scaling (`Z=64` Live 3-Strata Sky-Isles & Abyss, True `16×16×16` Cubic Bricks, 3D Altitude `world_laws[6, Z, H, W]` & `Z=128` `8.39M`-Voxel Sparse GPU Proof):**
+  - **3D Altitude-Varying World Laws `θ_world[6, Z, H, W]` & Vertical `HALO_Z = 3` Slab Sharding (`ml/world_model_3d_v8.py`, `ml/vertical_world_scaling.py`, [VERTICAL_SCALING_METRICS.json](models/VERTICAL_SCALING_METRICS.json), [vertical_scaling_viz.png](models/vertical_scaling_viz.png)):** Extended `WorldModel3D-v8` (`164,622` params, **0 extra parameters, 0 retraining**) to accept continuous 3D volumetric law fields blending Abyssal Geothermal (`1.15g, +42 K`) → Temperate Surface (`1.0g, 0 K`) → Floating Sky-Isles (`0.35g, -45 K`) with exact `0.0` identity parity at canonical laws. Vertically sharding `4` stacked slabs (`HALO_Z = 3`) matches monoliths to **`3.55e-15` (`Z=64`) / `1.58e-15` (`Z=128`)** in FP64 (`<= 2.55e-07` FP32) at just **`245–278 KB/tick`** compressed inter-slab halo traffic.
+  - **Sparse `16×16×8` Vertical GPU Scaling on Spark GB10 (FP16, `max_bricks_per_batch=192`):** Skips `87.3%` (`Z=64`) and **`90.7%`** (`Z=128`) of empty sky, solid bedrock, and quiescent bricks — accelerating **`256×256×64` (`4.19M` vox)** **`2.93×`** (`479.7 → 163.5 ms` @ `6.1 Hz` bench / `36.7 ms` daemon sparse steady-state, **`2.37 GB` VRAM**) and scaling **`256×256×128` (`8.39M` vox)** **`4.65×`** (`1,027.7 → 220.8 ms` @ `4.5 Hz`, **`3.40 GB` VRAM `<= 3.5 GB`**)!
+  - **True `16×16×16` Cubic Bricks (`bz`) & Live 3-Strata `Z=64` Sky-Isles & Abyss (`BIOME_SKY_ABYSS = 5`, `20/20` `field-core`, `3/3` `frostmarsh-proto`, `14/14` `frostmarsh-server`, `6/6` client, `0` warnings):** Stacked **Abyssal Magma & Crystal Caverns (`z=0..18m`)** + **Surface Arched Viaduct & Gorge (`z=18..38m`)** + **4 Floating Low-G Sky-Islands, `28m` Plunging Waterfalls & Cloud Deck (`z=38..63m`)** with 3 vertical shrines (`ABYSSAL HEART` / `CENTRAL VIADUCT` / `SKY CITADEL`), altitude-coupled conservation-exact physics (`mass_err = 0`, `energy_err = 0`), cubic `VolumetricSubBrick3D` / `VolumetricSubBrick3DDelta` streaming (**skipping `44.4–45.7%` pure sky & solid bedrock cubes**), and atomic LZ4 `"FMW1"` persistence verified across hard restart at `4.19M` voxels. Live Spark GB10 → Apple M4 Pro Metal renders `410.4K` Surface-Nets triangles across all 4 WGSL neural styles at **`110.0 FPS` @ 1080p Clean-3D (`9.09 ms`) / `103.5 FPS` @ 1080p Pixel-2×SS (`9.66 ms`) / `103.6 FPS` @ 4K Pixel-2×SS (`9.65 ms`)** over **`141.6 KB/s`** QUIC wire!
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
 | World Scale & Mode | Render Mode | Resolution | p50 Frame Time | FPS |
 |---|---|---|---:|---:|
+| **`256×256×64` (4.19M vox Sky-Isles & Abyss, 60P)** | **Cubic `16³` Surface-Nets (`410K` tris) + Clean 3D** | **1920×1080** | **`9.09 ms`** | **110.0 FPS** |
+| **`256×256×64` (4.19M vox Sky-Isles & Abyss, 60P)** | **Cubic `16³` Surface-Nets (`410K` tris) + Pixel-2xSS** | **1920×1080** | **`9.66 ms`** | **103.5 FPS** |
+| **`256×256×64` (4.19M vox Sky-Isles & Abyss, 60P)** | **Cubic `16³` Surface-Nets (`410K` tris) + Pixel-2xSS** | **3840×2160 (4K)** | **`9.65 ms`** | **103.6 FPS** |
 | **`256×256×16` (60P `WorldModel3D-v7` + AAA Shaders)** | **Surface-Nets + Voxel Shadows/Water + Pixel-2xSS** | **1920×1080** | **`7.43 ms`** | **134.6 FPS** |
 | **`256×256×16` (60P `WorldModel3D-v7` + AAA Shaders)** | **Surface-Nets + Voxel Shadows/Water + Clean 3D** | **1920×1080** | **`6.71 ms`** | **149.0 FPS** |
 | **`256×256×16` (60P `WorldModel3D-v7` + AAA Shaders)** | **Surface-Nets + Voxel Shadows/Water + Pixel-2xSS** | **3840×2160 (4K)** | **`7.25 ms`** | **138.0 FPS** |
@@ -142,6 +149,10 @@
 ---
 
 ## Visual Showcase
+
+| Vertical Scaling `Z=16..128` (`8.39M` Vox, `HALO_Z=3` `1.58e-15` Parity) | Live `256×256×64` (`4.19M` Vox) 4-Style WGSL Sky-Isles & Abyss (`104–110 FPS`) |
+|---|---|
+| ![Vertical Scaling Z=16..128 GPU Proof](models/vertical_scaling_viz.png) | ![Live Z=64 4-Style Sky-Isles & Abyss Orbit](models/unified_iter27_z64_sky_abyss/unified_orbit_4view.png) |
 
 | Seamless `2×2` Multi-Region Sharding (`4.19M` Vox @ `10.6 Hz`, `2.2e-15` Seam Parity) | `WorldModel3D-v8` (Law-Conditioned Across 4 Physical Regimes vs Law-Blind `v7`) |
 |---|---|

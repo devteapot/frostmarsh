@@ -1,0 +1,50 @@
+{
+  "wave": "Wave 29B: 6-Face Cubed-Sphere Exact Conservation & Curved Apple M4 Pro Metal Planetary Renderer",
+  "adapter": "Apple M4 Pro",
+  "backend": "Metal",
+  "face_size": 64,
+  "depth": 32,
+  "r_core": 48.0,
+  "outer_radius": 80.0,
+  "active_voxels_6face": 786432,
+  "sim_ticks": 10,
+  "planet_step_p50_ms": 16.876,
+  "planet_step_mean_ms": 17.254,
+  "global_mass_error": 0,
+  "global_energy_error": 0,
+  "total_seam_mass_crossed": 216041,
+  "buoyant_core_count": 8,
+  "mesh_stats": {
+    "terrain_vertices": 99846,
+    "terrain_triangles": 196608,
+    "sky_ring_vertices": 5104,
+    "sky_ring_triangles": 8960,
+    "ocean_vertices": 25350,
+    "ocean_triangles": 49152,
+    "total_vertices": 130300,
+    "total_triangles": 254720
+  },
+  "bench_1080p": {
+    "width": 1920,
+    "height": 1080,
+    "iters": 25,
+    "p50_ms": 2.303,
+    "p99_ms": 2.909,
+    "mean_ms": 2.362,
+    "fps_p50": 434.23
+  },
+  "bench_4k": {
+    "width": 3840,
+    "height": 2160,
+    "iters": 25,
+    "p50_ms": 6.983,
+    "p99_ms": 7.537,
+    "mean_ms": 7.004,
+    "fps_p50": 143.21
+  },
+  "showcase_outputs": [
+    "models/planet_showcase/planet_orbital_globe_1080p.png",
+    "models/planet_showcase/planet_horizon_surface_1080p.png",
+    "models/planet_showcase/planet_4view_showcase.png"
+  ]
+}

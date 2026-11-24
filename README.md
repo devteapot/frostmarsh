@@ -132,6 +132,13 @@
 - **Iteration 28 — Planet-Ready Unified Structural Support, Realistic Arch/Cave Collapse & Destructible Buoyant Sky-Island Cores (`crates/field-core/src/structural.rs`, `24/24` `field-core` tests, `0` ML Retraining):**
   - **One Unified Support Graph (`BaseAnchorMode::{GroundedFloor, RadialInnerShell, CustomAnchors}` + `BuoyantCore`):** Propagates material-specific load/cantilever support (`SP_ROCK`, `SP_WOOD` cool vs burning `>= 550 K`, `SP_ICE` cold vs melting `>= 278 K`, `SP_SOIL` steep landslide repose, `SP_ASH` loose; timber bridges support themselves but never cantilever stone islands!) using a 2-stage vertical-compression + 256-bucket Dial's BFS overhang solver — zero hardcoded bedrock dependency so it transfers 1:1 to Cubed-Sphere planetary shells.
   - **Live Sky-Island Crash & Hydrodynamic Splash (`mass_err == 0`, `energy_err == 0`):** Embedded glowing cyan-amethyst **Buoyant Crystal Core** veins underneath all 4 Sky-Islands (`field_mesh_z16.wgsl`) and interactive `/collapse_isle` + `/undercut_viaduct` chat commands. Shattering South Sky-Isle's core live on Spark GB10 (`256×256×64`, `60` bots) fractured its rim inward, snapped its timber Sky-Bridge, dropped **`56.9M` mass units** straight into the turquoise Surface Gorge (splashing `1.22M` river water outward and permanently creating a river-damming island crater in the canyon!) while the other 3 Sky-Islands stayed stably aloft with **`mass_err == 0 && energy_err == 0`**.
+- **Iterations 29–30 — 6-Face Cubed-Sphere Planetary Engine (Zero Bedrock, Zero Map Walls, Real-Time `11.3 Hz` `WorldModel3D-v8` Planet & `434 FPS` Curved Metal Renderer):**
+  - **6-Face Cubed-Sphere `WorldModel3D-v8` Planet (`ml/cubed_sphere_planet.py`, [PLANET_CUBED_SPHERE_METRICS.json](models/PLANET_CUBED_SPHERE_METRICS.json), [planet_cubed_sphere_viz.png](models/planet_cubed_sphere_viz.png), `0` Retraining):** Wraps 6 right-handed orthonormal faces (`+X/-X/+Y/-Y/+Z/-Z`) onto the sphere so local `-r` aligns with `WorldModel3D-v8`'s `-Z` axis natively (`164,622` params, **0 retraining**). Basis-derived 12-edge `HALO_XY = 6` + 8-corner spherical lookup achieves exact edge involution (`0` errors), **`2.72e-16`** gnomonic projection round-trip, **`0.0`** SO(2) tangent flow rotation error (`433,925×` polar seam jump reduction), and **`2.14e-7`** FP32 sparse-vs-dense parity. Live NVIDIA GB10 FP16 benchmarks:
+    - **Global Climate Shell (`6×64²×16`, `393K` vox):** **`33.25 ms` (`30.1 Hz`)**, `526 MB` VRAM, `68.6 KB/tick` 12-edge halo.
+    - **Playable Micro-Planet (`6×128²×32`, `3.15M` vox, `R=160m`):** **`88.27 ms` (`11.3 Hz` real-time, `3.34×`, `91.0%` skip)**, `1.76 GB` VRAM, `192.8 KB/tick` halo.
+    - **3-Strata Micro-Planet (`6×128²×64`, `6.29M` vox, Core+Surface+Sky-Ring):** **`138.28 ms` (`7.2 Hz`, `5.11×`, `93.3%` skip)**, `2.44 GB` VRAM, `359.9 KB/tick` halo.
+    - **20-Tick Rotating Solar Terminator Rollout:** Sweeps `sun_dir` `144°` around the equator (`+38 K` day / `-45 K` night `θ_world[6,L,H,W]`), producing **`11.48×` Day Melt**, **`9.00×` Night Freeze**, **`+20.70 K`** day/night thermal split, and `0` NaNs.
+  - **Exact 12-Edge Conservation `field-core::planet` & Curved Apple M4 Pro Metal Renderer (`crates/field-core/src/planet.rs`, `crates/frostmarsh-3d-sandbox/src/bin/planet_render.rs`, [PLANET_METAL_METRICS.json](models/PLANET_METAL_METRICS.json), `29/29` `field-core` tests, `0` warnings):** Couples 6 `VolumeField` faces using `BaseAnchorMode::RadialInnerShell` (no flat bedrock), exact antisymmetric 12-edge fluid/gas/heat exchange (`216,041` cross-seam mass crossed over 10 ticks with **`global_mass_error == 0 && global_energy_error == 0`**), sweeping solar terminator, and 6-DOF geodesic circumnavigation over both equator and poles. Renders `786K` active planetary voxels (`254.7K` curved triangles, Fresnel sapphire oceans, night-side volcanic magma rift, Rayleigh+Mie atmospheric limb glow & 8 Orbital Sky-Ring Islands with cyan Buoyant Crystal Cores) at **`434.2 FPS` @ 1080p (`2.30 ms`) / `143.2 FPS` @ 4K (`6.98 ms`)** on Apple M4 Pro Metal!
 
 ### Unified Client Performance (Apple M4 Pro Metal, Live over QUIC)
 
@@ -152,6 +159,10 @@
 ---
 
 ## Visual Showcase
+
+| Curved 6-Face Cubed-Sphere Planet (`434 FPS` 1080p / `143 FPS` 4K Metal, `mass_err=0`) | 6-Face `WorldModel3D-v8` Planet (`11.3 Hz` 3.15M Vox, Terminator & GB10 Scaling) |
+|---|---|
+| ![Cubed-Sphere Planet 4-View Metal Showcase](models/planet_showcase/planet_4view_showcase.png) | ![Cubed-Sphere WorldModel3D-v8 Scaling & Terminator](models/planet_cubed_sphere_viz.png) |
 
 | Live Sky-Island Core Fracture & Gorge Crash (`56.9M` mass, `mass_err=0`) | Live `256×256×64` (`4.19M` Vox) 4-Style WGSL Sky-Isles & Abyss (`104–110 FPS`) |
 |---|---|

@@ -1,0 +1,490 @@
+{
+  "wave": "29A",
+  "title": "6-Face Cubed-Sphere WorldModel3D-v8 Planetary Simulation, 12-Edge HALO_XY=6 & Multi-Scale GB10 Benchmarks",
+  "checkpoint": "world_model_3d_v8.pt",
+  "world_model_params": 164622,
+  "zero_retraining": true,
+  "halo_xy": 6,
+  "flow_channels_contract": {
+    "flow_e": 12,
+    "flow_s": 13
+  },
+  "topology_and_parity": {
+    "orthonormal_bases": {
+      "num_faces": 6,
+      "max_orthonormality_err": 0.0,
+      "min_det": 1.0,
+      "max_det": 1.0,
+      "all_right_handed": true
+    },
+    "projection_round_trip": {
+      "face_mismatches": 0,
+      "max_uv_err_interior": 1.1102230246251565e-16,
+      "max_xyz_err_interior": 2.7194799110210365e-16,
+      "max_xyz_err_12_edges": 0.0,
+      "max_xyz_err_8_corners": 0.0,
+      "passed_1e6_gate": true
+    },
+    "edge_involution_and_vector_rotation": {
+      "num_undirected_edges": 12,
+      "num_directed_half_edges": 24,
+      "edge_involution_mismatches": 0,
+      "cell_involution_mismatches": 0,
+      "tangent_vector_roundtrip_max_err": 0.0,
+      "tangent_vector_norm_max_err": 0.0,
+      "flow_channels_rotated": [
+        12,
+        13
+      ],
+      "passed_exact_zero_gate": true
+    },
+    "world_model_v8_cross_face_consistency": {
+      "grid": "6x32x32x16",
+      "dense_haloed_vs_sparse_6face_rel_horiz": 1.3323446447839272e-07,
+      "dense_haloed_vs_sparse_6face_rel_z_flux": 2.1373074713429814e-07,
+      "dense_haloed_vs_sparse_6face_rel_z_world": 8.708889686236123e-08,
+      "dense_haloed_vs_sparse_6face_max_rel": 2.1373074713429814e-07,
+      "dense_vs_sparse_passed_1e6_gate": true,
+      "unfolded_2face_monolith_vs_haloed_seam_rel_horiz": 2.7710193495530863e-07,
+      "unfolded_2face_monolith_vs_haloed_seam_rel_z_world": 2.9631068075316583e-07,
+      "unfolded_seam_passed_1e6_gate": true,
+      "rotated_polar_seam_flow_jump_with_R": 0.0,
+      "rotated_polar_seam_flow_jump_without_R": 0.43393,
+      "rotation_error_reduction_x": 433925.57,
+      "v8_rotated_seam_flux_vec_diff": 0.02024,
+      "v8_interior_flux_vec_diff": 0.01129,
+      "v8_rotated_seam_flux_rel_diff": 0.17367
+    }
+  },
+  "gpu_benchmarks": {
+    "host_alias": "spark-gb10",
+    "device": "NVIDIA GB10",
+    "dtype": "fp16",
+    "max_bricks_per_batch": 192,
+    "model_params": 164622,
+    "scales": {
+      "scale_a_coarse_global": {
+        "scale_id": "scale_a_coarse_global",
+        "label": "Coarse Global Climate",
+        "grid_shape": [
+          6,
+          16,
+          64,
+          64
+        ],
+        "grid_str": "6x64x64x16",
+        "planet_radius_m": 80.0,
+        "total_voxels": 393216,
+        "voxels_millions": 0.393,
+        "max_bricks_per_batch": 192,
+        "brick_stats": {
+          "total_bricks": 192,
+          "bricks_per_face": 32,
+          "active_bricks": 63,
+          "skipped_bricks": 129,
+          "empty_orbital_bricks": 3,
+          "deep_core_bricks": 0,
+          "quiescent_crust_bricks": 126,
+          "active_pct": 32.81,
+          "skip_pct": 67.19,
+          "orbital_plus_core_pct": 1.56
+        },
+        "halo_exchange_ms_p50": 0.746,
+        "halo_bandwidth": {
+          "num_edges": 12,
+          "num_directed_strips": 24,
+          "halo_xy": 6,
+          "total_halo_voxels_per_tick": 147456,
+          "mean_active_seam_voxel_pct": 7.27,
+          "raw_fp16_18ch_kb_per_tick": 5184.0,
+          "zlib_full_18ch_kb_per_tick": 153.55,
+          "zlib_delta_18ch_kb_per_tick": 68.57,
+          "raw_fp16_11ch_kb_per_tick": 3168.0,
+          "zlib_full_11ch_kb_per_tick": 104.2,
+          "zlib_delta_11ch_kb_per_tick": 40.23,
+          "zlib_delta_18ch_mb_per_sec_at_10hz": 0.67,
+          "zlib_full_18ch_mb_per_sec_at_10hz": 1.499
+        },
+        "dense": {
+          "mode": "6_faces_halo_xy6_monolith",
+          "p50_ms": 40.98,
+          "p95_ms": 48.854,
+          "mean_ms": 39.368,
+          "hz_p50": 24.4,
+          "peak_vram_mb": 145.51
+        },
+        "sparse": {
+          "p50_ms": 33.252,
+          "p95_ms": 42.352,
+          "mean_ms": 35.616,
+          "hz_p50": 30.07,
+          "peak_vram_mb": 525.84,
+          "speedup_vs_dense": 1.23,
+          "within_10hz_budget": true
+        }
+      },
+      "scale_b_micro_planet": {
+        "scale_id": "scale_b_micro_planet",
+        "label": "Playable Micro-Planet",
+        "grid_shape": [
+          6,
+          32,
+          128,
+          128
+        ],
+        "grid_str": "6x128x128x32",
+        "planet_radius_m": 160.0,
+        "total_voxels": 3145728,
+        "voxels_millions": 3.146,
+        "max_bricks_per_batch": 192,
+        "brick_stats": {
+          "total_bricks": 1536,
+          "bricks_per_face": 256,
+          "active_bricks": 139,
+          "skipped_bricks": 1397,
+          "empty_orbital_bricks": 407,
+          "deep_core_bricks": 214,
+          "quiescent_crust_bricks": 776,
+          "active_pct": 9.05,
+          "skip_pct": 90.95,
+          "orbital_plus_core_pct": 40.43
+        },
+        "halo_exchange_ms_p50": 4.285,
+        "halo_bandwidth": {
+          "num_edges": 12,
+          "num_directed_strips": 24,
+          "halo_xy": 6,
+          "total_halo_voxels_per_tick": 589824,
+          "mean_active_seam_voxel_pct": 6.08,
+          "raw_fp16_18ch_kb_per_tick": 20736.0,
+          "zlib_full_18ch_kb_per_tick": 415.75,
+          "zlib_delta_18ch_kb_per_tick": 192.78,
+          "raw_fp16_11ch_kb_per_tick": 12672.0,
+          "zlib_full_11ch_kb_per_tick": 296.22,
+          "zlib_delta_11ch_kb_per_tick": 112.63,
+          "zlib_delta_18ch_mb_per_sec_at_10hz": 1.883,
+          "zlib_full_18ch_mb_per_sec_at_10hz": 4.06
+        },
+        "dense": {
+          "mode": "6_faces_halo_xy6_monolith",
+          "p50_ms": 294.504,
+          "p95_ms": 511.565,
+          "mean_ms": 314.834,
+          "hz_p50": 3.4,
+          "peak_vram_mb": 971.83
+        },
+        "sparse": {
+          "p50_ms": 88.266,
+          "p95_ms": 112.141,
+          "mean_ms": 90.601,
+          "hz_p50": 11.33,
+          "peak_vram_mb": 1763.08,
+          "speedup_vs_dense": 3.34,
+          "within_10hz_budget": true
+        }
+      },
+      "scale_c_3strata_planet": {
+        "scale_id": "scale_c_3strata_planet",
+        "label": "3-Strata Micro-Planet",
+        "grid_shape": [
+          6,
+          64,
+          128,
+          128
+        ],
+        "grid_str": "6x128x128x64",
+        "planet_radius_m": 160.0,
+        "total_voxels": 6291456,
+        "voxels_millions": 6.291,
+        "max_bricks_per_batch": 192,
+        "brick_stats": {
+          "total_bricks": 3072,
+          "bricks_per_face": 512,
+          "active_bricks": 206,
+          "skipped_bricks": 2866,
+          "empty_orbital_bricks": 1128,
+          "deep_core_bricks": 495,
+          "quiescent_crust_bricks": 1243,
+          "active_pct": 6.71,
+          "skip_pct": 93.29,
+          "orbital_plus_core_pct": 52.83
+        },
+        "halo_exchange_ms_p50": 8.545,
+        "halo_bandwidth": {
+          "num_edges": 12,
+          "num_directed_strips": 24,
+          "halo_xy": 6,
+          "total_halo_voxels_per_tick": 1179648,
+          "mean_active_seam_voxel_pct": 6.39,
+          "raw_fp16_18ch_kb_per_tick": 41472.0,
+          "zlib_full_18ch_kb_per_tick": 762.72,
+          "zlib_delta_18ch_kb_per_tick": 359.94,
+          "raw_fp16_11ch_kb_per_tick": 25344.0,
+          "zlib_full_11ch_kb_per_tick": 567.21,
+          "zlib_delta_11ch_kb_per_tick": 219.24,
+          "zlib_delta_18ch_mb_per_sec_at_10hz": 3.515,
+          "zlib_full_18ch_mb_per_sec_at_10hz": 7.448
+        },
+        "dense": {
+          "mode": "6_faces_halo_xy6_2x32_slabs",
+          "p50_ms": 706.683,
+          "p95_ms": 807.956,
+          "mean_ms": 700.561,
+          "hz_p50": 1.42,
+          "peak_vram_mb": 1345.87
+        },
+        "sparse": {
+          "p50_ms": 138.278,
+          "p95_ms": 291.029,
+          "mean_ms": 162.455,
+          "hz_p50": 7.23,
+          "peak_vram_mb": 2442.59,
+          "speedup_vs_dense": 5.11,
+          "within_10hz_budget": false
+        }
+      }
+    }
+  },
+  "terminator_rollout_20tick": {
+    "grid": "6x64x64x16",
+    "num_ticks": 20,
+    "nan_or_inf_count": 0,
+    "mean_day_melt_rate": 0.00092,
+    "mean_day_freeze_rate": 0.00019,
+    "mean_night_freeze_rate": 0.0017,
+    "mean_night_melt_rate": 8e-05,
+    "raw_v8_mean_day_melt": 0.00146,
+    "raw_v8_mean_night_freeze": 0.00232,
+    "mean_day_melt_vs_night_freeze": 0.00235,
+    "day_vs_night_melt_ratio": 11.48,
+    "night_vs_day_freeze_ratio": 9.0,
+    "final_day_mean_temp_K": 299.71,
+    "final_night_mean_temp_K": 279.01,
+    "final_day_minus_night_temp_K": 20.7,
+    "mean_seam_vs_interior_flux_ratio": 2.344,
+    "stable_zero_nans": true,
+    "terminator_reaction_verified": true,
+    "ticks": [
+      {
+        "tick": 0,
+        "sun_lon_deg": 0.0,
+        "day_melt_rate": 0.0004,
+        "day_freeze_rate": 0.0007,
+        "night_freeze_rate": 0.00228,
+        "night_melt_rate": 0.0,
+        "day_mean_temp_K": 276.88,
+        "night_mean_temp_K": 271.19,
+        "seam_vs_interior_flux_ratio": 0.925
+      },
+      {
+        "tick": 1,
+        "sun_lon_deg": 7.6,
+        "day_melt_rate": 0.00049,
+        "day_freeze_rate": 0.00049,
+        "night_freeze_rate": 0.00226,
+        "night_melt_rate": 0.0,
+        "day_mean_temp_K": 280.28,
+        "night_mean_temp_K": 271.77,
+        "seam_vs_interior_flux_ratio": 1.837
+      },
+      {
+        "tick": 2,
+        "sun_lon_deg": 15.2,
+        "day_melt_rate": 0.0006,
+        "day_freeze_rate": 0.00032,
+        "night_freeze_rate": 0.00215,
+        "night_melt_rate": 0.0,
+        "day_mean_temp_K": 283.76,
+        "night_mean_temp_K": 272.5,
+        "seam_vs_interior_flux_ratio": 1.06
+      },
+      {
+        "tick": 3,
+        "sun_lon_deg": 22.7,
+        "day_melt_rate": 0.00068,
+        "day_freeze_rate": 0.00015,
+        "night_freeze_rate": 0.00205,
+        "night_melt_rate": 0.0,
+        "day_mean_temp_K": 286.97,
+        "night_mean_temp_K": 272.83,
+        "seam_vs_interior_flux_ratio": 0.864
+      },
+      {
+        "tick": 4,
+        "sun_lon_deg": 30.3,
+        "day_melt_rate": 0.00072,
+        "day_freeze_rate": 5e-05,
+        "night_freeze_rate": 0.00215,
+        "night_melt_rate": 0.0,
+        "day_mean_temp_K": 289.67,
+        "night_mean_temp_K": 273.07,
+        "seam_vs_interior_flux_ratio": 1.186
+      },
+      {
+        "tick": 5,
+        "sun_lon_deg": 37.9,
+        "day_melt_rate": 0.00073,
+        "day_freeze_rate": 4e-05,
+        "night_freeze_rate": 0.00213,
+        "night_melt_rate": 0.0,
+        "day_mean_temp_K": 291.88,
+        "night_mean_temp_K": 276.98,
+        "seam_vs_interior_flux_ratio": 1.513
+      },
+      {
+        "tick": 6,
+        "sun_lon_deg": 45.5,
+        "day_melt_rate": 0.00085,
+        "day_freeze_rate": 5e-05,
+        "night_freeze_rate": 0.00204,
+        "night_melt_rate": 0.0,
+        "day_mean_temp_K": 294.04,
+        "night_mean_temp_K": 278.4,
+        "seam_vs_interior_flux_ratio": 1.788
+      },
+      {
+        "tick": 7,
+        "sun_lon_deg": 53.1,
+        "day_melt_rate": 0.00086,
+        "day_freeze_rate": 4e-05,
+        "night_freeze_rate": 0.00193,
+        "night_melt_rate": 1e-05,
+        "day_mean_temp_K": 296.17,
+        "night_mean_temp_K": 279.74,
+        "seam_vs_interior_flux_ratio": 2.041
+      },
+      {
+        "tick": 8,
+        "sun_lon_deg": 60.6,
+        "day_melt_rate": 0.00094,
+        "day_freeze_rate": 7e-05,
+        "night_freeze_rate": 0.00179,
+        "night_melt_rate": 2e-05,
+        "day_mean_temp_K": 301.05,
+        "night_mean_temp_K": 281.28,
+        "seam_vs_interior_flux_ratio": 2.237
+      },
+      {
+        "tick": 9,
+        "sun_lon_deg": 68.2,
+        "day_melt_rate": 0.00096,
+        "day_freeze_rate": 0.00019,
+        "night_freeze_rate": 0.00164,
+        "night_melt_rate": 5e-05,
+        "day_mean_temp_K": 299.98,
+        "night_mean_temp_K": 283.04,
+        "seam_vs_interior_flux_ratio": 2.465
+      },
+      {
+        "tick": 10,
+        "sun_lon_deg": 75.8,
+        "day_melt_rate": 0.00093,
+        "day_freeze_rate": 0.00028,
+        "night_freeze_rate": 0.00151,
+        "night_melt_rate": 9e-05,
+        "day_mean_temp_K": 300.22,
+        "night_mean_temp_K": 283.44,
+        "seam_vs_interior_flux_ratio": 2.594
+      },
+      {
+        "tick": 11,
+        "sun_lon_deg": 83.4,
+        "day_melt_rate": 0.00091,
+        "day_freeze_rate": 0.0003,
+        "night_freeze_rate": 0.00139,
+        "night_melt_rate": 0.00013,
+        "day_mean_temp_K": 301.89,
+        "night_mean_temp_K": 283.92,
+        "seam_vs_interior_flux_ratio": 2.65
+      },
+      {
+        "tick": 12,
+        "sun_lon_deg": 90.9,
+        "day_melt_rate": 0.00095,
+        "day_freeze_rate": 0.00025,
+        "night_freeze_rate": 0.00131,
+        "night_melt_rate": 0.00018,
+        "day_mean_temp_K": 303.86,
+        "night_mean_temp_K": 283.92,
+        "seam_vs_interior_flux_ratio": 2.72
+      },
+      {
+        "tick": 13,
+        "sun_lon_deg": 98.5,
+        "day_melt_rate": 0.00104,
+        "day_freeze_rate": 0.00019,
+        "night_freeze_rate": 0.00125,
+        "night_melt_rate": 0.00019,
+        "day_mean_temp_K": 305.02,
+        "night_mean_temp_K": 283.6,
+        "seam_vs_interior_flux_ratio": 2.838
+      },
+      {
+        "tick": 14,
+        "sun_lon_deg": 106.1,
+        "day_melt_rate": 0.00113,
+        "day_freeze_rate": 0.00017,
+        "night_freeze_rate": 0.00124,
+        "night_melt_rate": 0.00019,
+        "day_mean_temp_K": 306.35,
+        "night_mean_temp_K": 283.52,
+        "seam_vs_interior_flux_ratio": 3.012
+      },
+      {
+        "tick": 15,
+        "sun_lon_deg": 113.7,
+        "day_melt_rate": 0.00119,
+        "day_freeze_rate": 0.00018,
+        "night_freeze_rate": 0.0013,
+        "night_melt_rate": 0.00018,
+        "day_mean_temp_K": 307.83,
+        "night_mean_temp_K": 283.78,
+        "seam_vs_interior_flux_ratio": 3.152
+      },
+      {
+        "tick": 16,
+        "sun_lon_deg": 121.3,
+        "day_melt_rate": 0.0012,
+        "day_freeze_rate": 0.00012,
+        "night_freeze_rate": 0.00138,
+        "night_melt_rate": 0.00016,
+        "day_mean_temp_K": 298.67,
+        "night_mean_temp_K": 278.79,
+        "seam_vs_interior_flux_ratio": 3.356
+      },
+      {
+        "tick": 17,
+        "sun_lon_deg": 128.8,
+        "day_melt_rate": 0.00123,
+        "day_freeze_rate": 0.0001,
+        "night_freeze_rate": 0.00143,
+        "night_melt_rate": 0.00014,
+        "day_mean_temp_K": 299.0,
+        "night_mean_temp_K": 278.66,
+        "seam_vs_interior_flux_ratio": 3.461
+      },
+      {
+        "tick": 18,
+        "sun_lon_deg": 136.4,
+        "day_melt_rate": 0.00124,
+        "day_freeze_rate": 6e-05,
+        "night_freeze_rate": 0.00143,
+        "night_melt_rate": 0.00012,
+        "day_mean_temp_K": 299.16,
+        "night_mean_temp_K": 278.85,
+        "seam_vs_interior_flux_ratio": 3.553
+      },
+      {
+        "tick": 19,
+        "sun_lon_deg": 144.0,
+        "day_melt_rate": 0.00127,
+        "day_freeze_rate": 3e-05,
+        "night_freeze_rate": 0.00138,
+        "night_melt_rate": 0.00012,
+        "day_mean_temp_K": 299.71,
+        "night_mean_temp_K": 279.01,
+        "seam_vs_interior_flux_ratio": 3.624
+      }
+    ]
+  }
+}

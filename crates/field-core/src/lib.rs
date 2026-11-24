@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod planet;
 pub mod sharding;
 pub mod structural;
 

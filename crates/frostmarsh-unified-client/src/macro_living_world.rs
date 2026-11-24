@@ -13,9 +13,10 @@
 //!    fireflies/pollen motes, hearth embers, and rising bioluminescent cavern spores)
 
 use crate::macro_planet_world::{
-    add_f64, cross_f64, push_contact_shadow_disc_f64, push_oriented_box_f64,
-    push_oriented_pyramid_f64, scale_f64, sub_f64, tangent_basis_f64, MacroPlanetVertex,
-    MAT_MACRO_BEAM, MAT_MACRO_CRYSTAL, MAT_MACRO_ENTITY, MAT_MACRO_GAS, MAT_MACRO_PROP,
+    add_f64, cross_f64, push_contact_shadow_disc_f64, push_grass_cluster, push_oriented_box_f64,
+    push_oriented_pyramid_f64, push_pitched_roof_f64, push_tapered_frustum_f64, scale_f64, sub_f64,
+    tangent_basis_f64, MacroPlanetVertex, MAT_MACRO_BEAM, MAT_MACRO_CRYSTAL, MAT_MACRO_ENTITY,
+    MAT_MACRO_GAS, MAT_MACRO_PROP,
 };
 use field_core::planet_macro::{
     dot3_f64, face_uv_to_sphere_dir_f64, face_virtual_uv_f64, normalize3_f64,
@@ -29,6 +30,7 @@ pub struct LivingShardCell {
     pub water_depth: f32,
     pub river_depth: f32,
     pub cavern_depth: f32,
+    pub continent_biome: u8,
     pub has_wood: bool,
     pub is_snowy: bool,
 }
@@ -49,6 +51,10 @@ pub struct ShardLivingAnchors {
     pub cavern_grottos: Vec<([f64; 3], f64)>,
     /// River/waterfall landmarks for circling seabirds.
     pub waterfall_sites: Vec<([f64; 3], f64)>,
+    /// Arched stone & timber river bridge centers `(sphere_dir, deck_z)`.
+    pub bridges: Vec<([f64; 3], f64)>,
+    /// Ancient mossy stone ruins hilltop anchors `(sphere_dir, surf_z)`.
+    pub ruins: Vec<([f64; 3], f64)>,
 }
 
 /// Populate one hydrated `256×256` shard with waterfalls, arched river bridges, a Nordic coastal
@@ -197,6 +203,7 @@ pub fn populate_shard_living_world(
                     origin_f64,
                 );
                 placed_bridges.push((lx, ly));
+                anchors.bridges.push((cell_dir(lx, ly), deck_z));
             }
         }
     }
@@ -351,6 +358,31 @@ pub fn populate_shard_living_world(
             );
         }
 
+        // Lush wind-swaying meadow grass tufts ringing the village clearing & frontier paths!
+        for gi in 0..56usize {
+            let ang = (gi as f64 / 56.0) * std::f64::consts::TAU + (gi % 3) as f64 * 0.08;
+            let rad = 4.2 + (gi % 6) as f64 * 2.4;
+            let gx_off = (ang.cos() * rad).round() as isize;
+            let gy_off = (ang.sin() * rad).round() as isize;
+            let gx = (vx as isize + gx_off).clamp(4, s as isize - 5) as usize;
+            let gy = (vy as isize + gy_off).clamp(4, s as isize - 5) as usize;
+            let gc = cells[gy * s + gx];
+            if gc.water_depth < 0.05 && gc.river_depth < 0.05 && gc.cavern_depth < 0.2 {
+                let g_dir = cell_dir(gx, gy);
+                let g_pos = scale_f64(g_dir, r_core + gc.surf_z);
+                push_grass_cluster(
+                    terrain_verts,
+                    terrain_indices,
+                    g_pos,
+                    g_dir,
+                    origin_f64,
+                    gi * 73 + vx * 19 + vy * 31,
+                    gc.continent_biome,
+                    false,
+                );
+            }
+        }
+
         // Coastal Wooden Jetty / Pier extending into the turquoise bay from the nearest beach!
         if sea_step != (0, 0) {
             for step_d in 6isize..38 {
@@ -427,6 +459,7 @@ pub fn populate_shard_living_world(
                 ((lx * 13 + ly * 29) as f64) * 0.4,
             );
             ruins_placed.push((lx, ly));
+            anchors.ruins.push((r_dir, c.surf_z));
         }
     }
 
@@ -470,6 +503,7 @@ pub fn emit_living_wildlife_and_weather(
     seed: u64,
     origin_f64: [f64; 3],
     sim_time: f32,
+    cam_alt_m: f64,
     local_wind_u: f32,
     local_wind_v: f32,
     local_temp_c: f32,
@@ -654,123 +688,126 @@ pub fn emit_living_wildlife_and_weather(
 
     // 5. Dynamic Live Climate Weather Particles & Ambient Motes around the camera/hero!
     //    Driven by live PlanetaryClimateNet (temp_c, cloud_cover, wind_u, wind_v)!
-    let is_snow_weather = local_temp_c < 7.5;
-    let is_rain_weather = !is_snow_weather && local_cloud_cover > 0.30;
-    let wu = (local_wind_u as f64).clamp(-6.0, 6.0);
-    let wv = (local_wind_v as f64).clamp(-6.0, 6.0);
-    let focus_alt = dot3_f64(focus_pos_f64, focus_pos_f64).sqrt() - r_core;
+    //    Cleanly culled above 160m altitude so ZERO snowflakes/specks float in Stratosphere or Orbit!
+    if cam_alt_m <= 160.0 {
+        let is_snow_weather = local_temp_c < 7.5;
+        let is_rain_weather = !is_snow_weather && local_cloud_cover > 0.30;
+        let wu = (local_wind_u as f64).clamp(-6.0, 6.0);
+        let wv = (local_wind_v as f64).clamp(-6.0, 6.0);
+        let focus_alt = dot3_f64(focus_pos_f64, focus_pos_f64).sqrt() - r_core;
 
-    // 5A. Live Precipitation (Snowflakes or Slanted Rain) + Golden Meadow Fireflies & Pollen
-    let weather_count = 240usize;
-    for i in 0..weather_count {
-        let h1 = ((i.wrapping_mul(2_654_435_761)) ^ (seed as usize)) & 0xFFFF;
-        let h2 = ((i.wrapping_mul(1_597_334_677)) ^ (seed as usize >> 8)) & 0xFFFF;
-        let h3 = ((i.wrapping_mul(3_266_489_917)) ^ (seed as usize >> 16)) & 0xFFFF;
-        let rx0 = (h1 as f64 / 65535.0) - 0.5;
-        let ry0 = (h2 as f64 / 65535.0) - 0.5;
-        let rz0 = h3 as f64 / 65535.0;
+        // 5A. Live Precipitation (Snowflakes or Slanted Rain) + Golden Meadow Fireflies & Pollen
+        let weather_count = 240usize;
+        for i in 0..weather_count {
+            let h1 = ((i.wrapping_mul(2_654_435_761)) ^ (seed as usize)) & 0xFFFF;
+            let h2 = ((i.wrapping_mul(1_597_334_677)) ^ (seed as usize >> 8)) & 0xFFFF;
+            let h3 = ((i.wrapping_mul(3_266_489_917)) ^ (seed as usize >> 16)) & 0xFFFF;
+            let rx0 = (h1 as f64 / 65535.0) - 0.5;
+            let ry0 = (h2 as f64 / 65535.0) - 0.5;
+            let rz0 = h3 as f64 / 65535.0;
 
-        // Mix 55% atmospheric precipitation/snowflakes + 45% golden-emerald meadow fireflies/pollen!
-        let is_firefly = (i % 9) < 4;
-        let span_xy = if is_firefly { 58.0 } else { 76.0 };
-        let span_z = if is_firefly { 9.5 } else { 28.0 };
+            // Mix 55% atmospheric precipitation/snowflakes + 45% golden-emerald meadow fireflies/pollen!
+            let is_firefly = (i % 9) < 4;
+            let span_xy = if is_firefly { 58.0 } else { 76.0 };
+            let span_z = if is_firefly { 9.5 } else { 28.0 };
 
-        let (px_l, py_l, pz_l, w_sz, h_sz, col, em) = if is_firefly {
-            let drift_x = ((rx0 * span_xy + (t * 0.45 + i as f64).sin() * 2.2) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
-            let drift_y = ((ry0 * span_xy + (t * 0.38 + i as f64 * 1.3).cos() * 2.2) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
-            let bob_z = 0.8 + rz0 * span_z + (t * 1.6 + i as f64 * 0.9).sin() * 0.65;
-            let pulse = (0.55 + 0.45 * (t * 3.8 + i as f64 * 2.1).sin()) as f32;
-            let warm_gold = i % 2 == 0;
-            let c = if warm_gold {
-                [1.00, 0.88, 0.36, 0.72 * pulse]
-            } else {
-                [0.45, 0.98, 0.72, 0.64 * pulse]
-            };
-            let e = [c[0] * 2.2 * pulse, c[1] * 2.2 * pulse, c[2] * 2.2 * pulse, MAT_MACRO_BEAM];
-            (drift_x, drift_y, bob_z, 0.072, 0.072, c, e)
-        } else if is_rain_weather {
-            let fall_spd = 17.5 + (i % 5) as f64 * 1.4;
-            let drift_x = ((rx0 * span_xy + t * (wu * 1.2 + 1.4)) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
-            let drift_y = ((ry0 * span_xy + t * (wv * 1.2 - 0.8)) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
-            let z_cur = ((rz0 * span_z - t * fall_spd).rem_euclid(span_z)) + 0.5;
-            let c = [0.70, 0.86, 1.00, 0.44];
-            let e = [0.22, 0.36, 0.52, MAT_MACRO_BEAM];
-            (drift_x, drift_y, z_cur, 0.032, 0.82, c, e)
-        } else {
-            // Crisp drifting alpine snowflakes (light flurries even on cool clear Nordic days!)
-            let fall_spd = if is_snow_weather { 3.2 } else { 1.9 } + (i % 5) as f64 * 0.35;
-            let sway = (t * 1.4 + i as f64 * 0.7).sin() * 1.6;
-            let drift_x = ((rx0 * span_xy + t * (wu * 0.85 + 0.9) + sway) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
-            let drift_y = ((ry0 * span_xy + t * (wv * 0.85 - 0.6)) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
-            let z_cur = ((rz0 * span_z - t * fall_spd).rem_euclid(span_z)) + 0.6;
-            let alpha = if is_snow_weather { 0.78 } else { 0.52 };
-            let c = [0.94, 0.98, 1.00, alpha];
-            let e = [0.55, 0.68, 0.85, MAT_MACRO_BEAM];
-            (drift_x, drift_y, z_cur, 0.068, 0.068, c, e)
-        };
-
-        let p_dir = normalize3_f64(add_f64(
-            focus_dir,
-            add_f64(scale_f64(ft1, px_l / r_surf), scale_f64(ft2, py_l / r_surf)),
-        ));
-        let p_pos = scale_f64(p_dir, r_core + focus_alt.max(z_sea_surf) + pz_l);
-        push_cross_particle_f64(
-            fx_verts,
-            fx_indices,
-            p_pos,
-            p_dir,
-            ft1,
-            ft2,
-            w_sz,
-            h_sz,
-            origin_f64,
-            col,
-            em,
-        );
-    }
-
-    // 5B. Rising Bioluminescent Cavern Spores drifting out of glowing cavern grottos!
-    for anc in anchors {
-        for (gi, &(g_dir, g_floor)) in anc.cavern_grottos.iter().enumerate() {
-            let (gt1, gt2) = tangent_basis_f64(g_dir);
-            for si in 0..16usize {
-                let ang = (si as f64) * 1.9 + t * 0.35 + gi as f64;
-                let r_sp = 1.5 + ((si % 5) as f64) * 1.4;
-                let z_rise = ((si as f64 * 0.85 + t * 1.35).rem_euclid(12.0)) + 0.8;
-                let s_dir = normalize3_f64(add_f64(
-                    g_dir,
-                    add_f64(
-                        scale_f64(gt1, (ang.cos() * r_sp) / r_surf),
-                        scale_f64(gt2, (ang.sin() * r_sp) / r_surf),
-                    ),
-                ));
-                let s_pos = scale_f64(s_dir, r_core + g_floor + z_rise);
-                let pulse = (0.55 + 0.45 * (t * 3.2 + si as f64).sin()) as f32;
-                let is_amethyst = si % 3 == 0;
-                let (c, e) = if is_amethyst {
-                    (
-                        [0.72, 0.36, 1.00, 0.78 * pulse],
-                        [1.45 * pulse, 0.65 * pulse, 2.60 * pulse, MAT_MACRO_BEAM],
-                    )
+            let (px_l, py_l, pz_l, w_sz, h_sz, col, em) = if is_firefly {
+                let drift_x = ((rx0 * span_xy + (t * 0.45 + i as f64).sin() * 2.2) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
+                let drift_y = ((ry0 * span_xy + (t * 0.38 + i as f64 * 1.3).cos() * 2.2) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
+                let bob_z = 0.8 + rz0 * span_z + (t * 1.6 + i as f64 * 0.9).sin() * 0.65;
+                let pulse = (0.55 + 0.45 * (t * 3.8 + i as f64 * 2.1).sin()) as f32;
+                let warm_gold = i % 2 == 0;
+                let c = if warm_gold {
+                    [1.00, 0.88, 0.36, 0.72 * pulse]
                 } else {
-                    (
-                        [0.18, 0.96, 0.88, 0.80 * pulse],
-                        [0.35 * pulse, 2.20 * pulse, 2.40 * pulse, MAT_MACRO_BEAM],
-                    )
+                    [0.45, 0.98, 0.72, 0.64 * pulse]
                 };
-                push_cross_particle_f64(
-                    fx_verts,
-                    fx_indices,
-                    s_pos,
-                    s_dir,
-                    gt1,
-                    gt2,
-                    0.20,
-                    0.20,
-                    origin_f64,
-                    c,
-                    e,
-                );
+                let e = [c[0] * 2.2 * pulse, c[1] * 2.2 * pulse, c[2] * 2.2 * pulse, MAT_MACRO_BEAM];
+                (drift_x, drift_y, bob_z, 0.072, 0.072, c, e)
+            } else if is_rain_weather {
+                let fall_spd = 17.5 + (i % 5) as f64 * 1.4;
+                let drift_x = ((rx0 * span_xy + t * (wu * 1.2 + 1.4)) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
+                let drift_y = ((ry0 * span_xy + t * (wv * 1.2 - 0.8)) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
+                let z_cur = ((rz0 * span_z - t * fall_spd).rem_euclid(span_z)) + 0.5;
+                let c = [0.70, 0.86, 1.00, 0.44];
+                let e = [0.22, 0.36, 0.52, MAT_MACRO_BEAM];
+                (drift_x, drift_y, z_cur, 0.032, 0.82, c, e)
+            } else {
+                // Crisp drifting alpine snowflakes (light flurries even on cool clear Nordic days!)
+                let fall_spd = if is_snow_weather { 3.2 } else { 1.9 } + (i % 5) as f64 * 0.35;
+                let sway = (t * 1.4 + i as f64 * 0.7).sin() * 1.6;
+                let drift_x = ((rx0 * span_xy + t * (wu * 0.85 + 0.9) + sway) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
+                let drift_y = ((ry0 * span_xy + t * (wv * 0.85 - 0.6)) + span_xy * 0.5).rem_euclid(span_xy) - span_xy * 0.5;
+                let z_cur = ((rz0 * span_z - t * fall_spd).rem_euclid(span_z)) + 0.6;
+                let alpha = if is_snow_weather { 0.78 } else { 0.52 };
+                let c = [0.94, 0.98, 1.00, alpha];
+                let e = [0.55, 0.68, 0.85, MAT_MACRO_BEAM];
+                (drift_x, drift_y, z_cur, 0.068, 0.068, c, e)
+            };
+
+            let p_dir = normalize3_f64(add_f64(
+                focus_dir,
+                add_f64(scale_f64(ft1, px_l / r_surf), scale_f64(ft2, py_l / r_surf)),
+            ));
+            let p_pos = scale_f64(p_dir, r_core + focus_alt.max(z_sea_surf) + pz_l);
+            push_cross_particle_f64(
+                fx_verts,
+                fx_indices,
+                p_pos,
+                p_dir,
+                ft1,
+                ft2,
+                w_sz,
+                h_sz,
+                origin_f64,
+                col,
+                em,
+            );
+        }
+
+        // 5B. Rising Bioluminescent Cavern Spores drifting out of glowing cavern grottos!
+        for anc in anchors {
+            for (gi, &(g_dir, g_floor)) in anc.cavern_grottos.iter().enumerate() {
+                let (gt1, gt2) = tangent_basis_f64(g_dir);
+                for si in 0..16usize {
+                    let ang = (si as f64) * 1.9 + t * 0.35 + gi as f64;
+                    let r_sp = 1.5 + ((si % 5) as f64) * 1.4;
+                    let z_rise = ((si as f64 * 0.85 + t * 1.35).rem_euclid(12.0)) + 0.8;
+                    let s_dir = normalize3_f64(add_f64(
+                        g_dir,
+                        add_f64(
+                            scale_f64(gt1, (ang.cos() * r_sp) / r_surf),
+                            scale_f64(gt2, (ang.sin() * r_sp) / r_surf),
+                        ),
+                    ));
+                    let s_pos = scale_f64(s_dir, r_core + g_floor + z_rise);
+                    let pulse = (0.55 + 0.45 * (t * 3.2 + si as f64).sin()) as f32;
+                    let is_amethyst = si % 3 == 0;
+                    let (c, e) = if is_amethyst {
+                        (
+                            [0.72, 0.36, 1.00, 0.78 * pulse],
+                            [1.45 * pulse, 0.65 * pulse, 2.60 * pulse, MAT_MACRO_BEAM],
+                        )
+                    } else {
+                        (
+                            [0.18, 0.96, 0.88, 0.80 * pulse],
+                            [0.35 * pulse, 2.20 * pulse, 2.40 * pulse, MAT_MACRO_BEAM],
+                        )
+                    };
+                    push_cross_particle_f64(
+                        fx_verts,
+                        fx_indices,
+                        s_pos,
+                        s_dir,
+                        gt1,
+                        gt2,
+                        0.20,
+                        0.20,
+                        origin_f64,
+                        c,
+                        e,
+                    );
+                }
             }
         }
     }
@@ -1015,20 +1052,29 @@ fn push_nordic_longhouse(
         0.34,
     );
 
-    // Carved stone foundation plinth
-    push_oriented_box_f64(
+    // Carved tapered stone foundation plinth
+    push_tapered_frustum_f64(
         terrain_verts,
         terrain_indices,
-        add_f64(base_world, scale_f64(up, 0.25)),
+        sub_f64(base_world, scale_f64(up, 0.35)),
         right,
         up,
         fwd,
-        [width + 0.6, 1.1, length + 0.6],
+        (width + 0.85) * 0.5,
+        (length + 0.85) * 0.5,
+        (width + 0.42) * 0.5,
+        (length + 0.42) * 0.5,
+        1.15,
+        0.0,
+        0.0,
+        4,
         origin_f64,
-        [0.30, 0.32, 0.36, 0.80],
+        [0.26, 0.28, 0.32, 0.82],
+        [0.34, 0.36, 0.40, 0.78],
         [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+        true,
     );
-    // Dark weathered Nordic timber log walls
+    // Dark weathered Nordic timber log walls + heavy corner timber pilasters
     push_oriented_box_f64(
         terrain_verts,
         terrain_indices,
@@ -1038,16 +1084,37 @@ fn push_nordic_longhouse(
         fwd,
         [width, wall_h, length],
         origin_f64,
-        [0.24, 0.15, 0.09, 0.88],
+        [0.25, 0.16, 0.095, 0.88],
         [0.0, 0.0, 0.0, MAT_MACRO_PROP],
     );
-    // Warm glowing amber leaded windows on both long sides & front gable!
+    for sx in [-1.0f64, 1.0] {
+        for sz in [-1.0f64, 1.0] {
+            let pil_p = add_f64(
+                add_f64(base_world, scale_f64(up, 0.75 + wall_h * 0.5)),
+                add_f64(scale_f64(right, sx * (width * 0.50)), scale_f64(fwd, sz * (length * 0.50))),
+            );
+            push_oriented_box_f64(
+                terrain_verts,
+                terrain_indices,
+                pil_p,
+                right,
+                up,
+                fwd,
+                [0.36, wall_h + 0.15, 0.36],
+                origin_f64,
+                [0.18, 0.11, 0.065, 0.90],
+                [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            );
+        }
+    }
+    // Warm glowing leaded windows with dark timber mullions/sills on both long sides & front gable!
     for side_s in [-1.0f64, 1.0] {
         for &z_off in &[-length * 0.24, length * 0.24] {
             let win_p = add_f64(
-                add_f64(base_world, scale_f64(up, 0.9 + wall_h * 0.48)),
+                add_f64(base_world, scale_f64(up, 0.92 + wall_h * 0.48)),
                 add_f64(scale_f64(right, side_s * (width * 0.505)), scale_f64(fwd, z_off)),
             );
+            // Timber window frame & sill
             push_oriented_box_f64(
                 terrain_verts,
                 terrain_indices,
@@ -1055,14 +1122,52 @@ fn push_nordic_longhouse(
                 right,
                 up,
                 fwd,
-                [0.14, 0.82, 0.92],
+                [0.12, 1.06, 1.14],
+                origin_f64,
+                [0.16, 0.10, 0.06, 0.88],
+                [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            );
+            // Warm glowing amber hearth-lit glass panes
+            push_oriented_box_f64(
+                terrain_verts,
+                terrain_indices,
+                add_f64(win_p, scale_f64(right, side_s * 0.05)),
+                right,
+                up,
+                fwd,
+                [0.10, 0.80, 0.88],
                 origin_f64,
                 [1.00, 0.78, 0.32, 0.16],
-                [2.5, 1.35, 0.30, MAT_MACRO_BEAM],
+                [2.6, 1.40, 0.32, MAT_MACRO_BEAM],
+            );
+            // Crossed leaded window mullion bars
+            push_oriented_box_f64(
+                terrain_verts,
+                terrain_indices,
+                add_f64(win_p, scale_f64(right, side_s * 0.10)),
+                right,
+                up,
+                fwd,
+                [0.05, 0.82, 0.08],
+                origin_f64,
+                [0.14, 0.09, 0.05, 0.86],
+                [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            );
+            push_oriented_box_f64(
+                terrain_verts,
+                terrain_indices,
+                add_f64(win_p, scale_f64(right, side_s * 0.10)),
+                right,
+                up,
+                fwd,
+                [0.05, 0.08, 0.90],
+                origin_f64,
+                [0.14, 0.09, 0.05, 0.86],
+                [0.0, 0.0, 0.0, MAT_MACRO_PROP],
             );
         }
     }
-    // Warm timber door on front gable
+    // Warm timber door + carved lintel on front gable
     push_oriented_box_f64(
         terrain_verts,
         terrain_indices,
@@ -1073,68 +1178,118 @@ fn push_nordic_longhouse(
         right,
         up,
         fwd,
-        [1.15, 1.85, 0.16],
+        [1.24, 1.92, 0.18],
         origin_f64,
         [0.34, 0.22, 0.12, 0.84],
         [0.25, 0.12, 0.03, MAT_MACRO_PROP],
     );
+    // Glowing upper gable loft window beneath the front dragon-prow!
+    let roof_base_z = 0.75 + wall_h;
+    let ridge_h = (width * 0.64).clamp(2.3, 3.5);
+    push_oriented_box_f64(
+        terrain_verts,
+        terrain_indices,
+        add_f64(
+            add_f64(base_world, scale_f64(up, roof_base_z + ridge_h * 0.42)),
+            scale_f64(fwd, length * 0.508),
+        ),
+        right,
+        up,
+        fwd,
+        [0.72, 0.72, 0.12],
+        origin_f64,
+        [1.00, 0.80, 0.36, 0.16],
+        [2.3, 1.25, 0.28, MAT_MACRO_BEAM],
+    );
 
-    // Steep pitched Nordic slate roof (3 stepped gabled tiers with optional snow-dusted eaves!)
-    let roof_col = if snowy_roof {
-        [0.80, 0.86, 0.93, 0.34]
-    } else {
-        [0.16, 0.20, 0.26, 0.68]
-    };
-    let roof_base_z = 0.72 + wall_h;
-    for (ti, &(frac_w, h_step, z_step)) in [(1.18f64, 0.95f64, 0.42f64), (0.82, 0.95, 1.25), (0.44, 0.85, 2.02)].iter().enumerate() {
-        let tier_col = if ti == 2 && snowy_roof {
-            [0.88, 0.93, 0.98, 0.28]
-        } else {
-            roof_col
-        };
-        push_oriented_box_f64(
-            terrain_verts,
-            terrain_indices,
-            add_f64(base_world, scale_f64(up, roof_base_z + z_step)),
-            right,
-            up,
-            fwd,
-            [width * frac_w, h_step, length + 0.85 - ti as f64 * 0.12],
-            origin_f64,
-            tier_col,
-            [0.0, 0.0, 0.0, MAT_MACRO_PROP],
-        );
-    }
-    // Stone chimney + gentle translucent hearth smoke wisp!
-    let chim_p = add_f64(
-        add_f64(base_world, scale_f64(up, roof_base_z + 2.2)),
-        add_f64(scale_f64(right, width * 0.18), scale_f64(fwd, -length * 0.22)),
+    // True steep triangular pitched Nordic slate roof with overhanging timber eaves,
+    // solid gables & carved crossed dragon-prow ridge beams!
+    let roof_col = [0.16, 0.21, 0.28, 0.68];
+    let gable_col = [0.22, 0.14, 0.085, 0.88];
+    let trim_col = [0.18, 0.11, 0.065, 0.86];
+    push_pitched_roof_f64(
+        terrain_verts,
+        terrain_indices,
+        add_f64(base_world, scale_f64(up, roof_base_z)),
+        right,
+        up,
+        fwd,
+        width,
+        length,
+        ridge_h,
+        0.65,
+        0.58,
+        origin_f64,
+        roof_col,
+        gable_col,
+        trim_col,
+        snowy_roof,
+    );
+
+    // Tapered stone chimney + crowned flue cap + gentle translucent hearth smoke wisp!
+    let chim_base = add_f64(
+        add_f64(base_world, scale_f64(up, roof_base_z + 0.55)),
+        add_f64(scale_f64(right, width * 0.22), scale_f64(fwd, -length * 0.22)),
+    );
+    let chim_h = ridge_h + 0.85;
+    push_tapered_frustum_f64(
+        terrain_verts,
+        terrain_indices,
+        chim_base,
+        right,
+        up,
+        fwd,
+        0.48,
+        0.48,
+        0.32,
+        0.32,
+        chim_h,
+        0.0,
+        0.0,
+        4,
+        origin_f64,
+        [0.28, 0.29, 0.33, 0.82],
+        [0.36, 0.37, 0.40, 0.78],
+        [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+        true,
     );
     push_oriented_box_f64(
         terrain_verts,
         terrain_indices,
-        chim_p,
+        add_f64(chim_base, scale_f64(up, chim_h + 0.12)),
         right,
         up,
         fwd,
-        [0.72, 2.2, 0.72],
+        [0.82, 0.22, 0.82],
         origin_f64,
-        [0.32, 0.33, 0.36, 0.80],
+        [0.24, 0.25, 0.29, 0.82],
         [0.0, 0.0, 0.0, MAT_MACRO_PROP],
     );
-    push_cross_particle_f64(
-        gas_verts,
-        gas_indices,
-        add_f64(chim_p, scale_f64(up, 2.3)),
-        up,
-        right,
-        fwd,
-        1.45,
-        2.2,
-        origin_f64,
-        [0.78, 0.82, 0.88, 0.26],
-        [0.04, 0.04, 0.05, MAT_MACRO_GAS],
-    );
+    // 3 staggered rising curling chimney smoke puffs (tighter near flue, wider & softer downwind!)
+    let chim_puffs: [(f64, f64, f64, f64, f64, [f32; 4], [f32; 4]); 3] = [
+        (0.85, 0.22, -0.14, 0.62, 0.72, [0.76, 0.80, 0.86, 0.30], [0.05, 0.045, 0.04, MAT_MACRO_GAS]),
+        (2.15, 0.78, -0.46, 1.05, 1.15, [0.80, 0.84, 0.90, 0.22], [0.03, 0.03, 0.04, MAT_MACRO_GAS]),
+        (3.75, 1.55, -0.88, 1.55, 1.50, [0.84, 0.88, 0.94, 0.14], [0.02, 0.02, 0.03, MAT_MACRO_GAS]),
+    ];
+    for (dz, dr, df, hw, hh, col, em) in chim_puffs {
+        let puff_c = add_f64(
+            add_f64(chim_base, scale_f64(up, chim_h + dz)),
+            add_f64(scale_f64(right, dr), scale_f64(fwd, df)),
+        );
+        push_cross_particle_f64(
+            gas_verts,
+            gas_indices,
+            puff_c,
+            up,
+            right,
+            fwd,
+            hw,
+            hh,
+            origin_f64,
+            col,
+            em,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1182,19 +1337,54 @@ fn push_village_hearth(
         [1.00, 0.62, 0.16, 0.14],
         [3.4, 1.55, 0.24, MAT_MACRO_BEAM],
     );
-    push_cross_particle_f64(
-        gas_verts,
-        gas_indices,
-        add_f64(base_world, scale_f64(up, 2.8)),
-        up,
-        t1,
-        t2,
-        1.6,
-        2.5,
-        origin_f64,
-        [0.82, 0.78, 0.74, 0.24],
-        [0.35, 0.14, 0.03, MAT_MACRO_GAS],
-    );
+    // Soft warm amber hearth light-pool illuminating surrounding dusk grass & fire-ring stones!
+    {
+        let base_g = gas_verts.len() as u32;
+        let gc = add_f64(base_world, scale_f64(up, 0.16));
+        let r_glow = 5.2;
+        let n_f = [up[0] as f32, up[1] as f32, up[2] as f32];
+        let corners = [
+            (add_f64(sub_f64(gc, scale_f64(t1, r_glow)), scale_f64(t2, -r_glow)), [-1.0f32, -1.0, 1.0, 0.0]),
+            (add_f64(add_f64(gc, scale_f64(t1, r_glow)), scale_f64(t2, -r_glow)), [1.0, -1.0, 1.0, 0.0]),
+            (add_f64(add_f64(gc, scale_f64(t1, r_glow)), scale_f64(t2, r_glow)), [1.0, 1.0, 1.0, 0.0]),
+            (add_f64(sub_f64(gc, scale_f64(t1, r_glow)), scale_f64(t2, r_glow)), [-1.0, 1.0, 1.0, 0.0]),
+        ];
+        for (p, uv) in corners {
+            gas_verts.push(MacroPlanetVertex {
+                pos: world_f64_to_camera_rel_f32(p, origin_f64),
+                normal: n_f,
+                color: [1.00, 0.56, 0.14, 0.24],
+                emissive_mat: [1.35, 0.58, 0.12, MAT_MACRO_BEAM],
+                water_ice: uv,
+            });
+        }
+        gas_indices.extend_from_slice(&[base_g, base_g + 1, base_g + 2, base_g, base_g + 2, base_g + 3]);
+    }
+    // 3 staggered rising curling hearth campfire smoke puffs (warm ember-lit base -> soft wisps!)
+    let hearth_puffs: [(f64, f64, f64, f64, f64, [f32; 4], [f32; 4]); 3] = [
+        (2.05, 0.20, -0.12, 0.78, 0.92, [0.84, 0.76, 0.68, 0.28], [0.42, 0.17, 0.04, MAT_MACRO_GAS]),
+        (3.55, 0.72, -0.42, 1.25, 1.32, [0.80, 0.79, 0.78, 0.20], [0.16, 0.07, 0.02, MAT_MACRO_GAS]),
+        (5.25, 1.48, -0.85, 1.78, 1.68, [0.82, 0.84, 0.88, 0.12], [0.04, 0.03, 0.03, MAT_MACRO_GAS]),
+    ];
+    for (dz, d1, d2, hw, hh, col, em) in hearth_puffs {
+        let puff_c = add_f64(
+            add_f64(base_world, scale_f64(up, dz)),
+            add_f64(scale_f64(t1, d1), scale_f64(t2, d2)),
+        );
+        push_cross_particle_f64(
+            gas_verts,
+            gas_indices,
+            puff_c,
+            up,
+            t1,
+            t2,
+            hw,
+            hh,
+            origin_f64,
+            col,
+            em,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1281,68 +1471,493 @@ fn push_ancient_stone_ruins(
     let fwd = normalize3_f64(add_f64(scale_f64(t1, yaw.cos()), scale_f64(t2, yaw.sin())));
     let right = normalize3_f64(cross_f64(fwd, up));
 
+    let stone_em = [0.0, 0.0, 0.0, MAT_MACRO_PROP];
+    let dais_dark = [0.22, 0.25, 0.26, 0.84];
+    let dais_granite = [0.24, 0.27, 0.28, 0.82];
+    let moss_granite = [0.19, 0.27, 0.21, 0.86];
+    let slate_cap = [0.15, 0.17, 0.21, 0.74];
+    let rune_col = [0.16, 0.90, 1.00, 0.14];
+    let rune_em = [0.35, 1.95, 2.55, MAT_MACRO_CRYSTAL];
+
     push_contact_shadow_disc_f64(
         gas_verts,
         gas_indices,
         add_f64(base_world, scale_f64(up, 0.12)),
         up,
-        6.2,
-        12,
+        7.4,
+        14,
         origin_f64,
-        0.30,
+        0.36,
     );
 
-    // Ancient standing Nordic Rune Archway (2 mossy carved granite monoliths + stone lintel!)
-    for s_sign in [-1.0f64, 1.0] {
-        let p_c = add_f64(
-            add_f64(base_world, scale_f64(right, s_sign * 2.5)),
-            scale_f64(up, 2.7),
-        );
-        push_oriented_box_f64(
-            terrain_verts,
-            terrain_indices,
-            p_c,
-            right,
-            up,
-            fwd,
-            [1.15, 5.8, 1.15],
-            origin_f64,
-            [0.32, 0.36, 0.38, 0.76],
-            [0.06, 0.24, 0.36, MAT_MACRO_PROP],
-        );
-    }
-    push_oriented_box_f64(
+    // 1. Stepped mossy dark-granite dais plinth + carved front entrance steps!
+    push_tapered_frustum_f64(
         terrain_verts,
         terrain_indices,
-        add_f64(base_world, scale_f64(up, 5.85)),
+        sub_f64(base_world, scale_f64(up, 0.25)),
         right,
         up,
         fwd,
-        [6.8, 1.05, 1.35],
+        4.95,
+        4.65,
+        4.55,
+        4.25,
+        0.78,
+        0.0,
+        0.0,
+        8,
         origin_f64,
-        [0.30, 0.35, 0.37, 0.76],
-        [0.08, 0.28, 0.42, MAT_MACRO_PROP],
+        dais_dark,
+        moss_granite,
+        stone_em,
+        true,
     );
-
-    // 4 broken surrounding granite colonnade pillars + 1 fallen mossy lintel
-    for ci in 0..4usize {
-        let ang = (ci as f64 / 4.0) * std::f64::consts::TAU + 0.65;
-        let cp = add_f64(
-            base_world,
-            add_f64(scale_f64(right, ang.cos() * 5.2), scale_f64(fwd, ang.sin() * 5.2)),
-        );
-        let h = 1.8 + (ci % 3) as f64 * 1.15;
+    push_tapered_frustum_f64(
+        terrain_verts,
+        terrain_indices,
+        add_f64(base_world, scale_f64(up, 0.50)),
+        right,
+        up,
+        fwd,
+        3.90,
+        3.60,
+        3.68,
+        3.38,
+        0.46,
+        0.0,
+        0.0,
+        8,
+        origin_f64,
+        dais_granite,
+        moss_granite,
+        stone_em,
+        true,
+    );
+    for (step_i, (dz, df, w)) in [(0.18f64, 4.35f64, 2.95f64), (0.58, 3.65, 2.55)].iter().enumerate() {
+        let sc = if step_i == 0 { moss_granite } else { dais_granite };
         push_oriented_box_f64(
             terrain_verts,
             terrain_indices,
-            add_f64(cp, scale_f64(up, h * 0.5 - 0.2)),
+            add_f64(add_f64(base_world, scale_f64(up, *dz)), scale_f64(fwd, *df)),
             right,
             up,
             fwd,
-            [0.95, h, 0.95],
+            [*w, 0.36, 0.85],
             origin_f64,
-            [0.30, 0.34, 0.35, 0.78],
-            [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            sc,
+            stone_em,
+        );
+    }
+
+    // 2. Twin weathered tapered dark-stone monolith pillars with beveled dark-slate capstones
+    //    & thin recessed glowing cyan rune bands (ZERO emissive on the stone itself!)
+    let dais_top = 0.92;
+    let pil_h = 5.05;
+    for s_sign in [-1.0f64, 1.0] {
+        let p_base = add_f64(
+            add_f64(base_world, scale_f64(right, s_sign * 2.55)),
+            scale_f64(up, dais_top),
+        );
+        // Heavy carved dark-granite base plinth
+        push_tapered_frustum_f64(
+            terrain_verts,
+            terrain_indices,
+            sub_f64(p_base, scale_f64(up, 0.08)),
+            right,
+            up,
+            fwd,
+            0.86,
+            0.86,
+            0.72,
+            0.72,
+            0.72,
+            0.0,
+            0.0,
+            6,
+            origin_f64,
+            dais_dark,
+            moss_granite,
+            stone_em,
+            true,
+        );
+        // Weathered tapered dark-stone monolith shaft
+        push_tapered_frustum_f64(
+            terrain_verts,
+            terrain_indices,
+            add_f64(p_base, scale_f64(up, 0.60)),
+            right,
+            up,
+            fwd,
+            0.68,
+            0.68,
+            0.52,
+            0.52,
+            pil_h - 0.60,
+            0.0,
+            0.0,
+            6,
+            origin_f64,
+            dais_granite,
+            [0.27, 0.30, 0.32, 0.78],
+            stone_em,
+            true,
+        );
+        // Thin recessed glowing cyan rune bands ringing the tapered shaft + narrow vertical rune strip
+        for (band_z, band_r) in [(1.85f64, 0.64f64), (3.45, 0.58)] {
+            push_tapered_frustum_f64(
+                terrain_verts,
+                terrain_indices,
+                add_f64(p_base, scale_f64(up, band_z)),
+                right,
+                up,
+                fwd,
+                band_r,
+                band_r,
+                band_r - 0.01,
+                band_r - 0.01,
+                0.15,
+                0.0,
+                0.0,
+                6,
+                origin_f64,
+                rune_col,
+                rune_col,
+                rune_em,
+                false,
+            );
+        }
+        for face_s in [-1.0f64, 1.0] {
+            push_oriented_box_f64(
+                terrain_verts,
+                terrain_indices,
+                add_f64(
+                    add_f64(p_base, scale_f64(up, 2.65)),
+                    scale_f64(fwd, face_s * 0.58),
+                ),
+                right,
+                up,
+                fwd,
+                [0.12, 1.48, 0.08],
+                origin_f64,
+                rune_col,
+                rune_em,
+            );
+        }
+        // Beveled dark-slate capstone crowning the monolith
+        push_tapered_frustum_f64(
+            terrain_verts,
+            terrain_indices,
+            add_f64(p_base, scale_f64(up, pil_h - 0.02)),
+            right,
+            up,
+            fwd,
+            0.54,
+            0.54,
+            0.84,
+            0.84,
+            0.44,
+            0.0,
+            0.0,
+            6,
+            origin_f64,
+            slate_cap,
+            [0.20, 0.22, 0.26, 0.74],
+            stone_em,
+            true,
+        );
+        // Angled stone corbel bracket supporting the lintel arch
+        push_oriented_box_f64(
+            terrain_verts,
+            terrain_indices,
+            add_f64(
+                add_f64(p_base, scale_f64(up, pil_h + 0.14)),
+                scale_f64(right, -s_sign * 0.65),
+            ),
+            right,
+            up,
+            fwd,
+            [0.95, 0.42, 1.05],
+            origin_f64,
+            dais_dark,
+            stone_em,
+        );
+    }
+
+    // 3. Dramatic carved lintel arch + beveled dark-slate cornice + central carved crest stone!
+    let lintel_z = dais_top + pil_h + 0.44;
+    push_oriented_box_f64(
+        terrain_verts,
+        terrain_indices,
+        add_f64(base_world, scale_f64(up, lintel_z + 0.34)),
+        right,
+        up,
+        fwd,
+        [6.65, 0.68, 1.24],
+        origin_f64,
+        dais_granite,
+        stone_em,
+    );
+    push_oriented_box_f64(
+        terrain_verts,
+        terrain_indices,
+        add_f64(base_world, scale_f64(up, lintel_z + 0.86)),
+        right,
+        up,
+        fwd,
+        [7.35, 0.40, 1.54],
+        origin_f64,
+        slate_cap,
+        stone_em,
+    );
+    // Central carved Nordic keystone crest + glowing inset cyan runic diamond
+    push_tapered_frustum_f64(
+        terrain_verts,
+        terrain_indices,
+        add_f64(base_world, scale_f64(up, lintel_z + 1.04)),
+        right,
+        up,
+        fwd,
+        1.28,
+        0.76,
+        0.34,
+        0.42,
+        1.25,
+        0.0,
+        0.0,
+        4,
+        origin_f64,
+        dais_granite,
+        slate_cap,
+        stone_em,
+        true,
+    );
+    for face_s in [-1.0f64, 1.0] {
+        push_oriented_box_f64(
+            terrain_verts,
+            terrain_indices,
+            add_f64(
+                add_f64(base_world, scale_f64(up, lintel_z + 0.42)),
+                scale_f64(fwd, face_s * 0.64),
+            ),
+            right,
+            up,
+            fwd,
+            [0.36, 0.36, 0.10],
+            origin_f64,
+            rune_col,
+            [0.45, 2.20, 2.80, MAT_MACRO_CRYSTAL],
+        );
+    }
+
+    // 4. Central glowing frost-crystal shrine basin casting warm/cool bloom!
+    let basin_base = add_f64(base_world, scale_f64(up, dais_top));
+    push_tapered_frustum_f64(
+        terrain_verts,
+        terrain_indices,
+        basin_base,
+        right,
+        up,
+        fwd,
+        0.92,
+        0.92,
+        0.64,
+        0.64,
+        0.88,
+        0.0,
+        0.0,
+        8,
+        origin_f64,
+        dais_dark,
+        dais_granite,
+        stone_em,
+        true,
+    );
+    push_tapered_frustum_f64(
+        terrain_verts,
+        terrain_indices,
+        add_f64(basin_base, scale_f64(up, 0.84)),
+        right,
+        up,
+        fwd,
+        0.58,
+        0.58,
+        1.08,
+        1.08,
+        0.44,
+        0.0,
+        0.0,
+        8,
+        origin_f64,
+        slate_cap,
+        [0.24, 0.28, 0.32, 0.72],
+        stone_em,
+        true,
+    );
+    // Warm amber brazier ember ring inside basin rim + radiant cyan-amethyst frost crystal cluster!
+    push_tapered_frustum_f64(
+        terrain_verts,
+        terrain_indices,
+        add_f64(basin_base, scale_f64(up, 1.20)),
+        right,
+        up,
+        fwd,
+        0.78,
+        0.78,
+        0.62,
+        0.62,
+        0.16,
+        0.0,
+        0.0,
+        8,
+        origin_f64,
+        [1.00, 0.72, 0.24, 0.16],
+        [1.00, 0.82, 0.38, 0.16],
+        [2.20, 1.12, 0.24, MAT_MACRO_BEAM],
+        true,
+    );
+    push_oriented_pyramid_f64(
+        terrain_verts,
+        terrain_indices,
+        add_f64(basin_base, scale_f64(up, 1.24)),
+        right,
+        up,
+        fwd,
+        0.44,
+        1.85,
+        origin_f64,
+        [0.18, 0.94, 1.00, 0.12],
+        [0.34, 2.15, 2.85, MAT_MACRO_CRYSTAL],
+    );
+    for ci in 0..4usize {
+        let ang = (ci as f64 / 4.0) * std::f64::consts::TAU + 0.4;
+        let tilt = normalize3_f64(add_f64(
+            scale_f64(up, 0.84),
+            add_f64(scale_f64(right, ang.cos() * 0.54), scale_f64(fwd, ang.sin() * 0.54)),
+        ));
+        let tfwd = normalize3_f64(cross_f64(tilt, right));
+        let shard_p = add_f64(
+            add_f64(basin_base, scale_f64(up, 1.20)),
+            add_f64(scale_f64(right, ang.cos() * 0.36), scale_f64(fwd, ang.sin() * 0.36)),
+        );
+        let is_amethyst = ci % 2 == 1;
+        let (scol, sem) = if is_amethyst {
+            ([0.68, 0.34, 1.00, 0.14], [1.15, 0.45, 2.55, MAT_MACRO_CRYSTAL])
+        } else {
+            ([0.16, 0.90, 0.98, 0.14], [0.30, 1.85, 2.50, MAT_MACRO_CRYSTAL])
+        };
+        push_oriented_pyramid_f64(
+            terrain_verts,
+            terrain_indices,
+            shard_p,
+            right,
+            tilt,
+            tfwd,
+            0.22,
+            1.05 + (ci % 2) as f64 * 0.25,
+            origin_f64,
+            scol,
+            sem,
+        );
+    }
+    // Soft radial arcane mist wisp rising from the frost-crystal shrine basin!
+    push_cross_particle_f64(
+        gas_verts,
+        gas_indices,
+        add_f64(basin_base, scale_f64(up, 2.35)),
+        up,
+        right,
+        fwd,
+        1.35,
+        1.55,
+        origin_f64,
+        [0.36, 0.92, 1.00, 0.22],
+        [0.24, 0.88, 1.15, MAT_MACRO_GAS],
+    );
+
+    // 5. 3 weathered broken tapered colonnade pillars + 2 fallen broken column drums on the snow!
+    for ci in 0..3usize {
+        let ang = (ci as f64 / 3.0) * std::f64::consts::TAU + 0.55;
+        let cp = add_f64(
+            base_world,
+            add_f64(scale_f64(right, ang.cos() * 5.6), scale_f64(fwd, ang.sin() * 5.6)),
+        );
+        let h = 1.65 + (ci % 3) as f64 * 0.95;
+        push_tapered_frustum_f64(
+            terrain_verts,
+            terrain_indices,
+            sub_f64(cp, scale_f64(up, 0.25)),
+            right,
+            up,
+            fwd,
+            0.58,
+            0.58,
+            0.46,
+            0.46,
+            h,
+            0.0,
+            0.0,
+            6,
+            origin_f64,
+            dais_dark,
+            moss_granite,
+            stone_em,
+            true,
+        );
+        push_contact_shadow_disc_f64(
+            gas_verts,
+            gas_indices,
+            add_f64(cp, scale_f64(up, 0.10)),
+            up,
+            1.25,
+            8,
+            origin_f64,
+            0.28,
+        );
+    }
+    let fallen_drums: [(f64, f64, f64, f64, f64); 2] = [
+        (3.8, 3.9, 0.35, 1.95, 0.48),
+        (-4.4, 2.6, -0.82, 1.65, 0.44),
+    ];
+    for (fx, fz, drum_yaw, d_len, d_rad) in fallen_drums {
+        let dp = add_f64(
+            add_f64(base_world, scale_f64(right, fx)),
+            add_f64(scale_f64(fwd, fz), scale_f64(up, d_rad * 0.72)),
+        );
+        let axis = normalize3_f64(add_f64(scale_f64(right, drum_yaw.cos()), scale_f64(fwd, drum_yaw.sin())));
+        let side = normalize3_f64(cross_f64(axis, up));
+        push_tapered_frustum_f64(
+            terrain_verts,
+            terrain_indices,
+            sub_f64(dp, scale_f64(axis, d_len * 0.5)),
+            side,
+            axis,
+            up,
+            d_rad,
+            d_rad,
+            d_rad * 0.92,
+            d_rad * 0.92,
+            d_len,
+            0.0,
+            0.0,
+            6,
+            origin_f64,
+            moss_granite,
+            dais_granite,
+            stone_em,
+            true,
+        );
+        push_contact_shadow_disc_f64(
+            gas_verts,
+            gas_indices,
+            add_f64(
+                add_f64(base_world, scale_f64(right, fx)),
+                add_f64(scale_f64(fwd, fz), scale_f64(up, 0.10)),
+            ),
+            up,
+            d_len * 0.68,
+            8,
+            origin_f64,
+            0.26,
         );
     }
 }
@@ -1512,89 +2127,327 @@ fn push_nordic_elk(
         0.30,
     );
 
-    // Torso
-    let body_c = add_f64(base_pos, scale_f64(up, 1.12 * sc));
-    push_oriented_box_f64(
+    let mane_col = if is_stag {
+        [0.22, 0.14, 0.09, 0.84]
+    } else {
+        [0.34, 0.24, 0.16, 0.82]
+    };
+    let belly_col = [0.56, 0.48, 0.38, 0.82];
+
+    // Sculpted tapered muscular torso (broad chest tapering smoothly into sleek hindquarters!)
+    let rump_p = add_f64(add_f64(base_pos, scale_f64(up, 1.12 * sc)), scale_f64(fwd, -0.78 * sc));
+    let chest_p = add_f64(add_f64(base_pos, scale_f64(up, 1.16 * sc)), scale_f64(fwd, 0.02 * sc));
+    push_tapered_frustum_f64(
         solid_verts,
         solid_indices,
-        body_c,
+        rump_p,
         right,
-        up,
         fwd,
-        [0.64 * sc, 0.66 * sc, 1.55 * sc],
+        up,
+        0.24 * sc,
+        0.26 * sc,
+        0.34 * sc,
+        0.38 * sc,
+        0.82 * sc,
+        0.0,
+        0.05 * sc,
+        6,
         origin_f64,
         coat,
+        coat,
         em,
+        true,
     );
-    // 4 animated striding legs
-    let swing = stride_phase.sin() * 0.22 * sc;
-    for &(sx, sz, s_dir) in &[(-0.22, 0.52, 1.0), (0.22, 0.52, -1.0), (-0.22, -0.52, -1.0), (0.22, -0.52, 1.0)] {
-        let leg_c = add_f64(
-            add_f64(base_pos, scale_f64(up, 0.45 * sc)),
+    push_tapered_frustum_f64(
+        solid_verts,
+        solid_indices,
+        chest_p,
+        right,
+        fwd,
+        up,
+        0.34 * sc,
+        0.38 * sc,
+        0.26 * sc,
+        0.34 * sc,
+        0.78 * sc,
+        0.0,
+        0.06 * sc,
+        6,
+        origin_f64,
+        coat,
+        mane_col,
+        em,
+        true,
+    );
+    // Short pale-tipped Nordic tail
+    push_tapered_frustum_f64(
+        solid_verts,
+        solid_indices,
+        sub_f64(rump_p, scale_f64(fwd, 0.04 * sc)),
+        right,
+        scale_f64(fwd, -1.0),
+        up,
+        0.10 * sc,
+        0.10 * sc,
+        0.03 * sc,
+        0.03 * sc,
+        0.28 * sc,
+        0.0,
+        -0.14 * sc,
+        5,
+        origin_f64,
+        coat,
+        belly_col,
+        em,
+        true,
+    );
+
+    // 4 tapered striding legs (muscular upper haunch tapering to slender lower shin & hoof)
+    let swing = stride_phase.sin() * 0.24 * sc;
+    for &(sx, sz, s_dir) in &[
+        (-0.22, 0.56, 1.0),
+        (0.22, 0.56, -1.0),
+        (-0.21, -0.54, -1.0),
+        (0.21, -0.54, 1.0),
+    ] {
+        let foot_p = add_f64(
+            base_pos,
             add_f64(scale_f64(right, sx * sc), scale_f64(fwd, sz * sc + swing * s_dir)),
         );
-        push_oriented_box_f64(
+        let knee_p = add_f64(
+            add_f64(base_pos, scale_f64(up, 0.50 * sc)),
+            add_f64(scale_f64(right, sx * sc), scale_f64(fwd, sz * sc + swing * s_dir * 0.55)),
+        );
+        push_tapered_frustum_f64(
             solid_verts,
             solid_indices,
-            leg_c,
+            foot_p,
             right,
             up,
             fwd,
-            [0.16 * sc, 0.88 * sc, 0.18 * sc],
+            0.055 * sc,
+            0.065 * sc,
+            0.075 * sc,
+            0.085 * sc,
+            0.52 * sc,
+            0.0,
+            -swing * s_dir * 0.45,
+            5,
             origin_f64,
-            [0.24, 0.16, 0.10, 0.82],
+            [0.14, 0.10, 0.07, 0.84],
+            [0.26, 0.18, 0.11, 0.82],
             em,
+            true,
+        );
+        push_tapered_frustum_f64(
+            solid_verts,
+            solid_indices,
+            knee_p,
+            right,
+            up,
+            fwd,
+            0.08 * sc,
+            0.095 * sc,
+            0.13 * sc,
+            0.16 * sc,
+            0.56 * sc,
+            0.0,
+            -swing * s_dir * 0.45,
+            5,
+            origin_f64,
+            [0.28, 0.19, 0.12, 0.82],
+            coat,
+            em,
+            true,
         );
     }
-    // Neck & head (gentle grazing bob)
+
+    // Curved arched neck with winter mane & sculpted tapered muzzle (gentle grazing bob)
     let bob = (stride_phase * 0.5).sin() * 0.10 * sc;
-    let head_c = add_f64(
-        add_f64(base_pos, scale_f64(up, 1.72 * sc + bob)),
-        scale_f64(fwd, 0.88 * sc),
-    );
-    push_oriented_box_f64(
+    let neck_base = add_f64(add_f64(base_pos, scale_f64(up, 1.24 * sc)), scale_f64(fwd, 0.56 * sc));
+    let neck_top = add_f64(add_f64(base_pos, scale_f64(up, 1.78 * sc + bob)), scale_f64(fwd, 0.86 * sc));
+    push_tapered_frustum_f64(
         solid_verts,
         solid_indices,
-        add_f64(add_f64(base_pos, scale_f64(up, 1.48 * sc + bob * 0.5)), scale_f64(fwd, 0.68 * sc)),
+        neck_base,
         right,
         up,
         fwd,
-        [0.32 * sc, 0.62 * sc, 0.36 * sc],
+        0.22 * sc,
+        0.28 * sc,
+        0.14 * sc,
+        0.18 * sc,
+        0.58 * sc + bob,
+        0.0,
+        0.30 * sc,
+        6,
         origin_f64,
+        mane_col,
         coat,
         em,
+        true,
     );
-    push_oriented_box_f64(
+    // Sculpted tapered head + narrow snout/muzzle
+    let muzzle_dir = normalize3_f64(add_f64(scale_f64(fwd, 0.92), scale_f64(up, -0.38)));
+    let muzzle_up = normalize3_f64(cross_f64(right, muzzle_dir));
+    push_tapered_frustum_f64(
         solid_verts,
         solid_indices,
-        head_c,
+        sub_f64(neck_top, scale_f64(fwd, 0.08 * sc)),
         right,
-        up,
-        fwd,
-        [0.32 * sc, 0.34 * sc, 0.58 * sc],
+        muzzle_dir,
+        muzzle_up,
+        0.16 * sc,
+        0.17 * sc,
+        0.075 * sc,
+        0.085 * sc,
+        0.62 * sc,
+        0.0,
+        0.0,
+        6,
         origin_f64,
-        [0.42, 0.30, 0.19, 0.78],
+        coat,
+        [0.24, 0.16, 0.11, 0.80],
         em,
+        true,
     );
-    // Proud branching antlers on stags!
+    // Alert swept ears
+    for side_s in [-1.0f64, 1.0] {
+        let ear_dir = normalize3_f64(add_f64(
+            add_f64(scale_f64(up, 0.65), scale_f64(right, side_s * 0.62)),
+            scale_f64(fwd, -0.42),
+        ));
+        let ear_fwd = normalize3_f64(cross_f64(ear_dir, right));
+        push_tapered_frustum_f64(
+            solid_verts,
+            solid_indices,
+            add_f64(add_f64(neck_top, scale_f64(up, 0.06 * sc)), scale_f64(right, side_s * 0.12 * sc)),
+            right,
+            ear_dir,
+            ear_fwd,
+            0.05 * sc,
+            0.03 * sc,
+            0.015 * sc,
+            0.01 * sc,
+            0.22 * sc,
+            0.0,
+            0.0,
+            4,
+            origin_f64,
+            coat,
+            mane_col,
+            em,
+            true,
+        );
+    }
+
+    // Proud multi-tine branching antlers on stags (curved main beam + 3 tapered tines per side)!
     if is_stag {
+        let ant_col_base = [0.68, 0.62, 0.48, 0.68];
+        let ant_col_tip = [0.88, 0.84, 0.72, 0.58];
+        let ant_em = [0.06, 0.05, 0.03, MAT_MACRO_ENTITY];
         for side_s in [-1.0f64, 1.0] {
-            let ant_c = add_f64(
-                add_f64(head_c, scale_f64(up, 0.48 * sc)),
-                scale_f64(right, side_s * 0.44 * sc),
+            let root = add_f64(
+                add_f64(neck_top, scale_f64(up, 0.12 * sc)),
+                scale_f64(right, side_s * 0.08 * sc),
             );
-            push_oriented_box_f64(
+            // Main sweeping antler beam (lower segment -> outer curved upper beam)
+            let mid_ant = add_f64(
+                add_f64(root, scale_f64(up, 0.34 * sc)),
+                add_f64(scale_f64(right, side_s * 0.36 * sc), scale_f64(fwd, -0.14 * sc)),
+            );
+            let beam1_dir = normalize3_f64(sub_f64(mid_ant, root));
+            let beam1_fwd = normalize3_f64(cross_f64(beam1_dir, right));
+            push_tapered_frustum_f64(
                 solid_verts,
                 solid_indices,
-                ant_c,
+                root,
                 right,
-                up,
-                fwd,
-                [0.62 * sc, 0.52 * sc, 0.14 * sc],
+                beam1_dir,
+                beam1_fwd,
+                0.042 * sc,
+                0.042 * sc,
+                0.030 * sc,
+                0.030 * sc,
+                0.52 * sc,
+                0.0,
+                0.0,
+                5,
                 origin_f64,
-                [0.78, 0.72, 0.58, 0.65],
-                [0.06, 0.05, 0.03, MAT_MACRO_ENTITY],
+                ant_col_base,
+                ant_col_tip,
+                ant_em,
+                true,
             );
+            let tip_ant = add_f64(
+                add_f64(mid_ant, scale_f64(up, 0.36 * sc)),
+                add_f64(scale_f64(right, side_s * 0.28 * sc), scale_f64(fwd, -0.22 * sc)),
+            );
+            let beam2_dir = normalize3_f64(sub_f64(tip_ant, mid_ant));
+            let beam2_fwd = normalize3_f64(cross_f64(beam2_dir, right));
+            push_tapered_frustum_f64(
+                solid_verts,
+                solid_indices,
+                mid_ant,
+                right,
+                beam2_dir,
+                beam2_fwd,
+                0.030 * sc,
+                0.030 * sc,
+                0.012 * sc,
+                0.012 * sc,
+                0.50 * sc,
+                0.0,
+                0.0,
+                5,
+                origin_f64,
+                ant_col_base,
+                ant_col_tip,
+                ant_em,
+                true,
+            );
+            // 3 distinct upward-swept tapered tines (brow tine, mid tine, crown fork!)
+            let tine_specs: [([f64; 3], [f64; 3], f64); 3] = [
+                (
+                    add_f64(root, scale_f64(beam1_dir, 0.18 * sc)),
+                    normalize3_f64(add_f64(add_f64(scale_f64(up, 0.55), scale_f64(fwd, 0.80)), scale_f64(right, side_s * 0.22))),
+                    0.34 * sc,
+                ),
+                (
+                    mid_ant,
+                    normalize3_f64(add_f64(add_f64(scale_f64(up, 0.86), scale_f64(fwd, 0.42)), scale_f64(right, side_s * 0.28))),
+                    0.38 * sc,
+                ),
+                (
+                    add_f64(mid_ant, scale_f64(beam2_dir, 0.28 * sc)),
+                    normalize3_f64(add_f64(add_f64(scale_f64(up, 0.90), scale_f64(fwd, 0.20)), scale_f64(right, side_s * 0.36))),
+                    0.32 * sc,
+                ),
+            ];
+            for (t_base, t_dir, t_len) in tine_specs {
+                let t_fwd = normalize3_f64(cross_f64(t_dir, right));
+                push_tapered_frustum_f64(
+                    solid_verts,
+                    solid_indices,
+                    t_base,
+                    right,
+                    t_dir,
+                    t_fwd,
+                    0.024 * sc,
+                    0.024 * sc,
+                    0.008 * sc,
+                    0.008 * sc,
+                    t_len,
+                    0.0,
+                    0.0,
+                    4,
+                    origin_f64,
+                    ant_col_base,
+                    ant_col_tip,
+                    ant_em,
+                    true,
+                );
+            }
         }
     }
 }
@@ -1616,84 +2469,209 @@ fn push_ocean_whale(
 ) {
     let w_fwd = normalize3_f64(add_f64(scale_f64(fwd, pitch.cos()), scale_f64(up, pitch.sin())));
     let w_up = normalize3_f64(cross_f64(right, w_fwd));
-    let whale_top = [0.10, 0.20, 0.32, 0.24];
-    let whale_belly = [0.58, 0.68, 0.78, 0.30];
+    let whale_top = [0.09, 0.19, 0.31, 0.22];
+    let whale_mid = [0.14, 0.26, 0.40, 0.24];
+    let whale_belly = [0.62, 0.72, 0.82, 0.28];
     let em = [0.01, 0.03, 0.06, MAT_MACRO_ENTITY];
 
-    // Main streamlined whale torso & pale belly
-    push_oriented_box_f64(
+    // 1. Sleek tapered curved whale head & arched forehead (`segs = 8`, tapering gracefully forward!)
+    let head_base = add_f64(pos, scale_f64(w_fwd, 1.6));
+    push_tapered_frustum_f64(
         solid_verts,
         solid_indices,
-        pos,
+        head_base,
         right,
-        w_up,
         w_fwd,
-        [2.9, 1.95, 7.6],
+        w_up,
+        1.52,
+        1.12,
+        0.58,
+        0.44,
+        3.4,
+        0.0,
+        -0.36,
+        8,
         origin_f64,
         whale_top,
+        whale_mid,
         em,
+        true,
     );
-    push_oriented_box_f64(
+    // Pale pleated throat & lower jaw curving smoothly beneath the snout
+    push_tapered_frustum_f64(
         solid_verts,
         solid_indices,
-        sub_f64(pos, scale_f64(w_up, 0.78)),
+        sub_f64(add_f64(pos, scale_f64(w_fwd, -1.6)), scale_f64(w_up, 0.48)),
         right,
-        w_up,
         w_fwd,
-        [2.5, 0.62, 6.4],
+        w_up,
+        1.15,
+        0.52,
+        0.46,
+        0.24,
+        6.1,
+        0.0,
+        0.16,
+        8,
         origin_f64,
         whale_belly,
+        whale_belly,
         em,
+        true,
     );
-    // Sweeping pectoral fins
+    // 2. Smooth arched dorsal midsection (`segs = 8`) + swept curved dorsal fin!
+    push_tapered_frustum_f64(
+        solid_verts,
+        solid_indices,
+        sub_f64(pos, scale_f64(w_fwd, 2.2)),
+        right,
+        w_fwd,
+        w_up,
+        1.18,
+        0.96,
+        1.52,
+        1.12,
+        3.8,
+        0.0,
+        0.24,
+        8,
+        origin_f64,
+        whale_mid,
+        whale_top,
+        em,
+        true,
+    );
+    // Curved swept dorsal fin cresting the arched back
+    push_tapered_frustum_f64(
+        solid_verts,
+        solid_indices,
+        add_f64(sub_f64(pos, scale_f64(w_fwd, 1.1)), scale_f64(w_up, 0.92)),
+        right,
+        w_up,
+        w_fwd,
+        0.18,
+        0.82,
+        0.04,
+        0.18,
+        0.95,
+        0.0,
+        -0.68,
+        4,
+        origin_f64,
+        whale_top,
+        whale_mid,
+        em,
+        true,
+    );
+
+    // 3. Swept curved pectoral fins angling outward, backward & gently downward!
     for side_s in [-1.0f64, 1.0] {
-        let fin_p = add_f64(
-            add_f64(pos, scale_f64(right, side_s * 2.2)),
-            scale_f64(w_fwd, 0.8),
+        let fin_root = add_f64(
+            add_f64(pos, scale_f64(right, side_s * 1.25)),
+            add_f64(scale_f64(w_fwd, 1.2), scale_f64(w_up, -0.35)),
         );
-        push_oriented_box_f64(
+        let fin_dir = normalize3_f64(add_f64(
+            add_f64(scale_f64(right, side_s * 0.86), scale_f64(w_fwd, -0.44)),
+            scale_f64(w_up, -0.25),
+        ));
+        let fin_up = normalize3_f64(cross_f64(w_fwd, scale_f64(fin_dir, side_s)));
+        push_tapered_frustum_f64(
             solid_verts,
             solid_indices,
-            fin_p,
-            right,
-            w_up,
+            fin_root,
             w_fwd,
-            [2.4, 0.28, 1.45],
+            fin_dir,
+            fin_up,
+            0.78,
+            0.18,
+            0.22,
+            0.05,
+            2.95,
+            -0.65,
+            -0.12,
+            4,
             origin_f64,
             whale_top,
+            whale_belly,
             em,
+            true,
         );
     }
-    // Undulating tail stock & wide horizontal tail fluke!
+
+    // 4. Undulating tapered tail peduncle (2 smooth segments) + graceful crescent tail flukes!
     let tail_und = tail_phase.sin() * 0.95;
-    let tail_p = add_f64(
-        sub_f64(pos, scale_f64(w_fwd, 5.2)),
-        scale_f64(w_up, tail_und),
-    );
-    push_oriented_box_f64(
+    let tail_mid = add_f64(sub_f64(pos, scale_f64(w_fwd, 4.7)), scale_f64(w_up, tail_und * 0.45));
+    let tail_end = add_f64(sub_f64(pos, scale_f64(w_fwd, 7.2)), scale_f64(w_up, tail_und));
+    push_tapered_frustum_f64(
         solid_verts,
         solid_indices,
-        tail_p,
+        sub_f64(pos, scale_f64(w_fwd, 2.1)),
         right,
+        scale_f64(w_fwd, -1.0),
         w_up,
-        w_fwd,
-        [1.15, 0.92, 3.2],
+        1.16,
+        0.92,
+        0.64,
+        0.54,
+        2.65,
+        0.0,
+        tail_und * 0.45,
+        8,
         origin_f64,
+        whale_mid,
         whale_top,
         em,
+        true,
     );
-    push_oriented_box_f64(
+    push_tapered_frustum_f64(
         solid_verts,
         solid_indices,
-        sub_f64(tail_p, scale_f64(w_fwd, 1.7)),
+        tail_mid,
         right,
+        scale_f64(w_fwd, -1.0),
         w_up,
-        w_fwd,
-        [4.2, 0.24, 1.5],
+        0.64,
+        0.54,
+        0.28,
+        0.22,
+        2.55,
+        0.0,
+        tail_und * 0.55,
+        6,
         origin_f64,
         whale_top,
+        whale_top,
         em,
+        true,
     );
+    // Twin curved crescent fluke blades sweeping outward and backward with central notch!
+    for side_s in [-1.0f64, 1.0] {
+        let fluke_dir = normalize3_f64(add_f64(
+            scale_f64(right, side_s * 0.88),
+            scale_f64(w_fwd, -0.47),
+        ));
+        push_tapered_frustum_f64(
+            solid_verts,
+            solid_indices,
+            add_f64(tail_end, scale_f64(right, side_s * 0.14)),
+            w_fwd,
+            fluke_dir,
+            w_up,
+            0.76,
+            0.14,
+            0.12,
+            0.04,
+            2.65,
+            -0.68,
+            0.0,
+            4,
+            origin_f64,
+            whale_top,
+            whale_mid,
+            em,
+            true,
+        );
+    }
 
     // Misty white blowhole water spout when surfacing/breaching!
     if spout_active {
@@ -1725,58 +2703,100 @@ fn push_nordic_longboat(
     origin_f64: [f64; 3],
 ) {
     let wood = [0.30, 0.18, 0.10, 0.82];
+    let dark_wood = [0.20, 0.12, 0.065, 0.84];
     let em = [0.01, 0.01, 0.01, MAT_MACRO_ENTITY];
-    push_oriented_box_f64(
-        solid_verts,
-        solid_indices,
-        pos,
-        right,
-        up,
-        fwd,
-        [1.95, 0.72, 5.4],
-        origin_f64,
-        wood,
-        em,
-    );
-    // Upturned Nordic prow & stern posts + mast
+    // Sculpted double-ended clinker-built Nordic longship hull (tapered fore & aft!)
     for end_s in [-1.0f64, 1.0] {
-        push_oriented_box_f64(
+        push_tapered_frustum_f64(
             solid_verts,
             solid_indices,
-            add_f64(add_f64(pos, scale_f64(fwd, end_s * 2.85)), scale_f64(up, 0.62)),
+            pos,
             right,
+            scale_f64(fwd, end_s),
             up,
-            fwd,
-            [0.36, 1.45, 0.52],
+            1.02,
+            0.44,
+            0.16,
+            0.22,
+            3.15,
+            0.0,
+            0.48,
+            6,
             origin_f64,
-            [0.24, 0.14, 0.08, 0.84],
+            wood,
+            dark_wood,
             em,
+            true,
+        );
+        // Swept upturned dragon prow & stern posts
+        let prow_b = add_f64(add_f64(pos, scale_f64(fwd, end_s * 2.95)), scale_f64(up, 0.42));
+        let prow_dir = normalize3_f64(add_f64(scale_f64(up, 0.84), scale_f64(fwd, end_s * 0.54)));
+        let prow_fwd = normalize3_f64(cross_f64(prow_dir, right));
+        push_tapered_frustum_f64(
+            solid_verts,
+            solid_indices,
+            prow_b,
+            right,
+            prow_dir,
+            prow_fwd,
+            0.16,
+            0.24,
+            0.05,
+            0.10,
+            1.45,
+            0.0,
+            0.0,
+            4,
+            origin_f64,
+            dark_wood,
+            [0.52, 0.36, 0.18, 0.72],
+            em,
+            true,
         );
     }
-    push_oriented_box_f64(
+    // Tapered central mast
+    push_tapered_frustum_f64(
         solid_verts,
         solid_indices,
-        add_f64(pos, scale_f64(up, 2.15)),
+        add_f64(pos, scale_f64(up, 0.20)),
         right,
         up,
         fwd,
-        [0.18, 3.8, 0.18],
+        0.11,
+        0.11,
+        0.055,
+        0.055,
+        4.15,
+        0.0,
+        0.0,
+        6,
         origin_f64,
-        [0.36, 0.24, 0.14, 0.82],
+        [0.34, 0.22, 0.12, 0.82],
+        [0.42, 0.28, 0.16, 0.80],
         em,
+        true,
     );
-    // Furled cream-crimson striped Nordic sail yard
-    push_oriented_box_f64(
+    // Furled crimson-and-cream striped Nordic sail & yardarm
+    push_tapered_frustum_f64(
         solid_verts,
         solid_indices,
-        add_f64(pos, scale_f64(up, 2.85)),
+        add_f64(add_f64(pos, scale_f64(up, 3.05)), scale_f64(right, -1.55)),
+        fwd,
         right,
         up,
-        fwd,
-        [2.6, 0.42, 0.36],
+        0.18,
+        0.22,
+        0.18,
+        0.22,
+        3.10,
+        0.0,
+        0.0,
+        6,
         origin_f64,
-        [0.86, 0.26, 0.22, 0.72],
+        [0.86, 0.24, 0.20, 0.72],
+        [0.94, 0.86, 0.72, 0.72],
         em,
+        true,
     );
 }
 
@@ -1851,13 +2871,19 @@ fn push_cross_particle_f64(
         let p1 = sub_f64(add_f64(center, scale_f64(axis, half_w)), scale_f64(up, half_h));
         let p2 = add_f64(add_f64(center, scale_f64(axis, half_w)), scale_f64(up, half_h));
         let p3 = add_f64(sub_f64(center, scale_f64(axis, half_w)), scale_f64(up, half_h));
-        for p in [p0, p1, p2, p3] {
+        let quad_pts: [([f64; 3], [f32; 4]); 4] = [
+            (p0, [-1.0, -1.0, 1.0, 0.0]),
+            (p1, [1.0, -1.0, 1.0, 0.0]),
+            (p2, [1.0, 1.0, 1.0, 0.0]),
+            (p3, [-1.0, 1.0, 1.0, 0.0]),
+        ];
+        for (p, uv) in quad_pts {
             verts.push(MacroPlanetVertex {
                 pos: world_f64_to_camera_rel_f32(p, origin_f64),
                 normal: n_f,
                 color,
                 emissive_mat,
-                water_ice: [0.0; 4],
+                water_ice: uv,
             });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);

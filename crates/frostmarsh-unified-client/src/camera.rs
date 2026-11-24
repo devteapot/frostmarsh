@@ -488,6 +488,107 @@ impl MacroPlanetCamera {
         }
     }
 
+    /// Instant 1-key landmark inspection jump (`F7` / `Alt+1..6`): snaps camera smoothly onto any
+    /// planetary landmark without diving through the sphere core!
+    pub fn focus_landmark(&mut self, target_pos: DVec3, look_fwd: DVec3, dist: f64, pitch: f64) {
+        let up = target_pos.normalize_or(DVec3::Z);
+        let mut fwd = (look_fwd - up * look_fwd.dot(up)).normalize_or_zero();
+        if fwd.length_squared() < 0.15 {
+            fwd = if up.y.abs() < 0.9 {
+                DVec3::Y.cross(up).normalize()
+            } else {
+                DVec3::X.cross(up).normalize()
+            };
+        }
+        let d = dist.clamp(12.0, 240.0);
+        self.mode = if d < 18.0 {
+            MacroPlanetCamMode::Ground3rdPerson
+        } else if d < 62.0 {
+            MacroPlanetCamMode::TacticalOverhead
+        } else {
+            MacroPlanetCamMode::SkywingFlight
+        };
+        self.orbit_dist = d;
+        self.orbit_pitch = pitch.clamp(0.16, 1.15);
+        self.orbit_yaw = 0.0;
+        self.smoothed_up = up;
+        self.smoothed_fwd = fwd;
+        let up_h = d * self.orbit_pitch.sin().clamp(0.32, 0.85);
+        let back_d = d * self.orbit_pitch.cos().clamp(0.45, 0.92);
+        self.eye_f64 = target_pos + up * up_h - fwd * back_d;
+        self.target_f64 = target_pos + up * 1.8;
+        self.up_f64 = up;
+        self.fov_y_deg = if d < 62.0 { 48.0 } else { 56.0 };
+        self.near = if d < 62.0 { 0.35 } else { 0.8 };
+        self.far = 4200.0;
+        self.exposure = 1.07;
+        self.initialized = true;
+    }
+
+    /// Headless Bonus Shot 5: Angled close-up overlooking Nordic Coastal Village, pier, longboats & bay!
+    pub fn village_harbor_shot(village_pos: DVec3, look_dir: DVec3) -> Self {
+        let up = village_pos.normalize_or(DVec3::Z);
+        let mut fwd = (look_dir - up * look_dir.dot(up)).normalize_or_zero();
+        if fwd.length_squared() < 0.15 {
+            fwd = if up.y.abs() < 0.9 {
+                DVec3::Y.cross(up).normalize()
+            } else {
+                DVec3::X.cross(up).normalize()
+            };
+        }
+        let right = fwd.cross(up).normalize_or(DVec3::X);
+        let eye = village_pos + up * 15.5 - fwd * 26.0 + right * 9.5;
+        let tgt = village_pos + fwd * 8.0 + up * 2.8;
+        Self {
+            mode: MacroPlanetCamMode::TacticalOverhead,
+            orbit_yaw: 0.0,
+            orbit_pitch: 0.52,
+            orbit_dist: 30.0,
+            smoothed_up: up,
+            smoothed_fwd: fwd,
+            eye_f64: eye,
+            target_f64: tgt,
+            up_f64: up,
+            initialized: true,
+            fov_y_deg: 50.0,
+            near: 0.30,
+            far: 3400.0,
+            exposure: 1.06,
+        }
+    }
+
+    /// Headless Bonus Shot 6: Angled close-up overlooking glowing Cavern Grotto or Carved River Valley!
+    pub fn cavern_river_shot(site_pos: DVec3, look_dir: DVec3) -> Self {
+        let up = site_pos.normalize_or(DVec3::Z);
+        let mut fwd = (look_dir - up * look_dir.dot(up)).normalize_or_zero();
+        if fwd.length_squared() < 0.15 {
+            fwd = if up.y.abs() < 0.9 {
+                DVec3::Y.cross(up).normalize()
+            } else {
+                DVec3::X.cross(up).normalize()
+            };
+        }
+        let right = fwd.cross(up).normalize_or(DVec3::X);
+        let eye = site_pos + up * 13.5 - fwd * 20.5 + right * 6.0;
+        let tgt = site_pos + fwd * 3.0 + up * 1.8;
+        Self {
+            mode: MacroPlanetCamMode::TacticalOverhead,
+            orbit_yaw: 0.0,
+            orbit_pitch: 0.56,
+            orbit_dist: 24.0,
+            smoothed_up: up,
+            smoothed_fwd: fwd,
+            eye_f64: eye,
+            target_f64: tgt,
+            up_f64: up,
+            initialized: true,
+            fov_y_deg: 52.0,
+            near: 0.25,
+            far: 3200.0,
+            exposure: 1.08,
+        }
+    }
+
     /// Headless Shot 4: Full Orbital Globe (~3,250m) framing spinning R=1,304m planet, Coriolis storms & Terminator!
     pub fn orbital_globe_shot(sun_dir: DVec3, _r_surf: f64) -> Self {
         let sun = sun_dir.normalize_or(DVec3::new(-0.72, 0.36, 0.59).normalize());

@@ -336,6 +336,10 @@ pub fn build_hud(
                 }
             }
 
+            let r_surf_f64 = planet_r_core as f64 + z_surf_est;
+            // Exact spherical horizon visibility cosine (prevents far-side shrines from bleeding onto the ground!)
+            let horizon_cos = ((r_surf_f64 / eye_r.max(r_surf_f64 + 1.0)) - 0.035).clamp(0.08, 0.96);
+
             for s in &ent.shrines {
                 let wpos_f64 = virtual_grid_to_world_f64(
                     s.face,
@@ -345,10 +349,13 @@ pub fn build_hud(
                     macro_face_virt,
                     planet_r_core as f64,
                 );
-                if dot3_f64(normalize3_f64(wpos_f64), eye_dir) < 0.08 {
+                if dot3_f64(normalize3_f64(wpos_f64), eye_dir) < horizon_cos {
                     continue;
                 }
                 let rel = Vec3::from_array(world_f64_to_camera_rel_f32(wpos_f64, eye_f64));
+                if !is_orbital_far && rel.length() > 360.0 {
+                    continue;
+                }
                 if let Some((sx, sy)) = project_world(rel, mats, sw, sh) {
                     let bw = 64.0 * ui;
                     let bh = 4.5 * ui;

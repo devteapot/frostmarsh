@@ -24,11 +24,13 @@ use crate::macro_living_world::{
 };
 use crate::net::{LiveEntityState, MacroClimateUpdate, MacroShardBrickUpdate};
 use bytemuck::{Pod, Zeroable};
-use field_core::planet::{FACE_COUNT, FACE_FRAMES};
+use field_core::planet::{edge_cell_coords, edge_neighbor, EDGE_COUNT, FACE_COUNT, FACE_FRAMES};
 use field_core::planet_macro::{
     dot3_f64, face_uv_to_sphere_dir_f64, face_uv_z_to_world_f64, face_virtual_uv_f64,
     normalize3_f64, sample_macro_planet_column, sample_micro_relief_m, sphere_dir_to_face_uv_f64,
-    world_f64_to_camera_rel_f32, MacroPlanetConfig, MacroSkyIsland, PlanetShardKey,
+    sphere_dir_to_shard_key, world_f64_to_camera_rel_f32, MacroBiome, MacroPlanetConfig,
+    MacroSkyIsland, PlanetShardKey, CONTINENT_AUTUMN_HIGHLANDS, CONTINENT_CRYSTAL_TUNDRA,
+    CONTINENT_NORDIC_EMERALD, CONTINENT_RED_OCHRE_MESA, CONTINENT_VOLCANIC_BADLANDS,
 };
 use frostmarsh_proto::{
     CHUNK_SIZE, CLASS_BURROWER, CLASS_EMBERSTALKER, CLASS_SKYWING, CLASS_STRIDER, CLASS_TIDEKIN,
@@ -207,6 +209,7 @@ struct ShardColumn {
     albedo: [f32; 3],
     emissive: [f32; 3],
     roughness: f32,
+    continent_biome: u8,
     has_wood: bool,
     has_plant: bool,
 }
@@ -285,6 +288,7 @@ impl MacroShardData {
                     albedo: col.albedo,
                     emissive: col.emissive,
                     roughness: col.roughness,
+                    continent_biome: col.continent_biome,
                     has_wood: col.forest_density > 0.40,
                     has_plant: col.forest_density > 0.15,
                 });
@@ -460,10 +464,10 @@ impl MacroShardData {
                     0.0
                 };
 
-                let mut albedo = best_col;
+                let mut albedo = proc_col.albedo;
                 let mut emissive = proc_col.emissive;
-                let mut roughness = best_rough.clamp(0.14, 0.94);
-                let has_wood = best_col[1] > best_col[0] * 1.15 && best_col[1] < 0.34 && roughness > 0.72;
+                let mut roughness = proc_col.roughness.clamp(0.14, 0.94);
+                let has_wood = best_col[1] > best_col[0] * 1.15 && best_col[1] < 0.34 && best_rough > 0.72;
                 let has_plant = best_col[1] > best_col[0] * 1.08 && best_col[1] > best_col[2] * 1.08;
 
                 if max_thermal > 0.45 {
@@ -479,19 +483,21 @@ impl MacroShardData {
                         albedo[2] * 0.45 + 0.05,
                     ];
                     emissive = [0.55 * ember, 0.12 * ember, 0.02 * ember];
-                } else if best_col[2] > 0.72 && best_col[0] > 0.56 && roughness < 0.36 {
+                } else if best_col[2] > 0.72 && best_col[0] > 0.56 && best_rough < 0.36 {
                     albedo = [0.85, 0.91, 0.97];
                     roughness = 0.25;
-                } else if surf_z > z_sea_f && surf_z < z_sea_f + 1.25 && !proc_col.is_polar {
-                    albedo = [0.54, 0.44, 0.27]; // Golden sandy coastal beach
-                    roughness = 0.88;
-                } else if has_wood {
-                    albedo = [0.042, 0.17, 0.068];
-                    roughness = 0.86;
-                } else if has_plant && surf_z > z_sea_f + 1.1 {
-                    let alt_t = ((surf_z - z_sea_f) / 11.0).clamp(0.0, 1.0) as f32;
-                    albedo = [0.085 + 0.10 * alt_t, 0.28 - 0.05 * alt_t, 0.08 + 0.025 * alt_t];
-                    roughness = 0.82;
+                } else if proc_col.continent_biome == CONTINENT_NORDIC_EMERALD {
+                    if surf_z > z_sea_f && surf_z < z_sea_f + 1.25 && !proc_col.is_polar {
+                        albedo = [0.54, 0.44, 0.27]; // Golden sandy coastal beach
+                        roughness = 0.88;
+                    } else if has_wood {
+                        albedo = [0.042, 0.17, 0.068];
+                        roughness = 0.86;
+                    } else if has_plant && surf_z > z_sea_f + 1.1 {
+                        let alt_t = ((surf_z - z_sea_f) / 11.0).clamp(0.0, 1.0) as f32;
+                        albedo = [0.085 + 0.10 * alt_t, 0.28 - 0.05 * alt_t, 0.08 + 0.025 * alt_t];
+                        roughness = 0.82;
+                    }
                 }
 
                 self.column_live_mask[ci] = true;
@@ -508,6 +514,7 @@ impl MacroShardData {
                     albedo: if proc_col.cavern_depth > 1.2 { proc_col.albedo } else { albedo },
                     emissive: if proc_col.cavern_depth > 1.2 { proc_col.emissive } else { emissive },
                     roughness,
+                    continent_biome: proc_col.continent_biome,
                     has_wood: (has_wood || proc_col.forest_density > 0.42)
                         && proc_col.river_depth < 0.08
                         && proc_col.cavern_depth < 0.35,
@@ -552,6 +559,8 @@ pub struct MacroPlanetWorld {
     /// Exact `f64` floating origin for near `1 m` shards & dynamic 3D entities (snapped when cam moves > 32 m).
     pub origin_f64: [f64; 3],
     origin_initialized: bool,
+    /// Current camera altitude above sea surface (meters), used to cull weather particles in Stratosphere/Orbit.
+    pub cam_alt_m: f64,
 
     /// Layer A: Deterministic 6-face macro globe cache & GPU-ready mesh buffers (origin = `[0,0,0]`)
     macro_sub: usize,
@@ -624,6 +633,7 @@ impl MacroPlanetWorld {
             seed: sd,
             origin_f64: [0.0, 0.0, rc + z_sea],
             origin_initialized: false,
+            cam_alt_m: 0.0,
             macro_sub,
             macro_base_faces: Vec::new(),
             macro_base_built: false,
@@ -728,6 +738,19 @@ impl MacroPlanetWorld {
             / 3
     }
 
+    /// Record active camera altitude above sea surface (`m`) so Stratosphere & Orbit views cleanly
+    /// cull low-altitude snowflakes/fireflies (`cam_alt_m > 160.0`).
+    #[inline]
+    pub fn set_camera_alt_m(&mut self, cam_pos_f64: [f64; 3]) {
+        let len = (cam_pos_f64[0] * cam_pos_f64[0]
+            + cam_pos_f64[1] * cam_pos_f64[1]
+            + cam_pos_f64[2] * cam_pos_f64[2])
+        .sqrt();
+        if len >= 10.0 {
+            self.cam_alt_m = (len - self.r_surf()).max(0.0);
+        }
+    }
+
     /// Update floating origin `origin_f64` whenever the camera moves `> 32 m` away from it!
     /// Returns `true` if `origin_f64` shifted and near shard meshes were marked for re-centering.
     pub fn ensure_floating_origin(&mut self, cam_pos_f64: [f64; 3]) -> bool {
@@ -738,6 +761,7 @@ impl MacroPlanetWorld {
         if len < 10.0 {
             return false;
         }
+        self.cam_alt_m = (len - self.r_surf()).max(0.0);
         // Anchor floating origin near the surface point below the camera when in ground/flight/strato
         let anchor = if len < self.r_surf() + 800.0 {
             let dir = normalize3_f64(cam_pos_f64);
@@ -758,7 +782,7 @@ impl MacroPlanetWorld {
 
     /// Initialize deterministic fallback Coriolis cloud & snowline climate faces before live packets arrive.
     fn init_procedural_climate_faces(res: usize, seed: u64) -> [Vec<u8>; FACE_COUNT] {
-        std::array::from_fn(|f| {
+        let faces = std::array::from_fn(|f| {
             let mut rgba = vec![0u8; res * res * 4];
             let rf = res as f64;
             for y in 0..res {
@@ -796,7 +820,68 @@ impl MacroPlanetWorld {
                 }
             }
             rgba
-        })
+        });
+        let mut faces = faces;
+        Self::stitch_climate_faces_in_place(&mut faces, res);
+        faces
+    }
+
+    /// Average each cube face's 1-texel outer border ring (`x=0, x=N-1, y=0, y=N-1`) with its exact
+    /// rotated neighbor border texel across all 12 cube-face seams (`edge_neighbor` / `edge_cell_coords`)
+    /// so there is 100% C0 continuity across the North Polar `+Y` and equatorial seams in Orbit!
+    fn stitch_climate_faces_in_place(
+        faces: &mut [Vec<u8>; FACE_COUNT],
+        res: usize,
+    ) -> [bool; FACE_COUNT] {
+        let mut touched = [false; FACE_COUNT];
+        let expected = res * res * 4;
+        if res < 2 || faces.iter().any(|f| f.len() != expected) {
+            return touched;
+        }
+        // 2 fast passes also harmonize the 8 three-way cube corners across all 3 incident faces!
+        for _pass in 0..2 {
+            for face_a in 0..FACE_COUNT {
+                for edge_a in 0..EDGE_COUNT {
+                    let link = edge_neighbor(face_a, edge_a);
+                    let face_b = link.face;
+                    if face_b <= face_a || face_b >= FACE_COUNT {
+                        continue;
+                    }
+                    let (lo, hi) = faces.split_at_mut(face_b);
+                    let buf_a = &mut lo[face_a];
+                    let buf_b = &mut hi[0];
+                    for k in 0..res {
+                        let (xa, ya) = edge_cell_coords(edge_a, k, res);
+                        let (xb, yb) = link.map_edge_cell(k, res);
+                        let off_a = (ya * res + xa) * 4;
+                        let off_b = (yb * res + xb) * 4;
+                        for c in 0..4 {
+                            let va = buf_a[off_a + c];
+                            let vb = buf_b[off_b + c];
+                            if va != vb {
+                                let avg = ((va as u16 + vb as u16 + 1) / 2) as u8;
+                                buf_a[off_a + c] = avg;
+                                buf_b[off_b + c] = avg;
+                                touched[face_a] = true;
+                                touched[face_b] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        touched
+    }
+
+    /// Stitch all 12 cube-face climate seams in place and mark any modified neighbor faces dirty
+    /// so the GPU 6-layer `climate_tex` array stays 100% C0 continuous!
+    pub fn stitch_climate_face_seams(&mut self) {
+        let touched = Self::stitch_climate_faces_in_place(&mut self.climate_faces, self.climate_res);
+        for (f, &changed) in touched.iter().enumerate() {
+            if changed {
+                self.climate_dirty_faces[f] = true;
+            }
+        }
     }
 
     // =========================================================================
@@ -833,6 +918,9 @@ impl MacroPlanetWorld {
             self.total_climate_updates_applied += 1;
             self.minimap_needs_rebuild = true;
             applied += 1;
+        }
+        if applied > 0 {
+            self.stitch_climate_face_seams();
         }
         applied
     }
@@ -1515,7 +1603,8 @@ impl MacroPlanetWorld {
         emit_skirt((0..=cells).map(|vy| (0, vy)).collect(), true);
         emit_skirt((0..=cells).map(|vy| (cells, vy)).collect(), false);
 
-        // Rich Nordic Biome Flora, Grounded Shadows, Coastal Crags, Wildflowers & Frontier Landmarks!
+        // Rich Continental Biome Flora, Wind-Swaying 3D Meadow Grass & Coastal Reeds,
+        // Grounded Shadows, Coastal Crags, Wildflowers & Frontier Landmarks!
         let prop_step = if step == 1 { 5usize } else { 8usize };
         for ly in (3..s - 3).step_by(prop_step) {
             for lx in (3..s - 3).step_by(prop_step) {
@@ -1547,24 +1636,88 @@ impl MacroPlanetWorld {
                     continue;
                 }
                 let pos = scale_f64(dir, r_core + sz);
-                let is_snowy = (cc.albedo[2] > 0.72 && cc.albedo[0] > 0.62) || sz > 31.2;
+                let is_snowy = (cc.albedo[2] > 0.72 && cc.albedo[0] > 0.62)
+                    || sz > 31.2
+                    || cc.continent_biome == CONTINENT_CRYSTAL_TUNDRA;
 
-                if sz > z_sea_surf + 2.15 && sz < 36.2 && (cc.has_wood || cc.has_plant) && (h % 100) < 26 {
-                    let tree_h = 5.2 + ((h % 37) as f64 / 37.0) * 5.2;
-                    let tree_r = 1.55 + ((h % 19) as f64 / 19.0) * 1.10;
+                let tree_chance = match cc.continent_biome {
+                    CONTINENT_AUTUMN_HIGHLANDS => 28,
+                    CONTINENT_RED_OCHRE_MESA => 14,
+                    CONTINENT_CRYSTAL_TUNDRA => 16,
+                    CONTINENT_VOLCANIC_BADLANDS => 6,
+                    _ => 26,
+                };
+                if sz > z_sea_surf + 2.05
+                    && sz < 36.2
+                    && (cc.has_wood || cc.has_plant || cc.continent_biome == CONTINENT_RED_OCHRE_MESA)
+                    && (h % 100) < tree_chance
+                {
+                    let edge_d = jx.min(s - 1 - jx).min(jy).min(s - 1 - jy) as f64;
+                    let edge_scale = (edge_d / 14.0).clamp(0.45, 1.0);
+                    let tree_h = (5.2 + ((h % 37) as f64 / 37.0) * 5.2) * edge_scale;
+                    let tree_r = (1.55 + ((h % 19) as f64 / 19.0) * 1.10) * edge_scale;
                     let tint = ((h % 11) as f32) / 11.0;
-                    let snow_cap = if is_snowy { 0.85 } else if sz > 29.2 { 0.35 } else { 0.0 };
-                    push_pine_tree(
-                        &mut terrain_verts,
-                        &mut terrain_indices,
-                        pos,
-                        dir,
-                        origin_f64,
-                        tree_h,
-                        tree_r,
-                        tint,
-                        snow_cap,
-                    );
+                    let snow_cap = if cc.continent_biome == CONTINENT_CRYSTAL_TUNDRA {
+                        0.88
+                    } else if is_snowy {
+                        0.85
+                    } else if sz > 29.2 {
+                        0.35
+                    } else {
+                        0.0
+                    };
+                    match cc.continent_biome {
+                        CONTINENT_AUTUMN_HIGHLANDS => {
+                            push_autumn_birch_tree(
+                                &mut terrain_verts,
+                                &mut terrain_indices,
+                                pos,
+                                dir,
+                                origin_f64,
+                                tree_h * 1.05,
+                                tree_r * 1.12,
+                                tint,
+                                h,
+                            );
+                        }
+                        CONTINENT_RED_OCHRE_MESA => {
+                            push_mesa_cypress_tree(
+                                &mut terrain_verts,
+                                &mut terrain_indices,
+                                pos,
+                                dir,
+                                origin_f64,
+                                tree_h * 0.76,
+                                tree_r * 0.92,
+                                tint,
+                                h,
+                            );
+                        }
+                        CONTINENT_VOLCANIC_BADLANDS => {
+                            push_volcanic_snag(
+                                &mut terrain_verts,
+                                &mut terrain_indices,
+                                pos,
+                                dir,
+                                origin_f64,
+                                tree_h * 0.65,
+                                h,
+                            );
+                        }
+                        _ => {
+                            push_pine_tree(
+                                &mut terrain_verts,
+                                &mut terrain_indices,
+                                pos,
+                                dir,
+                                origin_f64,
+                                tree_h,
+                                tree_r,
+                                tint,
+                                snow_cap,
+                            );
+                        }
+                    }
                     push_contact_shadow_disc_f64(
                         &mut gas_verts,
                         &mut gas_indices,
@@ -1576,7 +1729,7 @@ impl MacroPlanetWorld {
                         0.32,
                     );
                 } else if sz < z_sea_surf + 4.2 && (h % 100) < 10 {
-                    // Natural mossy granite boulder outcrop cluster + grounded contact shadow
+                    // Natural mossy granite / sandstone boulder outcrop cluster + grounded contact shadow
                     let r_b = 0.85 + ((h % 13) as f64 / 13.0) * 1.25;
                     push_boulder(
                         &mut terrain_verts,
@@ -1643,6 +1796,92 @@ impl MacroPlanetWorld {
                         origin_f64,
                         0.30,
                     );
+                }
+            }
+        }
+
+        // 3x Lusher Wind-Swaying 3D Meadow Grass Carpets, Riverbank Reeds & Golden Coastal Sea-Oats!
+        // Encodes GPU wind-sway amplitude in `water_ice.w = 1.5 + sway_amp` strictly on upper tips!
+        if step == 1 {
+            for ly in (3..s - 3).step_by(2) {
+                for lx in (3..s - 3).step_by(2) {
+                    let h = ((lx.wrapping_mul(37_476_139))
+                        ^ (ly.wrapping_mul(66_826_526))
+                        ^ (seed as usize).wrapping_mul(17))
+                        % 1000;
+                    let jx = (lx + (h % 2)).min(s - 2);
+                    let jy = (ly + ((h / 5) % 2)).min(s - 2);
+                    let edge_d = jx.min(s - 1 - jx).min(jy).min(s - 1 - jy) as f64;
+                    if edge_d < 8.0 && (h % 100) >= ((edge_d / 8.0) * 58.0) as usize {
+                        continue;
+                    }
+                    let cc = sh.column_cache[jy * s + jx];
+                    if cc.cavern_depth > 0.35
+                        || cc.water_depth > 0.22
+                        || cc.continent_biome == CONTINENT_VOLCANIC_BADLANDS
+                    {
+                        continue;
+                    }
+                    let is_river_reed = cc.river_depth > 0.01 && cc.river_depth < 0.35;
+                    let is_coastal_dune = !is_river_reed
+                        && cc.surf_z >= z_sea_surf + 0.05
+                        && cc.surf_z < z_sea_surf + 1.45
+                        && cc.continent_biome != CONTINENT_CRYSTAL_TUNDRA;
+                    let is_shore_reed = !is_river_reed
+                        && !is_coastal_dune
+                        && cc.surf_z >= z_sea_surf - 0.12
+                        && cc.surf_z < z_sea_surf + 1.15;
+                    let is_meadow_grass = !is_river_reed
+                        && !is_coastal_dune
+                        && !is_shore_reed
+                        && cc.surf_z >= z_sea_surf + 1.45
+                        && cc.surf_z < 32.0
+                        && cc.river_depth < 0.04;
+                    if !is_river_reed && !is_coastal_dune && !is_shore_reed && !is_meadow_grass {
+                        continue;
+                    }
+                    let pass_pct = if is_river_reed {
+                        80
+                    } else if is_coastal_dune {
+                        64
+                    } else if is_shore_reed {
+                        62
+                    } else if cc.continent_biome == CONTINENT_CRYSTAL_TUNDRA {
+                        22
+                    } else {
+                        58
+                    };
+                    if (h % 100) >= pass_pct {
+                        continue;
+                    }
+                    let (u, v) = face_virtual_uv_f64(
+                        (gx_base + jx) as f64 + 0.5,
+                        (gy_base + jy) as f64 + 0.5,
+                        n_virt,
+                    );
+                    let dir = face_uv_to_sphere_dir_f64(face, u, v);
+                    let pos = scale_f64(dir, r_core + cc.surf_z);
+                    if is_coastal_dune && (h % 3) != 0 {
+                        push_sea_oats_cluster(
+                            &mut terrain_verts,
+                            &mut terrain_indices,
+                            pos,
+                            dir,
+                            origin_f64,
+                            h,
+                        );
+                    } else {
+                        push_grass_cluster(
+                            &mut terrain_verts,
+                            &mut terrain_indices,
+                            pos,
+                            dir,
+                            origin_f64,
+                            h,
+                            cc.continent_biome,
+                            is_river_reed || is_shore_reed,
+                        );
+                    }
                 }
             }
         }
@@ -1769,13 +2008,19 @@ impl MacroPlanetWorld {
                             let p1 = sub_f64(add_f64(center, scale_f64(axis, half_w)), scale_f64(up, half_h * 0.4));
                             let p2 = add_f64(add_f64(center, scale_f64(axis, half_w)), scale_f64(up, half_h));
                             let p3 = add_f64(sub_f64(center, scale_f64(axis, half_w)), scale_f64(up, half_h));
-                            for p in [p0, p1, p2, p3] {
+                            let quad_pts: [([f64; 3], [f32; 4]); 4] = [
+                                (p0, [-1.0, -1.0, 1.0, 0.0]),
+                                (p1, [1.0, -1.0, 1.0, 0.0]),
+                                (p2, [1.0, 1.0, 1.0, 0.0]),
+                                (p3, [-1.0, 1.0, 1.0, 0.0]),
+                            ];
+                            for (p, uv) in quad_pts {
                                 gas_verts.push(MacroPlanetVertex {
                                     pos: world_f64_to_camera_rel_f32(p, origin_f64),
                                     normal: n_f,
                                     color: col,
                                     emissive_mat: em_mat,
-                                    water_ice: [0.0; 4],
+                                    water_ice: uv,
                                 });
                             }
                             gas_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -1795,8 +2040,11 @@ impl MacroPlanetWorld {
                 water_depth: cc.water_depth,
                 river_depth: cc.river_depth,
                 cavern_depth: cc.cavern_depth,
+                continent_biome: cc.continent_biome,
                 has_wood: cc.has_wood,
-                is_snowy: (cc.albedo[2] > 0.72 && cc.albedo[0] > 0.62) || cc.surf_z > 31.2,
+                is_snowy: (cc.albedo[2] > 0.72 && cc.albedo[0] > 0.62)
+                    || cc.surf_z > 31.2
+                    || cc.continent_biome == CONTINENT_CRYSTAL_TUNDRA,
             })
             .collect();
         let living_anchors = populate_shard_living_world(
@@ -2008,180 +2256,955 @@ impl MacroPlanetWorld {
             let is_self = p.id == ent.your_player_id;
 
             let team_col = if is_self {
-                [1.00, 0.88, 0.28]
+                [0.92, 0.68, 0.14] // Rich saturated Nordic gold crest
             } else if p.team == 0 {
-                [0.20, 0.78, 1.00]
+                [0.14, 0.56, 0.96] // Vibrant saturated Frost cobalt
             } else {
-                [1.00, 0.36, 0.18]
+                [0.90, 0.22, 0.12] // Vibrant saturated Ember crimson
             };
-            let accent_col = if p.team == 0 {
-                [0.65, 0.95, 1.00]
+            let visor_col = if is_self {
+                [1.00, 0.90, 0.36]
+            } else if p.team == 0 {
+                [0.34, 0.95, 1.00]
             } else {
-                [1.00, 0.82, 0.32]
+                [1.00, 0.58, 0.16]
             };
 
             let sc = if is_self { 1.15f64 } else { 1.0f64 };
-            let em_s = if is_self { 0.55f32 } else if p.ult_active { 1.25 } else { 0.32 };
-            let body_em = [team_col[0] * em_s, team_col[1] * em_s, team_col[2] * em_s, MAT_MACRO_ENTITY];
-            let acc_em = [accent_col[0] * (em_s + 0.45), accent_col[1] * (em_s + 0.45), accent_col[2] * (em_s + 0.45), MAT_MACRO_ENTITY];
+            // Grounded value contrast: burnished dark slate/steel plates, dark leather boots/belts,
+            // low cloth/armor base emissive (<= 0.30) so ONLY glowing visor slits & weapon edges bloom!
+            let steel_dark = [0.15, 0.17, 0.23, 0.34];
+            let steel_plate = [0.22, 0.25, 0.31, 0.26];
+            let steel_trim = [0.33, 0.37, 0.44, 0.22];
+            let leather_dark = [0.16, 0.11, 0.08, 0.82];
+            let cape_col = if is_self {
+                [0.74, 0.44, 0.07, 0.78]
+            } else if p.team == 0 {
+                [0.08, 0.28, 0.62, 0.78]
+            } else {
+                [0.58, 0.11, 0.08, 0.78]
+            };
+            let crest_col = [team_col[0], team_col[1], team_col[2], 0.48];
+            let cloth_em_s = if p.ult_active { 0.55f32 } else if is_self { 0.22 } else { 0.16 };
+            let armor_em = if p.ult_active {
+                [team_col[0] * 0.28, team_col[1] * 0.28, team_col[2] * 0.28, MAT_MACRO_ENTITY]
+            } else {
+                [0.025, 0.032, 0.048, MAT_MACRO_ENTITY]
+            };
+            let leather_em = [0.01, 0.008, 0.006, MAT_MACRO_ENTITY];
+            let cloth_em = [
+                team_col[0] * cloth_em_s,
+                team_col[1] * cloth_em_s,
+                team_col[2] * cloth_em_s,
+                MAT_MACRO_ENTITY,
+            ];
+            let visor_em = [visor_col[0] * 2.2, visor_col[1] * 2.2, visor_col[2] * 2.2, MAT_MACRO_BEAM];
+            let weapon_em = [visor_col[0] * 2.1, visor_col[1] * 2.1, visor_col[2] * 2.1, MAT_MACRO_BEAM];
+            let cape_wave = ((sim_time * 5.2 + p.id as f32 * 1.7).sin() * 0.14) as f64;
 
             match p.class_id {
                 CLASS_SKYWING => {
+                    // Stylized Winged Valkyrie / Skywing: dark leather flight boots, burnished steel
+                    // aerodynamic cuirass, saturated team scarf, crested steel helm + glowing visor & swept wings!
                     let bob = ((sim_time * 4.5 + p.id as f32).sin() * 0.25) as f64;
-                    let center = add_f64(base_pos, scale_f64(up, 1.45 * sc + bob));
-                    push_oriented_box_f64(
+                    let torso_base = add_f64(base_pos, scale_f64(up, 0.85 * sc + bob));
+                    // Lower leather/steel greaves
+                    push_tapered_frustum_f64(
                         &mut self.dynamic_solid_verts,
                         &mut self.dynamic_solid_indices,
-                        center,
+                        add_f64(base_pos, scale_f64(up, 0.18 * sc + bob)),
                         right,
                         up,
                         fwd,
-                        [0.55 * sc, 0.70 * sc, 1.15 * sc],
+                        0.18 * sc,
+                        0.16 * sc,
+                        0.28 * sc,
+                        0.24 * sc,
+                        0.72 * sc,
+                        0.0,
+                        0.06 * sc,
+                        6,
                         origin,
-                        [team_col[0], team_col[1], team_col[2], 0.30],
-                        body_em,
+                        leather_dark,
+                        steel_plate,
+                        armor_em,
+                        true,
                     );
+                    // Tapered burnished steel chest cuirass + saturated team tabard
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        torso_base,
+                        right,
+                        up,
+                        fwd,
+                        0.26 * sc,
+                        0.22 * sc,
+                        0.44 * sc,
+                        0.32 * sc,
+                        0.82 * sc,
+                        0.0,
+                        0.10 * sc,
+                        6,
+                        origin,
+                        steel_plate,
+                        crest_col,
+                        cloth_em,
+                        true,
+                    );
+                    // Crested Burnished Steel Falcon Helm + Crisp Glowing Visor Slit
+                    let head_b = add_f64(add_f64(torso_base, scale_f64(up, 0.82 * sc)), scale_f64(fwd, 0.10 * sc));
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        head_b,
+                        right,
+                        up,
+                        fwd,
+                        0.22 * sc,
+                        0.26 * sc,
+                        0.14 * sc,
+                        0.20 * sc,
+                        0.44 * sc,
+                        0.0,
+                        0.06 * sc,
+                        6,
+                        origin,
+                        steel_plate,
+                        steel_trim,
+                        armor_em,
+                        true,
+                    );
+                    push_oriented_box_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(head_b, scale_f64(up, 0.22 * sc)), scale_f64(fwd, 0.22 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        [0.26 * sc, 0.07 * sc, 0.08 * sc],
+                        origin,
+                        [visor_col[0], visor_col[1], visor_col[2], 0.14],
+                        visor_em,
+                    );
+                    // Flowing saturated team wind-scarf streaming behind
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(torso_base, scale_f64(up, 0.65 * sc)), scale_f64(fwd, -0.22 * sc)),
+                        right,
+                        scale_f64(fwd, -1.0),
+                        up,
+                        0.24 * sc,
+                        0.08 * sc,
+                        0.05 * sc,
+                        0.04 * sc,
+                        1.15 * sc,
+                        cape_wave * sc,
+                        -0.25 * sc,
+                        4,
+                        origin,
+                        cape_col,
+                        crest_col,
+                        cloth_em,
+                        true,
+                    );
+                    // Swept multi-blade steel-framed wings with glowing leading pinion edges!
                     let flap = ((sim_time * 7.2 + p.id as f32 * 1.3).sin() * 0.35) as f64;
+                    let wing_root = add_f64(torso_base, scale_f64(up, 0.62 * sc));
                     for side in [-1.0f64, 1.0] {
-                        let w_dir = normalize3_f64(add_f64(scale_f64(right, side), scale_f64(up, 0.22 + flap)));
-                        let w_up = scale_f64(normalize3_f64(cross_f64(fwd, w_dir)), side);
-                        let w_center = sub_f64(add_f64(center, scale_f64(w_dir, 1.25 * sc)), scale_f64(fwd, 0.15 * sc));
-                        push_oriented_box_f64(
+                        let w_dir = normalize3_f64(add_f64(
+                            add_f64(scale_f64(right, side), scale_f64(up, 0.28 + flap)),
+                            scale_f64(fwd, -0.22),
+                        ));
+                        let w_up = normalize3_f64(cross_f64(fwd, scale_f64(w_dir, side)));
+                        // Primary upper swept wing spar (burnished steel -> team crest)
+                        push_tapered_frustum_f64(
                             &mut self.dynamic_solid_verts,
                             &mut self.dynamic_solid_indices,
-                            w_center,
+                            add_f64(wing_root, scale_f64(right, side * 0.25 * sc)),
+                            fwd,
                             w_dir,
                             w_up,
-                            fwd,
-                            [1.35 * sc, 0.14 * sc, 0.65 * sc],
+                            0.36 * sc,
+                            0.08 * sc,
+                            0.10 * sc,
+                            0.03 * sc,
+                            1.85 * sc,
+                            -0.42 * sc,
+                            0.18 * sc,
+                            4,
                             origin,
-                            [accent_col[0], accent_col[1], accent_col[2], 0.22],
-                            acc_em,
+                            steel_plate,
+                            crest_col,
+                            cloth_em,
+                            true,
+                        );
+                        // Crisp glowing outer energy pinion edge
+                        push_tapered_frustum_f64(
+                            &mut self.dynamic_solid_verts,
+                            &mut self.dynamic_solid_indices,
+                            add_f64(wing_root, scale_f64(w_dir, 0.72 * sc)),
+                            fwd,
+                            w_dir,
+                            w_up,
+                            0.12 * sc,
+                            0.03 * sc,
+                            0.03 * sc,
+                            0.015 * sc,
+                            1.35 * sc,
+                            -0.38 * sc,
+                            0.16 * sc,
+                            4,
+                            origin,
+                            [visor_col[0], visor_col[1], visor_col[2], 0.14],
+                            [1.0, 0.98, 0.92, 0.12],
+                            weapon_em,
+                            true,
+                        );
+                        // Secondary lower feather pinion
+                        let w2_dir = normalize3_f64(add_f64(
+                            add_f64(scale_f64(right, side), scale_f64(up, -0.05 + flap * 0.75)),
+                            scale_f64(fwd, -0.38),
+                        ));
+                        push_tapered_frustum_f64(
+                            &mut self.dynamic_solid_verts,
+                            &mut self.dynamic_solid_indices,
+                            add_f64(wing_root, scale_f64(right, side * 0.22 * sc)),
+                            fwd,
+                            w2_dir,
+                            w_up,
+                            0.28 * sc,
+                            0.06 * sc,
+                            0.06 * sc,
+                            0.02 * sc,
+                            1.32 * sc,
+                            -0.36 * sc,
+                            0.0,
+                            4,
+                            origin,
+                            steel_dark,
+                            cape_col,
+                            cloth_em,
+                            true,
                         );
                     }
                 }
                 CLASS_STRIDER => {
-                    push_oriented_box_f64(
-                        &mut self.dynamic_solid_verts,
-                        &mut self.dynamic_solid_indices,
-                        add_f64(base_pos, scale_f64(up, 1.0 * sc)),
-                        right,
-                        up,
-                        fwd,
-                        [0.95 * sc, 1.25 * sc, 0.72 * sc],
-                        origin,
-                        [team_col[0], team_col[1], team_col[2], 0.36],
-                        body_em,
-                    );
-                    push_oriented_box_f64(
-                        &mut self.dynamic_solid_verts,
-                        &mut self.dynamic_solid_indices,
-                        add_f64(base_pos, scale_f64(up, 1.92 * sc)),
-                        right,
-                        up,
-                        fwd,
-                        [0.56 * sc, 0.52 * sc, 0.56 * sc],
-                        origin,
-                        [accent_col[0], accent_col[1], accent_col[2], 0.24],
-                        acc_em,
-                    );
-                    push_oriented_box_f64(
-                        &mut self.dynamic_solid_verts,
-                        &mut self.dynamic_solid_indices,
-                        add_f64(add_f64(base_pos, scale_f64(up, 1.05 * sc)), scale_f64(fwd, 0.62 * sc)),
-                        right,
-                        up,
-                        fwd,
-                        [0.88 * sc, 1.18 * sc, 0.18 * sc],
-                        origin,
-                        [accent_col[0], accent_col[1], accent_col[2], 0.18],
-                        acc_em,
-                    );
-                }
-                CLASS_TIDEKIN => {
-                    push_oriented_box_f64(
-                        &mut self.dynamic_solid_verts,
-                        &mut self.dynamic_solid_indices,
-                        add_f64(base_pos, scale_f64(up, 0.92 * sc)),
-                        right,
-                        up,
-                        fwd,
-                        [0.72 * sc, 1.15 * sc, 0.68 * sc],
-                        origin,
-                        [team_col[0], team_col[1], team_col[2], 0.24],
-                        body_em,
-                    );
-                    push_oriented_pyramid_f64(
-                        &mut self.dynamic_solid_verts,
-                        &mut self.dynamic_solid_indices,
-                        add_f64(base_pos, scale_f64(up, 1.48 * sc)),
-                        right,
-                        up,
-                        fwd,
-                        0.42 * sc,
-                        0.95 * sc,
-                        origin,
-                        [accent_col[0], accent_col[1], accent_col[2], 0.20],
-                        acc_em,
-                    );
-                }
-                CLASS_EMBERSTALKER => {
-                    push_oriented_box_f64(
-                        &mut self.dynamic_solid_verts,
-                        &mut self.dynamic_solid_indices,
-                        add_f64(base_pos, scale_f64(up, 0.88 * sc)),
-                        right,
-                        up,
-                        fwd,
-                        [0.68 * sc, 1.06 * sc, 0.86 * sc],
-                        origin,
-                        [1.0, 0.44, 0.18, 0.30],
-                        [0.65, 0.26, 0.08, MAT_MACRO_ENTITY],
-                    );
-                    for side in [-0.58f64, 0.58] {
-                        push_oriented_box_f64(
+                    // Stylized Frost-Knight Vanguard: dark leather boots & war-belt, burnished slate/steel
+                    // armor plates, saturated team tabard & billowing cape, horned steel helm with glowing visor,
+                    // dark-iron-rimmed kite shield around vibrant team emblem & glowing runeblade!
+                    // Dark leather boots -> burnished steel twin greaves
+                    for side in [-0.20f64, 0.20] {
+                        push_tapered_frustum_f64(
                             &mut self.dynamic_solid_verts,
                             &mut self.dynamic_solid_indices,
-                            add_f64(
-                                add_f64(add_f64(base_pos, scale_f64(up, 1.0 * sc)), scale_f64(right, side * sc)),
-                                scale_f64(fwd, 0.52 * sc),
-                            ),
+                            add_f64(base_pos, scale_f64(right, side * sc)),
                             right,
                             up,
                             fwd,
-                            [0.14 * sc, 0.20 * sc, 1.18 * sc],
+                            0.14 * sc,
+                            0.16 * sc,
+                            0.17 * sc,
+                            0.17 * sc,
+                            0.36 * sc,
+                            0.0,
+                            0.0,
+                            6,
                             origin,
-                            [1.0, 0.78, 0.26, 0.16],
-                            [1.45, 1.05, 0.28, MAT_MACRO_ENTITY],
+                            leather_dark,
+                            leather_dark,
+                            leather_em,
+                            true,
+                        );
+                        push_tapered_frustum_f64(
+                            &mut self.dynamic_solid_verts,
+                            &mut self.dynamic_solid_indices,
+                            add_f64(add_f64(base_pos, scale_f64(up, 0.34 * sc)), scale_f64(right, side * sc)),
+                            right,
+                            up,
+                            fwd,
+                            0.16 * sc,
+                            0.16 * sc,
+                            0.19 * sc,
+                            0.19 * sc,
+                            0.46 * sc,
+                            0.0,
+                            0.0,
+                            6,
+                            origin,
+                            steel_dark,
+                            steel_plate,
+                            armor_em,
+                            true,
                         );
                     }
-                }
-                CLASS_BURROWER | _ => {
-                    push_oriented_box_f64(
+                    // Dark leather war-belt cinching the waist
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(base_pos, scale_f64(up, 0.70 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.36 * sc,
+                        0.28 * sc,
+                        0.35 * sc,
+                        0.27 * sc,
+                        0.18 * sc,
+                        0.0,
+                        0.0,
+                        6,
+                        origin,
+                        leather_dark,
+                        leather_dark,
+                        leather_em,
+                        true,
+                    );
+                    // Broad tapered burnished slate/steel chest cuirass
+                    push_tapered_frustum_f64(
                         &mut self.dynamic_solid_verts,
                         &mut self.dynamic_solid_indices,
                         add_f64(base_pos, scale_f64(up, 0.82 * sc)),
                         right,
                         up,
                         fwd,
-                        [1.12 * sc, 0.90 * sc, 1.20 * sc],
+                        0.32 * sc,
+                        0.24 * sc,
+                        0.56 * sc,
+                        0.36 * sc,
+                        0.86 * sc,
+                        0.0,
+                        0.04 * sc,
+                        6,
                         origin,
-                        [team_col[0], team_col[1], team_col[2], 0.34],
-                        body_em,
+                        steel_dark,
+                        steel_plate,
+                        armor_em,
+                        true,
+                    );
+                    // Vibrant saturated team chest crest / tabard front strip
+                    push_oriented_box_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(base_pos, scale_f64(up, 1.24 * sc)), scale_f64(fwd, 0.30 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        [0.36 * sc, 0.68 * sc, 0.10 * sc],
+                        origin,
+                        crest_col,
+                        cloth_em,
+                    );
+                    // Sculpted angular burnished steel shoulder pauldrons with team edge trim
+                    for side in [-1.0f64, 1.0] {
+                        let p_base = add_f64(
+                            add_f64(base_pos, scale_f64(up, 1.46 * sc)),
+                            scale_f64(right, side * 0.50 * sc),
+                        );
+                        push_tapered_frustum_f64(
+                            &mut self.dynamic_solid_verts,
+                            &mut self.dynamic_solid_indices,
+                            p_base,
+                            right,
+                            up,
+                            fwd,
+                            0.25 * sc,
+                            0.28 * sc,
+                            0.14 * sc,
+                            0.18 * sc,
+                            0.30 * sc,
+                            side * 0.08 * sc,
+                            0.0,
+                            6,
+                            origin,
+                            steel_plate,
+                            steel_trim,
+                            armor_em,
+                            true,
+                        );
+                    }
+                    // Flowing saturated team hero cape billowing behind back
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(base_pos, scale_f64(up, 0.22 * sc)), scale_f64(fwd, -0.58 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.52 * sc,
+                        0.06 * sc,
+                        0.34 * sc,
+                        0.06 * sc,
+                        1.36 * sc,
+                        cape_wave * sc,
+                        0.32 * sc,
+                        4,
+                        origin,
+                        cape_col,
+                        crest_col,
+                        cloth_em,
+                        true,
+                    );
+                    // Sculpted burnished steel Nordic knight helm + crisp glowing visor slit!
+                    let helm_base = add_f64(base_pos, scale_f64(up, 1.66 * sc));
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        helm_base,
+                        right,
+                        up,
+                        fwd,
+                        0.26 * sc,
+                        0.28 * sc,
+                        0.18 * sc,
+                        0.20 * sc,
+                        0.48 * sc,
+                        0.0,
+                        0.04 * sc,
+                        6,
+                        origin,
+                        steel_plate,
+                        steel_trim,
+                        armor_em,
+                        true,
+                    );
+                    push_oriented_box_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(helm_base, scale_f64(up, 0.24 * sc)), scale_f64(fwd, 0.24 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        [0.30 * sc, 0.075 * sc, 0.08 * sc],
+                        origin,
+                        [visor_col[0], visor_col[1], visor_col[2], 0.14],
+                        visor_em,
+                    );
+                    // Kite / Heater Shield with metallic dark-iron border around vibrant saturated team emblem!
+                    let shield_base = add_f64(
+                        add_f64(base_pos, scale_f64(up, 0.50 * sc)),
+                        add_f64(scale_f64(right, -0.44 * sc), scale_f64(fwd, 0.52 * sc)),
+                    );
+                    // Outer dark-iron shield frame/border
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        shield_base,
+                        right,
+                        up,
+                        fwd,
+                        0.14 * sc,
+                        0.11 * sc,
+                        0.52 * sc,
+                        0.12 * sc,
+                        1.18 * sc,
+                        0.0,
+                        0.0,
+                        4,
+                        origin,
+                        steel_dark,
+                        steel_plate,
+                        armor_em,
+                        true,
+                    );
+                    // Inset vibrant saturated team shield emblem plate (low emissive, crisp contrast!)
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(shield_base, scale_f64(up, 0.14 * sc)), scale_f64(fwd, 0.07 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.10 * sc,
+                        0.05 * sc,
+                        0.38 * sc,
+                        0.05 * sc,
+                        0.90 * sc,
+                        0.0,
+                        0.0,
+                        4,
+                        origin,
+                        cape_col,
+                        crest_col,
+                        cloth_em,
+                        true,
+                    );
+                    // Small glowing rune boss in center of shield
+                    push_oriented_box_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(shield_base, scale_f64(up, 0.68 * sc)), scale_f64(fwd, 0.11 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        [0.14 * sc, 0.16 * sc, 0.06 * sc],
+                        origin,
+                        [visor_col[0], visor_col[1], visor_col[2], 0.14],
+                        visor_em,
+                    );
+                    // Dark-iron crossguard + Glowing Runeblade held ready in right hand!
+                    let blade_dir = normalize3_f64(add_f64(scale_f64(fwd, 0.78), scale_f64(up, 0.62)));
+                    let blade_up = normalize3_f64(cross_f64(right, blade_dir));
+                    let hilt_pos = add_f64(
+                        add_f64(base_pos, scale_f64(up, 1.05 * sc)),
+                        add_f64(scale_f64(right, 0.58 * sc), scale_f64(fwd, 0.28 * sc)),
+                    );
+                    push_oriented_box_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        hilt_pos,
+                        right,
+                        blade_up,
+                        blade_dir,
+                        [0.36 * sc, 0.09 * sc, 0.10 * sc],
+                        origin,
+                        steel_dark,
+                        armor_em,
+                    );
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(hilt_pos, scale_f64(blade_dir, 0.06 * sc)),
+                        right,
+                        blade_dir,
+                        blade_up,
+                        0.075 * sc,
+                        0.045 * sc,
+                        0.015 * sc,
+                        0.015 * sc,
+                        1.42 * sc,
+                        0.0,
+                        0.0,
+                        4,
+                        origin,
+                        [visor_col[0], visor_col[1], visor_col[2], 0.14],
+                        [1.0, 0.98, 0.92, 0.12],
+                        weapon_em,
+                        true,
+                    );
+                }
+                CLASS_TIDEKIN => {
+                    // Stylized Elemental Wavecaller / Mage: saturated mystic robe, dark leather belt,
+                    // burnished steel rune mantle, pointed hood + glowing arcane eyes & crystal staff!
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(base_pos, scale_f64(up, 0.06 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.58 * sc,
+                        0.54 * sc,
+                        0.32 * sc,
+                        0.28 * sc,
+                        1.02 * sc,
+                        0.0,
+                        0.0,
+                        8,
+                        origin,
+                        cape_col,
+                        crest_col,
+                        cloth_em,
+                        true,
+                    );
+                    // Dark leather waist sash
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(base_pos, scale_f64(up, 0.96 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.35 * sc,
+                        0.31 * sc,
+                        0.34 * sc,
+                        0.30 * sc,
+                        0.16 * sc,
+                        0.0,
+                        0.0,
+                        8,
+                        origin,
+                        leather_dark,
+                        leather_dark,
+                        leather_em,
+                        true,
+                    );
+                    // Upper robe torso & burnished steel shoulder mantle
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(base_pos, scale_f64(up, 1.06 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.30 * sc,
+                        0.26 * sc,
+                        0.48 * sc,
+                        0.36 * sc,
+                        0.54 * sc,
+                        0.0,
+                        0.0,
+                        8,
+                        origin,
+                        steel_plate,
+                        crest_col,
+                        cloth_em,
+                        true,
+                    );
+                    // Sculpted pointed wizard hood + crisp glowing arcane visor eyes
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(base_pos, scale_f64(up, 1.56 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.30 * sc,
+                        0.32 * sc,
+                        0.03 * sc,
+                        0.03 * sc,
+                        0.92 * sc,
+                        0.0,
+                        -0.22 * sc,
+                        6,
+                        origin,
+                        cape_col,
+                        steel_plate,
+                        cloth_em,
+                        true,
+                    );
+                    push_oriented_box_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(base_pos, scale_f64(up, 1.76 * sc)), scale_f64(fwd, 0.24 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        [0.24 * sc, 0.07 * sc, 0.08 * sc],
+                        origin,
+                        [visor_col[0], visor_col[1], visor_col[2], 0.14],
+                        visor_em,
+                    );
+                    // Dark hardwood & steel staff + radiant floating crystal orb finial!
+                    let staff_base = add_f64(
+                        add_f64(base_pos, scale_f64(right, 0.56 * sc)),
+                        scale_f64(fwd, 0.34 * sc),
+                    );
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        staff_base,
+                        right,
+                        up,
+                        fwd,
+                        0.055 * sc,
+                        0.055 * sc,
+                        0.075 * sc,
+                        0.075 * sc,
+                        2.18 * sc,
+                        0.0,
+                        0.12 * sc,
+                        6,
+                        origin,
+                        leather_dark,
+                        steel_plate,
+                        armor_em,
+                        true,
+                    );
+                    let orb_b = add_f64(add_f64(staff_base, scale_f64(up, 2.15 * sc)), scale_f64(fwd, 0.12 * sc));
+                    push_oriented_pyramid_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        orb_b,
+                        right,
+                        up,
+                        fwd,
+                        0.22 * sc,
+                        0.42 * sc,
+                        origin,
+                        [visor_col[0], visor_col[1], visor_col[2], 0.14],
+                        [visor_col[0] * 2.3, visor_col[1] * 2.3, visor_col[2] * 2.3, MAT_MACRO_CRYSTAL],
+                    );
+                }
+                CLASS_EMBERSTALKER => {
+                    // Stylized Pyro Assassin: dark leather boots, burnished dark-steel harness,
+                    // saturated crimson/gold scarf, charcoal hood + blazing visor slit & twin ember-blades!
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(base_pos, scale_f64(up, 0.08 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.34 * sc,
+                        0.42 * sc,
+                        0.28 * sc,
+                        0.26 * sc,
+                        0.72 * sc,
+                        0.0,
+                        0.14 * sc,
+                        6,
+                        origin,
+                        leather_dark,
+                        steel_dark,
+                        leather_em,
+                        true,
+                    );
+                    // Forward-crouched burnished slate-steel chest harness + team trim
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(base_pos, scale_f64(up, 0.74 * sc)), scale_f64(fwd, 0.14 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.28 * sc,
+                        0.26 * sc,
+                        0.44 * sc,
+                        0.34 * sc,
+                        0.74 * sc,
+                        0.0,
+                        0.20 * sc,
+                        6,
+                        origin,
+                        steel_dark,
+                        steel_plate,
+                        armor_em,
+                        true,
+                    );
+                    // Dark charcoal predator hood + blazing ember visor slit!
+                    let hood_b = add_f64(add_f64(base_pos, scale_f64(up, 1.44 * sc)), scale_f64(fwd, 0.32 * sc));
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        hood_b,
+                        right,
+                        up,
+                        fwd,
+                        0.24 * sc,
+                        0.28 * sc,
+                        0.08 * sc,
+                        0.12 * sc,
+                        0.46 * sc,
+                        0.0,
+                        -0.12 * sc,
+                        6,
+                        origin,
+                        steel_dark,
+                        cape_col,
+                        cloth_em,
+                        true,
+                    );
+                    push_oriented_box_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(hood_b, scale_f64(up, 0.18 * sc)), scale_f64(fwd, 0.22 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        [0.24 * sc, 0.065 * sc, 0.08 * sc],
+                        origin,
+                        [1.0, 0.72, 0.22, 0.14],
+                        [2.4, 1.15, 0.24, MAT_MACRO_BEAM],
+                    );
+                    // Streaming saturated hunter scarf
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(base_pos, scale_f64(up, 1.32 * sc)), scale_f64(fwd, -0.04 * sc)),
+                        right,
+                        scale_f64(fwd, -1.0),
+                        up,
+                        0.22 * sc,
+                        0.08 * sc,
+                        0.04 * sc,
+                        0.04 * sc,
+                        1.18 * sc,
+                        cape_wave * 1.4 * sc,
+                        -0.28 * sc,
+                        4,
+                        origin,
+                        cape_col,
+                        crest_col,
+                        cloth_em,
+                        true,
+                    );
+                    // Twin curved swept blazing ember-blades!
+                    for side in [-1.0f64, 1.0] {
+                        let b_dir = normalize3_f64(add_f64(
+                            add_f64(scale_f64(fwd, 0.90), scale_f64(right, side * 0.22)),
+                            scale_f64(up, -0.15),
+                        ));
+                        let b_up = normalize3_f64(cross_f64(right, b_dir));
+                        push_tapered_frustum_f64(
+                            &mut self.dynamic_solid_verts,
+                            &mut self.dynamic_solid_indices,
+                            add_f64(
+                                add_f64(base_pos, scale_f64(up, 0.98 * sc)),
+                                add_f64(scale_f64(right, side * 0.54 * sc), scale_f64(fwd, 0.18 * sc)),
+                            ),
+                            right,
+                            b_dir,
+                            b_up,
+                            0.06 * sc,
+                            0.12 * sc,
+                            0.015 * sc,
+                            0.02 * sc,
+                            1.38 * sc,
+                            -side * 0.14 * sc,
+                            0.16 * sc,
+                            4,
+                            origin,
+                            [1.0, 0.55, 0.16, 0.14],
+                            [1.0, 0.92, 0.42, 0.12],
+                            [2.3, 1.20, 0.24, MAT_MACRO_BEAM],
+                            true,
+                        );
+                    }
+                }
+                CLASS_BURROWER | _ => {
+                    // Stylized Crystal-Plated Geo-Burrower Exo-Suit: heavy dark burnished steel carapace,
+                    // saturated team crest collar, glowing visor slit, dorsal crystal spine & crystal drills!
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(base_pos, scale_f64(up, 0.14 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.48 * sc,
+                        0.48 * sc,
+                        0.68 * sc,
+                        0.62 * sc,
+                        1.15 * sc,
+                        0.0,
+                        0.04 * sc,
+                        8,
+                        origin,
+                        steel_dark,
+                        steel_plate,
+                        armor_em,
+                        true,
+                    );
+                    // Saturated team crest shoulder collar
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(base_pos, scale_f64(up, 1.06 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.69 * sc,
+                        0.63 * sc,
+                        0.58 * sc,
+                        0.54 * sc,
+                        0.24 * sc,
+                        0.0,
+                        0.02 * sc,
+                        8,
+                        origin,
+                        cape_col,
+                        crest_col,
+                        cloth_em,
+                        true,
+                    );
+                    // Burnished steel armored helm dome + crisp glowing cyan visor slit!
+                    push_tapered_frustum_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(base_pos, scale_f64(up, 1.26 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        0.48 * sc,
+                        0.46 * sc,
+                        0.22 * sc,
+                        0.24 * sc,
+                        0.52 * sc,
+                        0.0,
+                        0.08 * sc,
+                        6,
+                        origin,
+                        steel_plate,
+                        steel_trim,
+                        armor_em,
+                        true,
+                    );
+                    push_oriented_box_f64(
+                        &mut self.dynamic_solid_verts,
+                        &mut self.dynamic_solid_indices,
+                        add_f64(add_f64(base_pos, scale_f64(up, 1.48 * sc)), scale_f64(fwd, 0.42 * sc)),
+                        right,
+                        up,
+                        fwd,
+                        [0.44 * sc, 0.09 * sc, 0.10 * sc],
+                        origin,
+                        [0.32, 0.96, 0.92, 0.14],
+                        [0.45, 2.15, 2.25, MAT_MACRO_BEAM],
                     );
                     push_oriented_pyramid_f64(
                         &mut self.dynamic_solid_verts,
                         &mut self.dynamic_solid_indices,
-                        add_f64(base_pos, scale_f64(up, 1.28 * sc)),
+                        add_f64(add_f64(base_pos, scale_f64(up, 1.56 * sc)), scale_f64(fwd, -0.18 * sc)),
                         right,
                         up,
                         fwd,
-                        0.62 * sc,
-                        0.88 * sc,
+                        0.28 * sc,
+                        0.68 * sc,
                         origin,
-                        [0.44, 0.94, 0.88, 0.18],
-                        [0.25, 0.92, 0.85, MAT_MACRO_ENTITY],
+                        [0.36, 0.96, 0.92, 0.14],
+                        [0.32, 1.65, 1.85, MAT_MACRO_CRYSTAL],
                     );
+                    // Twin forward-mounted dark-iron drill housings + glowing diamond-crystal drill tips!
+                    for side in [-1.0f64, 1.0] {
+                        let d_base = add_f64(
+                            add_f64(base_pos, scale_f64(up, 0.86 * sc)),
+                            add_f64(scale_f64(right, side * 0.68 * sc), scale_f64(fwd, 0.24 * sc)),
+                        );
+                        push_tapered_frustum_f64(
+                            &mut self.dynamic_solid_verts,
+                            &mut self.dynamic_solid_indices,
+                            d_base,
+                            right,
+                            fwd,
+                            up,
+                            0.25 * sc,
+                            0.25 * sc,
+                            0.23 * sc,
+                            0.23 * sc,
+                            0.30 * sc,
+                            0.0,
+                            0.0,
+                            6,
+                            origin,
+                            steel_dark,
+                            steel_plate,
+                            armor_em,
+                            true,
+                        );
+                        push_tapered_frustum_f64(
+                            &mut self.dynamic_solid_verts,
+                            &mut self.dynamic_solid_indices,
+                            add_f64(d_base, scale_f64(fwd, 0.28 * sc)),
+                            right,
+                            fwd,
+                            up,
+                            0.22 * sc,
+                            0.22 * sc,
+                            0.02 * sc,
+                            0.02 * sc,
+                            0.88 * sc,
+                            0.0,
+                            0.0,
+                            6,
+                            origin,
+                            [0.24, 0.90, 0.92, 0.14],
+                            [0.42, 1.0, 0.94, 0.12],
+                            [0.35, 1.85, 1.95, MAT_MACRO_CRYSTAL],
+                            true,
+                        );
+                    }
                 }
             }
 
@@ -2480,6 +3503,7 @@ impl MacroPlanetWorld {
             self.seed,
             origin,
             sim_time,
+            self.cam_alt_m,
             ent.telemetry.local_wind_u,
             ent.telemetry.local_wind_v,
             ent.telemetry.local_temp_c,
@@ -2539,6 +3563,531 @@ impl MacroPlanetWorld {
             .unwrap_or_else(|| normalize3_f64(add_f64(f_dir, scale_f64(focus_fwd, 90.0 / self.r_surf()))));
 
         (focus_pos, focus_fwd, nearest_isl)
+    }
+
+    /// Instantly hydrate one `256×256×64` procedural `1 m` shard on the client without network I/O
+    /// (used by `--offline-planet` and offline 1-key landmark teleports in `< 20 ms`!).
+    pub fn ensure_procedural_shard_hydrated(&mut self, key: PlanetShardKey) -> bool {
+        let k = (key.face, key.sx, key.sy);
+        if self.shards.contains_key(&k) {
+            return false;
+        }
+        let sh = MacroShardData::new(
+            key.face,
+            key.sx,
+            key.sy,
+            self.shard_size,
+            self.depth,
+            self.face_size_virtual(),
+            self.seed,
+            self.z_sea + 0.55,
+        );
+        self.shards.insert(k, sh);
+        self.macro_clip_dirty = true;
+        true
+    }
+
+    /// Position the primary Hero Floating Sky-Island (`AETHER-CITADEL-PRIME`) over the scenic bay!
+    pub fn set_hero_sky_island_dir(&mut self, island_dir: [f64; 3]) {
+        if let Some(isl) = self.sky_islands.first_mut() {
+            isl.name = "AETHER-CITADEL-PRIME".to_string();
+            isl.center_dir = normalize3_f64(island_dir);
+            isl.radius_m = 36.0;
+            isl.has_waterfall = true;
+            if self.macro_base_built {
+                self.build_macro_sky_islands();
+                self.macro_gpu_dirty = true;
+            }
+        }
+    }
+
+    /// Deterministically locate the exact scenic coastal Hero Spawn site (matching the server's
+    /// `find_scenic_coastal_hero_site`) so `--offline-planet` boots straight into the lush emerald
+    /// fjord bay with `AETHER-CITADEL-PRIME` soaring overhead!
+    pub fn find_scenic_coastal_hero_site_offline(
+        &self,
+        sun_dir: [f64; 3],
+    ) -> (PlanetShardKey, f32, f32, f32, f32, f32, [f64; 3]) {
+        let m = self.shards_per_axis.max(1);
+        let n_virt = self.face_size_virtual();
+        let s = self.shard_size.max(8);
+        let r_surf = self.r_surf();
+
+        let mut best_shard = PlanetShardKey::new(4, (m / 2).min(m - 1), (m / 2).min(m - 1));
+        let mut best_shard_score = f64::NEG_INFINITY;
+
+        for f in 0..FACE_COUNT as u8 {
+            for sy in 0..m {
+                for sx in 0..m {
+                    let key = PlanetShardKey::new(f, sx, sy);
+                    let cdir = key.center_sphere_dir(m);
+                    let sdot = dot3_f64(cdir, sun_dir);
+                    if sdot < 0.56 || cdir[1].abs() > 0.42 {
+                        continue;
+                    }
+                    let mut water_cnt = 0usize;
+                    let mut land_cnt = 0usize;
+                    let mut forest_cnt = 0usize;
+                    let mut max_z = 0.0f64;
+                    let mut has_rift = false;
+                    for iy in 0..8 {
+                        let gy = (sy as usize * s) as f64 + (iy as f64 + 0.5) * (s as f64 / 8.0);
+                        for ix in 0..8 {
+                            let gx = (sx as usize * s) as f64 + (ix as f64 + 0.5) * (s as f64 / 8.0);
+                            let (u, v) = face_virtual_uv_f64(gx, gy, n_virt);
+                            let dir = face_uv_to_sphere_dir_f64(f as usize, u, v);
+                            let col = sample_macro_planet_column(dir, self.seed);
+                            if col.is_rift_core || col.is_rift_rim || col.is_polar {
+                                has_rift = true;
+                            }
+                            if col.water_depth > 0.3 {
+                                water_cnt += 1;
+                            } else {
+                                land_cnt += 1;
+                            }
+                            if col.biome == MacroBiome::PineForest
+                                || col.biome == MacroBiome::EmeraldMeadow
+                            {
+                                forest_cnt += 1;
+                            }
+                            if col.surf_z > max_z {
+                                max_z = col.surf_z;
+                            }
+                        }
+                    }
+                    if has_rift || water_cnt < 14 || land_cnt < 22 {
+                        continue;
+                    }
+                    let frac_w = water_cnt as f64 / 64.0;
+                    let coast_balance = 1.0 - (frac_w - 0.42).abs() * 3.0;
+                    let relief = ((max_z - 25.0) / 14.0).clamp(0.0, 1.4);
+                    let face_bonus = if f == 4 || f == 0 { 0.35 } else { 0.0 };
+                    let score = coast_balance * 4.0
+                        + relief * 2.5
+                        + (forest_cnt as f64 / 64.0) * 2.0
+                        + sdot * 2.5
+                        + face_bonus;
+                    if score > best_shard_score {
+                        best_shard_score = score;
+                        best_shard = key;
+                    }
+                }
+            }
+        }
+
+        let gx0 = best_shard.sx as usize * s;
+        let gy0 = best_shard.sy as usize * s;
+        let margin = (s / 8).clamp(2, 28);
+        let step = (s / 20).max(1).min(12);
+
+        let mut best_cam_score = f64::NEG_INFINITY;
+        let mut best_beach_dir = best_shard.center_sphere_dir(m);
+        let mut best_beach_gx = (gx0 + s / 2) as f32 + 0.5;
+        let mut best_beach_gy = (gy0 + s / 2) as f32 + 0.5;
+        let mut best_beach_z = 26.0f64;
+        let mut best_fwd = [1.0, 0.0, 0.0];
+
+        for ly in (margin..s.saturating_sub(margin).max(margin + 1)).step_by(step) {
+            for lx in (margin..s.saturating_sub(margin).max(margin + 1)).step_by(step) {
+                let gx_f = (gx0 + lx) as f64 + 0.5;
+                let gy_f = (gy0 + ly) as f64 + 0.5;
+                let (u, v) = face_virtual_uv_f64(gx_f, gy_f, n_virt);
+                let dir = face_uv_to_sphere_dir_f64(best_shard.face as usize, u, v);
+                let col = sample_macro_planet_column(dir, self.seed);
+                if col.surf_z < 24.9 || col.surf_z > 28.5 {
+                    continue;
+                }
+                let (t1, t2) = tangent_basis_f64(dir);
+                for dir_i in 0..12 {
+                    let ang = (dir_i as f64 / 12.0) * std::f64::consts::TAU;
+                    let fwd = normalize3_f64(add_f64(scale_f64(t1, ang.cos()), scale_f64(t2, ang.sin())));
+                    let mut bay_water = 0.0f64;
+                    let mut blocked_fg = false;
+                    for &d_m in &[12.0f64, 24.0, 42.0, 62.0, 82.0, 102.0, 130.0] {
+                        let pd = normalize3_f64(add_f64(dir, scale_f64(fwd, d_m / r_surf)));
+                        let pc = sample_macro_planet_column(pd, self.seed);
+                        if d_m <= 28.0 && pc.surf_z > col.surf_z + 1.8 {
+                            blocked_fg = true;
+                            break;
+                        }
+                        if (35.0..=115.0).contains(&d_m) && pc.water_depth > 0.3 {
+                            bay_water += 1.0;
+                        }
+                    }
+                    if blocked_fg {
+                        continue;
+                    }
+                    let right = normalize3_f64(cross_f64(fwd, dir));
+                    let mut flank_land = 0.0f64;
+                    for &side in &[-28.0f64, 28.0, -48.0, 48.0] {
+                        let pd = normalize3_f64(add_f64(
+                            dir,
+                            add_f64(scale_f64(fwd, 40.0 / r_surf), scale_f64(right, side / r_surf)),
+                        ));
+                        let pc = sample_macro_planet_column(pd, self.seed);
+                        if pc.surf_z > 25.5 && pc.surf_z < 36.0 {
+                            flank_land += 1.0;
+                        }
+                    }
+                    let sun_align = dot3_f64(fwd, sun_dir);
+                    let light_score = 1.0 - (sun_align - 0.15).abs();
+                    let sc = bay_water * 2.2 + flank_land * 1.1 + light_score * 1.8;
+                    if sc > best_cam_score {
+                        best_cam_score = sc;
+                        best_beach_dir = dir;
+                        best_beach_gx = gx_f as f32;
+                        best_beach_gy = gy_f as f32;
+                        best_beach_z = col.surf_z;
+                        best_fwd = fwd;
+                    }
+                }
+            }
+        }
+
+        let right = normalize3_f64(cross_f64(best_fwd, best_beach_dir));
+        let raw_island_dir = normalize3_f64(add_f64(
+            best_beach_dir,
+            add_f64(scale_f64(best_fwd, 94.0 / r_surf), scale_f64(right, 14.0 / r_surf)),
+        ));
+        let (u0, u1, v0, v1) = best_shard.uv_bounds(m);
+        let pad_u = (u1 - u0) * 0.16;
+        let pad_v = (v1 - v0) * 0.16;
+        let (if_id, iu, iv) = sphere_dir_to_face_uv_f64(raw_island_dir);
+        let island_dir = if if_id == best_shard.face as usize {
+            face_uv_to_sphere_dir_f64(
+                best_shard.face as usize,
+                iu.clamp(u0 + pad_u, u1 - pad_u),
+                iv.clamp(v0 + pad_v, v1 - pad_v),
+            )
+        } else {
+            best_shard.center_sphere_dir(m)
+        };
+        let (bu, bv) = face_virtual_uv_f64(best_beach_gx as f64, best_beach_gy as f64, n_virt);
+        let (_, tu, tv) = face_tangent_basis_f64(best_shard.face as usize, bu, bv);
+        let aim_x = dot3_f64(best_fwd, tu) as f32;
+        let aim_y = dot3_f64(best_fwd, tv) as f32;
+        let alen = aim_x.hypot(aim_y).max(1e-4);
+        (
+            best_shard,
+            best_beach_gx,
+            best_beach_gy,
+            best_beach_z as f32,
+            aim_x / alen,
+            aim_y / alen,
+            island_dir,
+        )
+    }
+
+    /// Resolve one of the 6 signature planetary landmarks for `F7` / `Alt+1..6` teleportation & inspection!
+    /// Returns `(label, target_pos_f64, look_fwd_f64, view_dist_m, pitch_rad)`.
+    pub fn resolve_landmark_f64(
+        &mut self,
+        idx: usize,
+        focus_pos: [f64; 3],
+        hydrate_if_offline: bool,
+    ) -> (&'static str, [f64; 3], [f64; 3], f64, f64) {
+        let focus_dir = normalize3_f64(focus_pos);
+        let r_core = self.r_core;
+        let seed = self.seed;
+        let spa = self.shards_per_axis;
+
+        match idx % 6 {
+            0 => {
+                // 1: Coastal Nordic Village & Pier
+                let best_v = self
+                    .shards
+                    .values()
+                    .filter_map(|sh| {
+                        let (vdir, vz) = sh.living_anchors.village_dir?;
+                        let look = sh
+                            .living_anchors
+                            .pier_anchor
+                            .map(|(_, out_t, _)| out_t)
+                            .unwrap_or_else(|| tangent_basis_f64(vdir).0);
+                        Some((dot3_f64(vdir, focus_dir), vdir, vz, look))
+                    })
+                    .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some((_, vdir, vz, look)) = best_v {
+                    (
+                        "1: Coastal Nordic Village & Pier",
+                        scale_f64(vdir, r_core + vz + 1.5),
+                        look,
+                        32.0,
+                        0.52,
+                    )
+                } else {
+                    (
+                        "1: Coastal Nordic Village & Pier",
+                        focus_pos,
+                        tangent_basis_f64(focus_dir).0,
+                        32.0,
+                        0.52,
+                    )
+                }
+            }
+            1 => {
+                // 2: Carved River Bridge & Waterfall
+                let best_b = self
+                    .shards
+                    .values()
+                    .flat_map(|sh| {
+                        sh.living_anchors
+                            .bridges
+                            .iter()
+                            .chain(sh.living_anchors.waterfall_sites.iter())
+                    })
+                    .max_by(|a, b| {
+                        dot3_f64(a.0, focus_dir)
+                            .partial_cmp(&dot3_f64(b.0, focus_dir))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .copied();
+                if let Some((bdir, bz)) = best_b {
+                    (
+                        "2: Carved River Bridge & Waterfall",
+                        scale_f64(bdir, r_core + bz + 1.2),
+                        tangent_basis_f64(bdir).0,
+                        28.0,
+                        0.55,
+                    )
+                } else {
+                    // Fallback: scan local ring around focus_dir for nearest carved river channel
+                    let (t1, t2) = tangent_basis_f64(focus_dir);
+                    let mut found = (focus_dir, self.z_sea + 3.0);
+                    'river_scan: for rad in (12..180).step_by(8) {
+                        for ai in 0..16 {
+                            let a = (ai as f64 / 16.0) * std::f64::consts::TAU;
+                            let d = normalize3_f64(add_f64(
+                                focus_dir,
+                                add_f64(
+                                    scale_f64(t1, a.cos() * rad as f64 / self.r_surf()),
+                                    scale_f64(t2, a.sin() * rad as f64 / self.r_surf()),
+                                ),
+                            ));
+                            let col = sample_macro_planet_column(d, seed);
+                            if col.river_depth > 0.25 {
+                                found = (d, col.surf_z);
+                                break 'river_scan;
+                            }
+                        }
+                    }
+                    if hydrate_if_offline {
+                        let sk = sphere_dir_to_shard_key(found.0, spa);
+                        self.ensure_procedural_shard_hydrated(sk);
+                    }
+                    (
+                        "2: Carved River Bridge & Waterfall",
+                        scale_f64(found.0, r_core + found.1 + 1.2),
+                        tangent_basis_f64(found.0).0,
+                        28.0,
+                        0.55,
+                    )
+                }
+            }
+            2 => {
+                // 3: Glowing Underground Cavern Grotto
+                let best_c = self
+                    .shards
+                    .values()
+                    .flat_map(|sh| sh.living_anchors.cavern_grottos.iter())
+                    .max_by(|a, b| {
+                        dot3_f64(a.0, focus_dir)
+                            .partial_cmp(&dot3_f64(b.0, focus_dir))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .copied();
+                let (cdir, cz) = if let Some(c) = best_c {
+                    c
+                } else {
+                    // Search nearby terrain for a natural glowing cavern sinkhole grotto
+                    let (t1, t2) = tangent_basis_f64(focus_dir);
+                    let mut best = (focus_dir, self.z_sea + 4.0, 0.0f64);
+                    for rad in (10..340).step_by(10) {
+                        for ai in 0..20 {
+                            let a = (ai as f64 / 20.0) * std::f64::consts::TAU;
+                            let d = normalize3_f64(add_f64(
+                                focus_dir,
+                                add_f64(
+                                    scale_f64(t1, a.cos() * rad as f64 / self.r_surf()),
+                                    scale_f64(t2, a.sin() * rad as f64 / self.r_surf()),
+                                ),
+                            ));
+                            let col = sample_macro_planet_column(d, seed);
+                            if col.cavern_depth > best.2 {
+                                best = (d, col.surf_z, col.cavern_depth);
+                                if best.2 > 4.0 {
+                                    break;
+                                }
+                            }
+                        }
+                        if best.2 > 4.0 {
+                            break;
+                        }
+                    }
+                    if hydrate_if_offline {
+                        let sk = sphere_dir_to_shard_key(best.0, spa);
+                        self.ensure_procedural_shard_hydrated(sk);
+                    }
+                    (best.0, best.1)
+                };
+                (
+                    "3: Glowing Underground Cavern Grotto",
+                    scale_f64(cdir, r_core + cz + 2.5),
+                    tangent_basis_f64(cdir).0,
+                    24.0,
+                    0.58,
+                )
+            }
+            3 => {
+                // 4: Floating Sky-Island Citadel (`AETHER-CITADEL-PRIME`)
+                let isl = self
+                    .sky_islands
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| MacroSkyIsland::default_archipelago(seed)[0].clone());
+                let idir = normalize3_f64(isl.center_dir);
+                (
+                    "4: Floating Sky-Island Citadel (AETHER-CITADEL-PRIME)",
+                    scale_f64(idir, r_core + isl.z_top + 4.0),
+                    tangent_basis_f64(idir).0,
+                    58.0,
+                    0.46,
+                )
+            }
+            4 => {
+                // 5: Equatorial Volcanic Magma Rift
+                let mut best_d = normalize3_f64([(-0.18f64).cos(), 0.02, (-0.18f64).sin()]);
+                let mut best_z = self.z_sea + 2.5;
+                'rift_scan: for li in -6..=6 {
+                    let lon = -0.18 + li as f64 * 0.06;
+                    for la in -6..=6 {
+                        let lat = la as f64 * 0.025;
+                        let cl = lat.cos();
+                        let d = normalize3_f64([cl * lon.cos(), lat.sin(), cl * lon.sin()]);
+                        let col = sample_macro_planet_column(d, seed);
+                        if col.is_rift_core {
+                            best_d = d;
+                            best_z = col.surf_z;
+                            break 'rift_scan;
+                        }
+                    }
+                }
+                if hydrate_if_offline {
+                    let sk = sphere_dir_to_shard_key(best_d, spa);
+                    self.ensure_procedural_shard_hydrated(sk);
+                }
+                (
+                    "5: Equatorial Volcanic Magma Rift",
+                    scale_f64(best_d, r_core + best_z + 2.0),
+                    tangent_basis_f64(best_d).0,
+                    48.0,
+                    0.54,
+                )
+            }
+            _ => {
+                // 6: Polar Glacier & Aurora Vista
+                let pdir = normalize3_f64([-0.34, 0.90, 0.27]);
+                let col = sample_macro_planet_column(pdir, seed);
+                if hydrate_if_offline {
+                    let sk = sphere_dir_to_shard_key(pdir, spa);
+                    self.ensure_procedural_shard_hydrated(sk);
+                }
+                (
+                    "6: Polar Glacier & Aurora Vista",
+                    scale_f64(pdir, r_core + col.surf_z + 2.5),
+                    tangent_basis_f64(pdir).0,
+                    54.0,
+                    0.44,
+                )
+            }
+        }
+    }
+
+    /// Locate the best showcase framing positions `(village_pos, village_look)` and
+    /// `(cavern_or_river_pos, cavern_or_river_look)` inside currently hydrated shards for the
+    /// 2 bonus headless close-up PNGs (`unified_village_harbor_1080p.png` & `unified_cavern_river_1080p.png`).
+    pub fn find_village_and_cavern_showcase_sites(
+        &self,
+        focus_pos: [f64; 3],
+        focus_fwd: [f64; 3],
+        isl_dir: [f64; 3],
+    ) -> (([f64; 3], [f64; 3]), ([f64; 3], [f64; 3])) {
+        let focus_dir = normalize3_f64(focus_pos);
+        let r_core = self.r_core;
+
+        // 1. Village & Harbor site: look from behind village toward pier/bay & Sky-Island!
+        let village_site = self
+            .shards
+            .values()
+            .filter_map(|sh| {
+                let (vdir, vz) = sh.living_anchors.village_dir?;
+                let vpos = scale_f64(vdir, r_core + vz);
+                let look = if let Some((_, out_t, _)) = sh.living_anchors.pier_anchor {
+                    out_t
+                } else {
+                    let to_isl = sub_f64(isl_dir, vdir);
+                    normalize3_f64(sub_f64(to_isl, scale_f64(vdir, dot3_f64(to_isl, vdir))))
+                };
+                Some((dot3_f64(vdir, focus_dir), vpos, look))
+            })
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, p, l)| (p, l))
+            .unwrap_or((focus_pos, focus_fwd));
+
+        // 2. Glowing Cavern Grotto -> Arched River Bridge -> Waterfall -> Ancient Carved Stone Ruins!
+        //    Select an unobstructed open-sightline 3/4 approach direction around the site.
+        let r_surf = self.r_surf();
+        let seed = self.seed;
+        let cavern_river_site = self
+            .shards
+            .values()
+            .flat_map(|sh| sh.living_anchors.cavern_grottos.iter())
+            .max_by(|a, b| {
+                dot3_f64(a.0, focus_dir)
+                    .partial_cmp(&dot3_f64(b.0, focus_dir))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .or_else(|| {
+                self.shards
+                    .values()
+                    .flat_map(|sh| sh.living_anchors.bridges.iter())
+                    .next()
+            })
+            .or_else(|| {
+                self.shards
+                    .values()
+                    .flat_map(|sh| sh.living_anchors.waterfall_sites.iter())
+                    .next()
+            })
+            .or_else(|| {
+                self.shards
+                    .values()
+                    .flat_map(|sh| sh.living_anchors.ruins.iter())
+                    .next()
+            })
+            .map(|&(d, z)| {
+                let (t1, t2) = tangent_basis_f64(d);
+                let mut best_fwd = t1;
+                let mut best_clear = f64::NEG_INFINITY;
+                for ai in 0..8 {
+                    let ang = (ai as f64 / 8.0) * std::f64::consts::TAU + 0.35;
+                    let cand = normalize3_f64(add_f64(scale_f64(t1, ang.cos()), scale_f64(t2, ang.sin())));
+                    // Eye stands at `-cand * 15m` behind site: prefer clear low-obstruction ground behind camera!
+                    let cam_d = normalize3_f64(sub_f64(d, scale_f64(cand, 15.0 / r_surf)));
+                    let cam_z = sample_macro_planet_column(cam_d, seed).surf_z;
+                    let mid_d = normalize3_f64(sub_f64(d, scale_f64(cand, 8.0 / r_surf)));
+                    let mid_z = sample_macro_planet_column(mid_d, seed).surf_z;
+                    let clear = (z + 2.5 - cam_z).min(z + 2.0 - mid_z);
+                    if clear > best_clear {
+                        best_clear = clear;
+                        best_fwd = cand;
+                    }
+                }
+                (scale_f64(d, r_core + z), best_fwd)
+            })
+            .unwrap_or((focus_pos, focus_fwd));
+
+        (village_site, cavern_river_site)
     }
 }
 
@@ -3130,7 +4679,8 @@ pub(crate) fn push_contact_shadow_disc_f64(
     }
 }
 
-/// Lush meadow fern & Nordic wildflower accent tuft (golden buttercups, heather violet, arctic white).
+/// Lush meadow fern & Nordic wildflower accent tuft (golden buttercups, heather violet, arctic white)
+/// with subtle GPU wind sway encoded on upper petal tips (`water_ice.w = 1.64`, roots `0.90`).
 fn push_wildflower_tuft(
     verts: &mut Vec<MacroPlanetVertex>,
     indices: &mut Vec<u32>,
@@ -3163,23 +4713,879 @@ fn push_wildflower_tuft(
             normal: n_f,
             color: [0.06, 0.22, 0.08, 0.88],
             emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
-            water_ice: [0.0, 0.0, 0.0, 0.85],
+            water_ice: [0.0, 0.0, 0.0, 0.90],
         });
         verts.push(MacroPlanetVertex {
             pos: world_f64_to_camera_rel_f32(p1, origin_f64),
             normal: n_f,
             color: [0.06, 0.22, 0.08, 0.88],
             emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
-            water_ice: [0.0, 0.0, 0.0, 0.85],
+            water_ice: [0.0, 0.0, 0.0, 0.90],
         });
         verts.push(MacroPlanetVertex {
             pos: world_f64_to_camera_rel_f32(p2, origin_f64),
             normal: [up_dir[0] as f32, up_dir[1] as f32, up_dir[2] as f32],
             color: [flower_col[0], flower_col[1], flower_col[2], 0.82],
             emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
-            water_ice: [0.0, 0.0, 0.0, 1.0],
+            water_ice: [0.0, 0.0, 0.0, 1.64],
         });
         indices.extend_from_slice(&[idx, idx + 1, idx + 2, idx, idx + 2, idx + 1]);
+    }
+}
+
+/// Lush Multi-Blade Wind-Swaying 3D Meadow Grass & Coastal Reed Cluster!
+/// Emits 3 tall curved 2-segment hero blades + 3 lush low fill blades (6 blades for only 24 tris!)
+/// with GPU wind sway encoded strictly on upper tips (`water_ice.w = 1.5 + sway_amp`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_grass_cluster(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    base_world: [f64; 3],
+    up_dir: [f64; 3],
+    origin_f64: [f64; 3],
+    hash: usize,
+    continent_biome: u8,
+    is_reed: bool,
+) {
+    let (t1, t2) = tangent_basis_f64(up_dir);
+    let (root_col, tip_col) = if is_reed {
+        ([0.08, 0.21, 0.075], [0.46, 0.45, 0.16])
+    } else {
+        match continent_biome {
+            CONTINENT_AUTUMN_HIGHLANDS => ([0.22, 0.14, 0.04], [0.76, 0.50, 0.13]),
+            CONTINENT_RED_OCHRE_MESA => ([0.26, 0.19, 0.10], [0.60, 0.43, 0.18]),
+            CONTINENT_CRYSTAL_TUNDRA => ([0.24, 0.35, 0.36], [0.64, 0.78, 0.82]),
+            _ => match hash % 4 {
+                0 => ([0.05, 0.20, 0.055], [0.26, 0.50, 0.13]), // Sunlit emerald-gold blade
+                1 => ([0.035, 0.16, 0.055], [0.14, 0.42, 0.11]), // Rich Nordic meadow emerald
+                2 => ([0.06, 0.22, 0.06], [0.34, 0.52, 0.14]), // Warm clover-green highlight
+                _ => ([0.035, 0.14, 0.06], [0.11, 0.35, 0.12]), // Deep shadowed forest-edge blade
+            },
+        }
+    };
+
+    let hero_blades = if is_reed { 4usize } else { 3usize };
+    let fill_blades = 3usize;
+    let base_h = if is_reed {
+        1.12 + ((hash % 11) as f64 / 11.0) * 0.60
+    } else {
+        0.58 + ((hash % 13) as f64 / 13.0) * 0.50
+    };
+    let half_w = if is_reed { 0.088 } else { 0.112 };
+    let spread = if is_reed { 0.38 } else { 0.52 };
+    let tip_sway = if is_reed { 1.75f32 } else { 1.69f32 };
+    let mid_sway = if is_reed { 1.60f32 } else { 1.58f32 };
+    let n_up = [up_dir[0] as f32, up_dir[1] as f32, up_dir[2] as f32];
+
+    for bi in 0..hero_blades {
+        let ang = (bi as f64 / hero_blades as f64) * std::f64::consts::TAU
+            + (hash as f64) * 0.61;
+        let lean_ang = ang + 0.42;
+        let radial_off = add_f64(scale_f64(t1, ang.cos()), scale_f64(t2, ang.sin()));
+        let lean_dir = add_f64(scale_f64(t1, lean_ang.cos()), scale_f64(t2, lean_ang.sin()));
+        let width_axis = normalize3_f64(cross_f64(up_dir, lean_dir));
+        let norm_v = normalize3_f64(add_f64(scale_f64(up_dir, 0.72), scale_f64(lean_dir, 0.68)));
+        let n_f = [norm_v[0] as f32, norm_v[1] as f32, norm_v[2] as f32];
+
+        let h_b = base_h * (0.85 + 0.38 * (((hash + bi * 7) % 10) as f64 / 9.0));
+        let root_c = add_f64(base_world, scale_f64(radial_off, spread * (0.30 + 0.68 * (bi as f64 / hero_blades as f64))));
+        let mid_c = add_f64(
+            add_f64(root_c, scale_f64(up_dir, h_b * 0.54)),
+            scale_f64(lean_dir, h_b * 0.17),
+        );
+        let tip_p = add_f64(
+            add_f64(root_c, scale_f64(up_dir, h_b)),
+            scale_f64(lean_dir, h_b * 0.42),
+        );
+
+        let r0 = sub_f64(root_c, scale_f64(width_axis, half_w));
+        let r1 = add_f64(root_c, scale_f64(width_axis, half_w));
+        let m0 = sub_f64(mid_c, scale_f64(width_axis, half_w * 0.58));
+        let m1 = add_f64(mid_c, scale_f64(width_axis, half_w * 0.58));
+        let mid_col = [
+            root_col[0] * 0.42 + tip_col[0] * 0.58,
+            root_col[1] * 0.42 + tip_col[1] * 0.58,
+            root_col[2] * 0.42 + tip_col[2] * 0.58,
+        ];
+
+        let base = verts.len() as u32;
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(r0, origin_f64),
+            normal: n_f,
+            color: [root_col[0], root_col[1], root_col[2], 0.88],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 0.95],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(r1, origin_f64),
+            normal: n_f,
+            color: [root_col[0], root_col[1], root_col[2], 0.88],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 0.95],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(m0, origin_f64),
+            normal: n_f,
+            color: [mid_col[0], mid_col[1], mid_col[2], 0.86],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, mid_sway],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(m1, origin_f64),
+            normal: n_f,
+            color: [mid_col[0], mid_col[1], mid_col[2], 0.86],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, mid_sway],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(tip_p, origin_f64),
+            normal: n_up,
+            color: [tip_col[0], tip_col[1], tip_col[2], 0.84],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, tip_sway],
+        });
+        // Double-sided curved grass blade (lower quad + tapered upper tip triangle)
+        indices.extend_from_slice(&[
+            base, base + 1, base + 3, base, base + 3, base + 2,
+            base, base + 3, base + 1, base, base + 2, base + 3,
+            base + 2, base + 3, base + 4,
+            base + 2, base + 4, base + 3,
+        ]);
+    }
+
+    // 3 low-cost layered fill blades (2 tris each = 6 tris total) giving full lush meadow volume!
+    for fi in 0..fill_blades {
+        let ang = ((fi as f64 + 0.5) / fill_blades as f64) * std::f64::consts::TAU
+            + (hash as f64) * 1.17;
+        let radial_off = add_f64(scale_f64(t1, ang.cos()), scale_f64(t2, ang.sin()));
+        let width_axis = normalize3_f64(cross_f64(up_dir, radial_off));
+        let norm_v = normalize3_f64(add_f64(scale_f64(up_dir, 0.78), scale_f64(radial_off, 0.62)));
+        let n_f = [norm_v[0] as f32, norm_v[1] as f32, norm_v[2] as f32];
+        let h_f = base_h * (0.58 + 0.28 * (((hash + fi * 11) % 7) as f64 / 6.0));
+        let root_c = add_f64(base_world, scale_f64(radial_off, spread * (0.48 + 0.42 * (fi as f64 / fill_blades as f64))));
+        let r0 = sub_f64(root_c, scale_f64(width_axis, half_w * 0.92));
+        let r1 = add_f64(root_c, scale_f64(width_axis, half_w * 0.92));
+        let tip_p = add_f64(add_f64(root_c, scale_f64(up_dir, h_f)), scale_f64(radial_off, h_f * 0.34));
+        let base = verts.len() as u32;
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(r0, origin_f64),
+            normal: n_f,
+            color: [root_col[0], root_col[1], root_col[2], 0.88],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 0.95],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(r1, origin_f64),
+            normal: n_f,
+            color: [root_col[0], root_col[1], root_col[2], 0.88],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 0.95],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(tip_p, origin_f64),
+            normal: n_up,
+            color: [tip_col[0], tip_col[1], tip_col[2], 0.84],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, tip_sway - 0.03],
+        });
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 1]);
+    }
+}
+
+/// Sunlit Golden Coastal Dune Grass & Swaying Sea-Oats along sandy Nordic beach borders!
+#[allow(clippy::too_many_arguments)]
+fn push_sea_oats_cluster(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    base_world: [f64; 3],
+    up_dir: [f64; 3],
+    origin_f64: [f64; 3],
+    hash: usize,
+) {
+    let (t1, t2) = tangent_basis_f64(up_dir);
+    let root_col = [0.24, 0.28, 0.12];
+    let mid_col = [0.56, 0.50, 0.22];
+    let tip_col = [0.86, 0.75, 0.38]; // Sunlit golden sea-oat plume tips!
+    let n_up = [up_dir[0] as f32, up_dir[1] as f32, up_dir[2] as f32];
+    let base_h = 0.82 + ((hash % 11) as f64 / 11.0) * 0.52;
+    let half_w = 0.082;
+    let spread = 0.44;
+
+    for bi in 0..3usize {
+        let ang = (bi as f64 / 3.0) * std::f64::consts::TAU + (hash as f64) * 0.73;
+        let lean_ang = ang + 0.38;
+        let radial_off = add_f64(scale_f64(t1, ang.cos()), scale_f64(t2, ang.sin()));
+        let lean_dir = add_f64(scale_f64(t1, lean_ang.cos()), scale_f64(t2, lean_ang.sin()));
+        let width_axis = normalize3_f64(cross_f64(up_dir, lean_dir));
+        let norm_v = normalize3_f64(add_f64(scale_f64(up_dir, 0.74), scale_f64(lean_dir, 0.67)));
+        let n_f = [norm_v[0] as f32, norm_v[1] as f32, norm_v[2] as f32];
+
+        let h_b = base_h * (0.86 + 0.34 * (((hash + bi * 5) % 9) as f64 / 8.0));
+        let root_c = add_f64(base_world, scale_f64(radial_off, spread * (0.28 + 0.55 * (bi as f64 / 3.0))));
+        let mid_c = add_f64(
+            add_f64(root_c, scale_f64(up_dir, h_b * 0.56)),
+            scale_f64(lean_dir, h_b * 0.20),
+        );
+        let tip_p = add_f64(
+            add_f64(root_c, scale_f64(up_dir, h_b)),
+            scale_f64(lean_dir, h_b * 0.48),
+        );
+
+        let r0 = sub_f64(root_c, scale_f64(width_axis, half_w));
+        let r1 = add_f64(root_c, scale_f64(width_axis, half_w));
+        let m0 = sub_f64(mid_c, scale_f64(width_axis, half_w * 0.68));
+        let m1 = add_f64(mid_c, scale_f64(width_axis, half_w * 0.68));
+
+        let base = verts.len() as u32;
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(r0, origin_f64),
+            normal: n_f,
+            color: [root_col[0], root_col[1], root_col[2], 0.86],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 0.95],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(r1, origin_f64),
+            normal: n_f,
+            color: [root_col[0], root_col[1], root_col[2], 0.86],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 0.95],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(m0, origin_f64),
+            normal: n_f,
+            color: [mid_col[0], mid_col[1], mid_col[2], 0.84],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 1.61],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(m1, origin_f64),
+            normal: n_f,
+            color: [mid_col[0], mid_col[1], mid_col[2], 0.84],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 1.61],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(tip_p, origin_f64),
+            normal: n_up,
+            color: [tip_col[0], tip_col[1], tip_col[2], 0.82],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 1.76],
+        });
+        indices.extend_from_slice(&[
+            base, base + 1, base + 3, base, base + 3, base + 2,
+            base, base + 3, base + 1, base, base + 2, base + 3,
+            base + 2, base + 3, base + 4,
+            base + 2, base + 4, base + 3,
+        ]);
+    }
+    for fi in 0..2usize {
+        let ang = ((fi as f64 + 0.5) / 2.0) * std::f64::consts::TAU + (hash as f64) * 1.43;
+        let radial_off = add_f64(scale_f64(t1, ang.cos()), scale_f64(t2, ang.sin()));
+        let width_axis = normalize3_f64(cross_f64(up_dir, radial_off));
+        let norm_v = normalize3_f64(add_f64(scale_f64(up_dir, 0.78), scale_f64(radial_off, 0.62)));
+        let n_f = [norm_v[0] as f32, norm_v[1] as f32, norm_v[2] as f32];
+        let h_f = base_h * (0.62 + 0.24 * (fi as f64));
+        let root_c = add_f64(base_world, scale_f64(radial_off, spread * 0.55));
+        let r0 = sub_f64(root_c, scale_f64(width_axis, half_w * 0.85));
+        let r1 = add_f64(root_c, scale_f64(width_axis, half_w * 0.85));
+        let tip_p = add_f64(add_f64(root_c, scale_f64(up_dir, h_f)), scale_f64(radial_off, h_f * 0.36));
+        let base = verts.len() as u32;
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(r0, origin_f64),
+            normal: n_f,
+            color: [root_col[0], root_col[1], root_col[2], 0.86],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 0.95],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(r1, origin_f64),
+            normal: n_f,
+            color: [root_col[0], root_col[1], root_col[2], 0.86],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 0.95],
+        });
+        verts.push(MacroPlanetVertex {
+            pos: world_f64_to_camera_rel_f32(tip_p, origin_f64),
+            normal: n_up,
+            color: [tip_col[0], tip_col[1], tip_col[2], 0.82],
+            emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            water_ice: [0.0, 0.0, 0.0, 1.72],
+        });
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 1]);
+    }
+}
+
+/// Golden Autumn Birch & Amber Highland Tree (pale white-silver birch trunk + layered golden-amber
+/// and russet-crimson foliage crowns).
+#[allow(clippy::too_many_arguments)]
+fn push_autumn_birch_tree(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    base_world: [f64; 3],
+    up_dir: [f64; 3],
+    origin_f64: [f64; 3],
+    height_m: f64,
+    radius_m: f64,
+    tint_var: f32,
+    hash: usize,
+) {
+    let (t1, t2) = tangent_basis_f64(up_dir);
+    let lean = ((hash % 7) as f64 - 3.0) * 0.08;
+    // Slender white-silver birch trunk with slight natural sway
+    push_tapered_frustum_f64(
+        verts,
+        indices,
+        sub_f64(base_world, scale_f64(up_dir, 0.35)),
+        t1,
+        up_dir,
+        t2,
+        radius_m * 0.18,
+        radius_m * 0.18,
+        radius_m * 0.08,
+        radius_m * 0.08,
+        height_m * 0.62,
+        lean,
+        -lean * 0.6,
+        5,
+        origin_f64,
+        [0.64, 0.62, 0.58, 0.82],
+        [0.84, 0.82, 0.78, 0.78],
+        [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+        false,
+    );
+    // Warm golden-amber, honey-ochre & crimson-russet layered foliage crown!
+    let (c_bot, c_mid, c_top) = match hash % 3 {
+        0 => (
+            [0.58, 0.24, 0.04, 0.84],
+            [0.82, 0.48, 0.08, 0.82],
+            [0.95, 0.72, 0.16, 0.80],
+        ),
+        1 => (
+            [0.48, 0.12, 0.05, 0.84],
+            [0.74, 0.26, 0.07, 0.82],
+            [0.92, 0.46, 0.12, 0.80],
+        ),
+        _ => (
+            [0.52 + 0.08 * tint_var, 0.30, 0.05, 0.84],
+            [0.78 + 0.08 * tint_var, 0.54, 0.10, 0.82],
+            [0.96, 0.78, 0.22, 0.80],
+        ),
+    };
+    let crown_b = add_f64(
+        add_f64(base_world, scale_f64(up_dir, height_m * 0.42)),
+        add_f64(scale_f64(t1, lean * 0.8), scale_f64(t2, -lean * 0.5)),
+    );
+    push_tapered_frustum_f64(
+        verts,
+        indices,
+        crown_b,
+        t1,
+        up_dir,
+        t2,
+        radius_m * 0.58,
+        radius_m * 0.54,
+        radius_m * 1.15,
+        radius_m * 1.08,
+        height_m * 0.26,
+        0.15,
+        -0.12,
+        6,
+        origin_f64,
+        c_bot,
+        c_mid,
+        [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+        true,
+    );
+    push_tapered_frustum_f64(
+        verts,
+        indices,
+        add_f64(crown_b, scale_f64(up_dir, height_m * 0.24)),
+        t1,
+        up_dir,
+        t2,
+        radius_m * 1.10,
+        radius_m * 1.04,
+        radius_m * 0.28,
+        radius_m * 0.26,
+        height_m * 0.38,
+        -0.10,
+        0.12,
+        6,
+        origin_f64,
+        c_mid,
+        c_top,
+        [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+        true,
+    );
+}
+
+/// Sculpted Twisted Cypress / Desert Juniper Scrub for Red-Ochre Terraced Mesas & Canyons!
+#[allow(clippy::too_many_arguments)]
+fn push_mesa_cypress_tree(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    base_world: [f64; 3],
+    up_dir: [f64; 3],
+    origin_f64: [f64; 3],
+    height_m: f64,
+    radius_m: f64,
+    tint_var: f32,
+    hash: usize,
+) {
+    let (t1, t2) = tangent_basis_f64(up_dir);
+    let ang = (hash as f64) * 1.17;
+    let bend_dir = add_f64(scale_f64(t1, ang.cos()), scale_f64(t2, ang.sin()));
+    let bend_side = normalize3_f64(cross_f64(up_dir, bend_dir));
+
+    // Gnarled leaning cedar trunk (2 kinked tapered segments)
+    let mid_p = add_f64(
+        add_f64(base_world, scale_f64(up_dir, height_m * 0.42)),
+        scale_f64(bend_dir, height_m * 0.18),
+    );
+    push_tapered_frustum_f64(
+        verts,
+        indices,
+        sub_f64(base_world, scale_f64(up_dir, 0.3)),
+        bend_dir,
+        up_dir,
+        bend_side,
+        radius_m * 0.26,
+        radius_m * 0.24,
+        radius_m * 0.16,
+        radius_m * 0.15,
+        height_m * 0.46,
+        height_m * 0.18,
+        0.08,
+        5,
+        origin_f64,
+        [0.34, 0.18, 0.10, 0.88],
+        [0.44, 0.25, 0.14, 0.86],
+        [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+        false,
+    );
+    push_tapered_frustum_f64(
+        verts,
+        indices,
+        mid_p,
+        bend_dir,
+        up_dir,
+        bend_side,
+        radius_m * 0.16,
+        radius_m * 0.15,
+        radius_m * 0.08,
+        radius_m * 0.08,
+        height_m * 0.36,
+        -height_m * 0.10,
+        0.14,
+        5,
+        origin_f64,
+        [0.42, 0.24, 0.13, 0.86],
+        [0.48, 0.28, 0.16, 0.86],
+        [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+        false,
+    );
+    // Flat windswept sage-olive & warm ochre canopy pads
+    let pad_bot = [0.22 + 0.06 * tint_var, 0.28 + 0.04 * tint_var, 0.12, 0.86];
+    let pad_top = [0.36 + 0.08 * tint_var, 0.38 + 0.05 * tint_var, 0.15, 0.84];
+    for &(z_frac, r_sc, off_f) in &[(0.52f64, 1.05f64, 0.32f64), (0.76, 0.86, -0.10)] {
+        let pad_p = add_f64(
+            add_f64(base_world, scale_f64(up_dir, height_m * z_frac)),
+            scale_f64(bend_dir, height_m * off_f * 0.45),
+        );
+        push_tapered_frustum_f64(
+            verts,
+            indices,
+            pad_p,
+            bend_dir,
+            up_dir,
+            bend_side,
+            radius_m * r_sc,
+            radius_m * r_sc * 0.82,
+            radius_m * r_sc * 0.55,
+            radius_m * r_sc * 0.48,
+            height_m * 0.20,
+            0.12,
+            0.0,
+            6,
+            origin_f64,
+            pad_bot,
+            pad_top,
+            [0.0, 0.0, 0.0, MAT_MACRO_PROP],
+            true,
+        );
+    }
+}
+
+/// Charred volcanic basalt deadwood snag for Obsidian Volcanic Badlands.
+fn push_volcanic_snag(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    base_world: [f64; 3],
+    up_dir: [f64; 3],
+    origin_f64: [f64; 3],
+    height_m: f64,
+    hash: usize,
+) {
+    let (t1, t2) = tangent_basis_f64(up_dir);
+    let ang = (hash as f64) * 1.7;
+    let dir = add_f64(scale_f64(t1, ang.cos()), scale_f64(t2, ang.sin()));
+    let side = normalize3_f64(cross_f64(up_dir, dir));
+    push_tapered_frustum_f64(
+        verts,
+        indices,
+        sub_f64(base_world, scale_f64(up_dir, 0.25)),
+        dir,
+        up_dir,
+        side,
+        0.34,
+        0.30,
+        0.07,
+        0.06,
+        height_m,
+        height_m * 0.22,
+        -height_m * 0.12,
+        5,
+        origin_f64,
+        [0.10, 0.09, 0.11, 0.86],
+        [0.18, 0.16, 0.18, 0.84],
+        [0.14, 0.03, 0.005, MAT_MACRO_PROP],
+        true,
+    );
+}
+
+/// Sculpted Oriented Tapered Frustum / Prism helper (`f64` floating origin, auto-outward normals).
+/// Used for armored hero torsos, capes, weapons, whale hulls, elk bodies/necks/antlers, stone chimneys & birch trunks!
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_tapered_frustum_f64(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    base_center: [f64; 3],
+    right: [f64; 3],
+    up: [f64; 3],
+    fwd: [f64; 3],
+    bot_rx: f64,
+    bot_rz: f64,
+    top_rx: f64,
+    top_rz: f64,
+    height: f64,
+    top_offset_r: f64,
+    top_offset_f: f64,
+    segs: usize,
+    origin_f64: [f64; 3],
+    col_bot: [f32; 4],
+    col_top: [f32; 4],
+    emissive_mat: [f32; 4],
+    cap_ends: bool,
+) {
+    let n_segs = segs.max(3);
+    let ang_off = if n_segs == 4 {
+        std::f64::consts::FRAC_PI_4
+    } else {
+        0.0
+    };
+    let scale_4 = if n_segs == 4 { std::f64::consts::SQRT_2 } else { 1.0 };
+    let top_center = add_f64(
+        add_f64(base_center, scale_f64(up, height)),
+        add_f64(scale_f64(right, top_offset_r), scale_f64(fwd, top_offset_f)),
+    );
+    let mid_axis = scale_f64(add_f64(base_center, top_center), 0.5);
+
+    let mut bot_pts = Vec::with_capacity(n_segs);
+    let mut top_pts = Vec::with_capacity(n_segs);
+    for i in 0..n_segs {
+        let a = (i as f64 / n_segs as f64) * std::f64::consts::TAU + ang_off;
+        let ca = a.cos() * scale_4;
+        let sa = a.sin() * scale_4;
+        bot_pts.push(add_f64(
+            base_center,
+            add_f64(scale_f64(right, ca * bot_rx), scale_f64(fwd, sa * bot_rz)),
+        ));
+        top_pts.push(add_f64(
+            top_center,
+            add_f64(scale_f64(right, ca * top_rx), scale_f64(fwd, sa * top_rz)),
+        ));
+    }
+
+    for i in 0..n_segs {
+        let j = (i + 1) % n_segs;
+        let b0 = bot_pts[i];
+        let b1 = bot_pts[j];
+        let t1 = top_pts[j];
+        let t0 = top_pts[i];
+        let face_mid = scale_f64(add_f64(add_f64(b0, b1), add_f64(t1, t0)), 0.25);
+        let out_hint = normalize3_f64(sub_f64(face_mid, mid_axis));
+        let mut n = normalize3_f64(cross_f64(sub_f64(b1, b0), sub_f64(t0, b0)));
+        let flip = dot3_f64(n, out_hint) < 0.0;
+        if flip {
+            n = scale_f64(n, -1.0);
+        }
+        let n_f = [n[0] as f32, n[1] as f32, n[2] as f32];
+        let base = verts.len() as u32;
+        for &(p, c) in &[(b0, col_bot), (b1, col_bot), (t1, col_top), (t0, col_top)] {
+            verts.push(MacroPlanetVertex {
+                pos: world_f64_to_camera_rel_f32(p, origin_f64),
+                normal: n_f,
+                color: c,
+                emissive_mat,
+                water_ice: [0.0, 0.0, 0.0, 1.0],
+            });
+        }
+        if flip {
+            indices.extend_from_slice(&[base, base + 3, base + 2, base, base + 2, base + 1]);
+        } else {
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+
+    if cap_ends {
+        // Top cap
+        if top_rx > 1e-4 && top_rz > 1e-4 {
+            let n_top = [up[0] as f32, up[1] as f32, up[2] as f32];
+            let base = verts.len() as u32;
+            verts.push(MacroPlanetVertex {
+                pos: world_f64_to_camera_rel_f32(top_center, origin_f64),
+                normal: n_top,
+                color: col_top,
+                emissive_mat,
+                water_ice: [0.0, 0.0, 0.0, 1.0],
+            });
+            for &p in &top_pts {
+                verts.push(MacroPlanetVertex {
+                    pos: world_f64_to_camera_rel_f32(p, origin_f64),
+                    normal: n_top,
+                    color: col_top,
+                    emissive_mat,
+                    water_ice: [0.0, 0.0, 0.0, 1.0],
+                });
+            }
+            let sample_n = cross_f64(sub_f64(top_pts[0], top_center), sub_f64(top_pts[1], top_center));
+            let rev = dot3_f64(sample_n, up) < 0.0;
+            for i in 0..n_segs {
+                let i1 = base + 1 + i as u32;
+                let i2 = base + 1 + ((i + 1) % n_segs) as u32;
+                if rev {
+                    indices.extend_from_slice(&[base, i2, i1]);
+                } else {
+                    indices.extend_from_slice(&[base, i1, i2]);
+                }
+            }
+        }
+        // Bottom cap
+        if bot_rx > 1e-4 && bot_rz > 1e-4 {
+            let down = scale_f64(up, -1.0);
+            let n_bot = [down[0] as f32, down[1] as f32, down[2] as f32];
+            let base = verts.len() as u32;
+            verts.push(MacroPlanetVertex {
+                pos: world_f64_to_camera_rel_f32(base_center, origin_f64),
+                normal: n_bot,
+                color: col_bot,
+                emissive_mat,
+                water_ice: [0.0, 0.0, 0.0, 1.0],
+            });
+            for &p in &bot_pts {
+                verts.push(MacroPlanetVertex {
+                    pos: world_f64_to_camera_rel_f32(p, origin_f64),
+                    normal: n_bot,
+                    color: col_bot,
+                    emissive_mat,
+                    water_ice: [0.0, 0.0, 0.0, 1.0],
+                });
+            }
+            let sample_n = cross_f64(sub_f64(bot_pts[0], base_center), sub_f64(bot_pts[1], base_center));
+            let rev = dot3_f64(sample_n, down) < 0.0;
+            for i in 0..n_segs {
+                let i1 = base + 1 + i as u32;
+                let i2 = base + 1 + ((i + 1) % n_segs) as u32;
+                if rev {
+                    indices.extend_from_slice(&[base, i2, i1]);
+                } else {
+                    indices.extend_from_slice(&[base, i1, i2]);
+                }
+            }
+        }
+    }
+}
+
+/// Sculpted Steep Triangular Pitched Gable Roof with Overhanging Timber Eaves, Solid Gable Pediments,
+/// Ridge Beam & Crossed Carved Nordic Dragon-Prow Finials (`f64` floating origin)!
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_pitched_roof_f64(
+    verts: &mut Vec<MacroPlanetVertex>,
+    indices: &mut Vec<u32>,
+    eave_center: [f64; 3],
+    right: [f64; 3],
+    up: [f64; 3],
+    fwd: [f64; 3],
+    wall_width: f64,
+    wall_length: f64,
+    ridge_height: f64,
+    eave_overhang: f64,
+    gable_overhang: f64,
+    origin_f64: [f64; 3],
+    roof_col: [f32; 4],
+    gable_col: [f32; 4],
+    trim_col: [f32; 4],
+    snow_cap: bool,
+) {
+    let em_prop = [0.0, 0.0, 0.0, MAT_MACRO_PROP];
+    let hw_wall = wall_width * 0.5;
+    let hl_wall = wall_length * 0.5;
+    let hw_roof = hw_wall + eave_overhang;
+    let hl_roof = hl_wall + gable_overhang;
+    let eave_drop = eave_overhang * (ridge_height / hw_wall.max(0.5)) * 0.72;
+    let roof_thick = 0.24;
+
+    let pt = |rx: f64, uy: f64, fz: f64| -> [f64; 3] {
+        add_f64(
+            add_f64(eave_center, scale_f64(right, rx)),
+            add_f64(scale_f64(up, uy), scale_f64(fwd, fz)),
+        )
+    };
+
+    // 1. Solid triangular front & back timber gable pediments closing the roof cleanly
+    {
+        let mut emit_tri = |a: [f64; 3], b: [f64; 3], c: [f64; 3], out_hint: [f64; 3], col: [f32; 4]| {
+            let mut n = normalize3_f64(cross_f64(sub_f64(b, a), sub_f64(c, a)));
+            let flip = dot3_f64(n, out_hint) < 0.0;
+            if flip {
+                n = scale_f64(n, -1.0);
+            }
+            let n_f = [n[0] as f32, n[1] as f32, n[2] as f32];
+            let base = verts.len() as u32;
+            for p in [a, b, c] {
+                verts.push(MacroPlanetVertex {
+                    pos: world_f64_to_camera_rel_f32(p, origin_f64),
+                    normal: n_f,
+                    color: col,
+                    emissive_mat: em_prop,
+                    water_ice: [0.0, 0.0, 0.0, 1.0],
+                });
+            }
+            if flip {
+                indices.extend_from_slice(&[base, base + 2, base + 1]);
+            } else {
+                indices.extend_from_slice(&[base, base + 1, base + 2]);
+            }
+        };
+        emit_tri(
+            pt(-hw_wall, 0.0, hl_wall),
+            pt(hw_wall, 0.0, hl_wall),
+            pt(0.0, ridge_height, hl_wall),
+            fwd,
+            gable_col,
+        );
+        emit_tri(
+            pt(hw_wall, 0.0, -hl_wall),
+            pt(-hw_wall, 0.0, -hl_wall),
+            pt(0.0, ridge_height, -hl_wall),
+            scale_f64(fwd, -1.0),
+            gable_col,
+        );
+    }
+
+    let mut emit_quad = |a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3], out_hint: [f64; 3], col: [f32; 4]| {
+        let mut n = normalize3_f64(cross_f64(sub_f64(b, a), sub_f64(c, a)));
+        let flip = dot3_f64(n, out_hint) < 0.0;
+        if flip {
+            n = scale_f64(n, -1.0);
+        }
+        let n_f = [n[0] as f32, n[1] as f32, n[2] as f32];
+        let base = verts.len() as u32;
+        for p in [a, b, c, d] {
+            verts.push(MacroPlanetVertex {
+                pos: world_f64_to_camera_rel_f32(p, origin_f64),
+                normal: n_f,
+                color: col,
+                emissive_mat: em_prop,
+                water_ice: [0.0, 0.0, 0.0, 1.0],
+            });
+        }
+        if flip {
+            indices.extend_from_slice(&[base, base + 3, base + 2, base, base + 2, base + 1]);
+        } else {
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    };
+
+    // 2. Two steep sloped roof planes (with thickness, soffit undersides & overhanging timber eaves!)
+    for side in [-1.0f64, 1.0] {
+        let slope_out = normalize3_f64(add_f64(scale_f64(right, side * ridge_height), scale_f64(up, hw_roof)));
+        let eave_f_top = pt(side * hw_roof, -eave_drop + roof_thick, hl_roof);
+        let eave_b_top = pt(side * hw_roof, -eave_drop + roof_thick, -hl_roof);
+        let ridge_f_top = pt(0.0, ridge_height + roof_thick, hl_roof);
+        let ridge_b_top = pt(0.0, ridge_height + roof_thick, -hl_roof);
+
+        let eave_f_bot = pt(side * hw_roof, -eave_drop, hl_roof);
+        let eave_b_bot = pt(side * hw_roof, -eave_drop, -hl_roof);
+        let ridge_f_bot = pt(0.0, ridge_height, hl_roof);
+        let ridge_b_bot = pt(0.0, ridge_height, -hl_roof);
+
+        // Upper roof slate / shingle surface
+        emit_quad(eave_f_top, eave_b_top, ridge_b_top, ridge_f_top, slope_out, roof_col);
+        // Timber soffit underside
+        emit_quad(eave_b_bot, eave_f_bot, ridge_f_bot, ridge_b_bot, scale_f64(slope_out, -1.0), trim_col);
+        // Eave fascia trim edge
+        emit_quad(eave_b_bot, eave_b_top, eave_f_top, eave_f_bot, scale_f64(right, side), trim_col);
+        // Front & back overhanging bargeboard edges
+        emit_quad(eave_f_bot, eave_f_top, ridge_f_top, ridge_f_bot, fwd, trim_col);
+        emit_quad(eave_b_top, eave_b_bot, ridge_b_bot, ridge_b_top, scale_f64(fwd, -1.0), trim_col);
+
+        // Optional glistening snow-dusted roof crust following the exact pitched slope!
+        if snow_cap {
+            let snow_col = [0.88, 0.93, 0.98, 0.28];
+            let lift = 0.14;
+            let sf_e = pt(side * (hw_roof - 0.10), -eave_drop + roof_thick + lift, hl_roof - 0.08);
+            let sb_e = pt(side * (hw_roof - 0.10), -eave_drop + roof_thick + lift, -hl_roof + 0.08);
+            let sf_r = pt(0.0, ridge_height + roof_thick + lift + 0.06, hl_roof - 0.08);
+            let sb_r = pt(0.0, ridge_height + roof_thick + lift + 0.06, -hl_roof + 0.08);
+            emit_quad(sf_e, sb_e, sb_r, sf_r, slope_out, snow_col);
+        }
+    }
+
+    // 3. Heavy carved timber ridge pole + iconic crossed Nordic dragon-prow finials at both peaks!
+    push_oriented_box_f64(
+        verts,
+        indices,
+        pt(0.0, ridge_height + roof_thick + 0.12, 0.0),
+        right,
+        up,
+        fwd,
+        [0.34, 0.32, wall_length + gable_overhang * 2.15],
+        origin_f64,
+        trim_col,
+        em_prop,
+    );
+    for end_s in [-1.0f64, 1.0] {
+        let apex = pt(0.0, ridge_height + roof_thick + 0.06, end_s * (hl_roof + 0.05));
+        for side in [-1.0f64, 1.0] {
+            let horn_dir = normalize3_f64(add_f64(
+                add_f64(scale_f64(right, side * 0.62), scale_f64(up, 0.78)),
+                scale_f64(fwd, end_s * 0.22),
+            ));
+            let horn_fwd = normalize3_f64(cross_f64(horn_dir, right));
+            push_tapered_frustum_f64(
+                verts,
+                indices,
+                sub_f64(apex, scale_f64(horn_dir, 0.22)),
+                right,
+                horn_dir,
+                horn_fwd,
+                0.15,
+                0.15,
+                0.04,
+                0.04,
+                1.25,
+                side * 0.12,
+                0.0,
+                4,
+                origin_f64,
+                trim_col,
+                [0.42, 0.28, 0.15, 0.76],
+                em_prop,
+                true,
+            );
+        }
     }
 }
 
@@ -3364,6 +5770,25 @@ mod tests {
         assert_eq!(shard_applied, 8);
         assert!(world.has_live_climate());
         assert_eq!(world.hydrated_shard_count(), 1);
+
+        // Verify 100% C0 continuity across all 12 cube-face climate seams (including North Polar +Y)!
+        for face_a in 0..FACE_COUNT {
+            for edge_a in 0..EDGE_COUNT {
+                let link = edge_neighbor(face_a, edge_a);
+                let face_b = link.face;
+                for k in 1..(MACRO_CLIMATE_RES - 1) {
+                    let (xa, ya) = edge_cell_coords(edge_a, k, MACRO_CLIMATE_RES);
+                    let (xb, yb) = link.map_edge_cell(k, MACRO_CLIMATE_RES);
+                    let off_a = (ya * MACRO_CLIMATE_RES + xa) * 4;
+                    let off_b = (yb * MACRO_CLIMATE_RES + xb) * 4;
+                    assert_eq!(
+                        &world.climate_faces[face_a][off_a..off_a + 4],
+                        &world.climate_faces[face_b][off_b..off_b + 4],
+                        "climate seam mismatch between face {face_a} edge {edge_a} k={k} and face {face_b}"
+                    );
+                }
+            }
+        }
 
         let cam_world = virtual_grid_to_world_f64(4, 3.5 * 256.0, 3.5 * 256.0, 28.0, 2048, 1280.0);
         assert!(world.ensure_floating_origin(cam_world));

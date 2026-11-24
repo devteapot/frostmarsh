@@ -23,15 +23,15 @@ use clap::Parser;
 use field_core::planet::{FACE_COUNT, face_uv_to_sphere_dir};
 use field_core::planet_macro::{MacroPlanetConfig, PlanetShardKey};
 use field_core::{
-    biome_name, EntityVoxelPhysics, Field, INPUT_CHANNELS, NUM_BIOMES, NUM_WORLD_LAW_PRESETS,
-    OUTPUT_CHANNELS, RawStepOutput, SP_ICE, SP_OIL, SP_PLANT, SP_ROCK, SP_STEAM, SP_WATER,
-    SP_WOOD, VolumeField, WorldLaws,
+    biome_name, C_NOM, EntityVoxelPhysics, Field, INPUT_CHANNELS, NUM_BIOMES, NUM_SPECIES,
+    NUM_WORLD_LAW_PRESETS, OUTPUT_CHANNELS, RawStepOutput, SP_ICE, SP_OIL, SP_PLANT, SP_ROCK,
+    SP_STEAM, SP_WATER, SP_WOOD, T_AMB, VolumeField, WorldLaws,
 };
 use frostmarsh_proto::*;
 use macro_planet_runtime::{
-    CLIMATE_GRID_N, ClimateInjection, MacroPlanetRuntime, OP_PLANET_CLIMATE_STEP,
-    PlanetClimateOp13Response, ShardSubbrickKey, decode_planet_op13_response,
-    encode_planet_op13_request,
+    CLIMATE_GRID_N, ClimateInjection, MACRO_EVENT_COASTAL_SQUALL, MACRO_EVENT_VOLCANIC_SURGE,
+    MacroPlanetRuntime, NeuralRoiSlab, OP_PLANET_CLIMATE_STEP, PlanetClimateOp13Response,
+    ShardSubbrickKey, decode_planet_op13_response, encode_planet_op13_request,
 };
 use planet_runtime::{
     OP_PLANET_V8_STEP, PLANET_FLAG_FP16_IO, PLANET_FLAG_USE_SPARSE, PlanetOp12Response,
@@ -326,6 +326,83 @@ impl CudaRpcClient {
             &dt_payload,
         )?;
         Ok((flat, gpu_ms, false))
+    }
+
+    /// Wave 38B: Zero-reallocation `op=11` (`OP_WORLD_V8_STEP`) / `op=9` RPC call using persistent
+    /// pre-encoded little-endian byte scratch buffers (eliminates >1.5 GB/tick `mmap`/`munmap` churn!).
+    fn step_world_v8_raw_into(
+        &mut self,
+        batch: usize,
+        gh: usize,
+        gw: usize,
+        req_v8_bytes: &[u8],
+        resp_bytes: &mut Vec<u8>,
+    ) -> Result<(f32, bool), String> {
+        let send_raw = |client: &mut Self, op: u8, payload: &[u8], dst: &mut Vec<u8>| -> Result<f32, (Option<u8>, String)> {
+            client.seq = client.seq.wrapping_add(1);
+            let seq = client.seq;
+            let payload_bytes = payload.len() as u32;
+            let mut hdr = [0u8; 16];
+            hdr[0] = op;
+            hdr[1] = (batch.min(255) as u8).max(1);
+            hdr[2..4].copy_from_slice(&(INPUT_CHANNELS as u16).to_le_bytes());
+            hdr[4..6].copy_from_slice(&(gh as u16).to_le_bytes());
+            hdr[6..8].copy_from_slice(&(gw as u16).to_le_bytes());
+            hdr[8..12].copy_from_slice(&payload_bytes.to_le_bytes());
+            hdr[12..16].copy_from_slice(&seq.to_le_bytes());
+
+            let res = (|| -> Result<f32, (Option<u8>, String)> {
+                let s = client
+                    .ensure_connected()
+                    .map_err(|e| (None, e.to_string()))?;
+                s.write_all(&hdr).map_err(|e| (None, e.to_string()))?;
+                s.write_all(payload).map_err(|e| (None, e.to_string()))?;
+
+                let mut rhdr = [0u8; 16];
+                s.read_exact(&mut rhdr).map_err(|e| (None, e.to_string()))?;
+                let status = rhdr[0];
+                if status != 0 {
+                    return Err((
+                        Some(status),
+                        format!("CUDA daemon op={} returned error status {}", op, status),
+                    ));
+                }
+                let rlen = u32::from_le_bytes(rhdr[8..12].try_into().unwrap()) as usize;
+                let infer_us = u32::from_le_bytes(rhdr[12..16].try_into().unwrap());
+                dst.resize(rlen, 0u8);
+                s.read_exact(dst).map_err(|e| (None, e.to_string()))?;
+                Ok(infer_us as f32 / 1000.0)
+            })();
+
+            if let Err((status, _)) = &res {
+                if *status != Some(1) {
+                    client.stream = None;
+                    client.world_v8_unsupported = false;
+                }
+            }
+            res
+        };
+
+        if !self.world_v8_unsupported {
+            match send_raw(self, 11, req_v8_bytes, resp_bytes) {
+                Ok(gpu_ms) => return Ok((gpu_ms, true)),
+                Err((Some(1), msg)) => {
+                    log::info!(
+                        "CUDA daemon returned STATUS_BAD_REQUEST for op=11 (OP_WORLD_V8_STEP: {}); latching fallback to op=9",
+                        msg
+                    );
+                    self.world_v8_unsupported = true;
+                }
+                Err((_, msg)) => {
+                    log::debug!("CUDA op=11 failed ({}); falling back to op=9", msg);
+                }
+            }
+        }
+
+        let dt_len = req_v8_bytes.len().saturating_sub(24);
+        let gpu_ms = send_raw(self, 9, &req_v8_bytes[..dt_len], resp_bytes)
+            .map_err(|(_, m)| m)?;
+        Ok((gpu_ms, false))
     }
 
     /// Wave 31A: Send pre-encoded `op=12` (`OP_PLANET_V8_STEP`) binary payload to GPU daemon
@@ -1395,6 +1472,8 @@ struct GameState {
     macro_field_tick_cached: u64,
     macro_total_chunks_cached: u16,
     macro_hero_spawn_cached: (u8, f32, f32, f32, f32, f32),
+    macro_local_climate_cached: (f32, f32, f32, f32),
+    macro_peer_climate_cached: HashMap<u32, (f32, f32, f32, f32)>,
     planet_r_core: f32,
     eco: EcosystemState,
     sim_mode: String,
@@ -1643,6 +1722,8 @@ impl GameState {
         let eco = EcosystemState::new(16, 16);
         let use_cuda = backend_name == "cuda-rpc";
         let r_core = config.r_core as f32;
+        let hero_spawn = mr.human_spawn_point();
+        let init_local_climate = mr.sample_local_climate(hero_spawn.0, hero_spawn.1, hero_spawn.2);
 
         let mut gs = Self {
             grid_w,
@@ -1674,7 +1755,9 @@ impl GameState {
                 * (mr.shard_chunks_xy() as usize)
                 * (mr.subbricks_z() as usize))
                 .min(u16::MAX as usize) as u16,
-            macro_hero_spawn_cached: mr.human_spawn_point(),
+            macro_hero_spawn_cached: hero_spawn,
+            macro_local_climate_cached: init_local_climate,
+            macro_peer_climate_cached: HashMap::new(),
             macro_planet_runtime: Some(mr),
             planet_r_core: r_core,
             eco,
@@ -1730,8 +1813,8 @@ impl GameState {
             pending_cryo_bridges: VecDeque::with_capacity(16),
             pending_basalt_quenches: VecDeque::with_capacity(16),
             neural_3d_vertical: false,
-            wind_x: 0.65,
-            wind_y: 0.35,
+            wind_x: init_local_climate.0,
+            wind_y: init_local_climate.1,
             infer_ms_last: 0.0,
             eco_infer_ms: 0.0,
             infer_window: VecDeque::with_capacity(100),
@@ -1867,6 +1950,8 @@ impl GameState {
             macro_field_tick_cached: 0,
             macro_total_chunks_cached: 0,
             macro_hero_spawn_cached: (0, 0.0, 0.0, 0.0, 1.0, 0.0),
+            macro_local_climate_cached: (0.65, 0.35, 15.0, 0.0),
+            macro_peer_climate_cached: HashMap::new(),
             planet_r_core: r_core,
             eco,
             sim_mode: "neural".to_string(),
@@ -2035,6 +2120,8 @@ impl GameState {
             macro_field_tick_cached: 0,
             macro_total_chunks_cached: 0,
             macro_hero_spawn_cached: (0, 0.0, 0.0, 0.0, 1.0, 0.0),
+            macro_local_climate_cached: (0.65, 0.35, 15.0, 0.0),
+            macro_peer_climate_cached: HashMap::new(),
             planet_r_core: 0.0,
             eco,
             sim_mode: "neural".to_string(),
@@ -3608,9 +3695,10 @@ impl GameState {
         if let Some((vf, lx, ly)) = self.volume_at_mut(p_face, tx, ty) {
             vf.apply_physical_actuator(lx, ly, layer, tf_s, sw_s, so_s, ss_s, r);
         }
-        // Wave 34A: Massive local heat/smoke actuators upscale directly into PlanetaryClimateNet (op=13)!
-        if tf_s > 0.65 || (tf_s > 0.45 && ss_s > 0.45) {
-            if let Some(ref mut mr) = self.macro_planet_runtime {
+        // Wave 38B: Prioritize sub-bricks around live actuators + upscale intense heat/smoke to op=13
+        if let Some(ref mut mr) = self.macro_planet_runtime {
+            mr.mark_priority_subbricks_around(p_face, tx, ty, z1_beam, r + 4.0);
+            if tf_s > 0.65 || (tf_s > 0.45 && ss_s > 0.45) {
                 mr.enqueue_climate_injection_virtual(
                     p_face,
                     tx,
@@ -4333,6 +4421,12 @@ impl GameState {
                     owner: 0,
                 })
                 .collect();
+            let hero_sp = mr.human_spawn_point();
+            self.macro_hero_spawn_cached = hero_sp;
+            self.macro_local_climate_cached = mr.sample_local_climate(hero_sp.0, hero_sp.1, hero_sp.2);
+            self.macro_peer_climate_cached.clear();
+            self.wind_x = self.macro_local_climate_cached.0;
+            self.wind_y = self.macro_local_climate_cached.1;
             self.macro_planet_runtime = Some(mr);
             self.mass_error = 0;
             self.energy_error = 0;
@@ -6867,6 +6961,9 @@ impl GameState {
                     let (wu, wv, _, _) = mr.sample_local_climate(face, x, y);
                     eff_vx += wu * 0.45;
                     eff_vy += wv * 0.45;
+                } else if self.macro_planet_enabled {
+                    eff_vx += self.macro_local_climate_cached.0 * 0.45;
+                    eff_vy += self.macro_local_climate_cached.1 * 0.45;
                 }
             }
             kb_vx *= 0.82;
@@ -7483,6 +7580,11 @@ impl GameState {
                 (self.chunks_x * self.chunks_y * self.grid_d) as u16,
             )
         };
+        let (default_wu, default_wv, default_tc, default_cc) = if self.macro_planet_enabled {
+            self.macro_local_climate_cached
+        } else {
+            (self.wind_x, self.wind_y, 15.0, 0.0)
+        };
         let telemetry = TelemetrySnap {
             mode: self.sim_mode.clone(),
             backend: self.backend_name.clone(),
@@ -7527,10 +7629,10 @@ impl GameState {
             planet_seed,
             climate_infer_ms,
             active_hydrated_shards,
-            local_wind_u: self.wind_x,
-            local_wind_v: self.wind_y,
-            local_temp_c: 15.0,
-            local_cloud_cover: 0.0,
+            local_wind_u: default_wu,
+            local_wind_v: default_wv,
+            local_temp_c: default_tc,
+            local_cloud_cover: default_cc,
         };
         let match_secs = (self.match_elapsed_offset_secs + self.match_start_instant.elapsed().as_secs()) as u32;
         let kill_feed: Vec<KillFeedEntry> = self.kill_feed.iter().cloned().collect();
@@ -7622,6 +7724,16 @@ impl GameState {
                 peer_telemetry.local_wind_v = wv;
                 peer_telemetry.local_temp_c = tc;
                 peer_telemetry.local_cloud_cover = cc;
+            } else if self.macro_planet_enabled {
+                let (wu, wv, tc, cc) = self
+                    .macro_peer_climate_cached
+                    .get(&pid)
+                    .copied()
+                    .unwrap_or(self.macro_local_climate_cached);
+                peer_telemetry.local_wind_u = wu;
+                peer_telemetry.local_wind_v = wv;
+                peer_telemetry.local_temp_c = tc;
+                peer_telemetry.local_cloud_cover = cc;
             }
             let msg = ServerDatagram::EntitySnapshot {
                 sim_tick: tick,
@@ -7673,6 +7785,7 @@ impl GameState {
             self.record_player_persistence(pid);
             self.peers.remove(&pid);
             self.players.remove(&pid);
+            self.macro_peer_climate_cached.remove(&pid);
         }
     }
 
@@ -8589,7 +8702,7 @@ impl GameState {
             return;
         }
         let rt_handle = self.rt_handle.clone();
-        const MAX_MACRO_BYTES_PER_PEER_TICK: u64 = 32 * 1024;
+        const MAX_MACRO_BYTES_PER_PEER_TICK: u64 = 18 * 1024;
         const NEAR_SHARD_STREAM_DIST_M: f32 = 192.0;
 
         let peer_count = self.peers.len().max(1) as u64;
@@ -8736,6 +8849,247 @@ impl GameState {
     }
 }
 
+/// Wave 38B: Persistent zero-reallocation `op=11` (`OP_WORLD_V8_STEP`) scratch buffer pool owned
+/// by the `--planet-macro` background thread. Reuses `req_bytes`, `resp_bytes`, `raws`, and
+/// `z_flux` across ticks and encodes/decodes layers in parallel across CPU cores!
+struct Op11Scratch {
+    req_bytes: Vec<u8>,
+    resp_bytes: Vec<u8>,
+    raws: Vec<RawStepOutput>,
+    z_flux: Vec<f32>,
+}
+
+impl Op11Scratch {
+    fn new() -> Self {
+        Self {
+            req_bytes: Vec::new(),
+            resp_bytes: Vec::new(),
+            raws: Vec::new(),
+            z_flux: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn encode_slab_v8_request(
+        &mut self,
+        vf: &VolumeField,
+        slab_z0: usize,
+        slab_len: usize,
+        laws: WorldLaws,
+    ) {
+        self.encode_roi_slab_v8_request(vf, 0, 0, vf.width, vf.height, slab_z0, slab_len, laws);
+    }
+
+    /// Wave 39B: Zero-reallocation `128×128×16` (or arbitrary `16`-aligned ROI) `op=11` encoder.
+    /// Extracts `[x0..x0+roi_w, y0..y0+roi_h, slab_z0..slab_z0+slab_len)` in parallel across CPU cores!
+    #[allow(clippy::too_many_arguments)]
+    fn encode_roi_slab_v8_request(
+        &mut self,
+        vf: &VolumeField,
+        x0: usize,
+        y0: usize,
+        roi_w: usize,
+        roi_h: usize,
+        slab_z0: usize,
+        slab_len: usize,
+        laws: WorldLaws,
+    ) {
+        let len = roi_w * roi_h;
+        let layer_bytes = INPUT_CHANNELS * len * 4;
+        let dt_bytes = len * 4;
+        let laws_bytes = 6 * 4;
+        let total_bytes = slab_len * layer_bytes + dt_bytes + laws_bytes;
+        if self.req_bytes.len() != total_bytes {
+            self.req_bytes.resize(total_bytes, 0u8);
+        }
+
+        let (state_dst, tail_dst) = self.req_bytes.split_at_mut(slab_len * layer_bytes);
+        let layers_slice = &vf.layers[slab_z0..slab_z0 + slab_len];
+
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 8)
+            .min(slab_len.max(1));
+
+        if n_threads <= 1 || slab_len <= 2 {
+            for (i, layer) in layers_slice.iter().enumerate() {
+                let dst = &mut state_dst[i * layer_bytes..(i + 1) * layer_bytes];
+                encode_layer_roi_18ch_le_bytes(layer, x0, y0, roi_w, roi_h, dst);
+            }
+        } else {
+            let chunk_layers = slab_len.div_ceil(n_threads);
+            let chunk_bytes = chunk_layers * layer_bytes;
+            std::thread::scope(|sc| {
+                for (ci, dst_chunk) in state_dst.chunks_mut(chunk_bytes).enumerate() {
+                    let l0 = ci * chunk_layers;
+                    let l1 = (l0 + chunk_layers).min(slab_len);
+                    let src_layers = &layers_slice[l0..l1];
+                    sc.spawn(move || {
+                        for (j, layer) in src_layers.iter().enumerate() {
+                            let dst = &mut dst_chunk[j * layer_bytes..(j + 1) * layer_bytes];
+                            encode_layer_roi_18ch_le_bytes(layer, x0, y0, roi_w, roi_h, dst);
+                        }
+                    });
+                }
+            });
+        }
+
+        // local_dt_map = 1.0f32 everywhere + 6-float world_laws
+        let one_le = 1.0f32.to_le_bytes();
+        for chunk in tail_dst[..dt_bytes].chunks_exact_mut(4) {
+            chunk.copy_from_slice(&one_le);
+        }
+        let law_vals = [
+            laws.gravity_g,
+            laws.ambient_temp_shift,
+            laws.volatility,
+            laws.viscosity,
+            laws.precipitation,
+            laws.thermal_cond,
+        ];
+        for (i, &v) in law_vals.iter().enumerate() {
+            tail_dst[dt_bytes + i * 4..dt_bytes + (i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    fn decode_response(&mut self, slab_len: usize, gw: usize, gh: usize) -> bool {
+        let per = OUTPUT_CHANNELS * gw * gh;
+        let horiz_len = slab_len * per;
+        let z_len = slab_len.saturating_sub(1) * 5 * gw * gh;
+        let expected_bytes = (horiz_len + z_len) * 4;
+        if self.resp_bytes.len() != expected_bytes {
+            return false;
+        }
+
+        if self.raws.len() < slab_len {
+            self.raws.resize_with(slab_len, || RawStepOutput {
+                width: gw,
+                height: gh,
+                data: vec![0.0f32; per],
+            });
+        }
+        for r in self.raws.iter_mut().take(slab_len) {
+            r.width = gw;
+            r.height = gh;
+            if r.data.len() != per {
+                r.data.resize(per, 0.0f32);
+            }
+        }
+
+        let resp_ref: &[u8] = &self.resp_bytes;
+        let per_bytes = per * 4;
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 8)
+            .min(slab_len.max(1));
+
+        if n_threads <= 1 || slab_len <= 2 {
+            for (l, raw) in self.raws.iter_mut().take(slab_len).enumerate() {
+                let src = &resp_ref[l * per_bytes..(l + 1) * per_bytes];
+                for (dst_f, b) in raw.data.iter_mut().zip(src.chunks_exact(4)) {
+                    *dst_f = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                }
+            }
+        } else {
+            let chunk_layers = slab_len.div_ceil(n_threads);
+            std::thread::scope(|sc| {
+                for (ci, raws_chunk) in self.raws[..slab_len].chunks_mut(chunk_layers).enumerate() {
+                    let l0 = ci * chunk_layers;
+                    sc.spawn(move || {
+                        for (j, raw) in raws_chunk.iter_mut().enumerate() {
+                            let l = l0 + j;
+                            let src = &resp_ref[l * per_bytes..(l + 1) * per_bytes];
+                            for (dst_f, b) in raw.data.iter_mut().zip(src.chunks_exact(4)) {
+                                *dst_f = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        if z_len > 0 {
+            if self.z_flux.len() != z_len {
+                self.z_flux.resize(z_len, 0.0f32);
+            }
+            let z_src = &resp_ref[horiz_len * 4..];
+            for (dst_f, b) in self.z_flux.iter_mut().zip(z_src.chunks_exact(4)) {
+                *dst_f = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        } else {
+            self.z_flux.clear();
+        }
+        true
+    }
+}
+
+/// Bit-exact zero-allocation ROI encoder matching `Field::encode_input_tensor()` into LE bytes
+/// for sub-rectangle `[x0..x0+roi_w, y0..y0+roi_h)`.
+#[inline]
+fn encode_layer_roi_18ch_le_bytes(
+    layer: &Field,
+    x0: usize,
+    y0: usize,
+    roi_w: usize,
+    roi_h: usize,
+    dst: &mut [u8],
+) {
+    let w = layer.width;
+    let len = roi_w * roi_h;
+    let inv_cnom = 1.0f32 / (C_NOM as f32);
+    let inv_31 = 1.0f32 / 31.0f32;
+    let inv_10k = 1.0f32 / 10_000.0f32;
+    let inv_1e8 = 1.0f32 / 1.0e8f32;
+    let write_f32 = |buf: &mut [u8], ch: usize, lidx: usize, v: f32| {
+        let off = (ch * len + lidx) * 4;
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    for ly in 0..roi_h {
+        let g_row = (y0 + ly) * w + x0;
+        let l_row = ly * roi_w;
+        for lx in 0..roi_w {
+            let gidx = g_row + lx;
+            let lidx = l_row + lx;
+            let mut tot = 0u32;
+            for s in 0..NUM_SPECIES {
+                let m = layer.mass[s][gidx];
+                tot += m as u32;
+                write_f32(dst, s, lidx, (m as f32) * inv_cnom);
+            }
+            let t = layer.cell_temp_ck(gidx);
+            write_f32(dst, 10, lidx, ((t - T_AMB) as f32) * inv_10k);
+            write_f32(dst, 11, lidx, (1.0 + (tot as f32) * inv_cnom).ln());
+            write_f32(dst, 12, lidx, (layer.flow_e[gidx] as f32) * inv_cnom);
+            write_f32(dst, 13, lidx, (layer.flow_s[gidx] as f32) * inv_cnom);
+            write_f32(dst, 14, lidx, (layer.elevation[gidx] as f32) * inv_31);
+            write_f32(
+                dst,
+                15,
+                lidx,
+                if layer.mass[SP_ROCK][gidx] >= 500 {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            write_f32(
+                dst,
+                16,
+                lidx,
+                ((layer.forcing_energy[gidx] as f32) * inv_1e8).clamp(-10.0, 10.0),
+            );
+            write_f32(
+                dst,
+                17,
+                lidx,
+                ((layer.forcing_mass[gidx] as f32) * inv_cnom).clamp(-4.0, 4.0),
+            );
+        }
+    }
+}
+
 fn make_quic_server_config() -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let cert = rcgen::generate_simple_self_signed(vec![
         "localhost".into(),
@@ -8825,7 +9179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         };
         gs.entity_aoi_radius = args.entity_aoi_radius;
-        gs.persistent_world = args.persistent_world;
+        gs.persistent_world = args.persistent_world || args.planet_macro;
         if !args.planet && !args.planet_macro {
             if let Some(ref sf) = args.state_file {
                 if sf.exists() {
@@ -8984,11 +9338,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let period = Duration::from_millis(100);
         if macro_planet_flag {
+            let mut op11_scratch = Op11Scratch::new();
+            let mut op11_cadence: u64 = 2; // Adaptive cadence: 1 (10 Hz) when fast, 2-3 when heavy
+            let mut op11_last_ms: f32 = 0.0;
             loop {
                 let t_loop = Instant::now();
-                // 1. Lock GameState for <0.05 ms ONLY to take MacroPlanetRuntime out + copy observer coords.
+                // 1. Lock GameState for <0.05 ms ONLY to take MacroPlanetRuntime out + copy observer/actuator coords.
                 //    Guarantees the 30 Hz player WASD / combat / snapshot loop NEVER stalls on 4.19M-voxel ticks!
-                let (mut mr_opt, observers, use_neural) = {
+                let (mut mr_opt, observers, priority_focus, use_neural) = {
                     let mut gs = field_state.lock().unwrap();
                     let obs: Vec<(u8, f32, f32)> = gs
                         .players
@@ -8996,12 +9353,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .filter(|p| !p.is_bot)
                         .map(|p| (p.face, p.x, p.y))
                         .collect();
+                    let mut focus = obs.clone();
+                    let hero_face = gs.macro_hero_spawn_cached.0;
+                    for &(_, _, ax, ay, _, exp) in &gs.recent_actuators {
+                        if gs.sim_tick <= exp && focus.len() < 16 {
+                            focus.push((hero_face, ax, ay));
+                        }
+                    }
                     let neural = gs.sim_mode == "neural" && cuda_rpc.is_some();
-                    (gs.macro_planet_runtime.take(), obs, neural)
+                    (gs.macro_planet_runtime.take(), obs, focus, neural)
                 };
 
-                // 2. 100% LOCK-FREE: shard hydration, tensor encoding, CUDA op=13 & op=11, and step_macro_tick!
+                // 2. 100% LOCK-FREE: shard hydration, zero-alloc op=11 active slab, CUDA op=13, and parallel step_macro_tick_slab!
                 let outcome_opt = if let Some(ref mut mr) = mr_opt {
+                    mr.set_priority_focus(&priority_focus);
                     let newly_hyd = mr.ensure_hydrated_around_observers(&observers);
                     for k in newly_hyd {
                         log::info!(
@@ -9018,7 +9383,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     let climate_req_opt = if should_clim && use_neural && mr.op13_backoff == 0 {
                         let next_sun = macro_planet_runtime::macro_sun_dir_from_angle(
-                            (mr.sun_angle + mr.sun_speed_rad_per_tick).rem_euclid(std::f32::consts::TAU),
+                            (mr.sun_angle + mr.sun_speed_rad_per_tick)
+                                .rem_euclid(std::f32::consts::TAU),
                         );
                         Some(encode_planet_op13_request(
                             mr.config().seed,
@@ -9029,59 +9395,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         None
                     };
-                    let hero_op11_prep = if use_neural {
-                        let hk = mr.hero_site.shard_key;
-                        mr.planet.shards.get(&hk).map(|vf| {
-                            let bin = vf.encode_batched_input_tensor();
-                            let dt_map = vec![1.0f32; vf.width * vf.height];
-                            (vf.depth, vf.height, vf.width, bin, dt_map, vf.world_laws)
-                        })
-                    } else {
-                        None
-                    };
 
                     let mut op13_outcome: Option<Result<PlanetClimateOp13Response, String>> = None;
                     if let (Some(rpc), Some(payload)) = (cuda_rpc.as_mut(), climate_req_opt) {
                         op13_outcome = Some(rpc.step_planet_climate_raw(&payload));
                     }
-                    let mut hero_op11_res: Option<(Vec<RawStepOutput>, Option<Vec<f32>>, f32, f32)> = None;
-                    if let (Some(rpc), Some((gd, gh, gw, bin, dt_map, laws))) =
-                        (cuda_rpc.as_mut(), hero_op11_prep)
-                    {
-                        let per = OUTPUT_CHANNELS * gw * gh;
-                        let horiz_len = gd * per;
-                        let z_len = gd.saturating_sub(1) * 5 * gw * gh;
-                        if let Ok((flat, gpu_ms, _used_v8)) =
-                            rpc.step_world_v8(gd, gh, gw, &bin, &dt_map, laws)
+
+                    // Wave 39B: Active 128×128×16 Hero ROI slab (16-voxel brick aligned) + quantized
+                    // climate WorldLaws so SparseWorld3DV8Runner keeps >80% sparse brick cache hits!
+                    let tick_now = mr.planet.tick;
+                    let run_op11_this_tick = use_neural
+                        && (tick_now == 0 || (tick_now % op11_cadence.max(1)) == 0);
+                    let mut op11_roi_meta: Option<(usize, usize, usize, usize, usize, usize, bool, f32, f32)> = None;
+                    if run_op11_this_tick {
+                        let hk = mr.hero_site.shard_key;
+                        if let (Some(rpc), Some(vf)) =
+                            (cuda_rpc.as_mut(), mr.planet.shards.get(&hk))
                         {
-                            if flat.len() == horiz_len + z_len {
-                                let raws: Vec<RawStepOutput> = (0..gd)
-                                    .map(|l| RawStepOutput {
-                                        width: gw,
-                                        height: gh,
-                                        data: flat[l * per..(l + 1) * per].to_vec(),
-                                    })
-                                    .collect();
-                                let zf = if z_len > 0 {
-                                    Some(flat[horiz_len..].to_vec())
-                                } else {
-                                    None
-                                };
-                                hero_op11_res = Some((raws, zf, gpu_ms, 0.25));
+                            let t_op11 = Instant::now();
+                            let (rx0, ry0, roi_w, roi_h, slab_z0, slab_z1) =
+                                mr.active_op11_hero_roi(vf.width, vf.height, vf.depth, &observers);
+                            let slab_len = slab_z1.saturating_sub(slab_z0);
+                            if slab_len > 0 && roi_w > 0 && roi_h > 0 {
+                                // Quantize climate-driven WorldLaws so sub-0.5C / sub-0.05 precip jitter
+                                // never invalidates SparseWorld3DV8Runner's sparse brick cache!
+                                let mut op11_laws = vf.world_laws;
+                                op11_laws.ambient_temp_shift =
+                                    (op11_laws.ambient_temp_shift / 50.0).round() * 50.0;
+                                op11_laws.precipitation =
+                                    (op11_laws.precipitation * 20.0).round() / 20.0;
+                                op11_scratch.encode_roi_slab_v8_request(
+                                    vf,
+                                    rx0,
+                                    ry0,
+                                    roi_w,
+                                    roi_h,
+                                    slab_z0,
+                                    slab_len,
+                                    op11_laws,
+                                );
+                                if let Ok((_gpu_ms, _used_v8)) = rpc.step_world_v8_raw_into(
+                                    slab_len,
+                                    roi_h,
+                                    roi_w,
+                                    &op11_scratch.req_bytes,
+                                    &mut op11_scratch.resp_bytes,
+                                ) {
+                                    if op11_scratch.decode_response(slab_len, roi_w, roi_h) {
+                                        let total_op11_ms =
+                                            t_op11.elapsed().as_secs_f32() * 1000.0;
+                                        op11_last_ms = total_op11_ms;
+                                        op11_cadence = if total_op11_ms < 28.0 {
+                                            1
+                                        } else if total_op11_ms < 55.0 {
+                                            2
+                                        } else {
+                                            3
+                                        };
+                                        let has_z = slab_z0 == 0
+                                            && slab_len == vf.depth
+                                            && roi_w == vf.width
+                                            && roi_h == vf.height
+                                            && !op11_scratch.z_flux.is_empty();
+                                        let roi_vol_frac = ((roi_w * roi_h * slab_len) as f32
+                                            / (vf.width * vf.height * vf.depth).max(1) as f32)
+                                            .clamp(0.05, 1.0);
+                                        op11_roi_meta = Some((
+                                            rx0,
+                                            ry0,
+                                            roi_w,
+                                            roi_h,
+                                            slab_z0,
+                                            slab_len,
+                                            has_z,
+                                            total_op11_ms,
+                                            roi_vol_frac,
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
 
-                    Some(mr.step_macro_tick(
-                        op13_outcome,
-                        &drained_injections,
-                        hero_op11_res,
-                    ))
+                    let roi_arg = op11_roi_meta.map(
+                        |(x0, y0, roi_w, roi_h, z0, slen, has_z, ms, afrac)| NeuralRoiSlab {
+                            x0,
+                            y0,
+                            roi_w,
+                            roi_h,
+                            z0,
+                            horiz: &op11_scratch.raws[..slen],
+                            z_flux: if has_z {
+                                Some(op11_scratch.z_flux.as_slice())
+                            } else {
+                                None
+                            },
+                            op11_ms: ms,
+                            active_frac: afrac,
+                        },
+                    );
+
+                    Some(mr.step_macro_tick_roi_slab(op13_outcome, &drained_injections, roi_arg))
                 } else {
                     None
                 };
 
-                // 3. Brief lock (<1 ms): restore MacroPlanetRuntime, refresh cached telemetry, & broadcast sub-bricks!
+                // 3. Brief lock (<1 ms): restore MacroPlanetRuntime, refresh cached telemetry & live climate, & broadcast sub-bricks!
                 {
                     let mut gs = field_state.lock().unwrap();
                     if let (Some(ref mut mr), Some(outcome)) = (mr_opt.as_mut(), outcome_opt) {
@@ -9128,6 +9547,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 outcome.splashed_fluid_mass
                             );
                         }
+                        // Wave 38B: Announce gentle periodic natural planetary world events (~45 s cadence)
+                        if let Some(ref ev) = outcome.world_event {
+                            gs.weather_kind = match ev.kind {
+                                MACRO_EVENT_VOLCANIC_SURGE => WEATHER_EMBER,
+                                MACRO_EVENT_COASTAL_SQUALL => WEATHER_SQUALL,
+                                _ => WEATHER_CLEAR,
+                            };
+                            gs.push_event(4, ev.x, ev.y, 0, 2, ev.title.clone());
+                            gs.push_speech_bubble(SpeechBubbleSnap {
+                                speaker_id: 0,
+                                speaker_name: "PLANET CLIMATE".into(),
+                                team: 2,
+                                x: ev.x,
+                                y: ev.y,
+                                z: ev.z,
+                                snr_db: 22.0,
+                                symbol_id: 4,
+                                text: ev.title.clone(),
+                                tick: sim_tick_u32,
+                                face: ev.face,
+                            });
+                            log::info!(
+                                "MACRO PLANET EVENT (tick={}): {} (face={}, pos=({:.0},{:.0}))",
+                                outcome.tick,
+                                ev.title,
+                                ev.face,
+                                ev.x,
+                                ev.y
+                            );
+                        }
+
+                        // Wave 38B: Refresh live climate cache for hero site & EVERY connected peer so 30 Hz
+                        // EntitySnapshot telemetry ALWAYS shows live TEMP/WIND/CLOUDS even when mr is off-lock!
+                        let primary_sample_pt = gs
+                            .players
+                            .values()
+                            .find(|p| !p.is_bot)
+                            .map(|p| (p.face, p.x, p.y))
+                            .unwrap_or((
+                                mr.hero_site.shard_key.face,
+                                mr.hero_site.beach_gx,
+                                mr.hero_site.beach_gy,
+                            ));
+                        let live_hero_clim = mr.sample_local_climate(
+                            primary_sample_pt.0,
+                            primary_sample_pt.1,
+                            primary_sample_pt.2,
+                        );
+                        gs.macro_local_climate_cached = live_hero_clim;
+                        gs.wind_x = live_hero_clim.0;
+                        gs.wind_y = live_hero_clim.1;
+                        gs.macro_peer_climate_cached.clear();
+                        let peer_ids: Vec<u32> = gs.peers.keys().copied().collect();
+                        for pid in peer_ids {
+                            if let Some(p) = gs.players.get(&pid) {
+                                let c = mr.sample_local_climate(p.face, p.x, p.y);
+                                gs.macro_peer_climate_cached.insert(pid, c);
+                            }
+                        }
+
                         gs.backend_name = outcome.backend.clone();
                         gs.infer_ms_last = outcome.infer_ms;
                         if gs.infer_window.len() >= 100 {
@@ -9151,7 +9630,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             (per_shard_sb * (outcome.active_hydrated_shards as usize).max(1))
                                 .min(u16::MAX as usize) as u16;
                         let dirty_sb = outcome.dirty_subbricks;
+                        let pending_sb = outcome.pending_dirty_subbricks;
                         let log_tick = outcome.tick;
+                        let log_op11_ms = if outcome.op11_ms > 0.0 {
+                            outcome.op11_ms
+                        } else {
+                            op11_last_ms
+                        };
+                        let log_cpu_step_ms = outcome.cpu_step_ms;
                         let log_clim_ms = outcome.climate_infer_ms;
                         let log_hyd = outcome.active_hydrated_shards;
                         let log_seam_tick = outcome.seam_mass_crossed;
@@ -9164,11 +9650,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if log_tick % 10 == 0 {
                             let bot_cnt = gs.players.values().filter(|p| p.is_bot).count();
                             log::info!(
-                                "macro_tick={} backend={} infer={:.2}ms climate={:.2}ms hydrated={} mass_err={} energy_err={} seam_mass={} (+{}) sky_cores={} bot_seams={} bots={} dirty_sb={} wire={:.1}KB/s peers={}",
+                                "macro_tick={} backend={} infer={:.2}ms op11={:.2}ms cpu_step={:.2}ms climate={:.2}ms temp={:.1}C clouds={:.0}% hydrated={} mass_err={} energy_err={} seam_mass={} (+{}) sky_cores={} bot_seams={} bots={} dirty_sb={}/{} wire={:.1}KB/s peers={}",
                                 log_tick,
                                 gs.backend_name,
                                 gs.infer_ms_last,
+                                log_op11_ms,
+                                log_cpu_step_ms,
                                 log_clim_ms,
+                                live_hero_clim.2,
+                                live_hero_clim.3 * 100.0,
                                 log_hyd,
                                 gs.mass_error,
                                 gs.energy_error,
@@ -9178,6 +9668,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 log_cross,
                                 bot_cnt,
                                 dirty_sb.len(),
+                                pending_sb,
                                 gs.wire_kbps,
                                 gs.peers.len()
                             );
@@ -11240,5 +11731,153 @@ mod tests {
         }
         assert!(saw_any, "expected at least one incremental macro shard sub-brick update");
         assert!(saw_delta, "expected at least one PlanetShardBrick3DDelta temporal delta packet");
+    }
+
+    #[tokio::test]
+    async fn test_wave38b_live_climate_cache_offlock_and_op11_scratch_parity() {
+        let mut cfg = MacroPlanetConfig::default();
+        cfg.shard_size = 32;
+        cfg.depth = 32;
+        cfg.shards_per_face_axis = 4;
+
+        let mut gs = GameState::new_macro_planet(
+            "refsim".to_string(),
+            "127.0.0.1:14440".to_string(),
+            cfg,
+            12,
+            4,
+        );
+        // 1. Macro planet must stay persistent_world == true and initialize live local climate (not static 0% clouds!)
+        assert!(gs.persistent_world, "macro planet must default to persistent_world = true");
+        let (init_wu, init_wv, init_tc, init_cc) = gs.macro_local_climate_cached;
+        assert!(
+            init_cc > 0.01,
+            "initial live macro_local_climate_cached must have non-zero cloud cover, got {}",
+            init_cc
+        );
+        assert!(
+            init_wu.hypot(init_wv) > 0.05 && init_tc.is_finite(),
+            "initial live climate wind/temp must be live, got wu={} wv={} tc={}",
+            init_wu,
+            init_wv,
+            init_tc
+        );
+
+        // 2. Apply a live op=13 climate step and verify cached climate persists even when runtime is off-lock (`None`)!
+        let hero_f = gs.macro_hero_spawn_cached.0;
+        let hero_x = gs.macro_hero_spawn_cached.1;
+        let hero_y = gs.macro_hero_spawn_cached.2;
+        let mut rgba_faces: [Vec<u8>; FACE_COUNT] =
+            std::array::from_fn(|_| vec![0u8; macro_planet_runtime::CLIMATE_FACE_RGBA_BYTES]);
+        let mut wind_uv_faces: [Vec<f32>; FACE_COUNT] =
+            std::array::from_fn(|_| vec![0.0f32; macro_planet_runtime::CLIMATE_FACE_WIND_FLOATS]);
+        for pix in 0..macro_planet_runtime::CLIMATE_FACE_PIXELS {
+            rgba_faces[hero_f as usize][pix * 4] = 192; // ~300.2K = +27.1C
+            rgba_faces[hero_f as usize][pix * 4 + 1] = 168; // ~65.9% cloud cover
+            wind_uv_faces[hero_f as usize][pix * 2] = 3.2;
+            wind_uv_faces[hero_f as usize][pix * 2 + 1] = -1.8;
+        }
+        let op13 = PlanetClimateOp13Response {
+            infer_ms: 5.2,
+            mean_temp_k: 295.0,
+            rgba_faces,
+            wind_uv_faces,
+        };
+        let pid = gs.spawn_player("WeatherWatcher".into(), 0, CLASS_WARDEN, false);
+        let outcome = gs
+            .macro_planet_runtime
+            .as_mut()
+            .unwrap()
+            .step_macro_tick_slab(Some(Ok(op13)), &[], None);
+        assert_eq!(outcome.global_mass_error, 0);
+        assert_eq!(outcome.global_energy_error, 0);
+        assert!(outcome.dirty_subbricks.len() <= macro_planet_runtime::DEFAULT_SUBBRICK_REFRESH_BUDGET);
+
+        // Refresh cached climate just as the background macro loop does, then take runtime off-lock (`None`)!
+        {
+            let mr = gs.macro_planet_runtime.as_ref().unwrap();
+            let c = mr.sample_local_climate(hero_f, hero_x, hero_y);
+            gs.macro_local_climate_cached = c;
+            gs.macro_peer_climate_cached.insert(pid, c);
+        }
+        let taken = gs.macro_planet_runtime.take();
+        assert!(gs.macro_planet_runtime.is_none());
+        let cached = gs
+            .macro_peer_climate_cached
+            .get(&pid)
+            .copied()
+            .unwrap_or(gs.macro_local_climate_cached);
+        assert!(cached.3 > 0.60, "off-lock cached cloud cover must stay > 0.60, got {}", cached.3);
+        assert!(cached.2 > 24.0, "off-lock cached temp_c must stay > 24C (not 15.0C), got {}", cached.2);
+        assert!(cached.0.hypot(cached.1) > 3.0, "off-lock cached wind must match live op=13");
+        gs.macro_planet_runtime = taken;
+
+        // 3. Verify zero-allocation parallel Op11Scratch encoder is bit-exact against VolumeField::encode_batched_input_tensor!
+        let mr = gs.macro_planet_runtime.as_ref().unwrap();
+        let vf = mr.planet.shards.get(&mr.hero_site.shard_key).unwrap();
+        let ref_tensor = vf.encode_batched_input_tensor();
+        let (z0, z1) = mr.active_op11_slab_range(vf.depth);
+        let slab_len = z1 - z0;
+        let mut scratch = Op11Scratch::new();
+        scratch.encode_slab_v8_request(vf, z0, slab_len, vf.world_laws);
+
+        let per_layer_f32 = INPUT_CHANNELS * vf.width * vf.height;
+        let ref_slice = &ref_tensor[z0 * per_layer_f32..z1 * per_layer_f32];
+        assert_eq!(
+            scratch.req_bytes.len(),
+            ref_slice.len() * 4 + vf.width * vf.height * 4 + 24
+        );
+        for (i, &expected_f) in ref_slice.iter().enumerate() {
+            let got_f = f32::from_le_bytes(
+                scratch.req_bytes[i * 4..(i + 1) * 4].try_into().unwrap(),
+            );
+            assert!(
+                (got_f - expected_f).abs() < 1e-6,
+                "Op11Scratch mismatch at elem {}: got {} expected {}",
+                i,
+                got_f,
+                expected_f
+            );
+        }
+
+        // 4. Wave 39B: Verify 16-voxel aligned sub-rectangle ROI crop matches VolumeField::encode_batched_input_tensor!
+        let (rx0, ry0, roi_w, roi_h) = (8usize, 8usize, 16usize, 16usize);
+        scratch.encode_roi_slab_v8_request(vf, rx0, ry0, roi_w, roi_h, z0, slab_len, vf.world_laws);
+        let roi_layer_f32 = INPUT_CHANNELS * roi_w * roi_h;
+        assert_eq!(
+            scratch.req_bytes.len(),
+            slab_len * roi_layer_f32 * 4 + roi_w * roi_h * 4 + 24
+        );
+        for l_rel in 0..slab_len {
+            let z = z0 + l_rel;
+            for c in 0..INPUT_CHANNELS {
+                for ly in 0..roi_h {
+                    for lx in 0..roi_w {
+                        let ref_idx = z * per_layer_f32
+                            + c * vf.width * vf.height
+                            + (ry0 + ly) * vf.width
+                            + (rx0 + lx);
+                        let roi_idx =
+                            l_rel * roi_layer_f32 + c * roi_w * roi_h + ly * roi_w + lx;
+                        let got_f = f32::from_le_bytes(
+                            scratch.req_bytes[roi_idx * 4..(roi_idx + 1) * 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let expected_f = ref_tensor[ref_idx];
+                        assert!(
+                            (got_f - expected_f).abs() < 1e-6,
+                            "Wave39B ROI mismatch at (z={},c={},x={},y={}): got {} expected {}",
+                            z,
+                            c,
+                            lx,
+                            ly,
+                            got_f,
+                            expected_f
+                        );
+                    }
+                }
+            }
+        }
     }
 }

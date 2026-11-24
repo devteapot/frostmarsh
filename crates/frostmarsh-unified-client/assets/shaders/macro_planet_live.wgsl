@@ -1,33 +1,49 @@
-// Wave 34B: Live Locally-Flat R = 1,304 m Dual-Scale Spherical Clipmap +
-//           Live Coriolis PlanetaryClimateNet Clouds/Storms Metal Shader (`macro_planet_live.wgsl`)
+// Wave 34B + Wave 38A: Live Locally-Flat R = 1,304 m Dual-Scale Spherical Clipmap +
+//                      Real-Time 2048x2048 3x3 PCF Sun Shadows + Separable HDR Bloom +
+//                      GPU Foliage Wind-Sway + Live Coriolis PlanetaryClimateNet (`macro_planet_live.wgsl`)
 //
 // Pipelines:
+//   0. vs_macro_shadow                              -> 2048x2048 Depth32Float directional sun shadow map
 //   1. vs_fullscreen   + fs_starfield               -> Deep cosmic starfield, nebula band & live Sun disc
 //   2. vs_macro_planet + fs_macro_solid             -> Floating-origin near 1m shards, Layer A 6-face R=1304m
 //                                                      macro globe, 3D Nordic pines, Floating Sky-Islands +
 //                                                      cyan-amethyst Buoyant Crystal Cores, 60 live 3D heroes,
-//                                                      shrines & solid projectiles (with live snowline & cloud shadows!)
-//   3. vs_macro_planet + fs_macro_ocean             -> Curved Fresnel sapphire ocean with surf foam & live sea-ice
+//                                                      shrines & solid projectiles (with 3x3 PCF sun shadows,
+//                                                      GPU wind-sway foliage, live snowline & cloud shadows!)
+//   3. vs_macro_planet + fs_macro_ocean             -> Curved Fresnel sapphire ocean with surf foam, live sea-ice
+//                                                      & real-time 3x3 PCF sun shadows
 //   4. vs_macro_planet + fs_macro_translucent       -> Geodesic actuator beams, shrine light pillars, aura rings
 //                                                      & translucent steam / volcanic ash plumes
 //   5. vs_fullscreen   + fs_macro_atmosphere_resolve-> Seamless Ground (2.5m) -> Flight (120m) -> Stratosphere (600m)
 //                                                      -> Orbit (3,300m) Rayleigh + Mie atmosphere + Live 6-face
-//                                                      PlanetaryClimateNet Coriolis Cloud & Ash Deck + ACES Filmic
+//                                                      PlanetaryClimateNet Coriolis Cloud & Ash Deck + HDR Bloom + ACES
 
 struct MacroPlanetUniforms {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
-    cam_pos: vec4<f32>,        // xyz = planet-centered camera pos (m), w = sim_time
-    model_offset: vec4<f32>,   // xyz = (mesh_origin_f64 - cam_pos_f64) as f32, w = r_ocean
-    sun_dir: vec4<f32>,        // xyz = normalized sun dir, w = r_cloud_shell
-    planet_cfg: vec4<f32>,     // x = r_core (1280), y = r_surf_atmo (1304), z = r_atmo_outer (1520), w = exposure
-    viewport: vec4<f32>,       // x = width, y = height, z = 1/width, w = 1/height
-    climate_params: vec4<f32>, // x = local_wind_u, y = local_wind_v, z = local_cloud_cover, w = has_live_climate
+    shadow_view_proj: mat4x4<f32>, // Floating-origin texel-snapped ortho light-space VP (camera-relative input!)
+    cam_pos: vec4<f32>,            // xyz = planet-centered camera pos (m), w = sim_time
+    model_offset: vec4<f32>,       // xyz = (mesh_origin_f64 - cam_pos_f64) as f32, w = r_ocean
+    sun_dir: vec4<f32>,            // xyz = normalized sun dir, w = r_cloud_shell
+    planet_cfg: vec4<f32>,         // x = r_core (1280), y = r_surf_atmo (1304), z = r_atmo_outer (1520), w = exposure
+    viewport: vec4<f32>,           // x = width, y = height, z = 1/width, w = 1/height
+    climate_params: vec4<f32>,     // x = local_wind_u, y = local_wind_v, z = local_cloud_cover, w = has_live_climate
+    shadow_params: vec4<f32>,      // x = depth_bias, y = texel_size (1/2048), z = shadow_strength, w = shadow_radius
 };
 
 @group(0) @binding(0) var<uniform> uni: MacroPlanetUniforms;
 @group(0) @binding(1) var climate_tex: texture_2d_array<f32>;
 @group(0) @binding(2) var climate_samp: sampler;
+
+// Group 1 resources (distinct bindings per pipeline layout so Pass 0 never binds macro_shadow_tex for reading):
+//   - Resolve pipeline binds bindings 0..3 (hdr_tex, depth_tex, bloom_tex, bloom_samp)
+//   - Solid & Ocean pipelines bind bindings 4..5 (macro_shadow_tex, macro_shadow_samp)
+@group(1) @binding(0) var hdr_tex: texture_2d<f32>;
+@group(1) @binding(1) var depth_tex: texture_depth_2d;
+@group(1) @binding(2) var bloom_tex: texture_2d<f32>;
+@group(1) @binding(3) var bloom_samp: sampler;
+@group(1) @binding(4) var macro_shadow_tex: texture_depth_2d;
+@group(1) @binding(5) var macro_shadow_samp: sampler_comparison;
 
 // -----------------------------------------------------------------------------
 // Seamless 3D Spherical Procedural Noise & Exact 6-Face Cubed-Sphere Climate Lookup
@@ -120,7 +136,8 @@ fn sample_climate_dir(dir_in: vec3<f32>) -> vec4<f32> {
         }
     }
 
-    let uv = clamp(vec2<f32>(u, v) * 0.5 + 0.5, vec2<f32>(0.004), vec2<f32>(0.996));
+    // Clamp cleanly to 64x64 texel centers (0.5/64 .. 1 - 0.5/64) for seamless bilinear climate borders
+    let uv = clamp(vec2<f32>(u, v) * 0.5 + 0.5, vec2<f32>(0.0078125), vec2<f32>(0.9921875));
     return textureSampleLevel(climate_tex, climate_samp, uv, face_idx, 0.0);
 }
 
@@ -210,7 +227,9 @@ fn fs_starfield(in: FullScreenOut) -> @location(0) vec4<f32> {
 //     4.0 = Live 3D Hero / Creature / Shrine Obelisk
 //     5.0 = Geodesic Beam / Projectile / Shrine Light Pillar / Aura Ring
 //     6.0 = Translucent Steam / Volcanic Ash Plume
-//   water_ice:    x = water_depth, y = ice_frac, z = is_macro, w = reserved
+//   water_ice:    x = water_depth, y = ice_frac, z = is_macro,
+//                 w = ao_shadow in [0.34, 1.0] (<= 1.05), OR > 1.5 encodes GPU wind-sway
+//                     amplitude `(w - 1.5)` meters for grass/foliage props (mat_kind == 1.0)!
 // -----------------------------------------------------------------------------
 struct VertIn {
     @location(0) pos: vec3<f32>,
@@ -230,11 +249,47 @@ struct VertOut {
     @location(5) water_ice: vec4<f32>,
 };
 
+/// Subtle tangential GPU wind-sway for opt-in grass/foliage props (`mat_kind == 1.0 && water_ice.w > 1.5`).
+fn apply_foliage_wind_sway(rel_pos_in: vec3<f32>, mat_kind: f32, water_ice_w: f32) -> vec3<f32> {
+    if (abs(mat_kind - 1.0) > 0.25 || water_ice_w <= 1.5) {
+        return rel_pos_in;
+    }
+    let sway_amp = clamp(water_ice_w - 1.5, 0.0, 0.85);
+    let world_pos = rel_pos_in + uni.cam_pos.xyz;
+    let radial = normalize(world_pos);
+    let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(radial.y) > 0.92);
+    let tang_u = normalize(cross(up_ref, radial));
+    let tang_v = cross(radial, tang_u);
+
+    let t = uni.cam_pos.w;
+    let wv = vec2<f32>(uni.climate_params.x, uni.climate_params.y);
+    let w_len = length(wv);
+    let wind_speed = clamp(w_len, 0.40, 2.50);
+    let wind_dir = select(vec2<f32>(0.84, 0.54), wv / max(w_len, 1e-4), w_len > 0.05);
+
+    let phase = dot(world_pos, vec3<f32>(0.72, 0.41, 0.63)) + t * (2.25 + wind_speed * 0.85);
+    let gust = sin(phase) * 0.72 + sin(phase * 2.13 + 1.7) * 0.28;
+    let disp = (tang_u * wind_dir.x + tang_v * wind_dir.y)
+        * (sway_amp * (0.22 + 0.78 * gust) * (0.75 + 0.25 * wind_speed));
+    return rel_pos_in + disp;
+}
+
+/// Pass 0: Lightweight depth-only directional sun shadow map vertex shader.
+@vertex
+fn vs_macro_shadow(in: VertIn) -> @builtin(position) vec4<f32> {
+    // Skip luminous spell orbs/beams so emissive FX never cast dark opaque shadows
+    if (in.emissive_mat.w > 4.5) {
+        return vec4<f32>(0.0, 0.0, 2.0, 1.0);
+    }
+    let rel_pos = apply_foliage_wind_sway(in.pos + uni.model_offset.xyz, in.emissive_mat.w, in.water_ice.w);
+    return uni.shadow_view_proj * vec4<f32>(rel_pos, 1.0);
+}
+
 @vertex
 fn vs_macro_planet(in: VertIn) -> VertOut {
     var out: VertOut;
     // Exact camera-relative floating-origin position (camera sits strictly at Vec3::ZERO!)
-    let rel_pos = in.pos + uni.model_offset.xyz;
+    let rel_pos = apply_foliage_wind_sway(in.pos + uni.model_offset.xyz, in.emissive_mat.w, in.water_ice.w);
     out.clip_pos = uni.view_proj * vec4<f32>(rel_pos, 1.0);
     out.rel_pos = rel_pos;
     out.world_pos = rel_pos + uni.cam_pos.xyz;
@@ -243,6 +298,42 @@ fn vs_macro_planet(in: VertIn) -> VertOut {
     out.emissive_mat = in.emissive_mat;
     out.water_ice = in.water_ice;
     return out;
+}
+
+/// Real-time 2048x2048 3x3 PCF directional sun shadow lookup with normal-offset bias,
+/// smooth frustum-edge fade (|uv - 0.5| > 0.42), and Orbit/Stratosphere altitude fade (> 450 m).
+fn sample_macro_shadow(rel_pos: vec3<f32>, n: vec3<f32>, sun: vec3<f32>) -> f32 {
+    let cam_alt = max(length(uni.cam_pos.xyz) - uni.planet_cfg.y, 0.0);
+    let alt_fade = 1.0 - smoothstep(320.0, 450.0, cam_alt);
+    if (alt_fade <= 0.001 || uni.shadow_params.z <= 0.001) {
+        return 1.0;
+    }
+
+    let ndl = max(dot(n, sun), 0.0);
+    let normal_bias = mix(0.32, 0.12, ndl);
+    let biased = rel_pos + n * normal_bias + sun * 0.08;
+    let lclip = uni.shadow_view_proj * vec4<f32>(biased, 1.0);
+    let ndc = lclip.xyz / max(lclip.w, 1e-5);
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let border_d = max(abs(uv.x - 0.5), abs(uv.y - 0.5));
+    if (border_d >= 0.495 || ndc.z <= 0.0 || ndc.z >= 1.0) {
+        return 1.0;
+    }
+
+    let edge_fade = 1.0 - smoothstep(0.42, 0.495, border_d);
+    let texel = uni.shadow_params.y;
+    let z = clamp(ndc.z - uni.shadow_params.x, 0.0, 1.0);
+
+    var sum = 0.0;
+    for (var oy: i32 = -1; oy <= 1; oy++) {
+        for (var ox: i32 = -1; ox <= 1; ox++) {
+            let off = vec2<f32>(f32(ox), f32(oy)) * texel;
+            sum += textureSampleCompareLevel(macro_shadow_tex, macro_shadow_samp, uv + off, z);
+        }
+    }
+    let pcf = sum * (1.0 / 9.0);
+    let weight = uni.shadow_params.z * edge_fade * alt_fade;
+    return mix(1.0, pcf, weight);
 }
 
 // -----------------------------------------------------------------------------
@@ -265,8 +356,8 @@ fn fs_macro_solid(in: VertOut) -> @location(0) vec4<f32> {
     let day_mask = smoothstep(-0.14, 0.22, term_raw);
     let twilight = exp(-pow((term_raw - 0.02) * 5.2, 2.0));
     let sun_col = mix(
-        vec3<f32>(1.0, 0.48, 0.18),
-        vec3<f32>(1.08, 1.00, 0.90),
+        vec3<f32>(1.04, 0.46, 0.16),
+        vec3<f32>(1.12, 1.01, 0.88),
         smoothstep(-0.04, 0.30, term_raw),
     );
 
@@ -282,16 +373,18 @@ fn fs_macro_solid(in: VertOut) -> @location(0) vec4<f32> {
     // 2. Live 3D Heroes, Creatures & Planetary Shrine Obelisks (mat_kind ~ 4.0)
     if (mat_kind > 3.5) {
         let n = normalize(in.normal);
+        let sun_shadow = sample_macro_shadow(in.rel_pos, n, sun);
         let ndl = max(dot(n, sun), 0.0);
         let wrap_ndl = max((dot(n, sun) + 0.28) / 1.28, 0.0);
         let sky_up = 0.5 + 0.5 * dot(n, radial);
-        let amb = mix(vec3<f32>(0.09, 0.13, 0.22), vec3<f32>(0.26, 0.38, 0.56), sky_up)
+        let amb = mix(vec3<f32>(0.08, 0.125, 0.24), vec3<f32>(0.25, 0.39, 0.62), sky_up)
             * mix(0.60, 1.0, day_mask);
-        let diff = sun_col * (ndl * 1.48 * day_mask + wrap_ndl * 0.42 * twilight + 0.22 * (1.0 - day_mask));
+        let diff = sun_col * (ndl * 1.52 * day_mask * sun_shadow + wrap_ndl * 0.42 * twilight + 0.22 * (1.0 - day_mask));
 
         let half_v = normalize(sun + view_dir);
         let shininess = mix(72.0, 12.0, rough);
-        let spec = pow(max(dot(n, half_v), 0.0), shininess) * mix(0.55, 0.12, rough) * (0.35 + 0.65 * day_mask);
+        let spec = pow(max(dot(n, half_v), 0.0), shininess) * mix(0.55, 0.12, rough)
+            * (0.35 + 0.65 * day_mask) * sun_shadow;
 
         let fres = pow(1.0 - max(dot(n, view_dir), 0.0), 2.4);
         let rim = in.color.rgb * fres * mix(0.75, 0.30, day_mask);
@@ -363,6 +456,10 @@ fn fs_macro_solid(in: VertOut) -> @location(0) vec4<f32> {
     if (is_macro > 0.5 && is_prop < 0.5 && is_emissive < 0.5) {
         let ridge_tint = mix(vec3<f32>(0.88, 0.92, 0.90), vec3<f32>(1.12, 1.09, 1.04), smoothstep(0.28, 0.78, macro_grain));
         base_albedo *= ridge_tint;
+        // High-frequency dappled pine-canopy shading on forested continents for seamless Stratosphere transitions
+        if (in.color.g > in.color.r * 1.15) {
+            base_albedo *= (0.84 + 0.30 * fbm3(radial * 420.0));
+        }
     }
 
     // Live PlanetaryClimateNet dynamic snowline (A), volcanic ash dust (B), & soft storm cloud shadows (G)!
@@ -374,32 +471,55 @@ fn fs_macro_solid(in: VertOut) -> @location(0) vec4<f32> {
     let ash_dust = smoothstep(0.32, 0.84, clim.b) * (1.0 - is_emissive) * (1.0 - is_prop) * has_clim;
     base_albedo = mix(base_albedo, vec3<f32>(0.15, 0.14, 0.16), ash_dust * 0.45);
 
+    // Subtle micro-normal perturbation along macro globe snowlines & coastlines for crisp polar horizons and ridges
+    if (is_macro > 0.5 && is_prop < 0.5 && is_emissive < 0.5) {
+        let v_snow = smoothstep(0.55, 0.82, in.color.b) * smoothstep(0.50, 0.78, in.color.r);
+        let snow_mix = clamp(max(v_snow, snow_frost), 0.0, 1.0);
+        let snowline_w = 4.0 * snow_mix * (1.0 - snow_mix);
+        let coast_w = exp(-abs(alt_m) * 0.12);
+        let ridge_w = clamp(max(snowline_w, coast_w * 0.75), 0.0, 1.0);
+        if (ridge_w > 0.04) {
+            let r_p = radial * 260.0;
+            let c0 = noise3(r_p);
+            let d_n = vec3<f32>(
+                noise3(r_p + vec3<f32>(0.35, 0.0, 0.0)) - c0,
+                noise3(r_p + vec3<f32>(0.0, 0.35, 0.0)) - c0,
+                noise3(r_p + vec3<f32>(0.0, 0.0, 0.35)) - c0,
+            );
+            let d_tang = d_n - radial * dot(d_n, radial);
+            n = normalize(n - d_tang * (ridge_w * 0.38));
+        }
+    }
+
     // Soft moving cumulus cloud shadows drifting across the meadows, forests & bays!
     let drift_p = radial + vec3<f32>(t * 0.004, 0.0, -t * 0.003);
     let c_billow = fbm3(drift_p * 14.0);
     let cloud_sh_raw = smoothstep(0.22, 0.80, clim.g * (0.65 + 0.75 * c_billow));
     let cloud_shadow = 1.0 - cloud_sh_raw * 0.36 * has_clim;
 
-    // Baked per-vertex valley AO & mountain ridge relief shadow packed in `water_ice.w`!
-    let ao_shadow = select(1.0, clamp(in.water_ice.w, 0.34, 1.0), in.water_ice.w > 0.01);
+    // Baked per-vertex valley AO & mountain ridge relief shadow packed in `water_ice.w` (<= 1.05; > 1.5 = wind-sway amp!)
+    let ao_shadow = select(1.0, clamp(in.water_ice.w, 0.34, 1.0), in.water_ice.w > 0.01 && in.water_ice.w <= 1.05);
+    let sun_shadow = sample_macro_shadow(in.rel_pos, n, sun);
 
     let ndl = max(dot(n, sun), 0.0);
     let wrap_ndl = max((dot(n, sun) + 0.14) / 1.14, 0.0);
-    let diffuse = sun_col * (ndl * 1.56 * day_mask * cloud_shadow * ao_shadow + wrap_ndl * 0.34 * twilight);
+    let diffuse = sun_col * (ndl * 1.60 * day_mask * cloud_shadow * sun_shadow * ao_shadow + wrap_ndl * 0.34 * twilight);
 
     let sky_up = 0.5 + 0.5 * dot(n, radial);
-    let day_amb = mix(vec3<f32>(0.045, 0.075, 0.125), vec3<f32>(0.17, 0.30, 0.49), sky_up)
+    // Richer cool-indigo shadow ambient vs warm golden sunlight for crisp Nordic atmospheric contrast!
+    let day_amb = mix(vec3<f32>(0.038, 0.068, 0.145), vec3<f32>(0.16, 0.31, 0.56), sky_up)
         * (0.16 + 0.84 * day_mask) * (0.45 + 0.55 * ao_shadow);
-    let night_amb = vec3<f32>(0.010, 0.016, 0.034) * (1.0 - day_mask);
+    let night_amb = vec3<f32>(0.010, 0.016, 0.036) * (1.0 - day_mask);
 
     let half_v = normalize(sun + view_dir);
     let is_snow = smoothstep(0.68, 0.85, base_albedo.b) * smoothstep(0.62, 0.80, base_albedo.r);
     let eff_rough = mix(rough, 0.24, max(snow_frost * 0.65, is_snow * 0.55));
     let shininess = mix(96.0, 6.0, eff_rough);
-    let spec = pow(max(dot(n, half_v), 0.0), shininess) * mix(0.48, 0.04, eff_rough) * day_mask * cloud_shadow * ao_shadow;
+    let spec = pow(max(dot(n, half_v), 0.0), shininess) * mix(0.48, 0.04, eff_rough)
+        * day_mask * cloud_shadow * sun_shadow * ao_shadow;
     // Crisp sunlit snow crystal micro-glitter at close range!
     let glitter_cell = hash31(floor(p * 7.5 + view_dir * 2.0));
-    let snow_sparkle = step(0.986, glitter_cell) * is_snow * ndl * day_mask * (1.0 - blend_far) * 0.85;
+    let snow_sparkle = step(0.986, glitter_cell) * is_snow * ndl * day_mask * sun_shadow * (1.0 - blend_far) * 0.85;
 
     let fres = pow(1.0 - max(dot(n, view_dir), 0.0), 3.4);
     let rim_col = mix(vec3<f32>(0.14, 0.38, 0.80), vec3<f32>(0.98, 0.46, 0.16), twilight)
@@ -468,9 +588,11 @@ fn fs_macro_ocean(in: VertOut) -> @location(0) vec4<f32> {
     water_col = mix(water_col, mid_col, smoothstep(0.16, 0.48, d_norm));
     water_col = mix(water_col, deep_col, smoothstep(0.42, 1.0, d_norm));
 
+    let sun_shadow = sample_macro_shadow(in.rel_pos, n, sun);
+
     // Shimmering shallow-water sunlit caustics on golden coastal sandbeds!
     let caustic_p = abs(sin((w1 * 6.5 - w2 * 5.5) * 3.14159));
-    let caustic = pow(1.0 - caustic_p, 3.2) * smoothstep(2.4, 0.15, water_depth) * day_mask * (1.0 - blend_far) * (1.0 - ice_frac);
+    let caustic = pow(1.0 - caustic_p, 3.2) * smoothstep(2.4, 0.15, water_depth) * day_mask * sun_shadow * (1.0 - blend_far) * (1.0 - ice_frac);
     water_col += vec3<f32>(0.18, 0.52, 0.56) * caustic * 0.65;
 
     // Rhythmic rolling shoreline surf foam bands lapping onto the golden beach!
@@ -491,13 +613,13 @@ fn fs_macro_ocean(in: VertOut) -> @location(0) vec4<f32> {
     let half_v = normalize(sun + view_dir);
     let spec_sharp = pow(max(dot(n, half_v), 0.0), mix(240.0, 28.0, ice_frac)) * mix(3.2, 0.4, ice_frac);
     let spec_broad = pow(max(dot(n, half_v), 0.0), 26.0) * mix(0.32, 0.08, ice_frac);
-    let spec = sun_col * (spec_sharp + spec_broad) * (day_mask * cloud_shadow + twilight * 0.50) * (1.0 - foam * 0.7);
+    let spec = sun_col * (spec_sharp + spec_broad) * (day_mask * cloud_shadow * sun_shadow + twilight * 0.50) * (1.0 - foam * 0.7);
 
     let ndl = max(dot(n, sun), 0.0);
     let diff = base_col * (
-        sun_col * ndl * 1.32 * day_mask * cloud_shadow
-            + vec3<f32>(0.10, 0.20, 0.36) * (0.20 + 0.80 * day_mask)
-            + vec3<f32>(0.008, 0.014, 0.032) * (1.0 - day_mask)
+        sun_col * ndl * 1.34 * day_mask * cloud_shadow * sun_shadow
+            + vec3<f32>(0.095, 0.21, 0.40) * (0.20 + 0.80 * day_mask)
+            + vec3<f32>(0.008, 0.014, 0.034) * (1.0 - day_mask)
     );
 
     let col = mix(diff, sky_refl, fresnel * mix(0.70, 0.22, ice_frac)) + spec;
@@ -505,7 +627,7 @@ fn fs_macro_ocean(in: VertOut) -> @location(0) vec4<f32> {
 }
 
 // -----------------------------------------------------------------------------
-// Pass 1D: Translucent Beams, Shrine Light Pillars, Aura Rings & Steam/Ash Plumes
+// Pass 1D: Translucent Beams, Shrine Light Pillars, Aura Rings, Soft Particles & Steam/Ash Plumes
 // -----------------------------------------------------------------------------
 @fragment
 fn fs_macro_translucent(in: VertOut) -> @location(0) vec4<f32> {
@@ -516,8 +638,22 @@ fn fs_macro_translucent(in: VertOut) -> @location(0) vec4<f32> {
     let mat_kind = in.emissive_mat.w;
     let em_rgb = max(in.emissive_mat.rgb, vec3<f32>(0.0));
     let alpha = clamp(in.color.a, 0.0, 1.0);
+    let is_particle = in.water_ice.z > 0.5;
 
-    // Volumetric steam / volcanic ash plumes (mat_kind >= 5.5)
+    // Smoothly fade (120..165 m) and cull (> 165 m) weather/smoke particles so ZERO particles float in Stratosphere/Orbit
+    var alt_fade = 1.0;
+    if (is_particle) {
+        let cam_alt = length(uni.cam_pos.xyz) - uni.planet_cfg.y;
+        if (cam_alt > 165.0) {
+            discard;
+        }
+        alt_fade = 1.0 - smoothstep(120.0, 165.0, cam_alt);
+        if (alt_fade < 0.01) {
+            discard;
+        }
+    }
+
+    // Volumetric gas / smoke / waterfall mist / whale spouts / volcanic ash plumes (mat_kind > 5.5)
     if (mat_kind > 5.5) {
         let puff = fbm3(p * 0.18 - radial * (t * 0.45));
         let term_raw = dot(radial, sun);
@@ -526,16 +662,41 @@ fn fs_macro_translucent(in: VertOut) -> @location(0) vec4<f32> {
         let sun_tint = mix(vec3<f32>(0.24, 0.30, 0.45), vec3<f32>(1.05, 0.98, 0.92), day_mask)
             + vec3<f32>(1.0, 0.48, 0.18) * twilight * 0.55;
         let col = in.color.rgb * sun_tint * (0.75 + 0.45 * puff) + em_rgb;
-        let a = alpha * smoothstep(0.18, 0.80, puff);
+        var a = alpha * smoothstep(0.18, 0.80, puff);
+        if (is_particle) {
+            let uv = in.water_ice.xy;
+            let r2 = dot(uv, uv);
+            let edge_mask = exp(-r2 * 2.6) * smoothstep(1.0, 0.18, sqrt(r2));
+            let wisp = 0.35 + 0.85 * smoothstep(0.16, 0.82, puff);
+            a = clamp(alpha * edge_mask * wisp * alt_fade, 0.0, 1.0);
+        }
         if (a < 0.02) {
             discard;
         }
         return vec4<f32>(col, a);
     }
 
-    // Soft grounded contact shadow discs (mat_kind ~ 4.0, alpha-blended dark shadow on terrain)
+    // Soft grounded contact shadow discs (mat_kind < 4.5, alpha-blended dark shadow on terrain)
     if (mat_kind < 4.5) {
         return vec4<f32>(in.color.rgb, alpha);
+    }
+
+    // Fireflies, snowflakes, cavern spores & rain streaks (mat_kind in [4.5, 5.5] with quad UV)
+    if (is_particle) {
+        let uv = in.water_ice.xy;
+        let r2 = dot(uv, uv);
+        let dot_mask = exp(-r2 * 3.8) * smoothstep(1.0, 0.12, sqrt(r2));
+        if (dot_mask < 0.03) {
+            discard;
+        }
+        let pulse = 0.88 + 0.18 * sin(t * 5.2 + length(in.rel_pos) * 0.18);
+        let core_boost = 0.85 + 0.55 * exp(-r2 * 6.5);
+        let col = (in.color.rgb * 0.55 + em_rgb * pulse) * core_boost;
+        let a = clamp(alpha * dot_mask * alt_fade, 0.0, 1.0);
+        if (a < 0.02) {
+            discard;
+        }
+        return vec4<f32>(col, a);
     }
 
     // Glowing Shrine Light Pillars, Hero Aura Rings & Curved Geodesic Actuator Beams
@@ -545,11 +706,10 @@ fn fs_macro_translucent(in: VertOut) -> @location(0) vec4<f32> {
 }
 
 // -----------------------------------------------------------------------------
-// Pass 2: Seamless Ground-to-Orbit Rayleigh + Mie Atmosphere +
-//         Live PlanetaryClimateNet Coriolis Cloud & Volcanic Ash Deck + Aurora + ACES
+// Pass 3: Seamless Ground-to-Orbit Rayleigh + Mie Atmosphere +
+//         Live PlanetaryClimateNet Coriolis Cloud & Volcanic Ash Deck + Aurora +
+//         Quarter-Res Separable HDR Bloom Composite + ACES Filmic
 // -----------------------------------------------------------------------------
-@group(1) @binding(0) var hdr_tex: texture_2d<f32>;
-@group(1) @binding(1) var depth_tex: texture_depth_2d;
 
 fn intersect_sphere(ro: vec3<f32>, rd: vec3<f32>, r: f32) -> vec2<f32> {
     let b = dot(ro, rd);
@@ -730,12 +890,12 @@ fn fs_macro_atmosphere_resolve(in: FullScreenOut) -> @location(0) vec4<f32> {
             }
 
             let sky_gain = mix(1.06, 1.32, in_atmo_factor);
-            let aerial_dist = smoothstep(105.0, 760.0, t_scene);
-            let surf_gain = mix(0.08, 0.14 * aerial_dist, in_atmo_factor);
+            let aerial_dist = smoothstep(85.0, 680.0, t_scene);
+            let surf_gain = mix(0.08, 0.17 * aerial_dist, in_atmo_factor);
             let scatter_gain = mix(surf_gain, sky_gain, is_sky);
 
-            let inscatter = (sum_r * beta_r * phase_r * 1.22 + sum_m * beta_m * phase_m * 0.30) * scatter_gain;
-            let trans_surf = exp(-(beta_r * od_r * mix(0.08, 0.10 * aerial_dist, in_atmo_factor) + beta_m * od_m * 0.09));
+            let inscatter = (sum_r * beta_r * phase_r * 1.24 + sum_m * beta_m * phase_m * 0.32) * scatter_gain;
+            let trans_surf = exp(-(beta_r * od_r * mix(0.08, 0.12 * aerial_dist, in_atmo_factor) + beta_m * od_m * 0.10));
             let trans_sky = exp(-(beta_r * od_r * 1.15 + beta_m * od_m * 0.90));
 
             let sky_luma = dot(inscatter, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -775,6 +935,11 @@ fn fs_macro_atmosphere_resolve(in: FullScreenOut) -> @location(0) vec4<f32> {
             }
         }
     }
+
+    // Quarter-res separable HDR bloom composite BEFORE ACES Filmic tonemapping!
+    let bloom_uv = clamp(in.pos.xy * uni.viewport.zw, vec2<f32>(0.0), vec2<f32>(1.0));
+    let bloom = textureSampleLevel(bloom_tex, bloom_samp, bloom_uv, 0.0).rgb;
+    hdr += bloom * 0.30;
 
     let mapped = aces_filmic(hdr * exposure);
     let srgb = pow(clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));

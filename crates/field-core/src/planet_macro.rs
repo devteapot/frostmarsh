@@ -496,6 +496,13 @@ fn fbm_3d_f64(p: [f64; 3], seed: u64, octaves: u32) -> f64 {
     if norm > 0.0 { sum / norm } else { 0.5 }
 }
 
+/// Continental macro-biome classification IDs (5 unmistakable planetary landscapes).
+pub const CONTINENT_NORDIC_EMERALD: u8 = 0;
+pub const CONTINENT_AUTUMN_HIGHLANDS: u8 = 1;
+pub const CONTINENT_RED_OCHRE_MESA: u8 = 2;
+pub const CONTINENT_CRYSTAL_TUNDRA: u8 = 3;
+pub const CONTINENT_VOLCANIC_BADLANDS: u8 = 4;
+
 /// Surface biome classification shared identically by the `6 × 64²` macro shell and `1 m` shards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MacroBiome {
@@ -539,6 +546,8 @@ pub struct MacroColumnSample {
     pub is_rift_core: bool,
     /// True if on the scorched obsidian volcanic caldera rim.
     pub is_rift_rim: bool,
+    /// Continental landscape ID (`CONTINENT_*`: 0=Nordic, 1=Autumn, 2=RedMesa, 3=Tundra, 4=Volcanic).
+    pub continent_biome: u8,
     /// Surface biome tag.
     pub biome: MacroBiome,
     /// Physically plausible linear RGB surface albedo.
@@ -576,6 +585,12 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
         seed ^ 0x7777,
         3,
     );
+    // Low-frequency 3D spherical continental biome field driving 5 distinct planetary landscapes
+    let n_continent_biome = fbm_3d_f64(
+        [dir[0] * 2.1, dir[1] * 2.1, dir[2] * 2.1],
+        seed ^ 0xB10E,
+        3,
+    );
 
     // Equatorial volcanic caldera rift belt (`|dir.y| < 0.17` along longitude `lon ≈ -0.18`)
     // Taper smoothly along longitude with organic jaggedness so there are ZERO boxy cutoffs!
@@ -594,13 +609,48 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
     let lon_taper = (1.0 - (d_lon / lon_span).powi(2)).max(0.0).powf(0.75);
     let core_half_w = (0.028 + 0.018 * (n_detail - 0.5).abs()) * lon_taper;
     let rim_half_w = (0.088 + 0.028 * n_detail) * lon_taper;
+    let badlands_half_w = rim_half_w * 1.72;
     let in_rift_belt = lon_taper > 0.05 && d_lat_rift < rim_half_w;
     let is_rift_core = lon_taper > 0.14 && d_lat_rift < core_half_w;
     let is_rift_rim = in_rift_belt && !is_rift_core;
+    let badlands_w = if lon_taper > 0.05 && !in_rift_belt && d_lat_rift < badlands_half_w {
+        let t = (1.0 - (d_lat_rift - rim_half_w) / (badlands_half_w - rim_half_w).max(0.01))
+            .clamp(0.0, 1.0);
+        smoothstep_f64(t) * lon_taper
+    } else {
+        0.0
+    };
 
     // Polar glacier ice caps (`|dir.y| > 0.74` with broad organic continental coastline modulation)
     let polar_thresh = 0.74 + 0.085 * (n_cont - 0.5) + 0.055 * (n_coast - 0.5);
     let is_polar = lat_abs > polar_thresh;
+
+    // Smooth continental macro-biome blend weights across the 6 faces:
+    // 1. Nordic Emerald Fjordlands (default temperate coastal fjords & hero spawn)
+    // 2. Golden Autumn Birch & Amber Highlands (`n_continent_biome > 0.64 && lat_abs < 0.58`)
+    // 3. Red-Ochre Terraced Canyon & Mesa Highlands (`n_continent_biome < 0.34 && n_moist < 0.46 && lat_abs < 0.50`)
+    // 4. Crystal Glacier Tundra & Frozen Fjords (polar & sub-polar `lat_abs > 0.58`)
+    // 5. Obsidian Volcanic Badlands & Magma Rift (equatorial caldera + scorched basalt highlands)
+    let autumn_w = if !is_polar && !in_rift_belt && badlands_w < 0.35 && lat_abs < 0.62 {
+        let b_t = smoothstep_f64(((n_continent_biome - 0.59) / 0.06).clamp(0.0, 1.0));
+        let l_t = smoothstep_f64(((0.62 - lat_abs) / 0.06).clamp(0.0, 1.0));
+        b_t * l_t
+    } else {
+        0.0
+    };
+    let mesa_w = if !is_polar && !in_rift_belt && badlands_w < 0.35 && lat_abs < 0.54 {
+        let b_t = smoothstep_f64(((0.38 - n_continent_biome) / 0.06).clamp(0.0, 1.0));
+        let m_t = smoothstep_f64(((0.50 - n_moist) / 0.06).clamp(0.0, 1.0));
+        let l_t = smoothstep_f64(((0.54 - lat_abs) / 0.06).clamp(0.0, 1.0));
+        b_t * m_t * l_t
+    } else {
+        0.0
+    };
+    let tundra_w = if !in_rift_belt && !is_polar && lat_abs > 0.56 {
+        smoothstep_f64(((lat_abs - 0.56) / 0.16).clamp(0.0, 1.0))
+    } else {
+        0.0
+    };
 
     // Smooth elevation in `z ∈ [16.0, 42.0]` (~52% curved oceans, ~48% continents & peaks)
     let mut h_norm = (n_cont - 0.515) * 2.55
@@ -612,13 +662,25 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
         h_norm = h_norm.max(0.20) + (lat_abs - polar_thresh) * 1.65;
     }
     if is_rift_rim {
-        let rim_t = 1.0 - ((d_lat_rift - core_half_w) / (rim_half_w - core_half_w).max(0.01)).clamp(0.0, 1.0);
+        let rim_t = 1.0
+            - ((d_lat_rift - core_half_w) / (rim_half_w - core_half_w).max(0.01)).clamp(0.0, 1.0);
         h_norm = h_norm.max(0.32) + 0.58 * rim_t * lon_taper;
     } else if is_rift_core {
         h_norm = 0.20; // Glowing lava fissure channel cleanly above sea level
+    } else if badlands_w > 0.01 {
+        h_norm += 0.18 * badlands_w * n_ridge;
     }
 
-    let raw_surf_z = (23.5 + h_norm * 11.8).clamp(16.0, 42.0);
+    let mut raw_surf_z = (23.5 + h_norm * 11.8).clamp(16.0, 42.0);
+    // Sculpt stepped sandstone mesas in Red-Ochre Canyon & Mesa Highlands!
+    if mesa_w > 0.01 && raw_surf_z > z_sea + 1.4 {
+        let step_h = 2.65;
+        let q = (raw_surf_z - z_sea) / step_h;
+        let frac = q.fract();
+        let riser = smoothstep_f64(((frac - 0.18) / 0.64).clamp(0.0, 1.0));
+        let terraced = z_sea + (q.floor() + riser) * step_h;
+        raw_surf_z = (raw_surf_z * (1.0 - 0.68 * mesa_w) + terraced * (0.68 * mesa_w)).clamp(16.0, 42.0);
+    }
 
     // Wave 37: Seamless 3D spherical carved highland-to-coast river valleys!
     let n_riv_a = fbm_3d_f64(
@@ -633,7 +695,9 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
         let smooth_bank = bank_t * bank_t * (3.0 - 2.0 * bank_t);
         let chan_t = (1.0 - riv_dist / 0.017).clamp(0.0, 1.0);
         let smooth_chan = chan_t * chan_t * (3.0 - 2.0 * chan_t);
-        let carve = smooth_bank * 2.55;
+        // Dramatic deeper carved canyon gorges in Red-Ochre Mesa Highlands!
+        let canyon_boost = 1.0 + 0.72 * mesa_w;
+        let carve = smooth_bank * 2.55 * canyon_boost;
         let r_depth = smooth_chan * 1.25;
         (carve, r_depth)
     } else {
@@ -667,7 +731,7 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
 
     // Latitudinal + altitudinal equilibrium temperature (K)
     let alt_above_sea = (surf_z - z_sea).max(0.0);
-    let base_temp = 298.0 - lat_abs * 30.0 - alt_above_sea * 1.15;
+    let base_temp = 298.0 - lat_abs * 30.0 - alt_above_sea * 1.15 + mesa_w * 7.5 - tundra_w * 9.0;
     let temp_k = if is_rift_core {
         1180.0
     } else if is_rift_rim {
@@ -675,10 +739,22 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
     } else if is_polar {
         (256.0 - (lat_abs - polar_thresh) * 24.0).clamp(242.0, 265.0)
     } else {
-        base_temp.clamp(256.0, 312.0)
+        (base_temp + badlands_w * 42.0).clamp(254.0, 340.0)
     };
 
-    let forest_density = if surf_z > z_sea + 1.3
+    let continent_biome = if is_rift_core || is_rift_rim || badlands_w > 0.35 {
+        CONTINENT_VOLCANIC_BADLANDS
+    } else if is_polar || tundra_w > 0.45 {
+        CONTINENT_CRYSTAL_TUNDRA
+    } else if n_continent_biome < 0.34 && n_moist < 0.46 && lat_abs < 0.50 {
+        CONTINENT_RED_OCHRE_MESA
+    } else if n_continent_biome > 0.64 && lat_abs < 0.58 {
+        CONTINENT_AUTUMN_HIGHLANDS
+    } else {
+        CONTINENT_NORDIC_EMERALD
+    };
+
+    let base_forest = if surf_z > z_sea + 1.3
         && surf_z < 35.5
         && !is_polar
         && !in_rift_belt
@@ -688,6 +764,21 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
         ((n_moist - 0.34) * 1.95).clamp(0.0, 1.0)
     } else {
         0.0
+    };
+    let forest_density = (base_forest
+        * (1.0 - 0.62 * mesa_w)
+        * (1.0 - 0.85 * badlands_w)
+        * (1.0 - 0.35 * tundra_w)
+        + 0.18 * autumn_w * if surf_z > z_sea + 1.6 && surf_z < 34.5 { 1.0 } else { 0.0 })
+        .clamp(0.0, 1.0);
+
+    let mix3 = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] {
+        let w = t.clamp(0.0, 1.0);
+        [
+            a[0] * (1.0 - w) + b[0] * w,
+            a[1] * (1.0 - w) + b[1] * w,
+            a[2] * (1.0 - w) + b[2] * w,
+        ]
     };
 
     let (biome, albedo, emissive, roughness) = if is_rift_core {
@@ -703,11 +794,17 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
             0.52,
         )
     } else if is_rift_rim {
-        let rim_heat = (1.0 - ((d_lat_rift - core_half_w) / (rim_half_w - core_half_w).max(0.01)).clamp(0.0, 1.0)) as f32;
+        let rim_heat = (1.0
+            - ((d_lat_rift - core_half_w) / (rim_half_w - core_half_w).max(0.01)).clamp(0.0, 1.0))
+            as f32;
         (
             MacroBiome::VolcanicRim,
             [0.09, 0.085, 0.10],
-            [0.45 * rim_heat * rim_heat, 0.09 * rim_heat * rim_heat, 0.01 * rim_heat],
+            [
+                0.45 * rim_heat * rim_heat,
+                0.09 * rim_heat * rim_heat,
+                0.01 * rim_heat,
+            ],
             0.66,
         )
     } else if cavern_depth > 1.2 {
@@ -720,11 +817,13 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
             0.58 - 0.25 * glow,
         )
     } else if is_polar {
+        // Crystal Glacier Tundra & Frozen Fjords: glistening pale ice plateaus & frost-blue ridges
+        let glint = (n_ridge * 0.55 + n_detail * 0.45) as f32;
         (
             MacroBiome::PolarGlacier,
-            [0.80, 0.89, 0.96],
+            [0.72 + 0.16 * glint, 0.86 + 0.09 * glint, 0.97],
             [0.0; 3],
-            0.24,
+            0.20 + 0.08 * (1.0 - glint),
         )
     } else if surf_z <= z_sea {
         (
@@ -734,53 +833,87 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
             0.86,
         )
     } else if river_depth > 0.08 {
-        // Wet river pebble bed & mossy stream bank
+        // Wet river pebble bed (sandstone canyon pebbles in mesas, mossy slate in Nordic fjords)
+        let bed = mix3([0.25, 0.27, 0.24], [0.44, 0.25, 0.15], mesa_w as f32);
+        (MacroBiome::CoastalBeach, bed, [0.0; 3], 0.64)
+    } else if badlands_w > 0.35 {
+        // Obsidian Volcanic Badlands scorched basalt highlands apron
+        let bw = badlands_w as f32;
+        let vein = ((n_detail - 0.58).max(0.0) * 2.5).clamp(0.0, 1.0) as f32 * bw;
         (
-            MacroBiome::CoastalBeach,
-            [0.25, 0.27, 0.24],
-            [0.0; 3],
-            0.64,
+            MacroBiome::VolcanicRim,
+            [0.12 + 0.04 * (1.0 - bw), 0.11 + 0.04 * (1.0 - bw), 0.13 + 0.05 * (1.0 - bw)],
+            [0.22 * vein, 0.04 * vein, 0.005 * vein],
+            0.62,
         )
     } else if surf_z < z_sea + 1.25 {
-        // Warm sunlit golden coastal beach
+        // Coastal beach tailored to continent (golden sand, warm amber, terracotta sandstone, or frosted pebble)
+        let mut beach = [0.54, 0.44, 0.28];
+        beach = mix3(beach, [0.58, 0.42, 0.22], autumn_w as f32);
+        beach = mix3(beach, [0.64, 0.39, 0.21], mesa_w as f32);
+        beach = mix3(beach, [0.62, 0.70, 0.78], tundra_w as f32);
         (
             MacroBiome::CoastalBeach,
-            [0.54, 0.44, 0.28],
+            beach,
             [0.0; 3],
-            0.88,
+            0.88 - 0.24 * tundra_w as f32,
         )
-    } else if surf_z >= 36.2 || (lat_abs > 0.67 && surf_z > 28.5) {
-        // High alpine snow-capped summit
+    } else if surf_z >= (36.2 - tundra_w * 4.2) || (lat_abs > 0.65 && surf_z > 28.0) {
+        // High alpine snow-capped summit / pale frost-blue crystal glacier ridge
+        let ridge_col = mix3([0.84, 0.90, 0.95], [0.74, 0.88, 0.98], tundra_w as f32);
         (
             MacroBiome::AlpineSnow,
-            [0.84, 0.90, 0.95],
+            ridge_col,
             [0.0; 3],
-            0.30,
+            0.30 - 0.08 * tundra_w as f32,
         )
     } else if surf_z >= 33.0 {
-        // Exposed granite alpine crags
+        // Exposed alpine crags (Nordic granite, amber crags, or stratified terracotta mesa rim)
+        let band = ((surf_z * 1.15 + n_detail * 2.0).sin() * 0.5 + 0.5) as f32;
+        let mesa_crag = [0.58 + 0.14 * band, 0.23 + 0.10 * band, 0.11 + 0.04 * band];
+        let mut rock = [0.32, 0.34, 0.38];
+        rock = mix3(rock, [0.42, 0.32, 0.22], autumn_w as f32 * 0.65);
+        rock = mix3(rock, mesa_crag, mesa_w as f32);
+        rock = mix3(rock, [0.54, 0.66, 0.76], tundra_w as f32 * 0.75);
         (
             MacroBiome::AlpineRock,
-            [0.32, 0.34, 0.38],
+            rock,
             [0.0; 3],
-            0.74,
+            0.74 - 0.22 * tundra_w as f32,
         )
     } else if forest_density > 0.40 {
-        // Deep Nordic emerald pine forest
+        // Continental forests: Nordic emerald spruce, Golden Autumn birch/amber, Red-Ochre scrub, or frost taiga
+        let var = n_detail as f32;
+        let mut col = [0.042, 0.175, 0.068];
+        let autumn_forest = [0.46 + 0.14 * var, 0.24 + 0.11 * var, 0.055 + 0.025 * var];
+        let mesa_scrub = [0.44 + 0.10 * var, 0.25 + 0.07 * var, 0.12 + 0.03 * var];
+        let tundra_taiga = [0.16, 0.29, 0.31];
+        col = mix3(col, autumn_forest, autumn_w as f32);
+        col = mix3(col, mesa_scrub, mesa_w as f32);
+        col = mix3(col, tundra_taiga, tundra_w as f32);
         (
             MacroBiome::PineForest,
-            [0.042, 0.175, 0.068],
+            col,
             [0.0; 3],
-            0.86,
+            0.86 - 0.12 * tundra_w as f32,
         )
     } else {
-        // Rolling sunlit emerald highland meadow
+        // Rolling continental highlands: Nordic emerald meadow, Golden Autumn amber meadow,
+        // Red-Ochre terraced sandstone canyon plateau, or Crystal frost-lichen tundra
         let alt_t = ((surf_z - z_sea) / 10.0).clamp(0.0, 1.0) as f32;
+        let band = ((surf_z * 1.15 + n_detail * 1.8).sin() * 0.5 + 0.5) as f32;
+        let mut col = [0.085 + 0.11 * alt_t, 0.28 - 0.05 * alt_t, 0.082 + 0.025 * alt_t];
+        let autumn_meadow = [0.44 + 0.16 * alt_t, 0.31 - 0.04 * alt_t, 0.085 + 0.02 * alt_t];
+        let mesa_plateau = [0.56 + 0.14 * band, 0.24 + 0.10 * band, 0.12 + 0.04 * band];
+        let tundra_lichen = [0.42 + 0.18 * alt_t, 0.56 + 0.14 * alt_t, 0.64 + 0.14 * alt_t];
+        col = mix3(col, autumn_meadow, autumn_w as f32);
+        col = mix3(col, mesa_plateau, mesa_w as f32);
+        col = mix3(col, tundra_lichen, tundra_w as f32);
         (
             MacroBiome::EmeraldMeadow,
-            [0.085 + 0.11 * alt_t, 0.28 - 0.05 * alt_t, 0.082 + 0.025 * alt_t],
+            col,
             [0.0; 3],
-            0.82,
+            0.82 - 0.04 * mesa_w as f32 - 0.30 * tundra_w as f32,
         )
     };
 
@@ -796,6 +929,7 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
         is_polar,
         is_rift_core,
         is_rift_rim,
+        continent_biome,
         biome,
         albedo,
         emissive,

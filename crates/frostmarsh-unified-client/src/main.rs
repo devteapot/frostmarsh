@@ -39,7 +39,7 @@ use crate::macro_planet_world::{
     MacroPlanetWorld, MACRO_MINIMAP_H, MACRO_MINIMAP_W,
 };
 use crate::mesh_gen::{StaticMeshBank, CLASS_BURROWER};
-use crate::net::QuicClientHandle;
+use crate::net::{LiveEntityState, QuicClientHandle};
 use crate::neural_style::NUM_Z16_STYLES;
 use crate::planet_world::{PlanetWorld, PLANET_MINIMAP_H, PLANET_MINIMAP_W};
 use crate::renderer::{z16_style_label, Approach4Renderer, Atmosphere, RenderStyle};
@@ -94,6 +94,10 @@ struct Args {
     /// Optional chat command automatically sent 1.5s into headless observation (e.g. "freeze north bridge")
     #[arg(long)]
     test_chat: Option<String>,
+    /// Boot straight into the R=1,304m locally-flat planet offline (< 0.5s) with 1 hydrated hero shard,
+    /// 60 local simulated bots & live sun/wildlife/weather (zero network server needed!)
+    #[arg(long, default_value_t = false)]
+    offline_planet: bool,
 }
 
 #[derive(Serialize)]
@@ -176,6 +180,882 @@ fn style_from_name(name: &str, out_h: u32) -> RenderStyle {
 }
 
 // =========================================================================
+// OFFLINE FAST-ITERATION MACRO PLANET SIMULATOR (`--offline-planet`, < 0.5s!)
+// =========================================================================
+
+struct OfflineBot {
+    id: u32,
+    name: String,
+    team: u8,
+    class_id: u8,
+    face: u8,
+    anchor_x: f32,
+    anchor_y: f32,
+    orbit_r: f32,
+    speed: f32,
+    phase: f32,
+    alt_off: f32,
+}
+
+struct OfflinePlanetSim {
+    player_name: String,
+    player_team: u8,
+    hero_face: u8,
+    hero_gx: f32,
+    hero_gy: f32,
+    hero_gz: f32,
+    hero_aim: (f32, f32),
+    hero_class: u8,
+    sim_tick: u64,
+    bots: Vec<OfflineBot>,
+    shrines: Vec<ShrineSnap>,
+}
+
+impl OfflinePlanetSim {
+    fn new(world: &mut MacroPlanetWorld, player_name: &str, player_team: u8) -> Self {
+        let sun_init = DVec3::new(-0.72, 0.36, 0.59).normalize();
+        let (hero_key, gx, gy, gz, aim_x, aim_y, isl_dir) =
+            world.find_scenic_coastal_hero_site_offline(sun_init.to_array());
+        world.set_hero_sky_island_dir(isl_dir);
+        world.ensure_procedural_shard_hydrated(hero_key);
+
+        let n_virt = world.face_size_virtual() as f32;
+        let classes = [
+            CLASS_STRIDER,
+            CLASS_SKYWING,
+            CLASS_TIDEKIN,
+            CLASS_EMBERSTALKER,
+            CLASS_BURROWER,
+        ];
+
+        // 3 scenic planetary shrines within the hydrated coastal fjord shard
+        let shrine_offsets = [(-26.0f32, 18.0f32, -1i8, "FJORD"), (28.0, -20.0, 1, "CREST"), (4.0, 34.0, 0, "BAY")];
+        let mut shrines = Vec::with_capacity(3);
+        for (i, &(ox, oy, owner, sname)) in shrine_offsets.iter().enumerate() {
+            shrines.push(ShrineSnap {
+                id: i as u8,
+                name: sname.to_string(),
+                x: (gx + ox).clamp(4.0, n_virt - 4.0),
+                y: (gy + oy).clamp(4.0, n_virt - 4.0),
+                progress: owner as f32 * 0.85,
+                owner,
+                face: hero_key.face,
+            });
+        }
+
+        // 60 simulated local bots across all 5 classes & both teams!
+        let mut bots = Vec::with_capacity(60);
+        for bi in 0..60usize {
+            let team = (bi % 2) as u8;
+            let class_id = classes[bi % classes.len()];
+            let ang = (bi as f32 / 60.0) * std::f32::consts::TAU * 3.0 + 0.25;
+            let ring_r = 12.0 + (bi % 12) as f32 * 5.8;
+            let ax = (gx + ang.cos() * ring_r).clamp(8.0, n_virt - 8.0);
+            let ay = (gy + ang.sin() * ring_r).clamp(8.0, n_virt - 8.0);
+            bots.push(OfflineBot {
+                id: 100 + bi as u32,
+                name: format!("Bot-{:02}", bi + 1),
+                team,
+                class_id,
+                face: hero_key.face,
+                anchor_x: ax,
+                anchor_y: ay,
+                orbit_r: 4.5 + (bi % 7) as f32 * 2.2,
+                speed: 0.35 + (bi % 5) as f32 * 0.12,
+                phase: bi as f32 * 1.13,
+                alt_off: if class_id == CLASS_SKYWING { 6.5 + (bi % 4) as f32 * 3.0 } else { 0.0 },
+            });
+        }
+
+        Self {
+            player_name: player_name.to_string(),
+            player_team,
+            hero_face: hero_key.face,
+            hero_gx: gx,
+            hero_gy: gy,
+            hero_gz: gz,
+            hero_aim: (aim_x, aim_y),
+            hero_class: CLASS_STRIDER,
+            sim_tick: 0,
+            bots,
+            shrines,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_and_snapshot(
+        &mut self,
+        world: &mut MacroPlanetWorld,
+        dt: f32,
+        move_u: f32,
+        move_v: f32,
+        aim: (f32, f32),
+        dash: bool,
+        sim_time: f32,
+    ) -> LiveEntityState {
+        self.sim_tick += 1;
+        let n_virt = world.face_size_virtual() as f32;
+        let speed = if dash { 26.0 } else { 11.5 };
+        self.hero_gx = (self.hero_gx + move_u * speed * dt).clamp(4.0, n_virt - 4.0);
+        self.hero_gy = (self.hero_gy + move_v * speed * dt).clamp(4.0, n_virt - 4.0);
+        let surf_z = world.sample_surface_z_f64(self.hero_face, self.hero_gx as f64, self.hero_gy as f64);
+        self.hero_gz = surf_z.max(world.z_sea + 0.55) as f32;
+        if aim.0.hypot(aim.1) > 0.05 {
+            self.hero_aim = aim;
+        }
+
+        // Gently sweep the planetary sun across golden hour!
+        let sun_rot = (sim_time as f64) * 0.004;
+        let base_sun = DVec3::new(-0.72, 0.36, 0.59).normalize();
+        let sun_d = DVec3::new(
+            base_sun.x * sun_rot.cos() - base_sun.z * sun_rot.sin(),
+            base_sun.y,
+            base_sun.x * sun_rot.sin() + base_sun.z * sun_rot.cos(),
+        )
+        .normalize();
+
+        let mut players = Vec::with_capacity(61);
+        players.push(PlayerSnap {
+            id: 1,
+            name: self.player_name.clone(),
+            team: self.player_team,
+            class_id: self.hero_class,
+            is_bot: false,
+            x: self.hero_gx,
+            y: self.hero_gy,
+            z: self.hero_gz,
+            vx: move_u * speed,
+            vy: move_v * speed,
+            vz: 0.0,
+            aim_x: self.hero_aim.0,
+            aim_y: self.hero_aim.1,
+            hp: 1000,
+            max_hp: 1000,
+            mana: 500,
+            max_mana: 500,
+            stamina: 100,
+            max_stamina: 100,
+            level: 5,
+            xp: 250,
+            kills: 3,
+            deaths: 0,
+            status_flags: 0,
+            dashing: dash,
+            melee_active: false,
+            ult_active: false,
+            carrying_relic: false,
+            dash_cd_frac: 0.0,
+            ability_e_cd_frac: 0.0,
+            ult_r_cd_frac: 0.0,
+            ack_input_seq: self.sim_tick as u32,
+            score: 420,
+            face: self.hero_face,
+        });
+
+        let mut actuator_pulses = Vec::new();
+        let mut projectiles = Vec::new();
+        for (bi, b) in self.bots.iter().enumerate() {
+            let ang = sim_time * b.speed + b.phase;
+            let bx = (b.anchor_x + ang.cos() * b.orbit_r).clamp(4.0, n_virt - 4.0);
+            let by = (b.anchor_y + ang.sin() * b.orbit_r).clamp(4.0, n_virt - 4.0);
+            let vx = -ang.sin() * b.orbit_r * b.speed;
+            let vy = ang.cos() * b.orbit_r * b.speed;
+            let vlen = vx.hypot(vy).max(1e-3);
+            let b_surf = world.sample_surface_z_f64(b.face, bx as f64, by as f64);
+            let bz = (b_surf.max(world.z_sea + 0.55) as f32) + b.alt_off;
+            players.push(PlayerSnap {
+                id: b.id,
+                name: b.name.clone(),
+                team: b.team,
+                class_id: b.class_id,
+                is_bot: true,
+                x: bx,
+                y: by,
+                z: bz,
+                vx,
+                vy,
+                vz: 0.0,
+                aim_x: vx / vlen,
+                aim_y: vy / vlen,
+                hp: 850,
+                max_hp: 1000,
+                mana: 400,
+                max_mana: 500,
+                stamina: 100,
+                max_stamina: 100,
+                level: 3 + (bi % 4) as u8,
+                xp: 120,
+                kills: (bi % 5) as u16,
+                deaths: (bi % 3) as u16,
+                status_flags: 0,
+                dashing: false,
+                melee_active: false,
+                ult_active: (bi % 11 == 0) && ((sim_time * 0.7 + bi as f32).sin() > 0.6),
+                carrying_relic: false,
+                dash_cd_frac: 0.0,
+                ability_e_cd_frac: 0.0,
+                ult_r_cd_frac: 0.0,
+                ack_input_seq: 0,
+                score: 120 + bi as u32 * 10,
+                face: b.face,
+            });
+            // Lively elemental skirmish beams & projectiles between nearby bots
+            if bi < 10 && ((sim_time * 1.4 + bi as f32 * 1.7).sin() > 0.35) {
+                let tx = (bx + (vx / vlen) * 14.0).clamp(4.0, n_virt - 4.0);
+                let ty = (by + (vy / vlen) * 14.0).clamp(4.0, n_virt - 4.0);
+                let tz = world.sample_surface_z_f64(b.face, tx as f64, ty as f64) as f32;
+                actuator_pulses.push(ActuatorPulseSnap {
+                    x0: bx,
+                    y0: by,
+                    z0: bz,
+                    x1: tx,
+                    y1: ty,
+                    z1: tz,
+                    thermal_flux: if b.team == 0 { -1.0 } else { 1.0 },
+                    sp_oil: 0.0,
+                    sp_water: if b.class_id == CLASS_TIDEKIN { 1.0 } else { 0.0 },
+                    sp_smoke: 0.0,
+                    focus_radius: 3.5,
+                    impulse: 0.0,
+                    team: b.team,
+                    face: b.face,
+                });
+            }
+            if bi < 6 {
+                let pt = (sim_time * 0.9 + bi as f32 * 0.6).fract();
+                projectiles.push(ProjectileSnap {
+                    id: 500 + bi as u32,
+                    element: (bi % 4) as u8,
+                    x: (bx + (vx / vlen) * (3.0 + pt * 18.0)).clamp(4.0, n_virt - 4.0),
+                    y: (by + (vy / vlen) * (3.0 + pt * 18.0)).clamp(4.0, n_virt - 4.0),
+                    z: bz + 1.2,
+                    vx: (vx / vlen) * 18.0,
+                    vy: (vy / vlen) * 18.0,
+                    vz: 0.0,
+                    radius: 0.65,
+                    face: b.face,
+                });
+            }
+        }
+
+        let telemetry = TelemetrySnap {
+            mode: "offline-macro-planet".to_string(),
+            backend: "Local-Metal".to_string(),
+            ecosystem_on: true,
+            grid_w: world.face_size_virtual() as u16,
+            grid_h: world.face_size_virtual() as u16,
+            grid_d: world.depth as u8,
+            field_tick: self.sim_tick,
+            infer_ms_last: 0.0,
+            infer_ms_p99: 0.0,
+            eco_infer_ms: 0.0,
+            proj_active_pct: 100.0,
+            mass_error: 0,
+            energy_error: 0,
+            wire_kbps: 0.0,
+            aoi_chunks_sent: 0,
+            total_chunks: 384,
+            active_bots: self.bots.len() as u16,
+            neural_bots_on: true,
+            bot_infer_ms: 0.1,
+            weather_kind: 0,
+            day_time: (sim_time * 0.01).fract(),
+            wind_x: 1.8,
+            wind_y: -0.9,
+            score_west: 120,
+            score_east: 110,
+            acoustic_ms: 0.0,
+            world_sparse_pct: 100.0,
+            physics_native: true,
+            time_scale: 1.0,
+            world_day: 1,
+            neural_3d_vertical: true,
+            active_time_domes: 0,
+            system2_slm_active: false,
+            planet_mode: false,
+            planet_r_core: world.r_core as f32,
+            sun_dir: [sun_d.x as f32, sun_d.y as f32, sun_d.z as f32],
+            seam_mass_crossed: 0,
+            active_sky_cores: world.sky_islands.len() as u8,
+            macro_planet: true,
+            planet_shards_per_axis: world.shards_per_axis,
+            planet_seed: world.seed,
+            climate_infer_ms: 0.0,
+            active_hydrated_shards: world.hydrated_shard_count() as u16,
+            local_wind_u: 1.8,
+            local_wind_v: -0.9,
+            local_temp_c: 11.5,
+            local_cloud_cover: 0.34,
+        };
+
+        LiveEntityState {
+            sim_tick: self.sim_tick,
+            match_time_secs: sim_time as u32,
+            your_player_id: 1,
+            echo_client_time_ms: 0,
+            relic_x: self.hero_gx,
+            relic_y: self.hero_gy,
+            players,
+            projectiles,
+            bodies: Vec::new(),
+            shrines: self.shrines.clone(),
+            events: Vec::new(),
+            telemetry,
+            bot_brains: Vec::new(),
+            kill_feed: Vec::new(),
+            speech_bubbles: Vec::new(),
+            actuator_pulses,
+            match_phase: 0,
+            match_time_left_s: 600,
+            mvp_name: self.player_name.clone(),
+            mvp_score: 420,
+            time_domes: Vec::new(),
+        }
+    }
+}
+
+/// Shared Macro-Planet headless capture & GPU benchmark runner (used by BOTH live QUIC and `--offline-planet`).
+/// Captures all 4 standard shots + `unified_metrics.json` PLUS 2 bonus 1080p close-up showcase PNGs:
+/// `unified_village_harbor_1080p.png` & `unified_cavern_river_1080p.png`!
+#[allow(clippy::too_many_arguments)]
+fn capture_macro_planet_headless(
+    args: &Args,
+    renderer: &mut Approach4Renderer,
+    macro_world: &mut MacroPlanetWorld,
+    entities: Option<&LiveEntityState>,
+    sun_d: DVec3,
+    focus_pos: [f64; 3],
+    focus_fwd: [f64; 3],
+    isl_dir: [f64; 3],
+    parametric_build_ms: f64,
+    full_sync_build_ms: f64,
+    dirty_p50: f64,
+    dirty_p99: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sun_f = [sun_d.x as f32, sun_d.y as f32, sun_d.z as f32];
+    let local_clim = entities
+        .map(|e| [e.telemetry.local_wind_u, e.telemetry.local_wind_v, e.telemetry.local_cloud_cover])
+        .unwrap_or([1.8, -0.9, 0.35]);
+
+    let world_dummy = LiveApproach4World::new(256, 256, 4);
+    let r_surf = macro_world.r_surf();
+    let cam_ground = MacroPlanetCamera::ground_3rd_person_shot(
+        DVec3::from_array(focus_pos),
+        DVec3::from_array(focus_fwd),
+        DVec3::from_array(isl_dir),
+    );
+    let mut cam_overhead = MacroPlanetCamera::new(r_surf);
+    cam_overhead.update_follow(
+        DVec3::from_array(focus_pos),
+        DVec3::from_array(focus_fwd),
+        r_surf,
+        0.016,
+    );
+    let cam_flight = MacroPlanetCamera::skywing_flight_shot(
+        DVec3::from_array(focus_pos),
+        DVec3::from_array(focus_fwd),
+        DVec3::from_array(isl_dir),
+        r_surf,
+    );
+    let cam_strato = MacroPlanetCamera::stratosphere_shot(
+        DVec3::from_array(focus_pos),
+        DVec3::from_array(focus_fwd),
+        r_surf,
+    );
+    let cam_orbital = MacroPlanetCamera::orbital_globe_shot(sun_d, r_surf);
+
+    let sim_time = 2.4f32;
+    macro_world.set_camera_alt_m(cam_ground.eye_f64.to_array());
+    macro_world.rebuild_dynamic_entities(entities, sim_time);
+    renderer.upload_macro_planet_world(macro_world);
+    renderer.upload_minimap(
+        MACRO_MINIMAP_W as u32,
+        MACRO_MINIMAP_H as u32,
+        &macro_world.minimap_rgba,
+    );
+
+    let mut gpu_benchmarks = Vec::new();
+    let mut fps_1080 = 300.0f32;
+    let mut last_weather_culled = macro_world.cam_alt_m > 160.0;
+    for (label, bw, bh, bcam) in [
+        ("1080p Macro Ground 1m + HUD", 1920u32, 1080u32, &cam_ground),
+        ("4K Macro Ground 1m + HUD", 3840u32, 2160u32, &cam_ground),
+        ("1080p Macro Orbital + Climate", 1920u32, 1080u32, &cam_orbital),
+        ("4K Macro Orbital + Climate", 3840u32, 2160u32, &cam_orbital),
+    ] {
+        macro_world.set_camera_alt_m(bcam.eye_f64.to_array());
+        let want_culled = macro_world.cam_alt_m > 160.0;
+        if want_culled != last_weather_culled {
+            macro_world.rebuild_dynamic_entities(entities, sim_time);
+            renderer.upload_macro_planet_world(macro_world);
+            last_weather_culled = want_culled;
+        }
+        let mm = bcam.compute_matrices(bw as f32, bh as f32);
+        let hm = mm.to_hud_camera_matrices();
+        let hb = build_hud(
+            bw as f32,
+            bh as f32,
+            &world_dummy,
+            None,
+            entities,
+            &hm,
+            &HudConfig {
+                show_hud: true,
+                show_telemetry: true,
+                show_brain_inspector: true,
+                brain_selected_idx: None,
+                selected_element: 0,
+                focus_radius: 4.0,
+                style_label: "MACRO-3D",
+                z16_active: false,
+                z16_style_label: "MACRO",
+                fps: fps_1080,
+                rtt_ms: 1.2,
+                chat_open: false,
+                chat_input: "",
+                chat_shout: true,
+                show_scoreboard: false,
+                audio_muted: true,
+                audio_available: false,
+                cave_enclosure: 0.0,
+                show_squad_links: true,
+                camera_preset_label: bcam.mode.label(),
+                macro_eye_f64: Some(mm.eye_f64),
+            },
+        );
+        let (p50, p99, mean) = renderer.benchmark_macro_planet_gpu(
+            bw,
+            bh,
+            &mm,
+            sun_f,
+            bcam.exposure,
+            local_clim,
+            macro_world,
+            Some(&hb),
+            6,
+            args.bench_iters,
+        );
+        let fps = 1000.0 / p50.max(0.001);
+        if bw == 1920 && bcam.mode == MacroPlanetCamMode::Ground3rdPerson {
+            fps_1080 = fps as f32;
+        }
+        println!(
+            "  [MacroPlanet Bench] {:32} | p50={:.3}ms p99={:.3}ms ({:.1} FPS)",
+            label, p50, p99, fps
+        );
+        gpu_benchmarks.push(GpuBenchEntry {
+            label: label.to_string(),
+            resolution: format!("{}x{}", bw, bh),
+            art_resolution: format!("{}x{}", bw, bh),
+            style: "MACRO-PLANET-METAL".to_string(),
+            p50_ms: (p50 * 1000.0).round() / 1000.0,
+            p99_ms: (p99 * 1000.0).round() / 1000.0,
+            mean_ms: (mean * 1000.0).round() / 1000.0,
+            fps_p50: (fps * 10.0).round() / 10.0,
+        });
+    }
+
+    std::fs::create_dir_all(&args.out_dir)?;
+
+    // Ensure low-altitude weather particles are active for Ground, Overhead & Flight shots
+    macro_world.set_camera_alt_m(cam_ground.eye_f64.to_array());
+    if last_weather_culled {
+        macro_world.rebuild_dynamic_entities(entities, sim_time);
+        renderer.upload_macro_planet_world(macro_world);
+    }
+
+    // Shot 1: `unified_live_1080p_hud.png` — Ground 3rd-Person Hero Shot (with HUD)
+    let mats_g_1080 = cam_ground.compute_matrices(1920.0, 1080.0);
+    let hm_g = mats_g_1080.to_hud_camera_matrices();
+    let hud_main = build_hud(
+        1920.0,
+        1080.0,
+        &world_dummy,
+        None,
+        entities,
+        &hm_g,
+        &HudConfig {
+            show_hud: true,
+            show_telemetry: true,
+            show_brain_inspector: true,
+            brain_selected_idx: None,
+            selected_element: 0,
+            focus_radius: 4.0,
+            style_label: "MACRO-3D",
+            z16_active: false,
+            z16_style_label: "MACRO",
+            fps: fps_1080,
+            rtt_ms: 1.2,
+            chat_open: false,
+            chat_input: "",
+            chat_shout: true,
+            show_scoreboard: false,
+            audio_muted: true,
+            audio_available: false,
+            cave_enclosure: 0.0,
+            show_squad_links: true,
+            camera_preset_label: MacroPlanetCamMode::Ground3rdPerson.label(),
+            macro_eye_f64: Some(mats_g_1080.eye_f64),
+        },
+    );
+    let (rgba_g, _) = renderer.render_macro_planet_to_rgba(
+        1920,
+        1080,
+        &mats_g_1080,
+        sun_f,
+        cam_ground.exposure,
+        sim_time,
+        local_clim,
+        macro_world,
+        Some(&hud_main),
+    );
+    save_rgba_png(&args.out_dir.join("unified_live_1080p_hud.png"), 1920, 1080, &rgba_g)?;
+
+    // Shot 2: `unified_closeup_action_1080p.png` — Skywing Flight Action Shot (~95m altitude)
+    let mats_fl_1080 = cam_flight.compute_matrices(1920.0, 1080.0);
+    let hm_fl = mats_fl_1080.to_hud_camera_matrices();
+    let hud_fl = build_hud(
+        1920.0,
+        1080.0,
+        &world_dummy,
+        None,
+        entities,
+        &hm_fl,
+        &HudConfig {
+            show_hud: true,
+            show_telemetry: true,
+            show_brain_inspector: true,
+            brain_selected_idx: None,
+            selected_element: 0,
+            focus_radius: 4.0,
+            style_label: "MACRO-3D",
+            z16_active: false,
+            z16_style_label: "MACRO",
+            fps: fps_1080,
+            rtt_ms: 1.2,
+            chat_open: false,
+            chat_input: "",
+            chat_shout: true,
+            show_scoreboard: false,
+            audio_muted: true,
+            audio_available: false,
+            cave_enclosure: 0.0,
+            show_squad_links: true,
+            camera_preset_label: MacroPlanetCamMode::SkywingFlight.label(),
+            macro_eye_f64: Some(mats_fl_1080.eye_f64),
+        },
+    );
+    let (rgba_fl, _) = renderer.render_macro_planet_to_rgba(
+        1920,
+        1080,
+        &mats_fl_1080,
+        sun_f,
+        cam_flight.exposure,
+        sim_time,
+        local_clim,
+        macro_world,
+        Some(&hud_fl),
+    );
+    save_rgba_png(&args.out_dir.join("unified_closeup_action_1080p.png"), 1920, 1080, &rgba_fl)?;
+
+    // Shot 7: `unified_overhead_tactical_1080p.png` — Default Playable Tactical Overhead (~48° MOBA view + HUD!)
+    let mats_ov_1080 = cam_overhead.compute_matrices(1920.0, 1080.0);
+    let hm_ov = mats_ov_1080.to_hud_camera_matrices();
+    let hud_ov = build_hud(
+        1920.0,
+        1080.0,
+        &world_dummy,
+        None,
+        entities,
+        &hm_ov,
+        &HudConfig {
+            show_hud: true,
+            show_telemetry: true,
+            show_brain_inspector: true,
+            brain_selected_idx: None,
+            selected_element: 0,
+            focus_radius: 4.0,
+            style_label: "MACRO-3D",
+            z16_active: false,
+            z16_style_label: "MACRO",
+            fps: fps_1080,
+            rtt_ms: 1.2,
+            chat_open: false,
+            chat_input: "",
+            chat_shout: true,
+            show_scoreboard: false,
+            audio_muted: true,
+            audio_available: false,
+            cave_enclosure: 0.0,
+            show_squad_links: true,
+            camera_preset_label: MacroPlanetCamMode::TacticalOverhead.label(),
+            macro_eye_f64: Some(mats_ov_1080.eye_f64),
+        },
+    );
+    let (rgba_ov, _) = renderer.render_macro_planet_to_rgba(
+        1920,
+        1080,
+        &mats_ov_1080,
+        sun_f,
+        cam_overhead.exposure,
+        sim_time,
+        local_clim,
+        macro_world,
+        Some(&hud_ov),
+    );
+    save_rgba_png(&args.out_dir.join("unified_overhead_tactical_1080p.png"), 1920, 1080, &rgba_ov)?;
+
+    // Shot 3: `unified_orbital_1080p.png` — Full Orbital Globe (3,250m) with live Coriolis storm clouds!
+    // Cull low-altitude weather particles (> 160m) so ZERO snowflake specks float in space!
+    macro_world.set_camera_alt_m(cam_orbital.eye_f64.to_array());
+    macro_world.rebuild_dynamic_entities(entities, sim_time);
+    renderer.upload_macro_planet_world(macro_world);
+    last_weather_culled = true;
+    let mats_orb_1080 = cam_orbital.compute_matrices(1920.0, 1080.0);
+    let hm_orb = mats_orb_1080.to_hud_camera_matrices();
+    let hud_orb = build_hud(
+        1920.0,
+        1080.0,
+        &world_dummy,
+        None,
+        entities,
+        &hm_orb,
+        &HudConfig {
+            show_hud: true,
+            show_telemetry: true,
+            show_brain_inspector: false,
+            brain_selected_idx: None,
+            selected_element: 0,
+            focus_radius: 4.0,
+            style_label: "MACRO-3D",
+            z16_active: false,
+            z16_style_label: "MACRO",
+            fps: fps_1080,
+            rtt_ms: 1.2,
+            chat_open: false,
+            chat_input: "",
+            chat_shout: true,
+            show_scoreboard: false,
+            audio_muted: true,
+            audio_available: false,
+            cave_enclosure: 0.0,
+            show_squad_links: true,
+            camera_preset_label: MacroPlanetCamMode::OrbitalGlobe.label(),
+            macro_eye_f64: Some(mats_orb_1080.eye_f64),
+        },
+    );
+    let (rgba_orb, _) = renderer.render_macro_planet_to_rgba(
+        1920,
+        1080,
+        &mats_orb_1080,
+        sun_f,
+        cam_orbital.exposure,
+        sim_time,
+        local_clim,
+        macro_world,
+        Some(&hud_orb),
+    );
+    save_rgba_png(&args.out_dir.join("unified_orbital_1080p.png"), 1920, 1080, &rgba_orb)?;
+
+    // Shot 4: `unified_orbit_4view.png` — 2×2 Live Dual-Scale Transition Showcase
+    let q_cams = [&cam_ground, &cam_flight, &cam_strato, &cam_orbital];
+    let mut panels = Vec::with_capacity(4);
+    for (qi, qcam) in q_cams.iter().enumerate() {
+        macro_world.set_camera_alt_m(qcam.eye_f64.to_array());
+        let want_culled = macro_world.cam_alt_m > 160.0;
+        if want_culled != last_weather_culled {
+            macro_world.rebuild_dynamic_entities(entities, sim_time);
+            renderer.upload_macro_planet_world(macro_world);
+            last_weather_culled = want_culled;
+        }
+        let qm = qcam.compute_matrices(960.0, 540.0);
+        let qhud = if qi == 0 {
+            let hm = qm.to_hud_camera_matrices();
+            Some(build_hud(
+                960.0,
+                540.0,
+                &world_dummy,
+                None,
+                entities,
+                &hm,
+                &HudConfig {
+                    show_hud: true,
+                    show_telemetry: true,
+                    show_brain_inspector: false,
+                    brain_selected_idx: None,
+                    selected_element: 0,
+                    focus_radius: 4.0,
+                    style_label: "MACRO-3D",
+                    z16_active: false,
+                    z16_style_label: "MACRO",
+                    fps: fps_1080,
+                    rtt_ms: 1.2,
+                    chat_open: false,
+                    chat_input: "",
+                    chat_shout: true,
+                    show_scoreboard: false,
+                    audio_muted: true,
+                    audio_available: false,
+                    cave_enclosure: 0.0,
+                    show_squad_links: true,
+                    camera_preset_label: qcam.mode.label(),
+                    macro_eye_f64: Some(qm.eye_f64),
+                },
+            ))
+        } else {
+            None
+        };
+        let (px, _) = renderer.render_macro_planet_to_rgba(
+            960,
+            540,
+            &qm,
+            sun_f,
+            qcam.exposure,
+            sim_time,
+            local_clim,
+            macro_world,
+            qhud.as_ref(),
+        );
+        panels.push(px);
+    }
+    let grid = compose_2x2_grid([&panels[0], &panels[1], &panels[2], &panels[3]], 960, 540);
+    save_rgba_png(&args.out_dir.join("unified_orbit_4view.png"), 1920, 1080, &grid)?;
+
+    // Bonus Showcase Shots 5 & 6: Nordic Village Harbor & Glowing Cavern / Arched Bridge / Runic Sanctuary!
+    let ((vil_pos, vil_look), (mut cav_pos, mut cav_look)) =
+        macro_world.find_village_and_cavern_showcase_sites(focus_pos, focus_fwd, isl_dir);
+
+    // Prefer Glowing Underground Cavern Grotto or Arched River Bridge via `resolve_landmark_f64` if present
+    // in hydrated shards, otherwise showcase our upgraded Nordic Runic Sanctuary Ruins!
+    let has_hydrated_grotto_or_bridge = macro_world
+        .shards
+        .values()
+        .any(|sh| !sh.living_anchors.cavern_grottos.is_empty() || !sh.living_anchors.bridges.is_empty());
+    if has_hydrated_grotto_or_bridge {
+        let has_grotto = macro_world
+            .shards
+            .values()
+            .any(|sh| !sh.living_anchors.cavern_grottos.is_empty());
+        let (_, lpos, lfwd, _, _) =
+            macro_world.resolve_landmark_f64(if has_grotto { 2 } else { 1 }, focus_pos, false);
+        cav_pos = lpos;
+        cav_look = lfwd;
+    }
+
+    let cam_village = MacroPlanetCamera::village_harbor_shot(
+        DVec3::from_array(vil_pos),
+        DVec3::from_array(vil_look),
+    );
+    let vil_origin_shifted = macro_world.ensure_floating_origin(cam_village.eye_f64.to_array());
+    macro_world.set_camera_alt_m(cam_village.eye_f64.to_array());
+    if vil_origin_shifted || last_weather_culled {
+        if vil_origin_shifted {
+            let _ = macro_world.rebuild_dirty(6);
+        }
+        macro_world.rebuild_dynamic_entities(entities, sim_time);
+        renderer.upload_macro_planet_world(macro_world);
+        last_weather_culled = false;
+    }
+    let mats_vil = cam_village.compute_matrices(1920.0, 1080.0);
+    let (rgba_vil, _) = renderer.render_macro_planet_to_rgba(
+        1920,
+        1080,
+        &mats_vil,
+        sun_f,
+        cam_village.exposure,
+        sim_time,
+        local_clim,
+        macro_world,
+        None,
+    );
+    save_rgba_png(&args.out_dir.join("unified_village_harbor_1080p.png"), 1920, 1080, &rgba_vil)?;
+
+    // Frame Cavern Grotto / Arched Bridge / Ancient Runic Sanctuary at an eye-level dramatic 3/4 angle!
+    let mut cam_cavern = MacroPlanetCamera::cavern_river_shot(
+        DVec3::from_array(cav_pos),
+        DVec3::from_array(cav_look),
+    );
+    let cav_p = DVec3::from_array(cav_pos);
+    let cav_up = cav_p.normalize_or(DVec3::Z);
+    let cav_fwd_raw = DVec3::from_array(cav_look);
+    let cav_fwd = (cav_fwd_raw - cav_up * cav_fwd_raw.dot(cav_up)).normalize_or(cam_cavern.smoothed_fwd);
+    let cav_right = cav_fwd.cross(cav_up).normalize_or(DVec3::X);
+    cam_cavern.eye_f64 = cav_p + cav_up * 5.2 - cav_fwd * 14.2 + cav_right * 6.4;
+    cam_cavern.target_f64 = cav_p + cav_up * 2.8 + cav_fwd * 1.0;
+    cam_cavern.up_f64 = cav_up;
+    cam_cavern.fov_y_deg = 50.0;
+
+    let cav_origin_shifted = macro_world.ensure_floating_origin(cam_cavern.eye_f64.to_array());
+    macro_world.set_camera_alt_m(cam_cavern.eye_f64.to_array());
+    if cav_origin_shifted || last_weather_culled {
+        if cav_origin_shifted {
+            let _ = macro_world.rebuild_dirty(6);
+        }
+        macro_world.rebuild_dynamic_entities(entities, sim_time);
+        renderer.upload_macro_planet_world(macro_world);
+    }
+    let mats_cav = cam_cavern.compute_matrices(1920.0, 1080.0);
+    let (rgba_cav, _) = renderer.render_macro_planet_to_rgba(
+        1920,
+        1080,
+        &mats_cav,
+        sun_f,
+        cam_cavern.exposure,
+        sim_time,
+        local_clim,
+        macro_world,
+        None,
+    );
+    save_rgba_png(&args.out_dir.join("unified_cavern_river_1080p.png"), 1920, 1080, &rgba_cav)?;
+
+    let tel = entities.map(|e| e.telemetry.clone());
+    let metrics = UnifiedMetrics {
+        server: if args.offline_planet {
+            "offline-planet".to_string()
+        } else {
+            args.server.to_string()
+        },
+        gpu_adapter: renderer.adapter_name.clone(),
+        gpu_backend: renderer.adapter_backend.clone(),
+        grid_w: macro_world.face_size_virtual(),
+        grid_h: macro_world.face_size_virtual(),
+        total_chunks: macro_world.received_brick_count(),
+        parametric_build_ms: (parametric_build_ms * 100.0).round() / 100.0,
+        sim_mode: tel
+            .as_ref()
+            .map(|t| t.mode.clone())
+            .unwrap_or_else(|| "macro-planet".to_string()),
+        backend: tel.as_ref().map(|t| t.backend.clone()).unwrap_or_default(),
+        field_tick: tel.as_ref().map(|t| t.field_tick).unwrap_or(0),
+        world_infer_ms: tel.as_ref().map(|t| t.infer_ms_last).unwrap_or(0.0),
+        eco_infer_ms: tel.as_ref().map(|t| t.eco_infer_ms).unwrap_or(0.0),
+        proj_active_pct: tel.as_ref().map(|t| t.proj_active_pct).unwrap_or(0.0),
+        mass_error: tel.as_ref().map(|t| t.mass_error).unwrap_or(0),
+        energy_error: tel.as_ref().map(|t| t.energy_error).unwrap_or(0),
+        wire_kbps: tel.as_ref().map(|t| t.wire_kbps).unwrap_or(0.0),
+        aoi_chunks_sent: macro_world.received_brick_count() as u16,
+        active_bots: tel.as_ref().map(|t| t.active_bots).unwrap_or(0),
+        weather_kind: tel.as_ref().map(|t| t.weather_kind).unwrap_or(0),
+        dirty_update_p50_ms: (dirty_p50 * 1000.0).round() / 1000.0,
+        dirty_update_p99_ms: (dirty_p99 * 1000.0).round() / 1000.0,
+        full_sync_build_ms: (full_sync_build_ms * 1000.0).round() / 1000.0,
+        visible_chunks: macro_world.hydrated_shard_count(),
+        terrain_triangles: macro_world.total_triangles(),
+        mesh_instances: entities.map(|e| e.players.len() + e.shrines.len()).unwrap_or(0),
+        surfel_draws: 0,
+        volumetric_splats: macro_world.near_gas_indices.len() / 3,
+        hud_vertices: hud_main.vertices.len(),
+        gpu_benchmarks,
+    };
+    let json = serde_json::to_string_pretty(&metrics)?;
+    std::fs::write(args.out_dir.join("unified_metrics.json"), &json)?;
+    println!(
+        "[Unified-MacroPlanet] Saved unified_live_1080p_hud.png, unified_overhead_tactical_1080p.png, unified_closeup_action_1080p.png, unified_orbital_1080p.png, unified_orbit_4view.png, unified_village_harbor_1080p.png, unified_cavern_river_1080p.png, unified_metrics.json"
+    );
+    Ok(())
+}
+
+// =========================================================================
 // HEADLESS CAPTURE & BENCHMARK MODE (1080p & 4K on GB10 / Desktop GPU)
 // =========================================================================
 
@@ -191,6 +1071,43 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "[Unified] Headless GPU: {} ({}) | Parametric build {:.2}ms",
         renderer.adapter_name, renderer.adapter_backend, parametric_build_ms
     );
+
+    if args.offline_planet {
+        let t_off = Instant::now();
+        let mut macro_world = MacroPlanetWorld::new(1280.0, 8, 64, 33_033);
+        let mut off_sim = OfflinePlanetSim::new(&mut macro_world, &args.name, args.team);
+        let entities_snap = off_sim.step_and_snapshot(&mut macro_world, 0.016, 0.0, 0.0, (1.0, 0.0), false, 2.4);
+        let entities = Some(entities_snap);
+        let sun_d = entities
+            .as_ref()
+            .map(|e| DVec3::new(e.telemetry.sun_dir[0] as f64, e.telemetry.sun_dir[1] as f64, e.telemetry.sun_dir[2] as f64).normalize())
+            .unwrap_or_else(|| DVec3::new(-0.72, 0.36, 0.59).normalize());
+        let (focus_pos, focus_fwd, isl_dir) =
+            macro_world.find_hero_or_best_cluster_f64(entities.as_ref(), sun_d.to_array());
+        macro_world.ensure_floating_origin(focus_pos);
+        let _ = macro_world.rebuild_dirty(4);
+        let full_sync_build_ms = t_off.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "[Unified-OfflinePlanet] Instant boot: {} hydrated shard, 60 local bots, {} tris in {:.1}ms!",
+            macro_world.hydrated_shard_count(),
+            macro_world.total_triangles(),
+            full_sync_build_ms
+        );
+        return capture_macro_planet_headless(
+            &args,
+            &mut renderer,
+            &mut macro_world,
+            entities.as_ref(),
+            sun_d,
+            focus_pos,
+            focus_fwd,
+            isl_dir,
+            parametric_build_ms,
+            full_sync_build_ms,
+            0.0,
+            0.0,
+        );
+    }
 
     let quic = rt.block_on(QuicClientHandle::connect(args.server, &args.name, args.team))?;
     let (rc, tot, has_ent) = rt.block_on(quic.wait_for_sync(0.95, Duration::from_secs(10)));
@@ -347,363 +1264,33 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let entities = { quic.state.lock().unwrap().entities.clone() };
         let sun_d = entities
-            .as_ref()
-            .map(|e| {
-                let s = DVec3::new(e.telemetry.sun_dir[0] as f64, e.telemetry.sun_dir[1] as f64, e.telemetry.sun_dir[2] as f64);
-                if s.length_squared() > 0.01 { s.normalize() } else { DVec3::new(-0.72, 0.36, 0.59).normalize() }
-            })
-            .unwrap_or_else(|| DVec3::new(-0.72, 0.36, 0.59).normalize());
-        let sun_f = [sun_d.x as f32, sun_d.y as f32, sun_d.z as f32];
-        let local_clim = entities
-            .as_ref()
-            .map(|e| [e.telemetry.local_wind_u, e.telemetry.local_wind_v, e.telemetry.local_cloud_cover])
-            .unwrap_or([0.0, 0.0, 0.35]);
+        .as_ref()
+        .map(|e| {
+            let s = DVec3::new(e.telemetry.sun_dir[0] as f64, e.telemetry.sun_dir[1] as f64, e.telemetry.sun_dir[2] as f64);
+            if s.length_squared() > 0.01 { s.normalize() } else { DVec3::new(-0.72, 0.36, 0.59).normalize() }
+        })
+        .unwrap_or_else(|| DVec3::new(-0.72, 0.36, 0.59).normalize());
 
-        let (focus_pos, focus_fwd, isl_dir) =
+    let (focus_pos, focus_fwd, isl_dir) =
             macro_world.find_hero_or_best_cluster_f64(entities.as_ref(), sun_d.to_array());
         if macro_world.ensure_floating_origin(focus_pos) {
             let _ = macro_world.rebuild_dirty(12);
         }
 
-        let sim_time = 2.4f32;
-        macro_world.rebuild_dynamic_entities(entities.as_ref(), sim_time);
-        renderer.upload_macro_planet_world(&mut macro_world);
-        renderer.upload_minimap(
-            MACRO_MINIMAP_W as u32,
-            MACRO_MINIMAP_H as u32,
-            &macro_world.minimap_rgba,
-        );
-
-        let world_dummy = LiveApproach4World::new(256, 256, 4);
-        let r_surf = macro_world.r_surf();
-        let cam_ground = MacroPlanetCamera::ground_3rd_person_shot(
-            DVec3::from_array(focus_pos),
-            DVec3::from_array(focus_fwd),
-            DVec3::from_array(isl_dir),
-        );
-        let cam_flight = MacroPlanetCamera::skywing_flight_shot(
-            DVec3::from_array(focus_pos),
-            DVec3::from_array(focus_fwd),
-            DVec3::from_array(isl_dir),
-            r_surf,
-        );
-        let cam_strato = MacroPlanetCamera::stratosphere_shot(
-            DVec3::from_array(focus_pos),
-            DVec3::from_array(focus_fwd),
-            r_surf,
-        );
-        let cam_orbital = MacroPlanetCamera::orbital_globe_shot(sun_d, r_surf);
-
-        let mut gpu_benchmarks = Vec::new();
-        let mut fps_1080 = 300.0f32;
-        for (label, bw, bh, bcam) in [
-            ("1080p Macro Ground 1m + HUD", 1920u32, 1080u32, &cam_ground),
-            ("4K Macro Ground 1m + HUD", 3840u32, 2160u32, &cam_ground),
-            ("1080p Macro Orbital + Climate", 1920u32, 1080u32, &cam_orbital),
-            ("4K Macro Orbital + Climate", 3840u32, 2160u32, &cam_orbital),
-        ] {
-            let mm = bcam.compute_matrices(bw as f32, bh as f32);
-            let hm = mm.to_hud_camera_matrices();
-            let hb = build_hud(
-                bw as f32,
-                bh as f32,
-                &world_dummy,
-                None,
-                entities.as_ref(),
-                &hm,
-                &HudConfig {
-                    show_hud: true,
-                    show_telemetry: true,
-                    show_brain_inspector: true,
-                    brain_selected_idx: None,
-                    selected_element: 0,
-                    focus_radius: 4.0,
-                    style_label: "MACRO-3D",
-                    z16_active: false,
-                    z16_style_label: "MACRO",
-                    fps: fps_1080,
-                    rtt_ms: 1.2,
-                    chat_open: false,
-                    chat_input: "",
-                    chat_shout: true,
-                    show_scoreboard: false,
-                    audio_muted: true,
-                    audio_available: false,
-                    cave_enclosure: 0.0,
-                    show_squad_links: true,
-                    camera_preset_label: bcam.mode.label(),
-                    macro_eye_f64: Some(mm.eye_f64),
-                },
-            );
-            let (p50, p99, mean) = renderer.benchmark_macro_planet_gpu(
-                bw,
-                bh,
-                &mm,
-                sun_f,
-                bcam.exposure,
-                local_clim,
-                &macro_world,
-                Some(&hb),
-                6,
-                args.bench_iters,
-            );
-            let fps = 1000.0 / p50.max(0.001);
-            if bw == 1920 && bcam.mode == MacroPlanetCamMode::Ground3rdPerson {
-                fps_1080 = fps as f32;
-            }
-            println!(
-                "  [MacroPlanet Bench] {:32} | p50={:.3}ms p99={:.3}ms ({:.1} FPS)",
-                label, p50, p99, fps
-            );
-            gpu_benchmarks.push(GpuBenchEntry {
-                label: label.to_string(),
-                resolution: format!("{}x{}", bw, bh),
-                art_resolution: format!("{}x{}", bw, bh),
-                style: "MACRO-PLANET-METAL".to_string(),
-                p50_ms: (p50 * 1000.0).round() / 1000.0,
-                p99_ms: (p99 * 1000.0).round() / 1000.0,
-                mean_ms: (mean * 1000.0).round() / 1000.0,
-                fps_p50: (fps * 10.0).round() / 10.0,
-            });
-        }
-
-        std::fs::create_dir_all(&args.out_dir)?;
-
-        // Shot 1: `unified_live_1080p_hud.png` — Ground 3rd-Person Hero Shot (with HUD)
-        let mats_g_1080 = cam_ground.compute_matrices(1920.0, 1080.0);
-        let hm_g = mats_g_1080.to_hud_camera_matrices();
-        let hud_main = build_hud(
-            1920.0,
-            1080.0,
-            &world_dummy,
-            None,
+        return capture_macro_planet_headless(
+            &args,
+            &mut renderer,
+            &mut macro_world,
             entities.as_ref(),
-            &hm_g,
-            &HudConfig {
-                show_hud: true,
-                show_telemetry: true,
-                show_brain_inspector: true,
-                brain_selected_idx: None,
-                selected_element: 0,
-                focus_radius: 4.0,
-                style_label: "MACRO-3D",
-                z16_active: false,
-                z16_style_label: "MACRO",
-                fps: fps_1080,
-                rtt_ms: 1.2,
-                chat_open: false,
-                chat_input: "",
-                chat_shout: true,
-                show_scoreboard: false,
-                audio_muted: true,
-                audio_available: false,
-                cave_enclosure: 0.0,
-                show_squad_links: true,
-                camera_preset_label: MacroPlanetCamMode::Ground3rdPerson.label(),
-                macro_eye_f64: Some(mats_g_1080.eye_f64),
-            },
+            sun_d,
+            focus_pos,
+            focus_fwd,
+            isl_dir,
+            parametric_build_ms,
+            full_sync_build_ms,
+            dirty_p50,
+            dirty_p99,
         );
-        let (rgba_g, _) = renderer.render_macro_planet_to_rgba(
-            1920,
-            1080,
-            &mats_g_1080,
-            sun_f,
-            cam_ground.exposure,
-            sim_time,
-            local_clim,
-            &macro_world,
-            Some(&hud_main),
-        );
-        save_rgba_png(&args.out_dir.join("unified_live_1080p_hud.png"), 1920, 1080, &rgba_g)?;
-
-        // Shot 2: `unified_closeup_action_1080p.png` — Skywing Flight Action Shot (~95m altitude)
-        let mats_fl_1080 = cam_flight.compute_matrices(1920.0, 1080.0);
-        let hm_fl = mats_fl_1080.to_hud_camera_matrices();
-        let hud_fl = build_hud(
-            1920.0,
-            1080.0,
-            &world_dummy,
-            None,
-            entities.as_ref(),
-            &hm_fl,
-            &HudConfig {
-                show_hud: true,
-                show_telemetry: true,
-                show_brain_inspector: true,
-                brain_selected_idx: None,
-                selected_element: 0,
-                focus_radius: 4.0,
-                style_label: "MACRO-3D",
-                z16_active: false,
-                z16_style_label: "MACRO",
-                fps: fps_1080,
-                rtt_ms: 1.2,
-                chat_open: false,
-                chat_input: "",
-                chat_shout: true,
-                show_scoreboard: false,
-                audio_muted: true,
-                audio_available: false,
-                cave_enclosure: 0.0,
-                show_squad_links: true,
-                camera_preset_label: MacroPlanetCamMode::SkywingFlight.label(),
-                macro_eye_f64: Some(mats_fl_1080.eye_f64),
-            },
-        );
-        let (rgba_fl, _) = renderer.render_macro_planet_to_rgba(
-            1920,
-            1080,
-            &mats_fl_1080,
-            sun_f,
-            cam_flight.exposure,
-            sim_time,
-            local_clim,
-            &macro_world,
-            Some(&hud_fl),
-        );
-        save_rgba_png(&args.out_dir.join("unified_closeup_action_1080p.png"), 1920, 1080, &rgba_fl)?;
-
-        // Shot 3: `unified_orbital_1080p.png` — Full Orbital Globe (3,250m) with live Coriolis storm clouds!
-        let mats_orb_1080 = cam_orbital.compute_matrices(1920.0, 1080.0);
-        let hm_orb = mats_orb_1080.to_hud_camera_matrices();
-        let hud_orb = build_hud(
-            1920.0,
-            1080.0,
-            &world_dummy,
-            None,
-            entities.as_ref(),
-            &hm_orb,
-            &HudConfig {
-                show_hud: true,
-                show_telemetry: true,
-                show_brain_inspector: false,
-                brain_selected_idx: None,
-                selected_element: 0,
-                focus_radius: 4.0,
-                style_label: "MACRO-3D",
-                z16_active: false,
-                z16_style_label: "MACRO",
-                fps: fps_1080,
-                rtt_ms: 1.2,
-                chat_open: false,
-                chat_input: "",
-                chat_shout: true,
-                show_scoreboard: false,
-                audio_muted: true,
-                audio_available: false,
-                cave_enclosure: 0.0,
-                show_squad_links: true,
-                camera_preset_label: MacroPlanetCamMode::OrbitalGlobe.label(),
-                macro_eye_f64: Some(mats_orb_1080.eye_f64),
-            },
-        );
-        let (rgba_orb, _) = renderer.render_macro_planet_to_rgba(
-            1920,
-            1080,
-            &mats_orb_1080,
-            sun_f,
-            cam_orbital.exposure,
-            sim_time,
-            local_clim,
-            &macro_world,
-            Some(&hud_orb),
-        );
-        save_rgba_png(&args.out_dir.join("unified_orbital_1080p.png"), 1920, 1080, &rgba_orb)?;
-
-        // Shot 4: `unified_orbit_4view.png` — 2×2 Live Dual-Scale Transition Showcase
-        //   (Ground 1m Flat + HUD | Skywing Flight | Stratosphere Limb | Full Orbital Globe w/ Coriolis Clouds)
-        let q_cams = [&cam_ground, &cam_flight, &cam_strato, &cam_orbital];
-        let mut panels = Vec::with_capacity(4);
-        for (qi, qcam) in q_cams.iter().enumerate() {
-            let qm = qcam.compute_matrices(960.0, 540.0);
-            let qhud = if qi == 0 {
-                let hm = qm.to_hud_camera_matrices();
-                Some(build_hud(
-                    960.0,
-                    540.0,
-                    &world_dummy,
-                    None,
-                    entities.as_ref(),
-                    &hm,
-                    &HudConfig {
-                        show_hud: true,
-                        show_telemetry: true,
-                        show_brain_inspector: false,
-                        brain_selected_idx: None,
-                        selected_element: 0,
-                        focus_radius: 4.0,
-                        style_label: "MACRO-3D",
-                        z16_active: false,
-                        z16_style_label: "MACRO",
-                        fps: fps_1080,
-                        rtt_ms: 1.2,
-                        chat_open: false,
-                        chat_input: "",
-                        chat_shout: true,
-                        show_scoreboard: false,
-                        audio_muted: true,
-                        audio_available: false,
-                        cave_enclosure: 0.0,
-                        show_squad_links: true,
-                        camera_preset_label: qcam.mode.label(),
-                        macro_eye_f64: Some(qm.eye_f64),
-                    },
-                ))
-            } else {
-                None
-            };
-            let (px, _) = renderer.render_macro_planet_to_rgba(
-                960,
-                540,
-                &qm,
-                sun_f,
-                qcam.exposure,
-                sim_time,
-                local_clim,
-                &macro_world,
-                qhud.as_ref(),
-            );
-            panels.push(px);
-        }
-        let grid = compose_2x2_grid([&panels[0], &panels[1], &panels[2], &panels[3]], 960, 540);
-        save_rgba_png(&args.out_dir.join("unified_orbit_4view.png"), 1920, 1080, &grid)?;
-
-        let tel = entities.as_ref().map(|e| e.telemetry.clone());
-        let metrics = UnifiedMetrics {
-            server: args.server.to_string(),
-            gpu_adapter: renderer.adapter_name.clone(),
-            gpu_backend: renderer.adapter_backend.clone(),
-            grid_w: macro_world.face_size_virtual(),
-            grid_h: macro_world.face_size_virtual(),
-            total_chunks: macro_world.received_brick_count(),
-            parametric_build_ms: (parametric_build_ms * 100.0).round() / 100.0,
-            sim_mode: tel.as_ref().map(|t| t.mode.clone()).unwrap_or_else(|| "macro-planet".to_string()),
-            backend: tel.as_ref().map(|t| t.backend.clone()).unwrap_or_default(),
-            field_tick: tel.as_ref().map(|t| t.field_tick).unwrap_or(0),
-            world_infer_ms: tel.as_ref().map(|t| t.infer_ms_last).unwrap_or(0.0),
-            eco_infer_ms: tel.as_ref().map(|t| t.eco_infer_ms).unwrap_or(0.0),
-            proj_active_pct: tel.as_ref().map(|t| t.proj_active_pct).unwrap_or(0.0),
-            mass_error: tel.as_ref().map(|t| t.mass_error).unwrap_or(0),
-            energy_error: tel.as_ref().map(|t| t.energy_error).unwrap_or(0),
-            wire_kbps: tel.as_ref().map(|t| t.wire_kbps).unwrap_or(0.0),
-            aoi_chunks_sent: macro_world.received_brick_count() as u16,
-            active_bots: tel.as_ref().map(|t| t.active_bots).unwrap_or(0),
-            weather_kind: tel.as_ref().map(|t| t.weather_kind).unwrap_or(0),
-            dirty_update_p50_ms: (dirty_p50 * 1000.0).round() / 1000.0,
-            dirty_update_p99_ms: (dirty_p99 * 1000.0).round() / 1000.0,
-            full_sync_build_ms: (full_sync_build_ms * 1000.0).round() / 1000.0,
-            visible_chunks: macro_world.hydrated_shard_count(),
-            terrain_triangles: macro_world.total_triangles(),
-            mesh_instances: entities.as_ref().map(|e| e.players.len() + e.shrines.len()).unwrap_or(0),
-            surfel_draws: 0,
-            volumetric_splats: macro_world.near_gas_indices.len() / 3,
-            hud_vertices: hud_main.vertices.len(),
-            gpu_benchmarks,
-        };
-        let json = serde_json::to_string_pretty(&metrics)?;
-        std::fs::write(args.out_dir.join("unified_metrics.json"), &json)?;
-        println!("[Unified-MacroPlanet] Saved unified_live_1080p_hud.png, unified_closeup_action_1080p.png, unified_orbital_1080p.png, unified_orbit_4view.png, unified_metrics.json");
-        return Ok(());
     }
 
     // Wave 31B: Dedicated Live 6-Face Spherical Planetary Headless Capture & Metal Benchmark
@@ -1897,6 +2484,9 @@ struct InteractiveApp {
     macro_planet_world: MacroPlanetWorld,
     macro_planet_mode: bool,
     macro_planet_camera: MacroPlanetCamera,
+    offline_sim: Option<OfflinePlanetSim>,
+    macro_landmark_idx: Option<usize>,
+    macro_inspect_anchor: Option<(DVec3, DVec3, String)>,
     z16_style_mode: u32,
     z16_cam_framed: bool,
     cave_enclosure_ema: f32,
@@ -1985,6 +2575,9 @@ impl InteractiveApp {
             macro_planet_world: MacroPlanetWorld::new(1280.0, 8, 64, 33_033),
             macro_planet_mode: false,
             macro_planet_camera: MacroPlanetCamera::new(1304.0),
+            offline_sim: None,
+            macro_landmark_idx: None,
+            macro_inspect_anchor: None,
             z16_style_mode: 0,
             z16_cam_framed: false,
             cave_enclosure_ema: 0.0,
@@ -2050,6 +2643,39 @@ impl InteractiveApp {
             last_snap_tick: 0,
             snap_age_s: 0.0,
         }
+    }
+
+    /// 1-key planetary landmark teleport & inspection (`F7` cycles 1..6, `Alt+1..6` jumps directly,
+    /// `Alt+0` or WASD returns camera follow to the hero!).
+    fn jump_to_macro_landmark(&mut self, idx: usize) {
+        if !self.macro_planet_mode {
+            return;
+        }
+        let focus = self
+            .macro_inspect_anchor
+            .as_ref()
+            .map(|(p, _, _)| p.to_array())
+            .unwrap_or_else(|| self.macro_planet_camera.target_f64.to_array());
+        let (label, pos, fwd, dist, pitch) = self.macro_planet_world.resolve_landmark_f64(
+            idx % 6,
+            focus,
+            self.offline_sim.is_some(),
+        );
+        self.macro_landmark_idx = Some(idx % 6);
+        self.macro_inspect_anchor = Some((
+            DVec3::from_array(pos),
+            DVec3::from_array(fwd),
+            label.to_string(),
+        ));
+        self.macro_planet_camera.focus_landmark(
+            DVec3::from_array(pos),
+            DVec3::from_array(fwd),
+            dist,
+            pitch,
+        );
+        self.macro_planet_world.ensure_floating_origin(pos);
+        self.macro_planet_world.rebuild_dirty(4);
+        println!("[Unified-MacroPlanet] Landmark -> {} (Alt+0 or WASD to return to hero)", label);
     }
 
     fn render_frame(&mut self) {
@@ -2192,6 +2818,48 @@ impl InteractiveApp {
             }
             drop(st);
             (ent, rtt)
+        } else if self.offline_sim.is_some() {
+            // Instant local offline macro-planet simulation (WASD hero + 60 simulated bots + live wildlife/weather!)
+            let (mut f_in, mut r_in) = (0.0f64, 0.0f64);
+            if !self.chat_open {
+                if self.keys.contains(&KeyCode::KeyW) { f_in += 1.0; }
+                if self.keys.contains(&KeyCode::KeyS) { f_in -= 1.0; }
+                if self.keys.contains(&KeyCode::KeyD) { r_in += 1.0; }
+                if self.keys.contains(&KeyCode::KeyA) { r_in -= 1.0; }
+            }
+            if f_in.abs() > 0.01 || r_in.abs() > 0.01 {
+                self.macro_inspect_anchor = None;
+            }
+            let (move_u, move_v, aim) = if let Some(ref sim) = self.offline_sim {
+                let n_virt = self.macro_planet_world.face_size_virtual();
+                let (u, v) = face_virtual_uv_f64(sim.hero_gx as f64, sim.hero_gy as f64, n_virt);
+                let (up, tu, tv) = macro_planet_world::face_tangent_basis_f64(sim.hero_face as usize, u, v);
+                let (cam_fwd, cam_right) = self.macro_planet_camera.tangent_move_basis_f64(DVec3::from_array(up));
+                let move_3d = (cam_fwd * f_in + cam_right * r_in).clamp_length_max(1.0);
+                let mu = move_3d.dot(DVec3::from_array(tu)) as f32;
+                let mv = move_3d.dot(DVec3::from_array(tv)) as f32;
+                let au = cam_fwd.dot(DVec3::from_array(tu)) as f32;
+                let av = cam_fwd.dot(DVec3::from_array(tv)) as f32;
+                let alen = au.hypot(av);
+                let aim_dir = if alen > 0.05 { (au / alen, av / alen) } else { sim.hero_aim };
+                (mu, mv, aim_dir)
+            } else {
+                (0.0, 0.0, (1.0, 0.0))
+            };
+            let dash = !self.chat_open && (self.pending_dash || self.keys.contains(&KeyCode::Space));
+            self.pending_dash = false;
+            let ent = self.offline_sim.as_mut().map(|sim| {
+                sim.step_and_snapshot(
+                    &mut self.macro_planet_world,
+                    dt,
+                    move_u,
+                    move_v,
+                    aim,
+                    dash,
+                    sim_time,
+                )
+            });
+            (ent, 0.0)
         } else {
             (None, 0.0)
         };
@@ -2278,9 +2946,14 @@ impl InteractiveApp {
                     )
                 });
 
+            let (cam_follow_pos, cam_follow_fwd) = if let Some((apos, afwd, _)) = &self.macro_inspect_anchor {
+                (*apos, *afwd)
+            } else {
+                (hero_pos, hero_fwd)
+            };
             self.macro_planet_camera.update_follow(
-                hero_pos,
-                hero_fwd,
+                cam_follow_pos,
+                cam_follow_fwd,
                 self.macro_planet_world.r_surf(),
                 dt,
             );
@@ -2439,6 +3112,8 @@ impl InteractiveApp {
             let out_w = cfg.width.max(1);
             let out_h = cfg.height.max(1);
 
+            self.macro_planet_world
+                .set_camera_alt_m(self.macro_planet_camera.eye_f64.to_array());
             self.macro_planet_world.rebuild_dynamic_entities(entities.as_ref(), sim_time);
             renderer.upload_macro_planet_world(&mut self.macro_planet_world);
             if self.macro_planet_world.minimap_dirty {
@@ -3550,17 +4225,52 @@ impl ApplicationHandler for InteractiveApp {
             renderer.adapter_name, renderer.adapter_backend, format, self.args.server
         );
 
-        match self.rt.block_on(QuicClientHandle::connect(
-            self.args.server,
-            &self.args.name,
-            self.args.team,
-        )) {
-            Ok(q) => {
-                println!("[Unified] Connected live to {}!", self.args.server);
-                self.quic = Some(q);
-            }
-            Err(e) => {
-                eprintln!("[Unified] QUIC connect failed: {}", e);
+        if self.args.offline_planet {
+            let t_off = Instant::now();
+            self.macro_planet_mode = true;
+            self.planet_mode = false;
+            self.z16_active = false;
+            let mut sim = OfflinePlanetSim::new(&mut self.macro_planet_world, &self.args.name, self.args.team);
+            let snap0 = sim.step_and_snapshot(
+                &mut self.macro_planet_world,
+                0.016,
+                0.0,
+                0.0,
+                sim.hero_aim,
+                false,
+                0.0,
+            );
+            let sun_d = DVec3::new(-0.72, 0.36, 0.59).normalize();
+            let (focus_pos, focus_fwd, _) =
+                self.macro_planet_world.find_hero_or_best_cluster_f64(Some(&snap0), sun_d.to_array());
+            self.macro_planet_world.ensure_floating_origin(focus_pos);
+            let _ = self.macro_planet_world.rebuild_dirty(4);
+            self.macro_planet_camera.update_follow(
+                DVec3::from_array(focus_pos),
+                DVec3::from_array(focus_fwd),
+                self.macro_planet_world.r_surf(),
+                0.016,
+            );
+            self.offline_sim = Some(sim);
+            println!(
+                "[Unified-OfflinePlanet] Instant boot in {:.1}ms! ({} hydrated shard, 60 local bots, {} tris | F5=Camera, F7/Alt+1..6=Landmarks)",
+                t_off.elapsed().as_secs_f64() * 1000.0,
+                self.macro_planet_world.hydrated_shard_count(),
+                self.macro_planet_world.total_triangles(),
+            );
+        } else {
+            match self.rt.block_on(QuicClientHandle::connect(
+                self.args.server,
+                &self.args.name,
+                self.args.team,
+            )) {
+                Ok(q) => {
+                    println!("[Unified] Connected live to {}!", self.args.server);
+                    self.quic = Some(q);
+                }
+                Err(e) => {
+                    eprintln!("[Unified] QUIC connect failed: {}", e);
+                }
             }
         }
 
@@ -3705,6 +4415,13 @@ impl ApplicationHandler for InteractiveApp {
                             if matches!(code, KeyCode::KeyE | KeyCode::KeyR) {
                                 self.actuator_edge_fire = true;
                             }
+                            let alt_held = self.keys.contains(&KeyCode::AltLeft)
+                                || self.keys.contains(&KeyCode::AltRight);
+                            if self.macro_planet_mode
+                                && matches!(code, KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD)
+                            {
+                                self.macro_inspect_anchor = None;
+                            }
                             match code {
                                 KeyCode::Escape => event_loop.exit(),
                                 KeyCode::Enter | KeyCode::NumpadEnter => {
@@ -3712,9 +4429,40 @@ impl ApplicationHandler for InteractiveApp {
                                     self.chat_input.clear();
                                     self.keys.clear();
                                 }
-                                KeyCode::Digit1 => self.selected_element = 0,
-                                KeyCode::Digit2 => self.selected_element = 1,
-                                KeyCode::Digit3 => self.selected_element = 2,
+                                KeyCode::Digit0 if alt_held && self.macro_planet_mode => {
+                                    self.macro_inspect_anchor = None;
+                                    println!("[Unified-MacroPlanet] Returned camera to Hero [Alt+0]");
+                                }
+                                KeyCode::Digit1 => {
+                                    if alt_held && self.macro_planet_mode {
+                                        self.jump_to_macro_landmark(0);
+                                    } else {
+                                        self.selected_element = 0;
+                                    }
+                                }
+                                KeyCode::Digit2 => {
+                                    if alt_held && self.macro_planet_mode {
+                                        self.jump_to_macro_landmark(1);
+                                    } else {
+                                        self.selected_element = 1;
+                                    }
+                                }
+                                KeyCode::Digit3 => {
+                                    if alt_held && self.macro_planet_mode {
+                                        self.jump_to_macro_landmark(2);
+                                    } else {
+                                        self.selected_element = 2;
+                                    }
+                                }
+                                KeyCode::Digit4 if alt_held && self.macro_planet_mode => {
+                                    self.jump_to_macro_landmark(3);
+                                }
+                                KeyCode::Digit5 if alt_held && self.macro_planet_mode => {
+                                    self.jump_to_macro_landmark(4);
+                                }
+                                KeyCode::Digit6 if alt_held && self.macro_planet_mode => {
+                                    self.jump_to_macro_landmark(5);
+                                }
                                 KeyCode::BracketLeft => {
                                     self.focus_radius = (self.focus_radius - 0.5).clamp(2.0, 8.0);
                                 }
@@ -3799,27 +4547,37 @@ impl ApplicationHandler for InteractiveApp {
                                 }
                                 KeyCode::F4 => self.show_telemetry = !self.show_telemetry,
                                 KeyCode::F1 => {
-                                    if let Some(ref q) = self.quic {
+                                    if let Some(ref mut sim) = self.offline_sim {
+                                        sim.hero_class = CLASS_STRIDER;
+                                    } else if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::SelectClass { class_id: CLASS_WARDEN });
                                     }
                                 }
                                 KeyCode::F2 => {
-                                    if let Some(ref q) = self.quic {
+                                    if let Some(ref mut sim) = self.offline_sim {
+                                        sim.hero_class = CLASS_TIDEKIN;
+                                    } else if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::SelectClass { class_id: CLASS_ALCHEMIST });
                                     }
                                 }
                                 KeyCode::F3 => {
-                                    if let Some(ref q) = self.quic {
+                                    if let Some(ref mut sim) = self.offline_sim {
+                                        sim.hero_class = CLASS_EMBERSTALKER;
+                                    } else if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::SelectClass { class_id: CLASS_RANGER });
                                     }
                                 }
                                 KeyCode::F8 => {
-                                    if let Some(ref q) = self.quic {
+                                    if let Some(ref mut sim) = self.offline_sim {
+                                        sim.hero_class = CLASS_SKYWING;
+                                    } else if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::SelectClass { class_id: 3 });
                                     }
                                 }
                                 KeyCode::F10 => {
-                                    if let Some(ref q) = self.quic {
+                                    if let Some(ref mut sim) = self.offline_sim {
+                                        sim.hero_class = CLASS_BURROWER;
+                                    } else if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::SelectClass {
                                             class_id: CLASS_BURROWER,
                                         });
@@ -3898,7 +4656,10 @@ impl ApplicationHandler for InteractiveApp {
                                     }
                                 }
                                 KeyCode::F7 => {
-                                    if let Some(ref q) = self.quic {
+                                    if self.macro_planet_mode {
+                                        let next = self.macro_landmark_idx.map(|i| (i + 1) % 6).unwrap_or(0);
+                                        self.jump_to_macro_landmark(next);
+                                    } else if let Some(ref q) = self.quic {
                                         q.send_reliable_detached(ClientReliable::CycleBiome);
                                         println!("[Unified] Cycling 3D server biome [F7]");
                                     }

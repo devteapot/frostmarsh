@@ -23,9 +23,10 @@ use crate::z16_world::{SurfaceVertex, Z16World, OCC_BRICK_SIZE, SN_BRICK_SIZE};
 use bytemuck::{Pod, Zeroable};
 use field_core::planet_macro::world_f64_to_camera_rel_f32;
 use frostmarsh_proto::{WEATHER_BLIZZARD, WEATHER_EMBER, WEATHER_SQUALL};
-use glam::Vec3;
+use glam::{DVec3, Vec3};
 use std::borrow::Cow;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -111,12 +112,20 @@ struct PlanetUniforms {
 struct MacroPlanetUniforms {
     view_proj: [[f32; 4]; 4],
     inv_view_proj: [[f32; 4]; 4],
+    shadow_view_proj: [[f32; 4]; 4],
     cam_pos: [f32; 4],        // xyz = planet-centered camera pos, w = sim_time
     model_offset: [f32; 4],   // xyz = (mesh_origin_f64 - cam_pos_f64) as f32, w = r_ocean
     sun_dir: [f32; 4],        // xyz = normalized sun dir, w = r_cloud_shell
     planet_cfg: [f32; 4],     // r_core, r_surf_atmo, r_atmo_outer, exposure
     viewport: [f32; 4],       // width, height, 1/width, 1/height
     climate_params: [f32; 4], // local_wind_u, local_wind_v, local_cloud_cover, has_live_climate
+    shadow_params: [f32; 4],  // bias, texel_size (1/2048), shadow_strength, shadow_radius
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BloomUniforms {
+    texel_size: [f32; 4], // xy = 1 / src_res, z = threshold (1.28), w = knee (0.42)
 }
 
 const STYLE_PARAMS_STRIDE: u64 = 256;
@@ -444,12 +453,39 @@ pub struct Approach4Renderer {
     planet_ent_fx_ibuf: wgpu::Buffer,
     planet_ent_fx_icap: usize,
 
-    // Wave 34B: Live Locally-Flat R=1,304m Dual-Scale Macro Planet + PlanetaryClimateNet Metal Pipelines
+    // Wave 34B + Wave 38A: Live Locally-Flat R=1,304m Dual-Scale Macro Planet +
+    //                      2048x2048 PCF Sun Shadow Map + Quarter-Res Separable HDR Bloom + Live WGSL Hot-Reload
+    pipe_macro_shadow: wgpu::RenderPipeline,
     pipe_macro_starfield: wgpu::RenderPipeline,
     pipe_macro_solid: wgpu::RenderPipeline,
     pipe_macro_ocean: wgpu::RenderPipeline,
     pipe_macro_translucent: wgpu::RenderPipeline,
     pipe_macro_resolve: wgpu::RenderPipeline,
+    pipe_bloom_prefilter: wgpu::RenderPipeline,
+    pipe_bloom_blur_h: wgpu::RenderPipeline,
+    pipe_bloom_blur_v: wgpu::RenderPipeline,
+    macro_uni_bgl: wgpu::BindGroupLayout,
+    macro_shadow_read_bgl: wgpu::BindGroupLayout,
+    macro_resolve_bgl: wgpu::BindGroupLayout,
+    macro_bloom_bgl: wgpu::BindGroupLayout,
+    macro_shadow_view: wgpu::TextureView,
+    macro_shadow_read_bg: wgpu::BindGroup,
+    macro_bloom_samp: wgpu::Sampler,
+    macro_bloom_prefilter_ubuf: wgpu::Buffer,
+    macro_bloom_blur_ubuf: wgpu::Buffer,
+    macro_bloom_src_w: u32,
+    macro_bloom_src_h: u32,
+    macro_bloom_a_view: wgpu::TextureView,
+    macro_bloom_b_view: wgpu::TextureView,
+    macro_bloom_prefilter_bg: wgpu::BindGroup,
+    macro_bloom_blur_h_bg: wgpu::BindGroup,
+    macro_bloom_blur_v_bg: wgpu::BindGroup,
+    macro_resolve_bg: wgpu::BindGroup,
+    macro_shader_frame_counter: u32,
+    macro_planet_shader_path: Option<PathBuf>,
+    macro_bloom_shader_path: Option<PathBuf>,
+    macro_planet_shader_mtime: Option<SystemTime>,
+    macro_bloom_shader_mtime: Option<SystemTime>,
     macro_climate_tex: wgpu::Texture,
     macro_uni_near_buf: wgpu::Buffer,
     macro_uni_near_bg: wgpu::BindGroup,
@@ -543,6 +579,508 @@ fn make_planet_hdr_targets(
         ],
     });
     (hdr_view, depth_view, bg)
+}
+
+const MACRO_SHADOW_RES: u32 = 2048;
+const MACRO_BLOOM_THRESHOLD: f32 = 1.28;
+const MACRO_BLOOM_KNEE: f32 = 0.42;
+const MACRO_PLANET_WGSL_FALLBACK: &str = include_str!("../assets/shaders/macro_planet_live.wgsl");
+const MACRO_BLOOM_WGSL_FALLBACK: &str = include_str!("../assets/shaders/macro_bloom.wgsl");
+
+struct MacroPipelines {
+    shadow: wgpu::RenderPipeline,
+    starfield: wgpu::RenderPipeline,
+    solid: wgpu::RenderPipeline,
+    ocean: wgpu::RenderPipeline,
+    translucent: wgpu::RenderPipeline,
+    resolve: wgpu::RenderPipeline,
+    bloom_prefilter: wgpu::RenderPipeline,
+    bloom_blur_h: wgpu::RenderPipeline,
+    bloom_blur_v: wgpu::RenderPipeline,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_macro_pipelines(
+    device: &wgpu::Device,
+    out_format: wgpu::TextureFormat,
+    macro_uni_bgl: &wgpu::BindGroupLayout,
+    macro_shadow_read_bgl: &wgpu::BindGroupLayout,
+    macro_resolve_bgl: &wgpu::BindGroupLayout,
+    macro_bloom_bgl: &wgpu::BindGroupLayout,
+    macro_planet_src: &str,
+    macro_bloom_src: &str,
+) -> MacroPipelines {
+    let macro_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("macro_planet_live_wgsl"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(macro_planet_src)),
+    });
+    let bloom_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("macro_bloom_wgsl"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(macro_bloom_src)),
+    });
+
+    let macro_uni_only_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("macro_uni_only_pl"),
+        bind_group_layouts: &[Some(macro_uni_bgl)],
+        immediate_size: 0,
+    });
+    let macro_hdr_shadow_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("macro_hdr_shadow_pl"),
+        bind_group_layouts: &[Some(macro_uni_bgl), Some(macro_shadow_read_bgl)],
+        immediate_size: 0,
+    });
+    let macro_res_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("macro_res_pl"),
+        bind_group_layouts: &[Some(macro_uni_bgl), Some(macro_resolve_bgl)],
+        immediate_size: 0,
+    });
+    let macro_bloom_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("macro_bloom_pl"),
+        bind_group_layouts: &[Some(macro_bloom_bgl)],
+        immediate_size: 0,
+    });
+
+    let shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("pipe_macro_shadow"),
+        layout: Some(&macro_uni_only_pl),
+        vertex: wgpu::VertexState {
+            module: &macro_mod,
+            entry_point: Some("vs_macro_shadow"),
+            buffers: &[Some(MacroPlanetVertex::desc())],
+            compilation_options: Default::default(),
+        },
+        fragment: None,
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: wgpu::DepthBiasState {
+                constant: 2,
+                slope_scale: 1.5,
+                clamp: 0.0,
+            },
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let starfield = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("pipe_macro_starfield"),
+        layout: Some(&macro_uni_only_pl),
+        vertex: wgpu::VertexState {
+            module: &macro_mod,
+            entry_point: Some("vs_fullscreen"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &macro_mod,
+            entry_point: Some("fs_starfield"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let solid = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("pipe_macro_solid"),
+        layout: Some(&macro_hdr_shadow_pl),
+        vertex: wgpu::VertexState {
+            module: &macro_mod,
+            entry_point: Some("vs_macro_planet"),
+            buffers: &[Some(MacroPlanetVertex::desc())],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &macro_mod,
+            entry_point: Some("fs_macro_solid"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let ocean = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("pipe_macro_ocean"),
+        layout: Some(&macro_hdr_shadow_pl),
+        vertex: wgpu::VertexState {
+            module: &macro_mod,
+            entry_point: Some("vs_macro_planet"),
+            buffers: &[Some(MacroPlanetVertex::desc())],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &macro_mod,
+            entry_point: Some("fs_macro_ocean"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let translucent = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("pipe_macro_translucent"),
+        layout: Some(&macro_uni_only_pl),
+        vertex: wgpu::VertexState {
+            module: &macro_mod,
+            entry_point: Some("vs_macro_planet"),
+            buffers: &[Some(MacroPlanetVertex::desc())],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &macro_mod,
+            entry_point: Some("fs_macro_translucent"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let resolve = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("pipe_macro_resolve"),
+        layout: Some(&macro_res_pl),
+        vertex: wgpu::VertexState {
+            module: &macro_mod,
+            entry_point: Some("vs_fullscreen"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &macro_mod,
+            entry_point: Some("fs_macro_atmosphere_resolve"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: out_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let mk_bloom_pipe = |label: &'static str, fs_entry: &'static str| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&macro_bloom_pl),
+            vertex: wgpu::VertexState {
+                module: &bloom_mod,
+                entry_point: Some("vs_bloom_fullscreen"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &bloom_mod,
+                entry_point: Some(fs_entry),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+
+    let bloom_prefilter = mk_bloom_pipe("pipe_macro_bloom_prefilter", "fs_bloom_prefilter");
+    let bloom_blur_h = mk_bloom_pipe("pipe_macro_bloom_blur_h", "fs_bloom_blur_h");
+    let bloom_blur_v = mk_bloom_pipe("pipe_macro_bloom_blur_v", "fs_bloom_blur_v");
+
+    MacroPipelines {
+        shadow,
+        starfield,
+        solid,
+        ocean,
+        translucent,
+        resolve,
+        bloom_prefilter,
+        bloom_blur_h,
+        bloom_blur_v,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_macro_bloom_and_resolve_targets(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    macro_bloom_bgl: &wgpu::BindGroupLayout,
+    macro_resolve_bgl: &wgpu::BindGroupLayout,
+    bloom_samp: &wgpu::Sampler,
+    prefilter_ubuf: &wgpu::Buffer,
+    blur_ubuf: &wgpu::Buffer,
+    hdr_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
+    w: u32,
+    h: u32,
+) -> (
+    wgpu::TextureView,
+    wgpu::TextureView,
+    wgpu::BindGroup,
+    wgpu::BindGroup,
+    wgpu::BindGroup,
+    wgpu::BindGroup,
+) {
+    let bw = (w / 4).max(1);
+    let bh = (h / 4).max(1);
+    let bsize = wgpu::Extent3d {
+        width: bw,
+        height: bh,
+        depth_or_array_layers: 1,
+    };
+    let mk_btex = |label: &'static str| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: bsize,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    };
+    let bloom_a_view = mk_btex("macro_bloom_a_quarter").create_view(&Default::default());
+    let bloom_b_view = mk_btex("macro_bloom_b_quarter").create_view(&Default::default());
+
+    let prefilter_u = BloomUniforms {
+        texel_size: [
+            1.0 / w.max(1) as f32,
+            1.0 / h.max(1) as f32,
+            MACRO_BLOOM_THRESHOLD,
+            MACRO_BLOOM_KNEE,
+        ],
+    };
+    let blur_u = BloomUniforms {
+        texel_size: [
+            1.0 / bw as f32,
+            1.0 / bh as f32,
+            MACRO_BLOOM_THRESHOLD,
+            MACRO_BLOOM_KNEE,
+        ],
+    };
+    queue.write_buffer(prefilter_ubuf, 0, bytemuck::bytes_of(&prefilter_u));
+    queue.write_buffer(blur_ubuf, 0, bytemuck::bytes_of(&blur_u));
+
+    let prefilter_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("macro_bloom_prefilter_bg"),
+        layout: macro_bloom_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(hdr_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(bloom_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: prefilter_ubuf.as_entire_binding(),
+            },
+        ],
+    });
+    let blur_h_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("macro_bloom_blur_h_bg"),
+        layout: macro_bloom_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&bloom_a_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(bloom_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: blur_ubuf.as_entire_binding(),
+            },
+        ],
+    });
+    let blur_v_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("macro_bloom_blur_v_bg"),
+        layout: macro_bloom_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&bloom_b_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(bloom_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: blur_ubuf.as_entire_binding(),
+            },
+        ],
+    });
+    let resolve_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("macro_resolve_bg"),
+        layout: macro_resolve_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(hdr_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&bloom_a_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(bloom_samp),
+            },
+        ],
+    });
+
+    (bloom_a_view, bloom_b_view, prefilter_bg, blur_h_bg, blur_v_bg, resolve_bg)
+}
+
+fn resolve_macro_shader_path(ws_rel: &str, crate_rel: &str) -> Option<PathBuf> {
+    let p_ws = Path::new(ws_rel);
+    if p_ws.is_file() {
+        return Some(p_ws.to_path_buf());
+    }
+    let p_manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join(crate_rel);
+    if p_manifest.is_file() {
+        return Some(p_manifest);
+    }
+    None
+}
+
+fn shader_file_mtime(path: &Option<PathBuf>) -> Option<SystemTime> {
+    path.as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+}
+
+fn poll_error_scope_sync(device: &wgpu::Device, guard: wgpu::ErrorScopeGuard) -> Option<wgpu::Error> {
+    let mut fut = std::pin::pin!(guard.pop());
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    for _ in 0..4 {
+        if let std::task::Poll::Ready(err) = fut.as_mut().poll(&mut cx) {
+            return err;
+        }
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    }
+    None
+}
+
+/// Floating-origin orthographic directional sun shadow matrix centered at `origin_f64`
+/// covering ±150 m horizontally and ±180 m along `sun`, snapped to exact 2048px texel increments in f64!
+fn compute_macro_shadow_view_proj(origin_f64: [f64; 3], eye_f64: [f64; 3], sun: Vec3) -> [[f32; 4]; 4] {
+    let sun_d = DVec3::new(sun.x as f64, sun.y as f64, sun.z as f64).normalize_or(DVec3::Y);
+    let up_ref = if sun_d.y.abs() > 0.95 { DVec3::Z } else { DVec3::Y };
+    let fwd_d = -sun_d;
+    let side_d = fwd_d.cross(up_ref).normalize_or(DVec3::X);
+    let up_d = side_d.cross(fwd_d);
+
+    let half_extent = 150.0_f64;
+    let texel_world = (half_extent * 2.0) / MACRO_SHADOW_RES as f64;
+    let center_d = DVec3::from_array(origin_f64);
+    let cx = (center_d.dot(side_d) / texel_world).round() * texel_world;
+    let cy = (center_d.dot(up_d) / texel_world).round() * texel_world;
+    let cz = center_d.dot(sun_d);
+    let snapped_center_f64 = side_d * cx + up_d * cy + sun_d * cz;
+
+    let snapped_rel = Vec3::from_array(world_f64_to_camera_rel_f32(snapped_center_f64.to_array(), eye_f64));
+    let light_up = Vec3::new(up_ref.x as f32, up_ref.y as f32, up_ref.z as f32);
+    let light_view = glam::camera::rh::view::look_at_mat4(snapped_rel + sun * 180.0, snapped_rel, light_up);
+    let light_proj = glam::camera::rh::proj::directx::orthographic(-150.0, 150.0, -150.0, 150.0, 0.0, 360.0);
+    (light_proj * light_view).to_cols_array_2d()
 }
 
 fn make_2d_targets(
@@ -1783,13 +2321,8 @@ impl Approach4Renderer {
         let planet_ent_fx_vbuf = mk_buf(planet_ent_fx_vcap * pv_stride, wgpu::BufferUsages::VERTEX);
         let planet_ent_fx_ibuf = mk_buf(planet_ent_fx_icap * 4, wgpu::BufferUsages::INDEX);
 
-        // Wave 34B: Live Dual-Scale Macro Planet + PlanetaryClimateNet 6-Layer Array Texture Pipelines
-        let macro_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("macro_planet_live_wgsl"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
-                "../assets/shaders/macro_planet_live.wgsl"
-            ))),
-        });
+        // Wave 34B + Wave 38A: Live Dual-Scale Macro Planet + 2048x2048 PCF Shadow Map +
+        //                      Quarter-Res Separable HDR Bloom + Live WGSL Hot-Reload
         let macro_climate_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("macro_planet_climate_6x64"),
             size: wgpu::Extent3d {
@@ -1816,6 +2349,39 @@ impl Approach4Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let macro_shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("macro_sun_shadow_2048"),
+            size: wgpu::Extent3d {
+                width: MACRO_SHADOW_RES,
+                height: MACRO_SHADOW_RES,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let macro_shadow_view = macro_shadow_tex.create_view(&Default::default());
+        let macro_shadow_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("macro_shadow_cmp_samp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let macro_bloom_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("macro_bloom_linear_samp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let macro_uni_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("macro_uni_bgl"),
             entries: &[
@@ -1838,8 +2404,95 @@ impl Approach4Renderer {
                 },
             ],
         });
+        let macro_shadow_read_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("macro_shadow_read_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+        let macro_resolve_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("macro_resolve_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let macro_bloom_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("macro_bloom_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                ubuf_entry(2, wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+
         let macro_uni_near_buf = mk_ubuf(std::mem::size_of::<MacroPlanetUniforms>());
         let macro_uni_global_buf = mk_ubuf(std::mem::size_of::<MacroPlanetUniforms>());
+        let macro_bloom_prefilter_ubuf = mk_ubuf(std::mem::size_of::<BloomUniforms>());
+        let macro_bloom_blur_ubuf = mk_ubuf(std::mem::size_of::<BloomUniforms>());
         let macro_uni_near_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("macro_uni_near_bg"),
             layout: &macro_uni_bgl,
@@ -1858,185 +2511,56 @@ impl Approach4Renderer {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&macro_climate_samp) },
             ],
         });
-        let macro_hdr_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("macro_hdr_pl"),
-            bind_group_layouts: &[Some(&macro_uni_bgl)],
-            immediate_size: 0,
-        });
-        let macro_res_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("macro_res_pl"),
-            bind_group_layouts: &[Some(&macro_uni_bgl), Some(&planet_resolve_bgl)],
-            immediate_size: 0,
+        let macro_shadow_read_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("macro_shadow_read_bg"),
+            layout: &macro_shadow_read_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&macro_shadow_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&macro_shadow_samp) },
+            ],
         });
 
-        let pipe_macro_starfield = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pipe_macro_starfield"),
-            layout: Some(&macro_hdr_pl),
-            vertex: wgpu::VertexState {
-                module: &macro_mod,
-                entry_point: Some("vs_fullscreen"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &macro_mod,
-                entry_point: Some("fs_starfield"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let macro_planet_shader_path = resolve_macro_shader_path(
+            "crates/frostmarsh-unified-client/assets/shaders/macro_planet_live.wgsl",
+            "assets/shaders/macro_planet_live.wgsl",
+        );
+        let macro_bloom_shader_path = resolve_macro_shader_path(
+            "crates/frostmarsh-unified-client/assets/shaders/macro_bloom.wgsl",
+            "assets/shaders/macro_bloom.wgsl",
+        );
+        let macro_planet_shader_mtime = shader_file_mtime(&macro_planet_shader_path);
+        let macro_bloom_shader_mtime = shader_file_mtime(&macro_bloom_shader_path);
 
-        let pipe_macro_solid = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pipe_macro_solid"),
-            layout: Some(&macro_hdr_pl),
-            vertex: wgpu::VertexState {
-                module: &macro_mod,
-                entry_point: Some("vs_macro_planet"),
-                buffers: &[Some(MacroPlanetVertex::desc())],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &macro_mod,
-                entry_point: Some("fs_macro_solid"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let pipe_macro_ocean = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pipe_macro_ocean"),
-            layout: Some(&macro_hdr_pl),
-            vertex: wgpu::VertexState {
-                module: &macro_mod,
-                entry_point: Some("vs_macro_planet"),
-                buffers: &[Some(MacroPlanetVertex::desc())],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &macro_mod,
-                entry_point: Some("fs_macro_ocean"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let pipe_macro_translucent = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pipe_macro_translucent"),
-            layout: Some(&macro_hdr_pl),
-            vertex: wgpu::VertexState {
-                module: &macro_mod,
-                entry_point: Some("vs_macro_planet"),
-                buffers: &[Some(MacroPlanetVertex::desc())],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &macro_mod,
-                entry_point: Some("fs_macro_translucent"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let pipe_macro_resolve = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pipe_macro_resolve"),
-            layout: Some(&macro_res_pl),
-            vertex: wgpu::VertexState {
-                module: &macro_mod,
-                entry_point: Some("vs_fullscreen"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &macro_mod,
-                entry_point: Some("fs_macro_atmosphere_resolve"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: out_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let macro_pipes = build_macro_pipelines(
+            &device,
+            out_format,
+            &macro_uni_bgl,
+            &macro_shadow_read_bgl,
+            &macro_resolve_bgl,
+            &macro_bloom_bgl,
+            MACRO_PLANET_WGSL_FALLBACK,
+            MACRO_BLOOM_WGSL_FALLBACK,
+        );
+        let (
+            macro_bloom_a_view,
+            macro_bloom_b_view,
+            macro_bloom_prefilter_bg,
+            macro_bloom_blur_h_bg,
+            macro_bloom_blur_v_bg,
+            macro_resolve_bg,
+        ) = make_macro_bloom_and_resolve_targets(
+            &device,
+            &queue,
+            &macro_bloom_bgl,
+            &macro_resolve_bgl,
+            &macro_bloom_samp,
+            &macro_bloom_prefilter_ubuf,
+            &macro_bloom_blur_ubuf,
+            &planet_hdr_view,
+            &planet_depth_view,
+            1920,
+            1080,
+        );
 
         let mv_stride = std::mem::size_of::<MacroPlanetVertex>();
         let macro_t_vcap = 16_384;
@@ -2202,11 +2726,37 @@ impl Approach4Renderer {
             planet_ent_fx_vcap,
             planet_ent_fx_ibuf,
             planet_ent_fx_icap,
-            pipe_macro_starfield,
-            pipe_macro_solid,
-            pipe_macro_ocean,
-            pipe_macro_translucent,
-            pipe_macro_resolve,
+            pipe_macro_shadow: macro_pipes.shadow,
+            pipe_macro_starfield: macro_pipes.starfield,
+            pipe_macro_solid: macro_pipes.solid,
+            pipe_macro_ocean: macro_pipes.ocean,
+            pipe_macro_translucent: macro_pipes.translucent,
+            pipe_macro_resolve: macro_pipes.resolve,
+            pipe_bloom_prefilter: macro_pipes.bloom_prefilter,
+            pipe_bloom_blur_h: macro_pipes.bloom_blur_h,
+            pipe_bloom_blur_v: macro_pipes.bloom_blur_v,
+            macro_uni_bgl,
+            macro_shadow_read_bgl,
+            macro_resolve_bgl,
+            macro_bloom_bgl,
+            macro_shadow_view,
+            macro_shadow_read_bg,
+            macro_bloom_samp,
+            macro_bloom_prefilter_ubuf,
+            macro_bloom_blur_ubuf,
+            macro_bloom_src_w: 1920,
+            macro_bloom_src_h: 1080,
+            macro_bloom_a_view,
+            macro_bloom_b_view,
+            macro_bloom_prefilter_bg,
+            macro_bloom_blur_h_bg,
+            macro_bloom_blur_v_bg,
+            macro_resolve_bg,
+            macro_shader_frame_counter: 0,
+            macro_planet_shader_path,
+            macro_bloom_shader_path,
+            macro_planet_shader_mtime,
+            macro_bloom_shader_mtime,
             macro_climate_tex,
             macro_uni_near_buf,
             macro_uni_near_bg,
@@ -3881,6 +4431,82 @@ impl Approach4Renderer {
         }
     }
 
+    /// Throttled (every 30 frames) live WGSL hot-reload for `macro_planet_live.wgsl` & `macro_bloom.wgsl`.
+    /// Validates shaders via wgpu validation error scope and swaps pipelines atomically (keeping old ones on error).
+    fn maybe_hot_reload_macro_shaders(&mut self) {
+        self.macro_shader_frame_counter = self.macro_shader_frame_counter.wrapping_add(1);
+        if self.macro_shader_frame_counter % 30 != 0 {
+            return;
+        }
+        if self.macro_planet_shader_path.is_none() {
+            self.macro_planet_shader_path = resolve_macro_shader_path(
+                "crates/frostmarsh-unified-client/assets/shaders/macro_planet_live.wgsl",
+                "assets/shaders/macro_planet_live.wgsl",
+            );
+            self.macro_planet_shader_mtime = shader_file_mtime(&self.macro_planet_shader_path);
+        }
+        if self.macro_bloom_shader_path.is_none() {
+            self.macro_bloom_shader_path = resolve_macro_shader_path(
+                "crates/frostmarsh-unified-client/assets/shaders/macro_bloom.wgsl",
+                "assets/shaders/macro_bloom.wgsl",
+            );
+            self.macro_bloom_shader_mtime = shader_file_mtime(&self.macro_bloom_shader_path);
+        }
+
+        let cur_planet_mtime = shader_file_mtime(&self.macro_planet_shader_path);
+        let cur_bloom_mtime = shader_file_mtime(&self.macro_bloom_shader_path);
+        let planet_changed = cur_planet_mtime.is_some() && cur_planet_mtime != self.macro_planet_shader_mtime;
+        let bloom_changed = cur_bloom_mtime.is_some() && cur_bloom_mtime != self.macro_bloom_shader_mtime;
+        if !planet_changed && !bloom_changed {
+            return;
+        }
+
+        let t0 = Instant::now();
+        self.macro_planet_shader_mtime = cur_planet_mtime;
+        self.macro_bloom_shader_mtime = cur_bloom_mtime;
+
+        let planet_src = self
+            .macro_planet_shader_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| MACRO_PLANET_WGSL_FALLBACK.to_string());
+        let bloom_src = self
+            .macro_bloom_shader_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| MACRO_BLOOM_WGSL_FALLBACK.to_string());
+
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let candidate = build_macro_pipelines(
+            &self.device,
+            self.out_format,
+            &self.macro_uni_bgl,
+            &self.macro_shadow_read_bgl,
+            &self.macro_resolve_bgl,
+            &self.macro_bloom_bgl,
+            &planet_src,
+            &bloom_src,
+        );
+        if let Some(err) = poll_error_scope_sync(&self.device, scope) {
+            eprintln!("[HotReload] Failed to reload macro shaders (keeping previous pipelines): {err}");
+            return;
+        }
+
+        self.pipe_macro_shadow = candidate.shadow;
+        self.pipe_macro_starfield = candidate.starfield;
+        self.pipe_macro_solid = candidate.solid;
+        self.pipe_macro_ocean = candidate.ocean;
+        self.pipe_macro_translucent = candidate.translucent;
+        self.pipe_macro_resolve = candidate.resolve;
+        self.pipe_bloom_prefilter = candidate.bloom_prefilter;
+        self.pipe_bloom_blur_h = candidate.bloom_blur_h;
+        self.pipe_bloom_blur_v = candidate.bloom_blur_v;
+        eprintln!(
+            "[HotReload] Reloaded macro_planet_live.wgsl & macro_bloom.wgsl in {:.1}ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render_macro_planet_into(
         &mut self,
@@ -3895,6 +4521,8 @@ impl Approach4Renderer {
         world: &MacroPlanetWorld,
         hud: Option<&HudBatch>,
     ) {
+        self.maybe_hot_reload_macro_shaders();
+
         let w = out_w.max(1);
         let h = out_h.max(1);
         if self.planet_hdr_w != w || self.planet_hdr_h != h {
@@ -3904,6 +4532,31 @@ impl Approach4Renderer {
             self.planet_hdr_view = hv;
             self.planet_depth_view = dv;
             self.planet_resolve_bg = bg;
+            self.macro_bloom_src_w = 0;
+            self.macro_bloom_src_h = 0;
+        }
+        if self.macro_bloom_src_w != w || self.macro_bloom_src_h != h {
+            let (ba, bb, pre_bg, bh_bg, bv_bg, res_bg) = make_macro_bloom_and_resolve_targets(
+                &self.device,
+                &self.queue,
+                &self.macro_bloom_bgl,
+                &self.macro_resolve_bgl,
+                &self.macro_bloom_samp,
+                &self.macro_bloom_prefilter_ubuf,
+                &self.macro_bloom_blur_ubuf,
+                &self.planet_hdr_view,
+                &self.planet_depth_view,
+                w,
+                h,
+            );
+            self.macro_bloom_src_w = w;
+            self.macro_bloom_src_h = h;
+            self.macro_bloom_a_view = ba;
+            self.macro_bloom_b_view = bb;
+            self.macro_bloom_prefilter_bg = pre_bg;
+            self.macro_bloom_blur_h_bg = bh_bg;
+            self.macro_bloom_blur_v_bg = bv_bg;
+            self.macro_resolve_bg = res_bg;
         }
 
         let ent_solid_icount = Self::upload_macro_mesh_pair(
@@ -3952,13 +4605,20 @@ impl Approach4Renderer {
         let r_atmo_outer = r_surf_atmo + 216.0;
         let r_cloud_shell = r_surf_atmo + 96.0;
 
+        let cam_r_f64 = DVec3::from_array(cam_mats.eye_f64).length();
+        let cam_alt = (cam_r_f64 - world.r_surf()).max(0.0) as f32;
+
         let near_off = world_f64_to_camera_rel_f32(world.origin_f64, cam_mats.eye_f64);
         let global_off = world_f64_to_camera_rel_f32([0.0, 0.0, 0.0], cam_mats.eye_f64);
         let has_clim = if world.has_live_climate() { 1.0f32 } else { 0.85f32 };
 
+        let shadow_view_proj = compute_macro_shadow_view_proj(world.origin_f64, cam_mats.eye_f64, sun);
+        let shadow_params = [0.00045_f32, 1.0 / MACRO_SHADOW_RES as f32, 0.78_f32, 150.0_f32];
+
         let make_uni = |offset: [f32; 3]| MacroPlanetUniforms {
             view_proj: cam_mats.vp.to_cols_array_2d(),
             inv_view_proj: cam_mats.inv_vp.to_cols_array_2d(),
+            shadow_view_proj,
             cam_pos: [
                 cam_mats.eye_f64[0] as f32,
                 cam_mats.eye_f64[1] as f32,
@@ -3970,6 +4630,7 @@ impl Approach4Renderer {
             planet_cfg: [r_core, r_surf_atmo, r_atmo_outer, exposure],
             viewport: [w as f32, h as f32, 1.0 / w as f32, 1.0 / h as f32],
             climate_params: [local_climate[0], local_climate[1], local_climate[2], has_clim],
+            shadow_params,
         };
 
         self.queue.write_buffer(&self.macro_uni_near_buf, 0, bytemuck::bytes_of(&make_uni(near_off)));
@@ -3991,6 +4652,48 @@ impl Approach4Renderer {
         });
 
         let mut enc = self.device.create_command_encoder(&Default::default());
+
+        // PASS 0 (2048x2048 Depth32Float): Real-Time Directional Sun Shadow Map
+        // Covers ±150m horizontally / ±180m along sun_dir around `world.origin_f64` (skipped above 460m Orbit!).
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("macro_planet_shadow_pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.macro_shadow_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            if cam_alt <= 460.0 {
+                rp.set_pipeline(&self.pipe_macro_shadow);
+                // Near 1m terrain, pines, villages, bridges, ruins, waterfalls, cavern arches
+                if self.near_t_icount > 0 {
+                    rp.set_bind_group(0, &self.macro_uni_near_bg, &[]);
+                    rp.set_vertex_buffer(0, self.near_t_vbuf.slice(..));
+                    rp.set_index_buffer(self.near_t_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..self.near_t_icount, 0, 0..1);
+                }
+                // Floating Sky-Islands (planet-centered global_off!)
+                if self.macro_sky_icount > 0 {
+                    rp.set_bind_group(0, &self.macro_uni_global_bg, &[]);
+                    rp.set_vertex_buffer(0, self.macro_sky_vbuf.slice(..));
+                    rp.set_index_buffer(self.macro_sky_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..self.macro_sky_icount, 0, 0..1);
+                }
+                // Dynamic 60 heroes, shrines, elk, whales, birds, longboats (floating-origin near_off!)
+                if ent_solid_icount > 0 {
+                    rp.set_bind_group(0, &self.macro_uni_near_bg, &[]);
+                    rp.set_vertex_buffer(0, self.macro_ent_solid_vbuf.slice(..));
+                    rp.set_index_buffer(self.macro_ent_solid_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..ent_solid_icount, 0, 0..1);
+                }
+            }
+        }
 
         // PASS 1 (HDR + Depth): Starfield + Layer B Near 1m Shards + Layer A Macro Globe + Sky-Islands + Ocean + Layer C Entities & Beams
         {
@@ -4023,6 +4726,7 @@ impl Approach4Renderer {
 
             // 1B: Layer B — Live Hydrated 1m Shards + Nordic Pines + Boulders + Live Sky-Island Voxels (floating-origin near_off!)
             rp.set_pipeline(&self.pipe_macro_solid);
+            rp.set_bind_group(1, &self.macro_shadow_read_bg, &[]);
             if self.near_t_icount > 0 {
                 rp.set_bind_group(0, &self.macro_uni_near_bg, &[]);
                 rp.set_vertex_buffer(0, self.near_t_vbuf.slice(..));
@@ -4051,8 +4755,9 @@ impl Approach4Renderer {
                 rp.draw_indexed(0..ent_solid_icount, 0, 0..1);
             }
 
-            // 1E: Fresnel Sapphire Ocean (Near 1m Bays + Macro Globe Ocean Shell)
+            // 1E: Fresnel Sapphire Ocean (Near 1m Bays + Macro Globe Ocean Shell) with Real-Time PCF Sun Shadows
             rp.set_pipeline(&self.pipe_macro_ocean);
+            rp.set_bind_group(1, &self.macro_shadow_read_bg, &[]);
             if self.near_o_icount > 0 {
                 rp.set_bind_group(0, &self.macro_uni_near_bg, &[]);
                 rp.set_vertex_buffer(0, self.near_o_vbuf.slice(..));
@@ -4083,7 +4788,66 @@ impl Approach4Renderer {
             }
         }
 
-        // PASS 2 (`dst_view`): Seamless Ground-to-Orbit Rayleigh+Mie Atmosphere + Live Coriolis Cloud/Ash Deck + ACES + HUD!
+        // PASS 2A/2B/2C (Quarter-Res Rgba16Float): Multi-Pass Separable HDR Bloom (`macro_bloom.wgsl`)
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("macro_bloom_prefilter_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.macro_bloom_a_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.pipe_bloom_prefilter);
+            rp.set_bind_group(0, &self.macro_bloom_prefilter_bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("macro_bloom_blur_h_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.macro_bloom_b_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.pipe_bloom_blur_h);
+            rp.set_bind_group(0, &self.macro_bloom_blur_h_bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("macro_bloom_blur_v_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.macro_bloom_a_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            rp.set_pipeline(&self.pipe_bloom_blur_v);
+            rp.set_bind_group(0, &self.macro_bloom_blur_v_bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+
+        // PASS 3 (`dst_view`): Seamless Ground-to-Orbit Rayleigh+Mie Atmosphere + Live Coriolis Cloud/Ash Deck + HDR Bloom + ACES + HUD!
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("macro_planet_resolve_and_hud_pass"),
@@ -4101,7 +4865,7 @@ impl Approach4Renderer {
             });
             rp.set_pipeline(&self.pipe_macro_resolve);
             rp.set_bind_group(0, &self.macro_uni_global_bg, &[]);
-            rp.set_bind_group(1, &self.planet_resolve_bg, &[]);
+            rp.set_bind_group(1, &self.macro_resolve_bg, &[]);
             rp.draw(0..3, 0..1);
 
             if hud_vert_count > 0 {
@@ -4201,5 +4965,46 @@ impl Approach4Renderer {
         let p99 = samples[((samples.len() as f64) * 0.99).floor().min((samples.len() - 1) as f64) as usize];
         let mean = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
         (p50, p99, mean)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn validate_macro_planet_and_bloom_wgsl() {
+        assert!((MACRO_BLOOM_THRESHOLD - 1.28).abs() < 1e-6);
+        assert!((MACRO_BLOOM_KNEE - 0.42).abs() < 1e-6);
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Some(adapter) = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                ..Default::default()
+            })
+            .await
+            .ok()
+        else {
+            return;
+        };
+        let (device, _queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .expect("request headless GPU device");
+
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _planet_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("test_macro_planet_live_wgsl"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(MACRO_PLANET_WGSL_FALLBACK)),
+        });
+        let _bloom_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("test_macro_bloom_wgsl"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(MACRO_BLOOM_WGSL_FALLBACK)),
+        });
+        let err = scope.pop().await;
+        assert!(err.is_none(), "WGSL validation error: {err:?}");
     }
 }

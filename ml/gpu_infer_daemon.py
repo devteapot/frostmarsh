@@ -599,8 +599,8 @@ class _SparseWorldDTAdapter:
         self.host_in_u8 = self.host_in_np.view(np.uint8).ravel()
         self.host_in_v8_u8 = self.host_in_v8_np.view(np.uint8).ravel()
         self.host_out_bytes = memoryview(self.host_out_np).cast("B")
-        sparse_thr = (0.65 if batch >= 32 else 0.30) if use_sparse else 0.0
-        act_eps = 4e-3 if batch >= 32 else 2e-3
+        sparse_thr = (0.65 if batch >= 16 else 0.30) if use_sparse else 0.0
+        act_eps = 4e-3 if batch >= 16 else 2e-3
         self.runner = _call_with_accepted_kwargs(
             runner_cls,
             model_dt,

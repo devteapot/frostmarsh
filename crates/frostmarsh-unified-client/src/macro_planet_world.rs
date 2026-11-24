@@ -18,6 +18,10 @@
 //!   and projectiles at exact `1 m` human scale, plus a live `256×128` equirectangular minimap
 //!   compositing continents, oceans, and live `PlanetaryClimateNet` Coriolis storms & ash plumes!
 
+use crate::macro_living_world::{
+    emit_living_wildlife_and_weather, populate_shard_living_world, LivingShardCell,
+    ShardLivingAnchors,
+};
 use crate::net::{LiveEntityState, MacroClimateUpdate, MacroShardBrickUpdate};
 use bytemuck::{Pod, Zeroable};
 use field_core::planet::{FACE_COUNT, FACE_FRAMES};
@@ -197,6 +201,8 @@ pub fn sphere_pos_f64_to_minimap_uv(pos: [f64; 3]) -> (f32, f32) {
 struct ShardColumn {
     surf_z: f64,
     water_depth: f32,
+    river_depth: f32,
+    cavern_depth: f32,
     ice_frac: f32,
     albedo: [f32; 3],
     emissive: [f32; 3],
@@ -226,6 +232,7 @@ pub struct MacroShardData {
     pub ocean_indices: Vec<u32>,
     pub gas_verts: Vec<MacroPlanetVertex>,
     pub gas_indices: Vec<u32>,
+    pub living_anchors: ShardLivingAnchors,
 }
 
 impl MacroShardData {
@@ -259,7 +266,11 @@ impl MacroShardData {
                 let edge_blend = (edge_d / 10.0).clamp(0.0, 1.0);
                 let surf_z = (col.surf_z + sample_micro_relief_m(dir, seed) * edge_blend * 0.85)
                     .clamp(16.0, 42.5);
-                let water_depth = (z_sea_surf - surf_z).max(0.0) as f32;
+                let water_depth = if col.cavern_depth > 1.2 {
+                    0.0
+                } else {
+                    (z_sea_surf - surf_z).max(0.0) as f32
+                };
                 let ice_frac = if water_depth > 0.05 && col.temp_k < 271.5 {
                     ((271.5 - col.temp_k) / 8.0).clamp(0.0, 1.0) as f32
                 } else {
@@ -268,6 +279,8 @@ impl MacroShardData {
                 column_cache.push(ShardColumn {
                     surf_z,
                     water_depth,
+                    river_depth: col.river_depth as f32,
+                    cavern_depth: col.cavern_depth as f32,
                     ice_frac,
                     albedo: col.albedo,
                     emissive: col.emissive,
@@ -296,6 +309,7 @@ impl MacroShardData {
             ocean_indices: Vec::new(),
             gas_verts: Vec::new(),
             gas_indices: Vec::new(),
+            living_anchors: ShardLivingAnchors::default(),
         }
     }
 
@@ -430,7 +444,9 @@ impl MacroShardData {
                 let live_surf_z = (solid_z as f64 + solid_fill).clamp(16.0, 42.5);
                 let surf_z = proc_surf_z * (1.0 - edge_blend) + live_surf_z * edge_blend;
 
-                let water_depth = if fluid_cols > 0.15 {
+                let water_depth = if proc_col.cavern_depth > 1.2 {
+                    0.0
+                } else if fluid_cols > 0.15 {
                     ((fluid_top_z.max(z_sea_f) - surf_z).max(fluid_cols as f64 * 0.65)).max(0.0) as f32
                 } else {
                     (z_sea_f - surf_z).max(0.0) as f32
@@ -480,14 +496,24 @@ impl MacroShardData {
 
                 self.column_live_mask[ci] = true;
                 self.column_cache[ci] = ShardColumn {
-                    surf_z,
+                    surf_z: if proc_col.cavern_depth > 1.2 {
+                        surf_z.min(proc_surf_z + 0.35)
+                    } else {
+                        surf_z
+                    },
                     water_depth,
+                    river_depth: proc_col.river_depth as f32,
+                    cavern_depth: proc_col.cavern_depth as f32,
                     ice_frac,
-                    albedo,
-                    emissive,
+                    albedo: if proc_col.cavern_depth > 1.2 { proc_col.albedo } else { albedo },
+                    emissive: if proc_col.cavern_depth > 1.2 { proc_col.emissive } else { emissive },
                     roughness,
-                    has_wood: has_wood || proc_col.forest_density > 0.42,
-                    has_plant: has_plant || proc_col.forest_density > 0.18,
+                    has_wood: (has_wood || proc_col.forest_density > 0.42)
+                        && proc_col.river_depth < 0.08
+                        && proc_col.cavern_depth < 0.35,
+                    has_plant: (has_plant || proc_col.forest_density > 0.18)
+                        && proc_col.river_depth < 0.08
+                        && proc_col.cavern_depth < 0.35,
                 };
             }
         }
@@ -507,6 +533,7 @@ struct MacroBaseFace {
     emissives: Vec<[f32; 3]>,
     roughness: Vec<f32>,
     water_depth: Vec<f32>,
+    river_depth: Vec<f32>,
     ice_frac: Vec<f32>,
 }
 
@@ -1053,6 +1080,7 @@ impl MacroPlanetWorld {
             let mut emissives = vec![[0.0f32; 3]; stride * stride];
             let mut roughness = vec![0.8f32; stride * stride];
             let mut water_depth = vec![0.0f32; stride * stride];
+            let mut river_depth = vec![0.0f32; stride * stride];
             let mut ice_frac = vec![0.0f32; stride * stride];
 
             for py in 0..pad_stride {
@@ -1068,7 +1096,11 @@ impl MacroPlanetWorld {
 
                     if iy >= 0 && iy <= sub as isize && ix >= 0 && ix <= sub as isize {
                         let vi = (iy as usize) * stride + (ix as usize);
-                        let wd = (z_sea_surf - col.surf_z).max(0.0) as f32;
+                        let wd = if col.cavern_depth > 1.2 {
+                            0.0
+                        } else {
+                            (z_sea_surf - col.surf_z).max(0.0) as f32
+                        };
                         let ice = if wd > 0.05 && col.temp_k < 271.5 {
                             ((271.5 - col.temp_k) / 8.0).clamp(0.0, 1.0) as f32
                         } else {
@@ -1080,6 +1112,7 @@ impl MacroPlanetWorld {
                         emissives[vi] = col.emissive;
                         roughness[vi] = col.roughness;
                         water_depth[vi] = wd;
+                        river_depth[vi] = col.river_depth as f32;
                         ice_frac[vi] = ice;
                     }
                 }
@@ -1116,6 +1149,7 @@ impl MacroPlanetWorld {
                 emissives,
                 roughness,
                 water_depth,
+                river_depth,
                 ice_frac,
             });
         }
@@ -1206,13 +1240,19 @@ impl MacroPlanetWorld {
                         water_ice: [bf.water_depth[vi], bf.ice_frac[vi], 1.0, ao_m],
                     });
 
-                    let o_pos = scale_f64(dir, r_core + z_sea_surf + r_offset * 0.5);
+                    let eff_wd = bf.water_depth[vi].max(bf.river_depth[vi]);
+                    let o_z = if bf.river_depth[vi] > 0.04 && bf.water_depth[vi] <= 0.01 {
+                        bf.surf_z[vi] + bf.river_depth[vi] as f64 * 0.72
+                    } else {
+                        z_sea_surf
+                    };
+                    let o_pos = scale_f64(dir, r_core + o_z + r_offset * 0.5);
                     self.macro_ocean_verts.push(MacroPlanetVertex {
                         pos: [o_pos[0] as f32, o_pos[1] as f32, o_pos[2] as f32],
                         normal: [dir[0] as f32, dir[1] as f32, dir[2] as f32],
                         color: [0.04, 0.24, 0.54, 0.08],
                         emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_OCEAN],
-                        water_ice: [bf.water_depth[vi], bf.ice_frac[vi], 1.0, 0.0],
+                        water_ice: [eff_wd, bf.ice_frac[vi], 1.0, 0.0],
                     });
                 }
             }
@@ -1242,10 +1282,10 @@ impl MacroPlanetWorld {
                     let o01 = base_o + ((iy + 1) * stride + ix) as u32;
                     let o11 = o01 + 1;
                     let vi00 = iy * stride + ix;
-                    if bf.water_depth[vi00] > 0.01
-                        || bf.water_depth[vi00 + 1] > 0.01
-                        || bf.water_depth[vi00 + stride] > 0.01
-                        || bf.water_depth[vi00 + stride + 1] > 0.01
+                    if bf.water_depth[vi00].max(bf.river_depth[vi00]) > 0.01
+                        || bf.water_depth[vi00 + 1].max(bf.river_depth[vi00 + 1]) > 0.01
+                        || bf.water_depth[vi00 + stride].max(bf.river_depth[vi00 + stride]) > 0.01
+                        || bf.water_depth[vi00 + stride + 1].max(bf.river_depth[vi00 + stride + 1]) > 0.01
                     {
                         self.macro_ocean_indices
                             .extend_from_slice(&[o00, o10, o11, o00, o11, o01]);
@@ -1319,6 +1359,7 @@ impl MacroPlanetWorld {
         let mut grid_em = Vec::with_capacity(stride * stride);
         let mut grid_rough = Vec::with_capacity(stride * stride);
         let mut grid_wd = Vec::with_capacity(stride * stride);
+        let mut grid_riv = Vec::with_capacity(stride * stride);
         let mut grid_ice = Vec::with_capacity(stride * stride);
 
         for vy in 0..=cells {
@@ -1341,6 +1382,7 @@ impl MacroPlanetWorld {
                 grid_em.push(cc.emissive);
                 grid_rough.push(cc.roughness);
                 grid_wd.push(cc.water_depth);
+                grid_riv.push(cc.river_depth);
                 grid_ice.push(cc.ice_frac);
             }
         }
@@ -1410,13 +1452,19 @@ impl MacroPlanetWorld {
                     water_ice: [grid_wd[vi], grid_ice[vi], 0.0, ao_shadow],
                 });
 
-                let ocean_pos = scale_f64(grid_dir[vi], r_core + z_sea_surf);
+                let eff_wd = grid_wd[vi].max(grid_riv[vi]);
+                let water_surf_z = if grid_riv[vi] > 0.04 && grid_wd[vi] <= 0.01 {
+                    grid_sz[vi] + grid_riv[vi] as f64 * 0.78
+                } else {
+                    z_sea_surf
+                };
+                let ocean_pos = scale_f64(grid_dir[vi], r_core + water_surf_z);
                 ocean_verts.push(MacroPlanetVertex {
                     pos: world_f64_to_camera_rel_f32(ocean_pos, origin_f64),
                     normal: [grid_dir[vi][0] as f32, grid_dir[vi][1] as f32, grid_dir[vi][2] as f32],
                     color: [0.04, 0.24, 0.54, 0.08],
                     emissive_mat: [0.0, 0.0, 0.0, MAT_MACRO_OCEAN],
-                    water_ice: [grid_wd[vi], grid_ice[vi], 0.0, 1.0],
+                    water_ice: [eff_wd, grid_ice[vi], 0.0, 1.0],
                 });
             }
         }
@@ -1428,10 +1476,10 @@ impl MacroPlanetWorld {
                 let i01 = ((vy + 1) * stride + vx) as u32;
                 let i11 = i01 + 1;
                 terrain_indices.extend_from_slice(&[i00, i10, i11, i00, i11, i01]);
-                if grid_wd[i00 as usize] > 0.01
-                    || grid_wd[i10 as usize] > 0.01
-                    || grid_wd[i01 as usize] > 0.01
-                    || grid_wd[i11 as usize] > 0.01
+                if grid_wd[i00 as usize].max(grid_riv[i00 as usize]) > 0.01
+                    || grid_wd[i10 as usize].max(grid_riv[i10 as usize]) > 0.01
+                    || grid_wd[i01 as usize].max(grid_riv[i01 as usize]) > 0.01
+                    || grid_wd[i11 as usize].max(grid_riv[i11 as usize]) > 0.01
                 {
                     ocean_indices.extend_from_slice(&[i00, i10, i11, i00, i11, i01]);
                 }
@@ -1495,7 +1543,7 @@ impl MacroPlanetWorld {
                     );
                     continue;
                 }
-                if sz <= z_sea_surf + 0.15 {
+                if sz <= z_sea_surf + 0.15 || cc.river_depth > 0.08 || cc.cavern_depth > 0.35 {
                     continue;
                 }
                 let pos = scale_f64(dir, r_core + sz);
@@ -1737,12 +1785,44 @@ impl MacroPlanetWorld {
             }
         }
 
+        // Wave 37: Cascading Mountain Waterfalls, Arched River Bridges, Nordic Coastal Village,
+        //          Ancient Stone Ruins & Explorable Glowing Underground Cavern Grottos!
+        let living_cells: Vec<LivingShardCell> = sh
+            .column_cache
+            .iter()
+            .map(|cc| LivingShardCell {
+                surf_z: cc.surf_z,
+                water_depth: cc.water_depth,
+                river_depth: cc.river_depth,
+                cavern_depth: cc.cavern_depth,
+                has_wood: cc.has_wood,
+                is_snowy: (cc.albedo[2] > 0.72 && cc.albedo[0] > 0.62) || cc.surf_z > 31.2,
+            })
+            .collect();
+        let living_anchors = populate_shard_living_world(
+            face,
+            sh.sx as usize,
+            sh.sy as usize,
+            s,
+            n_virt,
+            r_core,
+            z_sea_surf,
+            seed,
+            origin_f64,
+            &living_cells,
+            &mut terrain_verts,
+            &mut terrain_indices,
+            &mut gas_verts,
+            &mut gas_indices,
+        );
+
         sh.terrain_verts = terrain_verts;
         sh.terrain_indices = terrain_indices;
         sh.ocean_verts = ocean_verts;
         sh.ocean_indices = ocean_indices;
         sh.gas_verts = gas_verts;
         sh.gas_indices = gas_indices;
+        sh.living_anchors = living_anchors;
         sh.dirty = false;
     }
 
@@ -1812,6 +1892,10 @@ impl MacroPlanetWorld {
 
                 let mut rgb = if col.is_rift_core {
                     [1.0f32, 0.46, 0.14]
+                } else if col.cavern_depth > 2.0 {
+                    [0.14, 0.88, 0.92]
+                } else if col.river_depth > 0.14 {
+                    [0.12, 0.56, 0.84]
                 } else if col.water_depth > 0.1 {
                     if clim[3] > 0.72 {
                         [0.72, 0.88, 0.98]
@@ -2376,6 +2460,35 @@ impl MacroPlanetWorld {
                 [pcol[0] * em_v, pcol[1] * em_v, pcol[2] * em_v, MAT_MACRO_BEAM],
             );
         }
+
+        // 5. Wave 37: Living Ambient Wildlife (Nordic Elk Herds, Soaring Seabirds/Eagles,
+        //    Breaching Ocean Whales, Bobbing Longboats) & Live Climate Weather Particles!
+        let focus_pos = ent
+            .players
+            .iter()
+            .find(|p| p.id == ent.your_player_id && p.hp > 0)
+            .or_else(|| ent.players.iter().find(|p| p.hp > 0))
+            .map(|p| self.entity_world_frame_f64(p.face, p.x, p.y, p.z, p.aim_x, p.aim_y).0)
+            .unwrap_or(origin);
+        let anchor_refs: Vec<&ShardLivingAnchors> =
+            self.shards.values().map(|sh| &sh.living_anchors).collect();
+        emit_living_wildlife_and_weather(
+            &anchor_refs,
+            focus_pos,
+            self.r_core,
+            self.z_sea + 0.55,
+            self.seed,
+            origin,
+            sim_time,
+            ent.telemetry.local_wind_u,
+            ent.telemetry.local_wind_v,
+            ent.telemetry.local_temp_c,
+            ent.telemetry.local_cloud_cover,
+            &mut self.dynamic_solid_verts,
+            &mut self.dynamic_solid_indices,
+            &mut self.dynamic_fx_verts,
+            &mut self.dynamic_fx_indices,
+        );
     }
 
     /// Find the local hero (or sunlit coastal combat cluster) and nearest Floating Sky-Island direction
@@ -2792,7 +2905,7 @@ fn push_sky_island(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn push_oriented_box_f64(
+pub(crate) fn push_oriented_box_f64(
     verts: &mut Vec<MacroPlanetVertex>,
     indices: &mut Vec<u32>,
     center: [f64; 3],
@@ -2845,7 +2958,7 @@ fn push_oriented_box_f64(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn push_oriented_pyramid_f64(
+pub(crate) fn push_oriented_pyramid_f64(
     verts: &mut Vec<MacroPlanetVertex>,
     indices: &mut Vec<u32>,
     base_center: [f64; 3],
@@ -2973,7 +3086,7 @@ fn push_radial_pillar_f64(
 
 /// Soft grounded contact shadow disc (alpha-blended via `fs_macro_translucent`, `mat_kind = 4.0`).
 #[allow(clippy::too_many_arguments)]
-fn push_contact_shadow_disc_f64(
+pub(crate) fn push_contact_shadow_disc_f64(
     verts: &mut Vec<MacroPlanetVertex>,
     indices: &mut Vec<u32>,
     center: [f64; 3],

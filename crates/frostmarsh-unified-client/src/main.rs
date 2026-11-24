@@ -17,6 +17,7 @@
 mod audio;
 mod camera;
 mod hud;
+mod macro_living_world;
 mod macro_planet_world;
 mod mesh_gen;
 mod net;

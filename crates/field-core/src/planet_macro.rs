@@ -523,6 +523,10 @@ pub struct MacroColumnSample {
     pub z_sea: f64,
     /// Ocean water depth (`(z_sea - surf_z).max(0.0)`).
     pub water_depth: f64,
+    /// Carved highland/coastal river water depth above the riverbed (`0.0..1.6 m`).
+    pub river_depth: f64,
+    /// Natural glowing cavern sinkhole / grotto entrance depression (`0.0..10.5 m`).
+    pub cavern_depth: f64,
     /// Surface equilibrium temperature in Kelvin.
     pub temp_k: f64,
     /// Tree/forest canopy density in `[0, 1]`.
@@ -614,8 +618,52 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
         h_norm = 0.20; // Glowing lava fissure channel cleanly above sea level
     }
 
-    let surf_z = (23.5 + h_norm * 11.8).clamp(16.0, 42.0);
-    let water_depth = (z_sea - surf_z).max(0.0);
+    let raw_surf_z = (23.5 + h_norm * 11.8).clamp(16.0, 42.0);
+
+    // Wave 37: Seamless 3D spherical carved highland-to-coast river valleys!
+    let n_riv_a = fbm_3d_f64(
+        [dir[0] * 7.4 + 2.3, dir[1] * 7.4 - 4.1, dir[2] * 7.4 + 1.8],
+        seed ^ 0x517E,
+        3,
+    );
+    let riv_dist = (n_riv_a - 0.50).abs();
+    let can_river = raw_surf_z > z_sea + 0.15 && raw_surf_z < 37.5 && !is_polar && !in_rift_belt;
+    let (river_carve, river_depth) = if can_river && riv_dist < 0.030 {
+        let bank_t = (1.0 - riv_dist / 0.030).clamp(0.0, 1.0);
+        let smooth_bank = bank_t * bank_t * (3.0 - 2.0 * bank_t);
+        let chan_t = (1.0 - riv_dist / 0.017).clamp(0.0, 1.0);
+        let smooth_chan = chan_t * chan_t * (3.0 - 2.0 * chan_t);
+        let carve = smooth_bank * 2.55;
+        let r_depth = smooth_chan * 1.25;
+        (carve, r_depth)
+    } else {
+        (0.0, 0.0)
+    };
+
+    // Wave 37: Deterministic natural glowing underground cavern grotto entrances on inland hillsides!
+    let n_cav_grotto = value_noise_3d_f64(
+        [dir[0] * 28.0 - 1.9, dir[1] * 28.0 + 3.4, dir[2] * 28.0 - 2.7],
+        seed ^ 0xC47E,
+    );
+    let can_cavern = raw_surf_z > z_sea + 3.4
+        && raw_surf_z < 35.5
+        && !is_polar
+        && !in_rift_belt
+        && river_depth < 0.05;
+    let cavern_depth = if can_cavern && n_cav_grotto > 0.905 {
+        let ct = ((n_cav_grotto - 0.905) / 0.075).clamp(0.0, 1.0);
+        let cs = ct * ct * (3.0 - 2.0 * ct);
+        cs * 9.8
+    } else {
+        0.0
+    };
+
+    let surf_z = (raw_surf_z - river_carve - cavern_depth).clamp(16.0, 42.0);
+    let water_depth = if cavern_depth > 1.2 {
+        0.0
+    } else {
+        (z_sea - surf_z).max(0.0)
+    };
 
     // Latitudinal + altitudinal equilibrium temperature (K)
     let alt_above_sea = (surf_z - z_sea).max(0.0);
@@ -630,7 +678,13 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
         base_temp.clamp(256.0, 312.0)
     };
 
-    let forest_density = if surf_z > z_sea + 1.3 && surf_z < 35.5 && !is_polar && !in_rift_belt {
+    let forest_density = if surf_z > z_sea + 1.3
+        && surf_z < 35.5
+        && !is_polar
+        && !in_rift_belt
+        && river_depth < 0.05
+        && cavern_depth < 0.35
+    {
         ((n_moist - 0.34) * 1.95).clamp(0.0, 1.0)
     } else {
         0.0
@@ -656,6 +710,15 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
             [0.45 * rim_heat * rim_heat, 0.09 * rim_heat * rim_heat, 0.01 * rim_heat],
             0.66,
         )
+    } else if cavern_depth > 1.2 {
+        // Bioluminescent basalt cavern grotto shaft & glowing mineral floor!
+        let glow = ((cavern_depth - 1.2) / 8.0).clamp(0.0, 1.0) as f32;
+        (
+            MacroBiome::AlpineRock,
+            [0.12 + 0.06 * glow, 0.17 + 0.18 * glow, 0.22 + 0.24 * glow],
+            [0.04 * glow, 0.38 * glow, 0.56 * glow],
+            0.58 - 0.25 * glow,
+        )
     } else if is_polar {
         (
             MacroBiome::PolarGlacier,
@@ -669,6 +732,14 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
             [0.20, 0.26, 0.25],
             [0.0; 3],
             0.86,
+        )
+    } else if river_depth > 0.08 {
+        // Wet river pebble bed & mossy stream bank
+        (
+            MacroBiome::CoastalBeach,
+            [0.25, 0.27, 0.24],
+            [0.0; 3],
+            0.64,
         )
     } else if surf_z < z_sea + 1.25 {
         // Warm sunlit golden coastal beach
@@ -717,6 +788,8 @@ pub fn sample_macro_planet_column(dir_in: [f64; 3], seed: u64) -> MacroColumnSam
         surf_z,
         z_sea,
         water_depth,
+        river_depth,
+        cavern_depth,
         temp_k,
         forest_density,
         moisture: n_moist,
@@ -1243,7 +1316,8 @@ impl DualScalePlanet {
                             dir[2] * 42.0 + z as f64 * 0.19,
                         ];
                         let n_cav = value_noise_3d_f64(cav_p, seed ^ 0xCAFE);
-                        let in_cavern = z > z_cav_lo + 1 && z + 1 < z_cav_hi && n_cav > 0.68;
+                        let grotto_chamber = col.cavern_depth > 0.8 && z > z_cav_lo + 1 && z < z_cav_hi;
+                        let in_cavern = grotto_chamber || (z > z_cav_lo + 1 && z + 1 < z_cav_hi && n_cav > 0.68);
                         if !in_cavern {
                             layer.mass[SP_ROCK][idx] = 1000;
                             layer.set_cell_temp(idx, if col.is_rift_core { 58_000 } else { 30_500 });
@@ -1300,6 +1374,12 @@ impl DualScalePlanet {
                                 }
                                 layer.set_cell_temp(idx, (col.temp_k * 100.0) as i64);
                             }
+                        } else if col.river_depth > 0.15 && z == surf_z + 1 && z < d - 2 {
+                            // Flowing alpine & coastal river water!
+                            layer.mass[SP_WATER][idx] = 820;
+                            layer.flow_e[idx] = 36;
+                            layer.flow_s[idx] = 18;
+                            layer.set_cell_temp(idx, (col.temp_k * 100.0) as i64);
                         } else if z <= surf_z + 3
                             && col.forest_density > 0.42
                             && tree_n > 0.80

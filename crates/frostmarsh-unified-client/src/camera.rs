@@ -9,6 +9,8 @@ use glam::{DVec3, Mat4, Vec3};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MacroPlanetCamMode {
+    /// Classic Frostmarsh MOBA angled-overhead tactical camera (~48 deg looking down at your hero!).
+    TacticalOverhead,
     Ground3rdPerson,
     SkywingFlight,
     Stratosphere,
@@ -18,15 +20,17 @@ pub enum MacroPlanetCamMode {
 impl MacroPlanetCamMode {
     pub fn next(self) -> Self {
         match self {
+            Self::TacticalOverhead => Self::Ground3rdPerson,
             Self::Ground3rdPerson => Self::SkywingFlight,
             Self::SkywingFlight => Self::Stratosphere,
             Self::Stratosphere => Self::OrbitalGlobe,
-            Self::OrbitalGlobe => Self::Ground3rdPerson,
+            Self::OrbitalGlobe => Self::TacticalOverhead,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::TacticalOverhead => "OVERHEAD",
             Self::Ground3rdPerson => "GROUND",
             Self::SkywingFlight => "FLIGHT",
             Self::Stratosphere => "STRATO",
@@ -95,22 +99,70 @@ pub struct MacroPlanetCamera {
 impl MacroPlanetCamera {
     pub fn new(r_surf: f64) -> Self {
         let r = r_surf.max(100.0);
-        let eye = DVec3::new(0.0, 0.0, r + 6.0);
+        let eye = DVec3::new(0.0, 0.0, r + 28.0);
         Self {
-            mode: MacroPlanetCamMode::Ground3rdPerson,
-            orbit_yaw: 0.0,
-            orbit_pitch: 0.22,
-            orbit_dist: 12.0,
+            mode: MacroPlanetCamMode::TacticalOverhead,
+            orbit_yaw: 0.42,
+            orbit_pitch: 0.78,
+            orbit_dist: 38.0,
             smoothed_up: DVec3::Z,
             smoothed_fwd: DVec3::X,
             eye_f64: eye,
-            target_f64: DVec3::new(15.0, 0.0, r + 1.5),
+            target_f64: DVec3::new(0.0, 0.0, r + 1.5),
             up_f64: DVec3::Z,
             initialized: false,
-            fov_y_deg: 56.0,
-            near: 0.25,
-            far: 2800.0,
+            fov_y_deg: 44.0,
+            near: 0.4,
+            far: 3200.0,
             exposure: 1.06,
+        }
+    }
+
+    /// Raycast screen pixel `(sx, sy)` onto the hero's local horizontal ground tangent plane
+    /// `(p - hero_rel) · hero_up = 0`, returning the 3D tangent aim vector from hero to cursor!
+    #[allow(clippy::too_many_arguments)]
+    pub fn screen_to_tangent_aim_f64(
+        &self,
+        mats: &MacroPlanetCameraMatrices,
+        hero_pos: DVec3,
+        hero_up: DVec3,
+        sx: f32,
+        sy: f32,
+        sw: f32,
+        sh: f32,
+    ) -> Option<DVec3> {
+        let ndc_x = (sx / sw.max(1.0)) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (sy / sh.max(1.0)) * 2.0;
+        let p_near = mats.inv_vp * glam::Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+        let p_far = mats.inv_vp * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+        if p_near.w.abs() < 1e-5 || p_far.w.abs() < 1e-5 {
+            return None;
+        }
+        let ro = p_near.truncate() / p_near.w;
+        let rf = p_far.truncate() / p_far.w;
+        let rd_f = (rf - ro).normalize_or_zero();
+        if rd_f.length_squared() < 0.25 {
+            return None;
+        }
+        let ro_d = DVec3::new(ro.x as f64, ro.y as f64, ro.z as f64);
+        let rd_d = DVec3::new(rd_f.x as f64, rd_f.y as f64, rd_f.z as f64);
+        let hero_rel = hero_pos - DVec3::from_array(mats.eye_f64);
+        let up = hero_up.normalize_or(DVec3::Y);
+        let denom = rd_d.dot(up);
+        if denom.abs() < 1e-4 {
+            return None;
+        }
+        let t = (hero_rel - ro_d).dot(up) / denom;
+        if t <= 0.1 || t > 600.0 {
+            return None;
+        }
+        let hit_rel = ro_d + rd_d * t;
+        let delta = hit_rel - hero_rel;
+        let tang = delta - up * delta.dot(up);
+        if tang.length_squared() < 0.04 {
+            None
+        } else {
+            Some(tang)
         }
     }
 
@@ -137,12 +189,14 @@ impl MacroPlanetCamera {
         self.orbit_pitch = (self.orbit_pitch + dy as f64 * 0.005).clamp(-1.32, 1.32);
     }
 
-    /// Smooth continuous scroll-wheel zoom all the way from Ground (`6 m`) to Full Orbit (`4,600 m`)!
+    /// Smooth continuous scroll-wheel zoom all the way from Ground (`6 m`) -> Overhead (`38 m`) -> Orbit (`4,600 m`)!
     pub fn zoom(&mut self, delta: f32) {
         let factor = (1.0 - (delta as f64) * 0.045).clamp(0.70, 1.45);
         self.orbit_dist = (self.orbit_dist * factor).clamp(6.0, 4600.0);
-        self.mode = if self.orbit_dist < 36.0 {
+        self.mode = if self.orbit_dist < 18.0 {
             MacroPlanetCamMode::Ground3rdPerson
+        } else if self.orbit_dist < 62.0 {
+            MacroPlanetCamMode::TacticalOverhead
         } else if self.orbit_dist < 260.0 {
             MacroPlanetCamMode::SkywingFlight
         } else if self.orbit_dist < 1350.0 {
@@ -152,10 +206,16 @@ impl MacroPlanetCamera {
         };
     }
 
-    /// Cycle through the 4 signature altitudes via `F5`: GROUND -> FLIGHT -> STRATO -> ORBIT.
+    /// Cycle through the 5 signature views via `F5`: OVERHEAD -> GROUND -> FLIGHT -> STRATO -> ORBIT.
     pub fn cycle_mode(&mut self) {
         self.mode = self.mode.next();
         match self.mode {
+            MacroPlanetCamMode::TacticalOverhead => {
+                self.orbit_dist = 38.0;
+                self.orbit_pitch = 0.78;
+                self.fov_y_deg = 44.0;
+                self.exposure = 1.06;
+            }
             MacroPlanetCamMode::Ground3rdPerson => {
                 self.orbit_dist = 12.0;
                 self.orbit_pitch = 0.22;
@@ -240,10 +300,19 @@ impl MacroPlanetCamera {
         .normalize_or(self.smoothed_fwd);
 
         let (des_eye, des_tgt, des_up, fov, near, far, exp) = match self.mode {
+            MacroPlanetCamMode::TacticalOverhead => {
+                // Classic Frostmarsh angled-from-above MOBA camera (~48 deg pitch looking right down at your hero!)
+                let dist = self.orbit_dist.clamp(18.0, 62.0);
+                let up_h = dist * 0.78;
+                let back_d = dist * 0.64;
+                let eye = hero_world_pos + self.smoothed_up * up_h - look_dir * back_d;
+                let tgt = hero_world_pos + self.smoothed_up * 1.4;
+                (eye, tgt, self.smoothed_up, 44.0, 0.4, 3400.0, 1.06)
+            }
             MacroPlanetCamMode::Ground3rdPerson => {
                 // Classic over-the-shoulder 3rd-person (~12m behind, ~4.5m above hero) on 1m flat ground!
-                let back_d = self.orbit_dist.clamp(6.0, 35.0);
-                let up_h = (back_d * 0.36).clamp(3.0, 14.0);
+                let back_d = self.orbit_dist.clamp(6.0, 22.0);
+                let up_h = (back_d * 0.36).clamp(3.0, 10.0);
                 let eye = hero_world_pos + self.smoothed_up * up_h - look_dir * back_d;
                 let tgt = hero_world_pos + look_dir * 32.0 + self.smoothed_up * 2.2;
                 (eye, tgt, self.smoothed_up, 56.0, 0.25, 2900.0, 1.06)

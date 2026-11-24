@@ -1385,6 +1385,15 @@ struct GameState {
     volume: VolumeField,
     planet_runtime: Option<PlanetRuntime>,
     macro_planet_runtime: Option<MacroPlanetRuntime>,
+    macro_planet_enabled: bool,
+    macro_planet_cfg: MacroPlanetConfig,
+    macro_sun_dir_cached: [f32; 3],
+    macro_climate_infer_ms_cached: f32,
+    macro_hydrated_shards_cached: u16,
+    macro_sky_cores_cached: u8,
+    macro_seam_mass_cached: u64,
+    macro_field_tick_cached: u64,
+    macro_total_chunks_cached: u16,
     planet_r_core: f32,
     eco: EcosystemState,
     sim_mode: String,
@@ -1565,12 +1574,12 @@ impl GameState {
 
     #[inline]
     fn is_macro_planet_mode(&self) -> bool {
-        self.macro_planet_runtime.is_some()
+        self.macro_planet_enabled
     }
 
     #[inline]
     fn is_planet_mode(&self) -> bool {
-        self.planet_runtime.is_some() || self.macro_planet_runtime.is_some()
+        self.planet_runtime.is_some() || self.macro_planet_enabled
     }
 
     #[inline]
@@ -1639,7 +1648,7 @@ impl GameState {
             chunks_y,
             aoi_radius,
             entity_aoi_radius: 220.0,
-            persistent_world: false,
+            persistent_world: true,
             match_elapsed_offset_secs: 0,
             persistent_players: HashMap::new(),
             brick_raw_cache: HashMap::new(),
@@ -1647,6 +1656,18 @@ impl GameState {
             hazard_layers: vec![vec![1u8; 16 * 16]; 4],
             volume,
             planet_runtime: None,
+            macro_planet_enabled: true,
+            macro_planet_cfg: config,
+            macro_sun_dir_cached: mr.sun_dir_f32(),
+            macro_climate_infer_ms_cached: mr.climate_infer_ms,
+            macro_hydrated_shards_cached: mr.planet.shards.len().min(u16::MAX as usize) as u16,
+            macro_sky_cores_cached: mr.active_sky_cores(),
+            macro_seam_mass_cached: 0,
+            macro_field_tick_cached: 0,
+            macro_total_chunks_cached: ((mr.shard_chunks_xy() as usize)
+                * (mr.shard_chunks_xy() as usize)
+                * (mr.subbricks_z() as usize))
+                .min(u16::MAX as usize) as u16,
             macro_planet_runtime: Some(mr),
             planet_r_core: r_core,
             eco,
@@ -1829,6 +1850,15 @@ impl GameState {
             volume,
             planet_runtime: Some(pr),
             macro_planet_runtime: None,
+            macro_planet_enabled: false,
+            macro_planet_cfg: MacroPlanetConfig::default(),
+            macro_sun_dir_cached: [0.0, 0.0, 0.0],
+            macro_climate_infer_ms_cached: 0.0,
+            macro_hydrated_shards_cached: 0,
+            macro_sky_cores_cached: 0,
+            macro_seam_mass_cached: 0,
+            macro_field_tick_cached: 0,
+            macro_total_chunks_cached: 0,
             planet_r_core: r_core,
             eco,
             sim_mode: "neural".to_string(),
@@ -1987,6 +2017,15 @@ impl GameState {
             volume,
             planet_runtime: None,
             macro_planet_runtime: None,
+            macro_planet_enabled: false,
+            macro_planet_cfg: MacroPlanetConfig::default(),
+            macro_sun_dir_cached: [0.0, 0.0, 0.0],
+            macro_climate_infer_ms_cached: 0.0,
+            macro_hydrated_shards_cached: 0,
+            macro_sky_cores_cached: 0,
+            macro_seam_mass_cached: 0,
+            macro_field_tick_cached: 0,
+            macro_total_chunks_cached: 0,
             planet_r_core: 0.0,
             eco,
             sim_mode: "neural".to_string(),
@@ -6817,6 +6856,22 @@ impl GameState {
             // Smooth archetype radial altitude `z` tracking curved terrain / ocean / Sky-Ring
             let surf_z = if let Some(ref mr) = self.macro_planet_runtime {
                 mr.find_surface_z(face, x, y)
+            } else if self.macro_planet_enabled {
+                let (u, v) = field_core::planet_macro::face_virtual_uv_f64(
+                    x as f64,
+                    y as f64,
+                    self.macro_planet_cfg.face_size_virtual(),
+                );
+                let dir = field_core::planet_macro::face_uv_to_sphere_dir_f64(
+                    (face as usize) % FACE_COUNT,
+                    u,
+                    v,
+                );
+                let col = field_core::planet_macro::sample_macro_planet_column(
+                    dir,
+                    self.macro_planet_cfg.seed,
+                );
+                col.surf_z.max(self.macro_planet_cfg.z_sea as f64 + 0.5) as f32
             } else if let Some(ref pr) = self.planet_runtime {
                 pr.find_surface_z(face, x, y)
             } else {
@@ -7332,6 +7387,24 @@ impl GameState {
                 mr.planet.global_mass_error(),
                 mr.planet.global_energy_error(),
                 (per_shard_sb * (hydrated as usize).max(1)).min(u16::MAX as usize) as u16,
+            )
+        } else if self.macro_planet_enabled {
+            let cfg = self.macro_planet_cfg;
+            (
+                true,
+                true,
+                cfg.r_core as f32,
+                cfg.shards_per_face_axis,
+                cfg.seed,
+                self.macro_climate_infer_ms_cached,
+                self.macro_hydrated_shards_cached,
+                self.macro_sun_dir_cached,
+                self.macro_seam_mass_cached,
+                self.macro_sky_cores_cached,
+                self.macro_field_tick_cached,
+                self.mass_error,
+                self.energy_error,
+                self.macro_total_chunks_cached,
             )
         } else if let Some(ref pr) = self.planet_runtime {
             (
@@ -8871,104 +8944,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if macro_planet_flag {
             loop {
                 let t_loop = Instant::now();
-                // 1. Lazily hydrate shards around human observers + prepare op=13 climate payload outside lock
-                let (climate_req_opt, drained_injections, hero_op11_prep) = {
+                // 1. Lock GameState for <0.05 ms ONLY to take MacroPlanetRuntime out + copy observer coords.
+                //    Guarantees the 30 Hz player WASD / combat / snapshot loop NEVER stalls on 4.19M-voxel ticks!
+                let (mut mr_opt, observers, use_neural) = {
                     let mut gs = field_state.lock().unwrap();
-                    let observers: Vec<(u8, f32, f32)> = gs
+                    let obs: Vec<(u8, f32, f32)> = gs
                         .players
                         .values()
                         .filter(|p| !p.is_bot)
                         .map(|p| (p.face, p.x, p.y))
                         .collect();
-                    let use_neural = gs.sim_mode == "neural" && cuda_rpc.is_some();
-                    if let Some(ref mut mr) = gs.macro_planet_runtime {
-                        let newly_hyd = mr.ensure_hydrated_around_observers(&observers);
-                        for k in newly_hyd {
-                            log::info!(
-                                "Macro Planet lazily hydrated shard {:?} (active_hydrated={})",
-                                k,
-                                mr.planet.shards.len()
-                            );
-                        }
-                        let should_clim = mr.should_step_climate_this_tick();
-                        let injections: Vec<ClimateInjection> = if should_clim {
-                            std::mem::take(&mut mr.pending_climate_injections)
-                        } else {
-                            Vec::new()
-                        };
-                        let clim_req = if should_clim && use_neural && mr.op13_backoff == 0 {
-                            let next_sun = macro_planet_runtime::macro_sun_dir_from_angle(
-                                (mr.sun_angle + mr.sun_speed_rad_per_tick).rem_euclid(std::f32::consts::TAU),
-                            );
-                            Some(encode_planet_op13_request(
-                                mr.config().seed,
-                                next_sun,
-                                1,
-                                &injections,
-                            ))
-                        } else {
-                            None
-                        };
-                        // Optional op=11 WorldModel3D-v8 sparse step on primary hero shard when cuda-rpc is active
-                        let op11_req = if use_neural {
-                            let hk = mr.hero_site.shard_key;
-                            mr.planet.shards.get(&hk).map(|vf| {
-                                let bin = vf.encode_batched_input_tensor();
-                                let dt_map = vec![1.0f32; vf.width * vf.height];
-                                (vf.depth, vf.height, vf.width, bin, dt_map, vf.world_laws)
-                            })
-                        } else {
-                            None
-                        };
-                        (clim_req, injections, op11_req)
-                    } else {
-                        (None, Vec::new(), None)
-                    }
+                    let neural = gs.sim_mode == "neural" && cuda_rpc.is_some();
+                    (gs.macro_planet_runtime.take(), obs, neural)
                 };
 
-                // 2. Execute CUDA op=13 (PlanetaryClimateNet) & optional op=11 outside the GameState mutex!
-                let mut op13_outcome: Option<Result<PlanetClimateOp13Response, String>> = None;
-                if let (Some(rpc), Some(payload)) = (cuda_rpc.as_mut(), climate_req_opt) {
-                    op13_outcome = Some(rpc.step_planet_climate_raw(&payload));
-                }
-                let mut hero_op11_res: Option<(Vec<RawStepOutput>, Option<Vec<f32>>, f32, f32)> = None;
-                if let (Some(rpc), Some((gd, gh, gw, bin, dt_map, laws))) =
-                    (cuda_rpc.as_mut(), hero_op11_prep)
-                {
-                    let per = OUTPUT_CHANNELS * gw * gh;
-                    let horiz_len = gd * per;
-                    let z_len = gd.saturating_sub(1) * 5 * gw * gh;
-                    if let Ok((flat, gpu_ms, _used_v8)) =
-                        rpc.step_world_v8(gd, gh, gw, &bin, &dt_map, laws)
+                // 2. 100% LOCK-FREE: shard hydration, tensor encoding, CUDA op=13 & op=11, and step_macro_tick!
+                let outcome_opt = if let Some(ref mut mr) = mr_opt {
+                    let newly_hyd = mr.ensure_hydrated_around_observers(&observers);
+                    for k in newly_hyd {
+                        log::info!(
+                            "Macro Planet lazily hydrated shard {:?} (active_hydrated={})",
+                            k,
+                            mr.planet.shards.len()
+                        );
+                    }
+                    let should_clim = mr.should_step_climate_this_tick();
+                    let drained_injections: Vec<ClimateInjection> = if should_clim {
+                        std::mem::take(&mut mr.pending_climate_injections)
+                    } else {
+                        Vec::new()
+                    };
+                    let climate_req_opt = if should_clim && use_neural && mr.op13_backoff == 0 {
+                        let next_sun = macro_planet_runtime::macro_sun_dir_from_angle(
+                            (mr.sun_angle + mr.sun_speed_rad_per_tick).rem_euclid(std::f32::consts::TAU),
+                        );
+                        Some(encode_planet_op13_request(
+                            mr.config().seed,
+                            next_sun,
+                            1,
+                            &drained_injections,
+                        ))
+                    } else {
+                        None
+                    };
+                    let hero_op11_prep = if use_neural {
+                        let hk = mr.hero_site.shard_key;
+                        mr.planet.shards.get(&hk).map(|vf| {
+                            let bin = vf.encode_batched_input_tensor();
+                            let dt_map = vec![1.0f32; vf.width * vf.height];
+                            (vf.depth, vf.height, vf.width, bin, dt_map, vf.world_laws)
+                        })
+                    } else {
+                        None
+                    };
+
+                    let mut op13_outcome: Option<Result<PlanetClimateOp13Response, String>> = None;
+                    if let (Some(rpc), Some(payload)) = (cuda_rpc.as_mut(), climate_req_opt) {
+                        op13_outcome = Some(rpc.step_planet_climate_raw(&payload));
+                    }
+                    let mut hero_op11_res: Option<(Vec<RawStepOutput>, Option<Vec<f32>>, f32, f32)> = None;
+                    if let (Some(rpc), Some((gd, gh, gw, bin, dt_map, laws))) =
+                        (cuda_rpc.as_mut(), hero_op11_prep)
                     {
-                        if flat.len() == horiz_len + z_len {
-                            let raws: Vec<RawStepOutput> = (0..gd)
-                                .map(|l| RawStepOutput {
-                                    width: gw,
-                                    height: gh,
-                                    data: flat[l * per..(l + 1) * per].to_vec(),
-                                })
-                                .collect();
-                            let zf = if z_len > 0 {
-                                Some(flat[horiz_len..].to_vec())
-                            } else {
-                                None
-                            };
-                            hero_op11_res = Some((raws, zf, gpu_ms, 0.25));
+                        let per = OUTPUT_CHANNELS * gw * gh;
+                        let horiz_len = gd * per;
+                        let z_len = gd.saturating_sub(1) * 5 * gw * gh;
+                        if let Ok((flat, gpu_ms, _used_v8)) =
+                            rpc.step_world_v8(gd, gh, gw, &bin, &dt_map, laws)
+                        {
+                            if flat.len() == horiz_len + z_len {
+                                let raws: Vec<RawStepOutput> = (0..gd)
+                                    .map(|l| RawStepOutput {
+                                        width: gw,
+                                        height: gh,
+                                        data: flat[l * per..(l + 1) * per].to_vec(),
+                                    })
+                                    .collect();
+                                let zf = if z_len > 0 {
+                                    Some(flat[horiz_len..].to_vec())
+                                } else {
+                                    None
+                                };
+                                hero_op11_res = Some((raws, zf, gpu_ms, 0.25));
+                            }
                         }
                     }
-                }
 
-                // 3. Apply macro-planet physics tick + exact border exchange + AMR climate + sub-brick streaming!
+                    Some(mr.step_macro_tick(
+                        op13_outcome,
+                        &drained_injections,
+                        hero_op11_res,
+                    ))
+                } else {
+                    None
+                };
+
+                // 3. Brief lock (<1 ms): restore MacroPlanetRuntime, refresh cached telemetry, & broadcast sub-bricks!
                 {
                     let mut gs = field_state.lock().unwrap();
-                    let mut mr_opt = gs.macro_planet_runtime.take();
-                    if let Some(ref mut mr) = mr_opt {
-                        let outcome = mr.step_macro_tick(
-                            op13_outcome,
-                            &drained_injections,
-                            hero_op11_res,
-                        );
+                    if let (Some(ref mut mr), Some(outcome)) = (mr_opt.as_mut(), outcome_opt) {
                         let sim_tick_u32 = gs.sim_tick as u32;
                         for (fi, _cid, cname, cx, cy, cz) in &outcome.newly_fracturing_cores {
                             let msg = format!("SKY-ISLAND FRACTURING: {}!", cname);
@@ -9022,6 +9096,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         gs.neural_3d_vertical = outcome.neural_3d_vertical;
                         gs.mass_error = outcome.global_mass_error;
                         gs.energy_error = outcome.global_energy_error;
+                        gs.macro_sun_dir_cached = mr.sun_dir_f32();
+                        gs.macro_climate_infer_ms_cached = outcome.climate_infer_ms;
+                        gs.macro_hydrated_shards_cached = outcome.active_hydrated_shards as u16;
+                        gs.macro_sky_cores_cached = mr.active_sky_cores();
+                        gs.macro_seam_mass_cached = mr.planet.total_seam_mass_crossed.max(0) as u64;
+                        gs.macro_field_tick_cached = outcome.tick;
+                        let per_shard_sb = (mr.shard_chunks_xy() as usize)
+                            * (mr.shard_chunks_xy() as usize)
+                            * (mr.subbricks_z() as usize);
+                        gs.macro_total_chunks_cached =
+                            (per_shard_sb * (outcome.active_hydrated_shards as usize).max(1))
+                                .min(u16::MAX as usize) as u16;
                         let dirty_sb = outcome.dirty_subbricks;
                         let log_tick = outcome.tick;
                         let log_clim_ms = outcome.climate_infer_ms;
@@ -9054,7 +9140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 gs.peers.len()
                             );
                         }
-                    } else {
+                    } else if mr_opt.is_some() {
                         gs.macro_planet_runtime = mr_opt;
                     }
                 }

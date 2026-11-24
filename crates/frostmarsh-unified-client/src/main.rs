@@ -2197,6 +2197,28 @@ impl InteractiveApp {
 
         // Wave 34B: Dedicated Live Dual-Scale Locally-Flat R=1,304m Macro Planet Interactive Frame Path
         if self.macro_planet_mode {
+            // Smooth 220 FPS client-side velocity extrapolation between 30 Hz server snapshots!
+            if let Some(ref mut ent) = entities {
+                if ent.sim_tick != self.last_snap_tick {
+                    self.last_snap_tick = ent.sim_tick;
+                    self.snap_age_s = 0.0;
+                } else {
+                    self.snap_age_s = (self.snap_age_s + dt).min(0.12);
+                }
+                let extrap = self.snap_age_s.min(0.08);
+                let n_lim = (self.macro_planet_world.face_size_virtual() as f32 - 0.05).max(1.0);
+                for p in &mut ent.players {
+                    p.x = (p.x + p.vx * extrap).clamp(0.05, n_lim);
+                    p.y = (p.y + p.vy * extrap).clamp(0.05, n_lim);
+                    p.z = (p.z + p.vz * extrap).clamp(1.0, self.macro_planet_world.depth as f32 - 1.0);
+                }
+                for pr in &mut ent.projectiles {
+                    pr.x = (pr.x + pr.vx * extrap).clamp(0.05, n_lim);
+                    pr.y = (pr.y + pr.vy * extrap).clamp(0.05, n_lim);
+                    pr.z = (pr.z + pr.vz * extrap).clamp(1.0, self.macro_planet_world.depth as f32 - 1.0);
+                }
+            }
+
             let sun_d = entities
                 .as_ref()
                 .map(|e| {
@@ -2286,15 +2308,49 @@ impl InteractiveApp {
                     let mlen = mx.hypot(my);
                     let (mx, my) = if mlen > 1.0 { (mx / mlen, my / mlen) } else { (mx, my) };
 
-                    let aim_u = cam_fwd.dot(hero_tang_u) as f32;
-                    let aim_v = cam_fwd.dot(hero_tang_v) as f32;
-                    let alen = aim_u.hypot(aim_v);
-                    let (aim_x, aim_y) = if alen > 0.01 {
-                        (aim_u / alen, aim_v / alen)
-                    } else if mlen > 0.05 {
-                        (mx / mlen, my / mlen)
+                    // Exact 360-deg mouse-cursor ground raycast aiming in Overhead / Ground / Flight views!
+                    let (sw, sh) = self
+                        .surface_cfg
+                        .as_ref()
+                        .map(|c| (c.width.max(1) as f32, c.height.max(1) as f32))
+                        .unwrap_or((1280.0, 720.0));
+                    let mmats_aim = self.macro_planet_camera.compute_matrices(sw, sh);
+                    let cursor_aim = if !matches!(
+                        self.macro_planet_camera.mode,
+                        MacroPlanetCamMode::Stratosphere | MacroPlanetCamMode::OrbitalGlobe
+                    ) {
+                        self.macro_planet_camera.screen_to_tangent_aim_f64(
+                            &mmats_aim,
+                            hero_pos,
+                            hero_up,
+                            self.mouse_pos.0,
+                            self.mouse_pos.1,
+                            sw,
+                            sh,
+                        )
                     } else {
-                        self.local_aim_dir
+                        None
+                    };
+                    let (aim_x, aim_y, aim_dist) = if let Some(tang) = cursor_aim {
+                        let au = tang.dot(hero_tang_u) as f32;
+                        let av = tang.dot(hero_tang_v) as f32;
+                        let len = au.hypot(av);
+                        if len > 0.05 {
+                            (au / len, av / len, len.clamp(2.5, 22.0))
+                        } else {
+                            (self.local_aim_dir.0, self.local_aim_dir.1, 12.0)
+                        }
+                    } else {
+                        let aim_u = cam_fwd.dot(hero_tang_u) as f32;
+                        let aim_v = cam_fwd.dot(hero_tang_v) as f32;
+                        let alen = aim_u.hypot(aim_v);
+                        if alen > 0.01 {
+                            (aim_u / alen, aim_v / alen, 12.0)
+                        } else if mlen > 0.05 {
+                            (mx / mlen, my / mlen, 12.0)
+                        } else {
+                            (self.local_aim_dir.0, self.local_aim_dir.1, 12.0)
+                        }
                     };
                     self.local_aim_dir = (aim_x, aim_y);
 
@@ -2355,8 +2411,8 @@ impl InteractiveApp {
                                 impulse = 1.0;
                             }
                             quic.send_reliable_detached(ClientReliable::PhysicalActuator {
-                                dx: aim_x * 12.0,
-                                dy: aim_y * 12.0,
+                                dx: aim_x * aim_dist,
+                                dy: aim_y * aim_dist,
                                 thermal_flux,
                                 sp_water,
                                 sp_oil,

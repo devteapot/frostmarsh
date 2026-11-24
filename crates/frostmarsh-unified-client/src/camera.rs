@@ -78,23 +78,42 @@ pub struct PlanetCamera {
 
 impl PlanetCamera {
     pub fn new(r_core: f32, depth: f32) -> Self {
-        let r_outer = r_core + depth;
-        let eye = Vec3::new(0.42, 0.24, 0.875).normalize() * (r_outer * 2.45);
+        let r_surf = r_core + depth * 0.55;
+        let eye = Vec3::new(0.0, 6.0, r_surf + 14.0);
         Self {
-            mode: PlanetCamMode::OrbitalGlobe,
-            orbit_yaw: 0.45,
+            mode: PlanetCamMode::SurfaceHorizon,
+            orbit_yaw: 0.0,
             orbit_pitch: 0.24,
-            orbit_dist: r_outer * 2.45,
+            orbit_dist: 14.0,
             smoothed_up: Vec3::Z,
             smoothed_fwd: Vec3::X,
             eye,
-            target: Vec3::ZERO,
-            up: Vec3::Y,
-            fov_y_deg: 44.0,
-            near: 0.5,
+            target: Vec3::new(0.0, 0.0, r_surf),
+            up: Vec3::Z,
+            fov_y_deg: 56.0,
+            near: 0.35,
             far: 950.0,
-            exposure: 1.22,
+            exposure: 1.12,
         }
+    }
+
+    /// Return the camera's `(forward, right)` unit vectors projected onto the tangent plane perpendicular to `hero_up`.
+    pub fn tangent_move_basis(&self, hero_up: Vec3) -> (Vec3, Vec3) {
+        let up = hero_up.normalize_or(Vec3::Y);
+        let raw_look = (self.target - self.eye).normalize_or(self.smoothed_fwd);
+        let mut fwd = (raw_look - up * raw_look.dot(up)).normalize_or_zero();
+        if fwd.length_squared() < 0.15 {
+            fwd = (self.smoothed_fwd - up * self.smoothed_fwd.dot(up)).normalize_or_zero();
+        }
+        if fwd.length_squared() < 0.15 {
+            fwd = if up.y.abs() < 0.9 {
+                Vec3::Y.cross(up).normalize()
+            } else {
+                Vec3::X.cross(up).normalize()
+            };
+        }
+        let right = fwd.cross(up).normalize_or(Vec3::X);
+        (fwd, right)
     }
 
     pub fn drag_orbit(&mut self, dx: f32, dy: f32) {
@@ -163,32 +182,26 @@ impl PlanetCamera {
             self.smoothed_up = hero_up;
         }
 
-        // Parallel-transport & orthonormalize tangent forward perpendicular to `smoothed_up`
-        let proj_target_fwd =
-            (hero_tangent_fwd - self.smoothed_up * hero_tangent_fwd.dot(self.smoothed_up))
-                .normalize_or_zero();
+        // Parallel-transport `smoothed_fwd` smoothly across the curved sphere perpendicular to `smoothed_up`
+        // (never snaps when strafing A/D or walking backwards S — camera heading stays rock-steady!).
         let proj_cur_fwd =
             (self.smoothed_fwd - self.smoothed_up * self.smoothed_fwd.dot(self.smoothed_up))
+                .normalize_or_zero();
+        let proj_target_fwd =
+            (hero_tangent_fwd - self.smoothed_up * hero_tangent_fwd.dot(self.smoothed_up))
                 .normalize_or_zero();
         let fallback_fwd = if self.smoothed_up.y.abs() < 0.9 {
             Vec3::Y.cross(self.smoothed_up).normalize()
         } else {
             Vec3::X.cross(self.smoothed_up).normalize()
         };
-        let cur_f = if proj_cur_fwd.length_squared() > 0.25 {
-            proj_cur_fwd
+        if proj_cur_fwd.length_squared() > 0.25 {
+            self.smoothed_fwd = proj_cur_fwd;
+        } else if proj_target_fwd.length_squared() > 0.25 {
+            self.smoothed_fwd = proj_target_fwd;
         } else {
-            fallback_fwd
-        };
-        let tgt_f = if proj_target_fwd.length_squared() > 0.25 {
-            proj_target_fwd
-        } else {
-            cur_f
-        };
-        self.smoothed_fwd = cur_f.lerp(tgt_f, 1.0 - (-6.0 * dt.clamp(0.001, 0.1)).exp()).normalize_or(cur_f);
-        // Re-project strictly perpendicular to smoothed_up
-        self.smoothed_fwd = (self.smoothed_fwd - self.smoothed_up * self.smoothed_fwd.dot(self.smoothed_up))
-            .normalize_or(fallback_fwd);
+            self.smoothed_fwd = fallback_fwd;
+        }
 
         let r_outer = r_core + depth;
         let alpha_pos = 1.0 - (-10.0 * dt.clamp(0.001, 0.1)).exp();
@@ -223,16 +236,22 @@ impl PlanetCamera {
                 self.exposure = 1.15;
             }
             PlanetCamMode::SurfaceHorizon => {
+                // Orbitable 3rd-person over-the-shoulder geodesic camera behind your hero!
                 let back_d = self.orbit_dist.clamp(8.0, 28.0);
-                let des_eye = hero_world_pos + self.smoothed_up * 6.8 - self.smoothed_fwd * back_d;
-                let des_tgt = hero_world_pos + self.smoothed_fwd * 32.0 - self.smoothed_up * 3.8;
+                let tang_r = self.smoothed_fwd.cross(self.smoothed_up).normalize_or(Vec3::X);
+                let look_dir = (self.smoothed_fwd * self.orbit_yaw.cos()
+                    + tang_r * self.orbit_yaw.sin())
+                .normalize_or(self.smoothed_fwd);
+                let des_eye = hero_world_pos + self.smoothed_up * (back_d * 0.44).clamp(4.0, 11.0)
+                    - look_dir * back_d;
+                let des_tgt = hero_world_pos + look_dir * 22.0 + self.smoothed_up * 1.4;
                 self.eye = self.eye.lerp(des_eye, alpha_pos);
                 self.target = self.target.lerp(des_tgt, alpha_pos);
                 self.up = self.smoothed_up;
                 self.fov_y_deg = 56.0;
                 self.near = 0.35;
-                self.far = 600.0;
-                self.exposure = 1.10;
+                self.far = 650.0;
+                self.exposure = 1.12;
             }
         }
     }

@@ -1542,13 +1542,13 @@ impl InteractiveApp {
 
         // Camera keyboard orbit + smooth F5 CameraPreset easing (locked while typing in acoustic chat!)
         if !self.chat_open {
-            if self.keys.contains(&KeyCode::KeyQ) {
+            if self.keys.contains(&KeyCode::KeyQ) || self.keys.contains(&KeyCode::ArrowLeft) {
                 self.camera.yaw -= 1.6 * dt;
-                self.planet_camera.orbit_yaw -= 1.6 * dt;
+                self.planet_camera.orbit_yaw -= 1.8 * dt;
             }
-            if self.keys.contains(&KeyCode::KeyZ) {
+            if self.keys.contains(&KeyCode::KeyZ) || self.keys.contains(&KeyCode::ArrowRight) {
                 self.camera.yaw += 1.6 * dt;
-                self.planet_camera.orbit_yaw += 1.6 * dt;
+                self.planet_camera.orbit_yaw += 1.8 * dt;
             }
         }
         if self.camera_preset_easing {
@@ -1657,21 +1657,34 @@ impl InteractiveApp {
                 })
                 .unwrap_or_else(|| Vec3::new(-0.78, 0.28, 0.56).normalize());
 
-            let (hero_pos, hero_fwd) = entities
+            let (hero_pos, hero_up, hero_tang_u, hero_tang_v, hero_fwd, physics_native_planet) = entities
                 .as_ref()
                 .and_then(|e| {
+                    let pn = e.telemetry.physics_native;
                     e.players
                         .iter()
                         .find(|p| p.id == e.your_player_id)
                         .or_else(|| e.players.first())
+                        .map(|me| (me, pn))
                 })
-                .map(|me| {
+                .map(|(me, pn)| {
                     let (pos, _, _, fwd) =
                         self.planet_world.entity_world_frame(me.face, me.x, me.y, me.z, me.aim_x, me.aim_y);
-                    (pos, fwd)
+                    let nf = self.planet_world.face_size.max(1) as f32;
+                    let u = (me.x / nf) * 2.0 - 1.0;
+                    let v = (me.y / nf) * 2.0 - 1.0;
+                    let (up, tu, tv) = planet_world::face_tangent_basis(me.face as usize, u, v);
+                    (pos, up, tu, tv, fwd, pn)
                 })
                 .unwrap_or_else(|| {
-                    (Vec3::new(0.0, 0.0, self.planet_world.r_ocean()), Vec3::X)
+                    (
+                        Vec3::new(0.0, 0.0, self.planet_world.r_ocean()),
+                        Vec3::Z,
+                        Vec3::X,
+                        Vec3::Y,
+                        Vec3::X,
+                        true,
+                    )
                 });
 
             self.planet_camera.update_follow(
@@ -1683,7 +1696,7 @@ impl InteractiveApp {
                 dt,
             );
 
-            // Send 60 Hz player movement / combat inputs on the sphere
+            // Send 60 Hz camera-relative 6-DOF spherical WASD movement & live PhysicalActuator beams!
             let send_elapsed = self.last_input_send.elapsed();
             if self.input_dirty || send_elapsed >= Duration::from_millis(16) {
                 self.last_input_send = Instant::now();
@@ -1697,30 +1710,99 @@ impl InteractiveApp {
                         if self.keys.contains(&KeyCode::KeyD) { r_in += 1.0; }
                         if self.keys.contains(&KeyCode::KeyA) { r_in -= 1.0; }
                     }
-                    let mlen = r_in.hypot(f_in);
-                    let (mx, my) = if mlen > 1.0 { (r_in / mlen, -f_in / mlen) } else { (r_in, -f_in) };
+                    let (cam_fwd, cam_right) = self.planet_camera.tangent_move_basis(hero_up);
+                    let move_3d = (cam_fwd * f_in + cam_right * r_in).clamp_length_max(1.0);
+                    let mx = move_3d.dot(hero_tang_u);
+                    let my = move_3d.dot(hero_tang_v);
+                    let mlen = mx.hypot(my);
+                    let (mx, my) = if mlen > 1.0 { (mx / mlen, my / mlen) } else { (mx, my) };
+
+                    // Aim straight along the camera's forward direction on the curved sphere!
+                    let aim_u = cam_fwd.dot(hero_tang_u);
+                    let aim_v = cam_fwd.dot(hero_tang_v);
+                    let alen = aim_u.hypot(aim_v);
+                    let (aim_x, aim_y) = if alen > 0.01 {
+                        (aim_u / alen, aim_v / alen)
+                    } else if mlen > 0.05 {
+                        (mx / mlen, my / mlen)
+                    } else {
+                        self.local_aim_dir
+                    };
+                    self.local_aim_dir = (aim_x, aim_y);
+
+                    let shift_held = !self.chat_open
+                        && (self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight));
+                    let dash_req = !self.chat_open && (self.pending_dash || self.keys.contains(&KeyCode::Space));
+                    let emit_matter = !self.chat_open
+                        && (self.pending_ability_e
+                            || self.keys.contains(&KeyCode::KeyE)
+                            || (shift_held && self.mouse_left));
+                    let emit_heat = !self.chat_open && self.mouse_left && !shift_held;
+                    let emit_cryo = !self.chat_open && self.mouse_right;
+                    let emit_pulse = !self.chat_open && self.pending_ult_r;
+
                     self.input_seq = self.input_seq.wrapping_add(1);
                     let now_ms = quic.state.lock().unwrap().client_time_ms();
                     let inp = ClientInputDatagram {
                         seq: self.input_seq,
                         move_x: mx,
                         move_y: my,
-                        aim_x: if mlen > 0.05 { mx } else { self.local_aim_dir.0 },
-                        aim_y: if mlen > 0.05 { my } else { self.local_aim_dir.1 },
-                        dash: !self.chat_open && (self.pending_dash || self.keys.contains(&KeyCode::Space)),
-                        melee: !self.chat_open && self.mouse_right,
-                        cast_bolt: !self.chat_open && self.mouse_left,
+                        aim_x,
+                        aim_y,
+                        dash: dash_req,
+                        melee: emit_cryo,
+                        cast_bolt: emit_heat,
                         bolt_element: self.selected_element,
                         carve_ice: !self.chat_open && self.pending_carve,
                         cast_ability_e: !self.chat_open && self.pending_ability_e,
-                        cast_ultimate_r: !self.chat_open && self.pending_ult_r,
+                        cast_ultimate_r: emit_pulse,
                         client_time_ms: now_ms,
                     };
+                    quic.send_input(&inp);
+
+                    if physics_native_planet && !self.chat_open {
+                        let ready_cont = self.actuator_edge_fire
+                            || self.last_actuator_send.elapsed() >= Duration::from_millis(85);
+                        if emit_pulse || (ready_cont && (emit_heat || emit_cryo || emit_matter)) {
+                            self.last_actuator_send = Instant::now();
+                            self.actuator_edge_fire = false;
+                            let mut thermal_flux = 0.0f32;
+                            if emit_heat { thermal_flux += 1.0; }
+                            if emit_cryo { thermal_flux -= 1.0; }
+                            let mut sp_oil = 0.0f32;
+                            let mut sp_water = 0.0f32;
+                            let mut sp_smoke = 0.0f32;
+                            if emit_matter {
+                                match self.selected_element % 3 {
+                                    0 => sp_oil = 1.0,
+                                    1 => sp_water = 1.0,
+                                    _ => sp_smoke = 1.0,
+                                }
+                            }
+                            let mut radius = self.focus_radius;
+                            let mut impulse = 0.0f32;
+                            if emit_pulse {
+                                thermal_flux = if shift_held { -1.0 } else { 1.0 };
+                                radius = (self.focus_radius + 2.0).min(8.0);
+                                impulse = 1.0;
+                            }
+                            quic.send_reliable_detached(ClientReliable::PhysicalActuator {
+                                dx: aim_x * 9.0,
+                                dy: aim_y * 9.0,
+                                thermal_flux,
+                                sp_water,
+                                sp_oil,
+                                sp_smoke,
+                                focus_radius: radius,
+                                impulse,
+                            });
+                        }
+                    }
+
                     self.pending_dash = false;
                     self.pending_carve = false;
                     self.pending_ability_e = false;
                     self.pending_ult_r = false;
-                    quic.send_input(&inp);
                 }
             }
 

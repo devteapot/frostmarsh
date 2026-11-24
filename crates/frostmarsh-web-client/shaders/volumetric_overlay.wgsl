@@ -1,7 +1,8 @@
-// Pass 2: Wave 12C Depth-Tested Volumetric Fluid & Gas Overlay + Sky + ACES Tonemap (WebGPU, Z=16..32)
+// Pass 2: Wave 18A Living Animated Water, Waterfalls, Fresnel Reflections & Blackbody Fire Overlay (WebGPU, Z=16..32)
 // Reads hardware depth from Surface-Nets + Hero Mesh pass, skips all non-fluid/non-gas bricks
-// in O(bricks) via 8x8x8 brick DDA, applies live 4-style fluid/plasma/lava/emerald appearance,
-// and composites flowing water, plunging waterfall, fire, smoke & sky.
+// in O(bricks) via 8x8x8 brick DDA, applies animated multi-frequency wave normals, Schlick Fresnel
+// sky reflections, dual-lobe crisp sun specular glints, solid-adjacency shoreline/waterfall foam,
+// live 4-style fluid/lava/plasma/emerald appearance, turbulent fire/ember sparks, & ACES tonemap.
 
 struct SceneUniforms {
     view_proj: mat4x4<f32>,
@@ -59,6 +60,26 @@ fn sample_albedo(p: vec3<f32>) -> vec4<f32> {
     return textureSampleLevel(albedo_tex, vol_samp, world_to_uvw(p), 0.0);
 }
 
+fn hash2(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+
+fn hash3(p: vec3<f32>) -> f32 {
+    return fract(sin(dot(p, vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+}
+
+fn vnoise2(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u2 = f * f * (vec2<f32>(3.0) - 2.0 * f);
+    return mix(
+        mix(hash2(i), hash2(i + vec2<f32>(1.0, 0.0)), u2.x),
+        mix(hash2(i + vec2<f32>(0.0, 1.0)), hash2(i + vec2<f32>(1.0, 1.0)), u2.x),
+        u2.y,
+    );
+}
+
+// Multi-frequency animated wave normals for living rivers, shorelines & plunging waterfalls
 fn sample_fluid_normal(p: vec3<f32>, time: f32) -> vec3<f32> {
     let e = 0.45;
     let gx = sample_density(p + vec3<f32>(e, 0.0, 0.0)).g - sample_density(p - vec3<f32>(e, 0.0, 0.0)).g;
@@ -71,9 +92,25 @@ fn sample_fluid_normal(p: vec3<f32>, time: f32) -> vec3<f32> {
     } else {
         n = n / len;
     }
-    let w1 = sin(p.x * 2.1 + p.z * 1.4 + time * 2.2) * 0.035;
-    let w2 = cos(p.x * 1.6 - p.z * 2.5 + time * 1.8) * 0.035;
-    return normalize(n + vec3<f32>(w1, 0.0, w2));
+    let flow_z = p.z - time * 1.9;
+    let w1x = sin(p.x * 0.95 + flow_z * 1.55) * 0.095
+            + sin(p.x * 2.35 - p.z * 1.25 + time * 2.6) * 0.055
+            + cos(p.x * 4.70 + flow_z * 3.80 - time * 3.4) * 0.032;
+    let w1z = cos(p.x * 1.30 - flow_z * 1.15) * 0.095
+            + cos(p.x * 0.85 + p.z * 2.65 - time * 2.9) * 0.055
+            + sin(p.x * 3.90 - flow_z * 4.40 + time * 3.1) * 0.032;
+    return normalize(n + vec3<f32>(w1x, 0.0, w1z));
+}
+
+// Solid-adjacency probe in `density_tex` for hugging shoreline & bridge-pier whitewater foam
+fn sample_shore_adjacency(p: vec3<f32>) -> vec2<f32> {
+    let sx0 = sample_density(p + vec3<f32>( 0.95, -0.25,  0.00)).r;
+    let sx1 = sample_density(p + vec3<f32>(-0.95, -0.25,  0.00)).r;
+    let sz0 = sample_density(p + vec3<f32>( 0.00, -0.25,  0.95)).r;
+    let sz1 = sample_density(p + vec3<f32>( 0.00, -0.25, -0.95)).r;
+    let bed = sample_density(p + vec3<f32>( 0.00, -1.05,  0.00)).r;
+    let shore = max(max(sx0, sx1), max(sz0, sz1));
+    return vec2<f32>(shore, bed);
 }
 
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
@@ -212,23 +249,52 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 if (occ.g > 0.02 && dm.g > 0.12) {
                     let at = sample_albedo(p);
                     let is_waterfall = p.y > 4.2 && p.y < dims.y - 1.5;
-                    if (!in_fluid && dm.g >= 0.32) {
+                    var surf_shore = 0.0;
+                    var surf_bed = 0.0;
+
+                    if (!in_fluid && dm.g >= 0.26) {
                         in_fluid = true;
                         let fn_w = sample_fluid_normal(p, sim_t);
                         let ndv = clamp(dot(fn_w, -rd), 0.0, 1.0);
-                        let fres = clamp(0.04 + 0.92 * pow(1.0 - ndv, 4.5), 0.04, 0.92);
+                        // Schlick Fresnel sky reflection
+                        let fres = clamp(0.04 + 0.88 * pow(1.0 - ndv, 4.0), 0.04, 0.84);
                         let refl_dir = reflect(rd, fn_w);
-                        let refl_sky = eval_sky(vec3<f32>(refl_dir.x, max(refl_dir.y, 0.02), refl_dir.z));
+                        let refl_sky = eval_sky(vec3<f32>(refl_dir.x, max(refl_dir.y, 0.05), refl_dir.z));
+                        let sky_tint = select(vec3<f32>(0.80, 0.93, 1.12), vec3<f32>(1.0), style_id != 0);
+
+                        // Dual-lobe crisp sun specular glints (sparkling diamond highlights + broad sun path)
                         let h_w = normalize(u.sun_dir.xyz - rd);
-                        let sun_glint = pow(max(dot(fn_w, h_w), 0.0), 160.0) * 2.4;
-                        let surf_refl = refl_sky * 0.95 + u.sun_col.rgb * sun_glint;
-                        accum_col += trans * fres * surf_refl;
-                        trans *= (1.0 - fres * 0.85);
+                        let ndh = max(dot(fn_w, h_w), 0.0);
+                        let glint_sharp = pow(ndh, 110.0) * 3.4;
+                        let glint_broad = pow(ndh, 24.0) * 0.56;
+                        let sparkle_mask = 0.70 + 0.65 * vnoise2(p.xz * 2.8 + vec2<f32>(sim_t * 1.4, -sim_t * 2.2));
+                        let sun_glint = (glint_sharp * sparkle_mask + glint_broad) * u.sun_col.rgb;
+
+                        // Solid-adjacency shoreline & waterfall rim whitewater foam
+                        let adj = sample_shore_adjacency(p);
+                        surf_shore = adj.x;
+                        surf_bed = adj.y;
+                        let foam_n = vnoise2(p.xz * 2.3 + vec2<f32>(sim_t * 0.7, -sim_t * 1.8));
+                        let shore_lap = smoothstep(0.14, 0.52, surf_shore) * smoothstep(0.28, 0.74, foam_n + surf_shore * 0.48);
+                        let steep_wf = smoothstep(0.72, 0.35, abs(fn_w.y));
+                        let wf_streak = 0.5 + 0.5 * sin(p.y * 3.8 + sim_t * 11.5 + p.x * 1.9 + foam_n * 3.2);
+                        let surf_foam = select(
+                            clamp(shore_lap * 0.92 + steep_wf * (0.45 + 0.50 * wf_streak), 0.0, 1.0),
+                            0.0,
+                            style_id != 0,
+                        );
+
+                        let surf_refl = refl_sky * sky_tint * 0.92 + sun_glint;
+                        let foam_col = vec3<f32>(0.92, 0.97, 1.00) * (u.sun_col.rgb * 0.80 + u.sky_top.rgb * 0.62);
+                        let refl_mix = mix(surf_refl * fres, foam_col * 0.86, surf_foam * 0.76);
+                        accum_col += trans * refl_mix;
+                        trans *= (1.0 - mix(fres * 0.62, 0.74, surf_foam));
                     }
 
                     // 4-Style fluid reinterpretation (0=Glacial Azure, 1=Molten Lava, 2=Arcane Plasma, 3=Emerald Cascade)
                     var fluid_rgb = at.rgb;
                     var fluid_glow = at.a;
+                    var extra_foam = 0.0;
                     if (style_id == 1) {
                         let lava_pulse = 0.72 + 0.28 * sin(p.x * 0.7 + p.z * 0.9 - sim_t * 2.4);
                         fluid_rgb = mix(vec3<f32>(0.92, 0.22, 0.04), vec3<f32>(1.00, 0.76, 0.18), lava_pulse * select(0.55, 0.92, is_waterfall));
@@ -241,23 +307,41 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                         let jade_pulse = 0.68 + 0.32 * sin(p.x * 0.8 - p.y * 1.6 + sim_t * 2.6);
                         fluid_rgb = mix(vec3<f32>(0.06, 0.62, 0.46), vec3<f32>(0.36, 0.96, 0.74), jade_pulse * select(0.50, 0.88, is_waterfall));
                         fluid_glow = max(fluid_glow, 0.44 + select(0.0, 0.24, is_waterfall));
-                    } else if (is_waterfall) {
-                        let streak = 0.5 + 0.5 * sin(p.y * 3.6 + sim_t * 9.0 + p.x * 1.8);
-                        fluid_rgb = mix(vec3<f32>(0.42, 0.84, 0.98), vec3<f32>(0.92, 0.98, 1.00), 0.55 + streak * 0.35);
+                    } else {
+                        // Nordic glacial fjord water: deep sapphire channel -> turquoise shallows + animated ripple caustics
+                        let c1 = vnoise2(p.xz * 1.15 - vec2<f32>(0.0, sim_t * 1.55));
+                        let c2 = vnoise2(p.xz * 2.25 + vec2<f32>(sim_t * 0.85, -sim_t * 1.10) + vec2<f32>(6.4, -3.2));
+                        let caustic = pow(clamp(1.0 - abs(c1 - c2) * 3.2, 0.0, 1.0), 3.0);
+                        let deep_fjord = vec3<f32>(0.06, 0.24, 0.44);
+                        let shallow_turq = vec3<f32>(0.14, 0.56, 0.72);
+                        let shallow_w = clamp(surf_bed * 0.85 + surf_shore * 0.60, 0.0, 1.0);
+                        let base_water = mix(deep_fjord, shallow_turq, shallow_w);
+                        fluid_rgb = mix(fluid_rgb, base_water, 0.58) + vec3<f32>(0.16, 0.34, 0.42) * caustic * (0.45 + 0.55 * shallow_w);
+
+                        if (is_waterfall) {
+                            let streak = 0.5 + 0.5 * sin(p.y * 3.6 + sim_t * 11.5 + p.x * 2.1 + c1 * 2.4);
+                            let crest = smoothstep(0.32, 0.86, streak * 0.75 + c2 * 0.40);
+                            fluid_rgb = mix(vec3<f32>(0.34, 0.74, 0.94), vec3<f32>(0.96, 0.99, 1.00), 0.38 + crest * 0.60);
+                            extra_foam = 0.45 + crest * 0.48;
+                        }
                     }
 
-                    let foam = smoothstep(0.45, 0.80, dot(fluid_rgb, vec3<f32>(0.3, 0.59, 0.11)));
+                    let lin_w = srgb_to_linear(clamp(fluid_rgb, vec3<f32>(0.0), vec3<f32>(1.0)));
+                    let foam = clamp(
+                        max(smoothstep(0.50, 0.84, dot(fluid_rgb, vec3<f32>(0.3, 0.59, 0.11))), extra_foam),
+                        0.0,
+                        1.0,
+                    );
                     let sigma = select(
-                        mix(vec3<f32>(0.55, 0.16, 0.09), vec3<f32>(1.25, 1.20, 1.15), foam),
-                        vec3<f32>(1.22, 1.12, 1.06),
+                        mix(vec3<f32>(0.68, 0.20, 0.10), vec3<f32>(1.36, 1.30, 1.24), foam),
+                        vec3<f32>(1.24, 1.14, 1.08),
                         style_id != 0
                     ) * dm.g;
                     let step_att = exp(-sigma * dt);
-                    let sun_lit = u.sun_col.rgb * 0.68 + u.sky_top.rgb * 0.45;
-                    let lin_w = srgb_to_linear(fluid_rgb);
-                    var water_scatter = mix(lin_w * 0.78, vec3<f32>(0.88, 0.94, 1.00), foam * select(0.85, 0.18, style_id != 0)) * sun_lit;
+                    let sun_lit = u.sun_col.rgb * 0.74 + u.sky_top.rgb * 0.50;
+                    var water_scatter = mix(lin_w * 0.90, vec3<f32>(0.92, 0.97, 1.00), foam * select(0.86, 0.16, style_id != 0)) * sun_lit;
                     if (fluid_glow > 0.05) {
-                        water_scatter += blackbody_ramp(fluid_glow, lin_w, style_id) * 0.85;
+                        water_scatter += blackbody_ramp(fluid_glow, lin_w, style_id) * 0.88;
                     }
                     accum_col += trans * (vec3<f32>(1.0) - step_att) * water_scatter;
                     trans *= step_att;
@@ -267,14 +351,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
                 if (occ.b > 0.01 && dm.b > 0.015) {
                     let at = sample_albedo(p);
-                    let ext = dm.b * 0.78 * dt;
+                    let is_hot_fire = at.a > 0.06;
+                    var turb = 1.0;
+                    if (is_hot_fire) {
+                        let fn0 = vnoise2(vec2<f32>(p.x + p.z, p.y * 1.4 - sim_t * 3.8) * 1.25);
+                        turb = 0.72 + 0.56 * fn0;
+                    }
+                    let ext = dm.b * 0.80 * turb * dt;
                     let step_t = exp(-ext);
                     let sun_vis = 0.55 + 0.45 * clamp(p.y / depth_norm_scale, 0.0, 1.0);
                     let lin_g = srgb_to_linear(at.rgb);
                     let scatter = lin_g * (u.sun_col.rgb * 0.62 * sun_vis + u.sky_horizon.rgb * 0.42);
                     var emit = vec3<f32>(0.0);
-                    if (at.a > 0.05) {
-                        emit = blackbody_ramp(at.a, lin_g, style_id) * 1.75;
+                    if (is_hot_fire) {
+                        let core_temp = clamp(at.a * (0.85 + 0.35 * turb), 0.0, 1.0);
+                        emit = blackbody_ramp(core_temp, lin_g, style_id) * 2.10;
+                        let spark_p = floor(p * 1.85 + vec3<f32>(sin(sim_t * 1.7 + p.y) * 0.4, -sim_t * 5.2, cos(sim_t * 1.4 + p.x) * 0.4));
+                        let spark = step(0.955, hash3(spark_p));
+                        emit += vec3<f32>(2.6, 1.38, 0.30) * spark;
                     }
                     accum_col += trans * (1.0 - step_t) * (scatter + emit);
                     trans *= step_t;

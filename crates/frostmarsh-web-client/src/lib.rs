@@ -36,7 +36,7 @@ mod wasm_app {
         ARCHETYPE_STRIDER, NUM_ARCHETYPES,
     };
     use crate::live_entities::{
-        expand_beams_to_orbs, parse_live_entities_json, EvolutionStats, LiveBeam,
+        expand_beams_to_orbs, parse_live_entities_json, EvolutionStats, LiveBeam, TacticalEvent,
     };
     use crate::renderer::WebRenderer;
     use crate::style_name_for;
@@ -97,6 +97,7 @@ mod wasm_app {
         live_projectiles: Vec<HeroInstance>,
         live_beams: Vec<LiveBeam>,
         live_evolution: Option<EvolutionStats>,
+        live_events: Vec<TacticalEvent>,
         live_entities_active: bool,
         live_tick: u64,
         live_server_tps: f32,
@@ -208,6 +209,7 @@ mod wasm_app {
                 live_projectiles: Vec::new(),
                 live_beams: Vec::new(),
                 live_evolution: None,
+                live_events: Vec::new(),
                 live_entities_active: false,
                 live_tick: 0,
                 live_server_tps: 0.0,
@@ -474,6 +476,9 @@ mod wasm_app {
             if parsed.evolution.is_some() {
                 self.live_evolution = parsed.evolution;
             }
+            if parsed.has_events {
+                self.live_events = parsed.events;
+            }
             self.live_entities_active = true;
             self.live_tick = parsed.tick;
             self.live_server_tps = parsed.server_tps;
@@ -607,6 +612,23 @@ mod wasm_app {
             };
             let archetype_types = self.archetype_counts.iter().filter(|&&c| c > 0).count();
             let evo = self.live_evolution.unwrap_or_default();
+            let mut events_json = String::from("[");
+            for (idx, ev) in self.live_events.iter().enumerate() {
+                if idx > 0 {
+                    events_json.push(',');
+                }
+                events_json.push_str("{\"label\":\"");
+                events_json.push_str(&json_escape(&ev.label));
+                events_json.push('"');
+                if let Some(team) = ev.team {
+                    events_json.push_str(&format!(",\"team\":{team}"));
+                }
+                if let Some(tick) = ev.tick {
+                    events_json.push_str(&format!(",\"tick\":{tick}"));
+                }
+                events_json.push('}');
+            }
+            events_json.push(']');
             format!(
                 concat!(
                     "{{",
@@ -646,6 +668,7 @@ mod wasm_app {
                     "\"evo_trees\":{},",
                     "\"evo_glaciers\":{},",
                     "\"evo_erosion\":{},",
+                    "\"events\":{},",
                     "\"live_bricks_rx\":{},",
                     "\"last_brick_ms\":{:.3},",
                     "\"live_tick\":{},",
@@ -693,6 +716,7 @@ mod wasm_app {
                 evo.trees,
                 evo.glaciers,
                 evo.erosion,
+                events_json,
                 self.live_bricks_rx,
                 self.last_brick_rebuild_ms,
                 self.live_tick,
@@ -972,6 +996,48 @@ mod tests {
         assert!(beam_orbs.len() >= 20, "expected dense volumetric orb-stream, got {}", beam_orbs.len());
         let first = beam_orbs[0].pos_yaw;
         assert!((first[0] - 120.0).abs() < 1e-3 && (first[1] - 14.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_wave18a_tactical_events_parsing() {
+        // String-array format (standalone demo / compact feed)
+        let str_json = r#"{
+            "tick": 200,
+            "players": [],
+            "events": [
+                "TIDEKIN QUENCH RESCUE!",
+                "SUBTERRANEAN BREACH!",
+                "SHIELD WALL!",
+                "CRYO-BRIDGE FORGED!"
+            ]
+        }"#;
+        let parsed_str = parse_live_entities_json(str_json).expect("parse string events");
+        assert!(parsed_str.has_events);
+        assert_eq!(parsed_str.events.len(), 4);
+        assert_eq!(parsed_str.events[0].label, "TIDEKIN QUENCH RESCUE!");
+        assert_eq!(parsed_str.events[1].label, "SUBTERRANEAN BREACH!");
+        assert_eq!(parsed_str.events[2].label, "SHIELD WALL!");
+        assert_eq!(parsed_str.events[3].label, "CRYO-BRIDGE FORGED!");
+        assert_eq!(parsed_str.events[0].team, None);
+
+        // Structured object-array format (live Rust frostmarsh-server 0x02 bridge)
+        let obj_json = r#"{
+            "tick": 512,
+            "players": [{"id": 1, "class_id": 2, "x": 115.0, "y": 3.2, "z": 128.0, "team": 0}],
+            "events": [
+                {"label": "TIDEKIN QUENCH RESCUE!", "team": 0, "x": 115.0, "y": 128.0, "tick": 500},
+                {"label": "SUBTERRANEAN BREACH!", "team": 1, "x": 96.0, "y": 152.0, "tick": 510}
+            ]
+        }"#;
+        let parsed_obj = parse_live_entities_json(obj_json).expect("parse object events");
+        assert!(parsed_obj.has_events);
+        assert_eq!(parsed_obj.events.len(), 2);
+        assert_eq!(parsed_obj.events[0].label, "TIDEKIN QUENCH RESCUE!");
+        assert_eq!(parsed_obj.events[0].team, Some(0));
+        assert_eq!(parsed_obj.events[0].tick, Some(500));
+        assert_eq!(parsed_obj.events[1].label, "SUBTERRANEAN BREACH!");
+        assert_eq!(parsed_obj.events[1].team, Some(1));
+        assert_eq!(parsed_obj.events[1].tick, Some(510));
     }
 
     #[test]

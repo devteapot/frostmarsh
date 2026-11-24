@@ -36,6 +36,7 @@ Checkpoint: `/home/gooning/.t3/scratch/frostmarsh-ml/acoustic_comm_live.pt`
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import math
 import time
@@ -87,7 +88,10 @@ TACTIC_NAMES = [
     "FREEZE_CHOKE",
     "CAVERN_DROP",
 ]
+# Legacy 4-class table kept for ViewerInterpreter checkpoint shape (n_classes=4)
 SPEAKER_CLASSES = ["Vanguard", "Pyromancer", "Cryo-Scout", "Shadow-Flanker"]
+# Wave 17C: Full 5 Frostmarsh physical archetypes (indices 0..4 match frostmarsh-proto CLASS_*)
+ARCHETYPE_CLASSES = ["STRIDER", "SKYWING", "TIDEKIN", "EMBERSTALKER", "BURROWER"]
 ABILITY_NAMES = ["dash", "melee", "cast_bolt", "carve_ice", "ability_e", "ult_r"]
 
 EVENT_TO_ELEM = [0, 1, 0, 2, 1, 2]
@@ -1165,17 +1169,468 @@ def render_speech_bubble(
     )
 
 
-def _cls_to_idx(cls_val: Any) -> int:
+def _archetype_to_idx(cls_val: Any) -> int:
+    """Map int class_id (0..4) or string name to canonical 5-archetype index."""
     if isinstance(cls_val, (int, np.integer)):
-        return int(cls_val) % len(SPEAKER_CLASSES)
-    s = str(cls_val).lower()
-    if "pyro" in s or "fire" in s:
-        return 1
-    if "cryo" in s or "frost" in s or "scout" in s:
-        return 2
-    if "shadow" in s or "flank" in s or "oil" in s or "rogue" in s:
+        return int(cls_val) % len(ARCHETYPE_CLASSES)
+    s = str(cls_val).strip().lower()
+    if "burrow" in s or "terramole" in s or "mole" in s:
+        return 4
+    if "ember" in s or "stalker" in s or "shadow" in s or "flank" in s or "rogue" in s:
         return 3
+    if "tide" in s or "cryo" in s or "ranger" in s or "hydro" in s or "scout" in s:
+        return 2
+    if "sky" in s or "wing" in s or "pyro" in s or "alchem" in s or "fire" in s:
+        return 1
     return 0
+
+
+def _cls_to_idx(cls_val: Any) -> int:
+    """Legacy 4-class index for ViewerInterpreter checkpoint input (n_classes=4)."""
+    a_idx = _archetype_to_idx(cls_val)
+    return a_idx if a_idx < len(SPEAKER_CLASSES) else 0
+
+
+def _pos_to_sector_name(x: float, y: float, w: int, h: int) -> str:
+    nx = x / float(max(w, 1))
+    ny = y / float(max(h, 1))
+    if 0.40 <= nx <= 0.60 and 0.40 <= ny <= 0.60:
+        return "Central Spire"
+    if 0.38 <= nx <= 0.62 and ny < 0.30:
+        return "North Gorge"
+    if 0.38 <= nx <= 0.62 and ny > 0.70:
+        return "South Caldera"
+    if nx < 0.50 and ny < 0.50:
+        return "NW Highland"
+    if nx >= 0.50 and ny < 0.50:
+        return "East Ridge"
+    if nx < 0.50 and ny >= 0.50:
+        return "SW Oil Basin"
+    return "SE Shrine Valley"
+
+
+def _event_label_to_key(label: str) -> str:
+    up = label.upper()
+    if "QUENCH" in up:
+        return "EVT_QUENCH_RESCUE"
+    if "SHIELD WALL" in up:
+        return "EVT_SHIELD_WALL"
+    if "AERIAL OIL" in up or "OIL-IGNITION" in up:
+        return "EVT_AERIAL_OIL"
+    if "SUBTERRANEAN BREACH" in up or "TUNNEL AMBUSH" in up or "SEISMIC BREACH" in up:
+        return "EVT_SUBTERRANEAN_BREACH"
+    if "SOLO ASSASSINATION" in up or "SMOKE AMBUSH" in up:
+        return "EVT_SOLO_ASSASSINATION"
+    if "CRYO-BRIDGE" in up or "ICE BRIDGE" in up:
+        return "EVT_CRYO_BRIDGE"
+    if "BASALT BULWARK" in up:
+        return "EVT_BASALT_BULWARK"
+    if "STASIS" in up:
+        return "EVT_STASIS_DOME"
+    if "EPOCH" in up:
+        return "EVT_EPOCH_SHIFT"
+    if "SUBMERGED GEYSER" in up:
+        return "EVT_SUBMERGED_GEYSER"
+    if "RELIC" in up:
+        return "EVT_RELIC"
+    if "CAP:" in up:
+        return "EVT_SHRINE_CAP"
+    return ""
+
+
+def _build_grounded_variants(
+    archetype_idx: int,
+    pred_event: int,
+    pred_sector: int,
+    pred_elem: int,
+    sector_label: str,
+    event_key: str,
+    event_raw: str,
+    bot_ctx: dict[str, Any],
+    world_ctx: dict[str, Any],
+) -> list[tuple[str, str, str, str]]:
+    """
+    Build ordered list of grounded (semantic_key, clear_text, partial_text, muffled_text)
+    candidates for the speaker, combining live tactical events, 5-archetype telemetry
+    (`bot_z`, `in_tunnel`, `in_water`, `airborne`, `shield_wall_active`, `burning`, `hp`,
+    `epoch`, `biome`), and neural `ViewerInterpreter` predictions.
+    """
+    sec = sector_label or SECTOR_NAMES[int(pred_sector) % len(SECTOR_NAMES)]
+    elem = ELEMENT_NAMES[int(pred_elem) % len(ELEMENT_NAMES)]
+    arch = ARCHETYPE_CLASSES[archetype_idx % len(ARCHETYPE_CLASSES)]
+    alt_m = max(1, int(round(float(bot_ctx.get("bot_z", bot_ctx.get("z", bot_ctx.get("layer", 1.0)))))))
+    hp_val = float(bot_ctx.get("bot_hp", bot_ctx.get("hp", 1.0)))
+    hp_low = (hp_val < 0.45) if hp_val <= 1.5 else (hp_val < 55.0)
+    in_tunnel = bool(bot_ctx.get("in_tunnel", False))
+    in_water = bool(bot_ctx.get("in_water", False))
+    airborne = bool(bot_ctx.get("airborne", False)) or (archetype_idx == 1 and alt_m >= 5)
+    shield_wall = bool(bot_ctx.get("shield_wall_active", False))
+    burning = bool(bot_ctx.get("burning", False))
+    epoch = str(world_ctx.get("epoch", "")).strip() or "the new Epoch"
+    biome = str(world_ctx.get("biome", "")).strip() or "the gorge"
+
+    cands: list[tuple[str, str, str, str]] = []
+
+    # 1. Live tactical event callouts (highest salience, grounded in what just happened!)
+    if event_key == "EVT_SUBTERRANEAN_BREACH":
+        cands.extend([
+            (
+                f"EVT_SUBTERRANEAN_BREACH:{sec}:0",
+                f"Carved under {sec}—erupting behind their shields!",
+                f"Tunnel breach under {sec}... erupting behind shields!",
+                f"...carved under... [rumble] ...{sec}...",
+            ),
+            (
+                f"EVT_SUBTERRANEAN_BREACH:{sec}:1",
+                f"Subterranean shockwave at {sec}—their frontline just shattered!",
+                f"Seismic breach at {sec}... frontline broken!",
+                f"...breach... [crumble] ...{sec}...",
+            ),
+        ])
+    elif event_key == "EVT_AERIAL_OIL":
+        cands.extend([
+            (
+                f"EVT_AERIAL_OIL:{sec}:0",
+                f"Riding volcanic updraft at +{alt_m}m—dropping oil on their vanguard!",
+                f"Updraft at +{alt_m}m... dropping oil on {sec}!",
+                f"...updraft... +{alt_m}m... [wind] ...oil...",
+            ),
+            (
+                f"EVT_AERIAL_OIL:{sec}:1",
+                f"Aerial oil-ignition over {sec} from +{alt_m}m—light them up!",
+                f"Aerial ignition over {sec}... +{alt_m}m!",
+                f"...aerial... [roar] ...oil {sec}...",
+            ),
+        ])
+    elif event_key == "EVT_QUENCH_RESCUE":
+        cands.extend([
+            (
+                f"EVT_QUENCH_RESCUE:{sec}:0",
+                f"Extinguishing Strider at {sec}—push through the steam!",
+                f"Quenched burning ally at {sec}... push the steam!",
+                f"...extinguishing... [hiss] ...{sec}...",
+            ),
+            (
+                f"EVT_QUENCH_RESCUE:{sec}:1",
+                f"Hydro quench saved our squadmate in {sec}—press the counterattack!",
+                f"Hydro rescue at {sec}... counterattack now!",
+                f"...quench... [steam] ...{sec}...",
+            ),
+        ])
+    elif event_key == "EVT_SHIELD_WALL":
+        cands.extend([
+            (
+                f"EVT_SHIELD_WALL:{sec}:0",
+                f"Strider shield-wall locked at {sec}—hold behind my phalanx!",
+                f"Shield-wall up at {sec}... form on me!",
+                f"...shield wall... [clang] ...{sec}...",
+            ),
+            (
+                f"EVT_SHIELD_WALL:{sec}:1",
+                f"Squad phalanx active in {sec}—absorbing their barrage!",
+                f"Phalanx holding {sec}... absorbing fire!",
+                f"...phalanx... [static] ...{sec}...",
+            ),
+        ])
+    elif event_key == "EVT_SOLO_ASSASSINATION":
+        cands.extend([
+            (
+                f"EVT_SOLO_ASSASSINATION:{sec}:0",
+                f"Isolated Tidekin on {sec}—closing through smoke veil.",
+                f"Isolated target at {sec}... closing in smoke!",
+                f"...isolated... [whisper] ...{sec}...",
+            ),
+            (
+                f"EVT_SOLO_ASSASSINATION:{sec}:1",
+                f"Straggler ambushed behind {sec}—vanishing back into smoke!",
+                f"Backstab at {sec}... slipping into smoke!",
+                f"...ambush... [static] ...smoke...",
+            ),
+        ])
+    elif event_key == "EVT_CRYO_BRIDGE":
+        cands.extend([
+            (
+                f"EVT_CRYO_BRIDGE:{sec}:0",
+                f"Cryo-bridge forged across {sec}—squad, cross the ice span now!",
+                f"Ice bridge solid at {sec}... cross now!",
+                f"...cryo-bridge... [crack] ...{sec}...",
+            ),
+            (
+                f"EVT_CRYO_BRIDGE:{sec}:1",
+                f"River frozen at {sec}—flank route open over the ice!",
+                f"River frozen at {sec}... cross the span!",
+                f"...frozen river... [wind] ...{sec}...",
+            ),
+        ])
+    elif event_key == "EVT_BASALT_BULWARK":
+        cands.extend([
+            (
+                f"EVT_BASALT_BULWARK:{sec}:0",
+                f"Quenched magma into a basalt bulwark at {sec}—use the cover!",
+                f"Basalt cover forged at {sec}... take cover!",
+                f"...basalt... [hiss] ...{sec}...",
+            ),
+            (
+                f"EVT_BASALT_BULWARK:{sec}:1",
+                f"Solidified basalt rampart at {sec}—anchoring our line!",
+                f"Basalt bulwark up at {sec}... hold!",
+                f"...bulwark... [rumble] ...{sec}...",
+            ),
+        ])
+    elif event_key == "EVT_STASIS_DOME":
+        cands.extend([
+            (
+                f"EVT_STASIS_DOME:{sec}:0",
+                f"Stasis dome deployed at {sec}—freezing their barrage!",
+                f"Stasis dome up in {sec}... barrage slowed!",
+                f"...stasis dome... [hum] ...{sec}...",
+            ),
+            (
+                f"EVT_STASIS_DOME:{sec}:1",
+                f"Time-dilation bubble active over {sec}—regroup inside!",
+                f"Stasis bubble at {sec}... regroup!",
+                f"...time dome... [warble] ...{sec}...",
+            ),
+        ])
+    elif event_key == "EVT_EPOCH_SHIFT":
+        cands.extend([
+            (
+                f"EVT_EPOCH_SHIFT:{epoch}:0",
+                f"Basalt hardening across {biome}—{epoch} advancing!",
+                f"Terrain shifting... {epoch} advancing!",
+                f"...basalt... [tremor] ...{epoch}...",
+            ),
+            (
+                f"EVT_EPOCH_SHIFT:{epoch}:1",
+                f"Living world entered {epoch}—watch for reshaped routes near {sec}!",
+                f"{epoch} active... terrain shifting at {sec}!",
+                f"...epoch... [echo] ...{sec}...",
+            ),
+        ])
+    elif event_key == "EVT_SUBMERGED_GEYSER":
+        cands.append((
+            f"EVT_SUBMERGED_GEYSER:{sec}:0",
+            f"Submerged geyser erupted in {sec}—blinding them with steam!",
+            f"Geyser burst at {sec}... steam cover up!",
+            f"...geyser... [roar] ...{sec}...",
+        ))
+    elif event_key == "EVT_RELIC":
+        cands.append((
+            f"EVT_RELIC:{sec}:0",
+            f"Relic contested at {sec}—escort the carrier to sanctuary!",
+            f"Relic moving near {sec}... escort now!",
+            f"...relic... [static] ...{sec}...",
+        ))
+    elif event_key == "EVT_SHRINE_CAP":
+        shrine_txt = event_raw.replace("WEST CAP:", "").replace("EAST CAP:", "").strip() or sec
+        cands.append((
+            f"EVT_SHRINE_CAP:{shrine_txt}:0",
+            f"{shrine_txt} shrine flipped—rotating squad to lock the perimeter!",
+            f"Shrine captured at {shrine_txt}... lock perimeter!",
+            f"...shrine... [static] ...{shrine_txt}...",
+        ))
+
+    # 2. Live 5-archetype physical telemetry callouts
+    if archetype_idx == 4:  # BURROWER
+        if in_tunnel:
+            cands.append((
+                f"ARCH_BURROWER:TUNNEL:{sec}",
+                f"Boring beneath {sec} at +{alt_m}m—prepping breach behind their line!",
+                f"Tunneling under {sec}... breach ready!",
+                f"...tunnel... [rumble] ...{sec}...",
+            ))
+        cands.extend([
+            (
+                f"ARCH_BURROWER:SEISMIC:{sec}",
+                f"Carved under {sec}—erupting behind their shields!",
+                f"Undermining {sec}... watch for breach!",
+                f"...carved... [crumble] ...{sec}...",
+            ),
+            (
+                f"ARCH_BURROWER:ROCK:{sec}",
+                f"Terramole displacing rock at {sec}—opening a subterranean flank!",
+                f"New tunnel open at {sec}... flank ready!",
+                f"...subterranean... [echo] ...{sec}...",
+            ),
+        ])
+    elif archetype_idx == 1:  # SKYWING
+        if airborne:
+            cands.append((
+                f"ARCH_SKYWING:AIR:{sec}:{alt_m}",
+                f"Riding thermal updraft at +{alt_m}m over {sec}—dropping oil on their vanguard!",
+                f"Airborne +{alt_m}m over {sec}... bombing pass!",
+                f"...updraft +{alt_m}m... [wind] ...{sec}...",
+            ))
+        cands.extend([
+            (
+                f"ARCH_SKYWING:OIL:{sec}",
+                f"Spotted enemy cluster at {sec}—diving with oil and flame!",
+                f"Cluster at {sec}... aerial fire run!",
+                f"...diving... [roar] ...{sec}...",
+            ),
+            (
+                f"ARCH_SKYWING:OVERWATCH:{sec}",
+                f"High-altitude overwatch at +{alt_m}m—tracking flanks near {sec}!",
+                f"Overwatch +{alt_m}m... movement at {sec}!",
+                f"...overwatch... [wind] ...{sec}...",
+            ),
+        ])
+    elif archetype_idx == 2:  # TIDEKIN
+        if in_water:
+            cands.append((
+                f"ARCH_TIDEKIN:WATER:{sec}",
+                f"Surging through the channel at {sec}—ready to quench burning allies!",
+                f"In the river at {sec}... hydro surge active!",
+                f"...channel... [splash] ...{sec}...",
+            ))
+        cands.extend([
+            (
+                f"ARCH_TIDEKIN:QUENCH:{sec}",
+                f"Extinguishing fire front at {sec}—push through the steam!",
+                f"Dousing flames at {sec}... push the steam!",
+                f"...extinguishing... [hiss] ...{sec}...",
+            ),
+            (
+                f"ARCH_TIDEKIN:FREEZE:{sec}",
+                f"Chilling river ford near {sec}—forging cryo-bridge cover!",
+                f"Freezing ford at {sec}... crossing soon!",
+                f"...freezing... [crack] ...{sec}...",
+            ),
+        ])
+    elif archetype_idx == 3:  # EMBERSTALKER
+        cands.extend([
+            (
+                f"ARCH_EMBERSTALKER:FLANK:{sec}",
+                f"Isolated Tidekin on {sec}—closing through smoke veil.",
+                f"Isolated target at {sec}... smoke veil up!",
+                f"...smoke veil... [whisper] ...{sec}...",
+            ),
+            (
+                f"ARCH_EMBERSTALKER:CLIMB:{sec}",
+                f"Scaling ridge above {sec} at +{alt_m}m—lining up a solo ambush!",
+                f"Climbing {sec} ridge... ambush set!",
+                f"...ridge... [scrape] ...{sec}...",
+            ),
+            (
+                f"ARCH_EMBERSTALKER:OILTRAP:{sec}",
+                f"Oil veil laid along {sec}—waiting for a straggler to cross!",
+                f"Oil trap at {sec}... holding stealth!",
+                f"...trap... [static] ...{sec}...",
+            ),
+        ])
+    else:  # STRIDER (0)
+        if shield_wall:
+            cands.append((
+                f"ARCH_STRIDER:SHIELD:{sec}",
+                f"Shield-wall anchored at {sec}—stack on my vanguard for blast cover!",
+                f"Shield-wall at {sec}... rally on me!",
+                f"...shield... [clang] ...{sec}...",
+            ))
+        cands.extend([
+            (
+                f"ARCH_STRIDER:HOLD:{sec}",
+                f"Holding frontline at {sec}—carving frost cover for the squad!",
+                f"Frontline locked at {sec}... deploying frost!",
+                f"...frontline... [static] ...{sec}...",
+            ),
+            (
+                f"ARCH_STRIDER:PUSH:{sec}",
+                f"Advancing with squad into {sec}—draw their fire on my shield!",
+                f"Pushing {sec}... shields forward!",
+                f"...advancing... [clash] ...{sec}...",
+            ),
+        ])
+
+    if burning or hp_low:
+        cands.append((
+            f"STATE_DISTRESS:{arch}:{sec}",
+            f"{arch.title()} taking heavy heat at {sec}—need Tidekin quench or stasis!",
+            f"Taking heat at {sec}... need quench!",
+            f"...burning... [crackle] ...{sec}...",
+        ))
+
+    # 3. Neural ViewerInterpreter fallback variants (always diverse across 6 events!)
+    ev = int(pred_event) % len(EVENT_NAMES)
+    neural_bank = [
+        (
+            f"NEURAL_0:{sec}:{elem}",
+            f"Oil slick pooled across {sec}—ignite it with {elem} now!",
+            f"Oil slick... {sec}... light it up with {elem}!",
+            f"...oil... [static] ...{sec}... ...{elem}...",
+        ),
+        (
+            f"NEURAL_1:{sec}:{elem}",
+            f"Wildfire pushing through {sec}—suppress the flank with {elem}!",
+            f"Wildfire on the flank... {sec}... hit it with {elem}!",
+            f"...fire... [crackle] ...flank {sec}...",
+        ),
+        (
+            f"NEURAL_2:{sec}:{elem}",
+            f"Frozen river bridge spotted near {sec}—control the crossing with {elem}!",
+            f"Ice bridge... {sec}... secure it with {elem}!",
+            f"...ice bridge... [muffled] ...{elem}...",
+        ),
+        (
+            f"NEURAL_3:{sec}:{elem}",
+            f"Enemy vanguard converging on {sec}—counter with {elem}!",
+            f"Contact at {sec}... watch the shrine—deploy {elem}!",
+            f"...contact... [static] ...{sec}...",
+        ),
+        (
+            f"NEURAL_4:{sec}:{elem}",
+            f"High-ground choke open at {sec}—lock it down with {elem}!",
+            f"High-ground choke... {sec}... seal with {elem}!",
+            f"...choke... [roar] ...{sec}...",
+        ),
+        (
+            f"NEURAL_5:{sec}:{elem}",
+            f"Subterranean shaft clear under {sec}—drop in with {elem} on my mark!",
+            f"Cavern shaft below {sec}... drop {elem}!",
+            f"...shaft... [echo] ...{sec}...",
+        ),
+    ]
+    # Rotate starting from predicted neural event so every fallback stays fresh
+    for off in range(len(neural_bank)):
+        cands.append(neural_bank[(ev + off) % len(neural_bank)])
+
+    return cands
+
+
+def format_snr_bubble(
+    clear_text: str,
+    partial_text: str,
+    muffled_text: str,
+    snr_db: float,
+    cause_id: int,
+    walls_crossed: float,
+    ceiling_muffled: bool,
+    speaker_name: str,
+    src_layer: int,
+    volume: float,
+) -> tuple[str, str, str]:
+    """Apply exact 4-tier physical SNR degradation to a grounded callout."""
+    reason_txt = _build_cause_text(cause_id, walls_crossed, ceiling_muffled)
+    tier = _snr_tier_label(snr_db)
+    tone = "SHOUT" if volume >= 0.72 else ("CALL" if volume >= 0.38 else "whisper")
+    if snr_db < -6.0:
+        return (
+            f"[{speaker_name} @ L{src_layer} ({tone}) | {snr_db:+.1f} dB] [inaudible — drowned out by {reason_txt}]",
+            tier,
+            reason_txt,
+        )
+    if snr_db >= 10.0:
+        return f"[{speaker_name} @ L{src_layer} ({tone}) | {snr_db:+.1f} dB] \"{clear_text}\"", tier, reason_txt
+    if snr_db >= 2.0:
+        return (
+            f"[{speaker_name} @ L{src_layer} ({tone}) | {snr_db:+.1f} dB, partial {reason_txt}] \"{partial_text}\"",
+            tier,
+            reason_txt,
+        )
+    return (
+        f"[{speaker_name} @ L{src_layer} ({tone}) | {snr_db:+.1f} dB, muffled by {reason_txt}] \"{muffled_text}\"",
+        tier,
+        reason_txt,
+    )
 
 
 def _to_grid_xy(x: float, y: float, w: int, h: int, force_norm: bool | None = None) -> tuple[float, float]:
@@ -1574,31 +2029,40 @@ class LiveAcousticEngine:
         use_fp16: bool = True,
         auto_train: bool = True,
         world_pt: Path | str = DEFAULT_WORLD_PT,
+        allow_random_init: bool = False,
     ) -> None:
         self.device = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
         self.use_fp16 = bool(use_fp16) and (self.device.type == "cuda")
         self.ckpt_path = Path(ckpt_path)
 
-        if not self.ckpt_path.exists():
+        ckpt: dict[str, Any] | None = None
+        if self.ckpt_path.exists():
+            ckpt = torch.load(str(self.ckpt_path), map_location=self.device, weights_only=False)
+        elif allow_random_init:
+            ckpt = None
+        else:
             if not auto_train:
                 raise FileNotFoundError(f"Missing acoustic checkpoint: {self.ckpt_path}")
             train_and_save(self.ckpt_path, world_pt=world_pt, device=self.device)
+            ckpt = torch.load(str(self.ckpt_path), map_location=self.device, weights_only=False)
 
-        ckpt = torch.load(str(self.ckpt_path), map_location=self.device, weights_only=False)
-        self.meta: dict[str, Any] = ckpt.get("meta", {})
+        self.meta: dict[str, Any] = ckpt.get("meta", {}) if ckpt is not None else {"mode": "random_init"}
 
         self.acoustics = AcousticField3D(layers=4, n_coarse_steps=8, n_fine_steps=2).to(self.device).eval()
 
         self.comm_pair = CommBotPair(num_symbols=16, prosody_dim=8).to(self.device).eval()
-        self.comm_pair.load_state_dict(ckpt["comm_pair"])
+        if ckpt is not None:
+            self.comm_pair.load_state_dict(ckpt["comm_pair"])
 
         self.viewer_interp = ViewerInterpreter().to(self.device).eval()
-        self.viewer_interp.load_state_dict(ckpt["viewer_interp"])
+        if ckpt is not None:
+            self.viewer_interp.load_state_dict(ckpt["viewer_interp"])
 
         self.human_encoder = HumanCommandEncoder(
             bow_dim=256, goal_dim=16, num_intents=len(LIVE_HUMAN_INTENTS)
         ).to(self.device).eval()
-        self.human_encoder.load_state_dict(ckpt["human_encoder"])
+        if ckpt is not None:
+            self.human_encoder.load_state_dict(ckpt["human_encoder"])
 
         for m in (self.acoustics, self.comm_pair, self.viewer_interp, self.human_encoder):
             for p in m.parameters():
@@ -1613,6 +2077,16 @@ class LiveAcousticEngine:
         # Small cache for encoded human chat BoW + decoder output (instant on repeated texts)
         self._last_chat_text: str | None = None
         self._last_chat_decoded: dict[str, Any] | None = None
+
+        # Wave 17C: Per-speaker cooldown + global semantic deduplication over last 45 ticks
+        self._step_counter: int = 0
+        self.speaker_cooldown_ticks: int = 12
+        self.dedupe_window_ticks: int = 45
+        self._speaker_last_tick: dict[Any, int] = {}
+        self._archetype_last_tick: dict[int, int] = {}
+        self.recent_utterances: deque[tuple[int, str, str, Any]] = deque(maxlen=45)
+        self._last_emitted_body: str = ""
+        self._last_emitted_key: str = ""
 
         # Pre-captured CUDA Graph for fixed-batch k=2 (Spotter -> AcousticChannel -> ViewerInterpreter)
         self._speech_graph: dict[str, Any] | None = None
@@ -1768,6 +2242,115 @@ class LiveAcousticEngine:
         self._last_chat_decoded = decoded
         return decoded
 
+    def _prune_recent_utterances(self) -> None:
+        cutoff = self._step_counter - self.dedupe_window_ticks
+        while self.recent_utterances and self.recent_utterances[0][0] < cutoff:
+            self.recent_utterances.popleft()
+
+    def _select_fresh_utterance(
+        self,
+        speaker_id: Any,
+        archetype_idx: int,
+        pred_event: int,
+        pred_sector: int,
+        pred_elem: int,
+        sector_label: str,
+        bot_ctx: dict[str, Any],
+        world_ctx: dict[str, Any],
+    ) -> tuple[str, str, str, str]:
+        """Pick the highest-priority grounded callout that does not repeat recent_utterances."""
+        self._prune_recent_utterances()
+        recent_keys = {entry[1] for entry in self.recent_utterances}
+        recent_bodies = {entry[2] for entry in self.recent_utterances}
+
+        # Match fresh live tactical event from world_context (prefer events matching this speaker's archetype/team)
+        matched_event_key = ""
+        matched_event_raw = ""
+        matched_sector = sector_label
+        recent_events = world_ctx.get("recent_events") or []
+        arch_event_affinity = {
+            0: {"EVT_SHIELD_WALL", "EVT_CRYO_BRIDGE", "EVT_BASALT_BULWARK", "EVT_STASIS_DOME"},
+            1: {"EVT_AERIAL_OIL", "EVT_STASIS_DOME", "EVT_EPOCH_SHIFT"},
+            2: {"EVT_QUENCH_RESCUE", "EVT_SUBMERGED_GEYSER", "EVT_CRYO_BRIDGE", "EVT_BASALT_BULWARK"},
+            3: {"EVT_SOLO_ASSASSINATION", "EVT_RELIC", "EVT_SHRINE_CAP"},
+            4: {"EVT_SUBTERRANEAN_BREACH", "EVT_BASALT_BULWARK", "EVT_SHRINE_CAP"},
+        }
+        preferred_keys = arch_event_affinity.get(archetype_idx, set())
+        global_event_keys = {
+            "EVT_EPOCH_SHIFT",
+            "EVT_STASIS_DOME",
+            "EVT_CRYO_BRIDGE",
+            "EVT_BASALT_BULWARK",
+            "EVT_RELIC",
+            "EVT_SHRINE_CAP",
+        }
+        fallback_evt: tuple[str, str, str] | None = None
+        for ev in recent_events:
+            if isinstance(ev, dict):
+                raw_lbl = str(ev.get("label", "")).strip()
+                ex = ev.get("x")
+                ey = ev.get("y")
+                ev_sec = (
+                    _pos_to_sector_name(float(ex), float(ey), int(world_ctx.get("grid_w", 256)), int(world_ctx.get("grid_h", 256)))
+                    if (ex is not None and ey is not None)
+                    else sector_label
+                )
+            else:
+                raw_lbl = str(ev).strip()
+                ev_sec = sector_label
+            ek = _event_label_to_key(raw_lbl)
+            if not ek:
+                continue
+            # Check if this event category+sector was already spoken recently
+            already_covered = any(rk.startswith(f"{ek}:{ev_sec}") or rk.startswith(f"{ek}:") for rk in recent_keys)
+            if already_covered:
+                continue
+            if ek in preferred_keys:
+                matched_event_key, matched_event_raw, matched_sector = ek, raw_lbl, ev_sec
+                break
+            if ek in global_event_keys and fallback_evt is None:
+                fallback_evt = (ek, raw_lbl, ev_sec)
+        if not matched_event_key and fallback_evt is not None:
+            matched_event_key, matched_event_raw, matched_sector = fallback_evt
+
+        cands = _build_grounded_variants(
+            archetype_idx=archetype_idx,
+            pred_event=pred_event,
+            pred_sector=pred_sector,
+            pred_elem=pred_elem,
+            sector_label=matched_sector,
+            event_key=matched_event_key,
+            event_raw=matched_event_raw,
+            bot_ctx=bot_ctx,
+            world_ctx=world_ctx,
+        )
+
+        # 1st pass: neither semantic key nor normalized clear body appeared in last 45 ticks
+        for sem_key, clr, part, muf in cands:
+            norm = clr.strip().lower()
+            if (
+                sem_key not in recent_keys
+                and norm not in recent_bodies
+                and sem_key != self._last_emitted_key
+                and norm != self._last_emitted_body
+            ):
+                return sem_key, clr, part, muf
+
+        # 2nd pass: guaranteed non-consecutive (different from immediately preceding utterance)
+        rot = (self._step_counter + archetype_idx) % max(1, len(cands))
+        for off in range(len(cands)):
+            sem_key, clr, part, muf = cands[(rot + off) % len(cands)]
+            norm = clr.strip().lower()
+            if norm != self._last_emitted_body and sem_key != self._last_emitted_key:
+                return f"{sem_key}#{self._step_counter}", clr, part, muf
+
+        # Absolute fallback with dynamic sector/step disambiguation so two consecutive lines NEVER match
+        arch_name = ARCHETYPE_CLASSES[archetype_idx % len(ARCHETYPE_CLASSES)].title()
+        clr = f"{arch_name} repositioning across {matched_sector} — holding line!"
+        part = f"{arch_name} shifting near {matched_sector}..."
+        muf = f"...{arch_name.lower()}... [static] ...{matched_sector}..."
+        return f"DYN:{archetype_idx}:{matched_sector}:{self._step_counter}", clr, part, muf
+
     @torch.inference_mode()
     def step_live(
         self,
@@ -1777,6 +2360,7 @@ class LiveAcousticEngine:
         listener_pos: tuple[float, float, float],
         human_chat: dict[str, Any] | None = None,
         max_bubbles: int = 2,
+        world_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Run one live 10 Hz acoustic tick (<1.5 ms on NVIDIA GB10 for both 256x256x4 & 512x512x4).
@@ -1784,18 +2368,24 @@ class LiveAcousticEngine:
         Args:
             w_state      : [L, 18, H, W] float16/float32 on CUDA
             z_world      : [L, 48, H, W] float16/float32 on CUDA
-            bot_states   : list of dicts {id, name, team, cls, x, y, layer, hp}
+            bot_states   : list of dicts {id, name, team, cls/class_id/bot_class, x, y, layer/bot_z, hp/bot_hp, in_tunnel, in_water, airborne, ...}
             listener_pos : (x, y, layer) normalized [0..1] or grid units [0..W, 0..H]
             human_chat   : optional {"text": str, "x": float, "y": float, "layer": int, "volume": float, "team": int}
+            world_context: optional {"recent_events": [...], "epoch": str, "biome": str}
 
         Returns dict with:
-            speech_bubbles     : list of grounded bot speech bubbles (1-2 salient bots)
+            speech_bubbles     : list of grounded bot speech bubbles (1-2 salient bots, zero consecutive duplicates!)
             human_overrides    : list of per-bot g_i steering overrides (friendly bots with snr_db > 0)
             human_replies      : list of live bot replies to human chat (clear + muffled)
             enemy_eavesdropped : list of enemy bots that overheard the human chat (snr_db > +6 dB)
             ambient_stats      : listener ambient noise dB & dominant noise cause
         """
+        self._step_counter += 1
+        self._prune_recent_utterances()
+        w_ctx = dict(world_context) if world_context else {}
         L, _, H, W = w_state.shape
+        w_ctx.setdefault("grid_w", W)
+        w_ctx.setdefault("grid_h", H)
         dt = torch.float16 if self.use_fp16 else torch.float32
         w_gpu = w_state.to(device=self.device, dtype=dt, non_blocking=True)
         z_gpu = z_world.to(device=self.device, non_blocking=True)
@@ -1813,7 +2403,7 @@ class LiveAcousticEngine:
         li_y = int(np.clip(round(ly * (Ha - 1) / max(H - 1, 1)), 0, Ha - 1))
         li_z = int(round(lz))
 
-        alive_bots = [b for b in bot_states if float(b.get("hp", 1.0)) > 0.0]
+        alive_bots = [b for b in bot_states if float(b.get("bot_hp", b.get("hp", 1.0))) > 0.0]
         if not alive_bots:
             l_ndb = float(noise_db[li_z, li_y, li_x].item())
             l_cause = int(noise_cause[li_z, li_y, li_x].item())
@@ -1837,15 +2427,57 @@ class LiveAcousticEngine:
         bot_xyz_np = np.empty((n_bots, 3), dtype=np.float32)
         bot_teams_np = np.empty(n_bots, dtype=np.int64)
         bot_cls_np = np.empty(n_bots, dtype=np.int64)
+        bot_arch_np = np.empty(n_bots, dtype=np.int64)
+        cooldown_penalty_np = np.zeros(n_bots, dtype=np.float32)
+
+        # Map latest live tactical event to preferred speaker archetype so relevant specialists speak up!
+        preferred_arch: int | None = None
+        raw_evts = w_ctx.get("recent_events") if isinstance(w_ctx, dict) else None
+        if isinstance(raw_evts, list) and raw_evts:
+            latest_ev = raw_evts[-1]
+            ev_lbl = str(latest_ev.get("label", latest_ev) if isinstance(latest_ev, dict) else latest_ev).upper()
+            if "SHIELD" in ev_lbl:
+                preferred_arch = 0
+            elif "AERIAL" in ev_lbl or "UPDRAFT" in ev_lbl:
+                preferred_arch = 1
+            elif "TIDEKIN" in ev_lbl or "QUENCH" in ev_lbl or "GEYSER" in ev_lbl:
+                preferred_arch = 2
+            elif "SOLO" in ev_lbl or "ASSASSIN" in ev_lbl:
+                preferred_arch = 3
+            elif "BREACH" in ev_lbl or "TUNNEL" in ev_lbl:
+                preferred_arch = 4
 
         for i, b in enumerate(alive_bots):
             bx, by = _to_grid_xy(float(b["x"]), float(b["y"]), W, H, force_norm=bots_are_norm)
-            bz = float(np.clip(b.get("layer", 1), 0, L - 1))
+            bz = float(np.clip(b.get("layer", b.get("bot_z", 1)), 0, L - 1))
             bot_xyz_np[i, 0] = bx
             bot_xyz_np[i, 1] = by
             bot_xyz_np[i, 2] = bz
             bot_teams_np[i] = int(b.get("team", 0))
-            bot_cls_np[i] = _cls_to_idx(b.get("cls", 0))
+            raw_cls = b.get("bot_class", b.get("class_id", b.get("cls", 0)))
+            arch_idx = _archetype_to_idx(raw_cls)
+            bot_arch_np[i] = arch_idx
+            bot_cls_np[i] = arch_idx if arch_idx < len(SPEAKER_CLASSES) else 0
+            bid_key = b.get("id", i)
+            last_t = self._speaker_last_tick.get(bid_key, -10_000)
+            age = self._step_counter - last_t
+            if age < self.speaker_cooldown_ticks:
+                cooldown_penalty_np[i] = -60.0 + float(age)
+            arch_age = self._step_counter - self._archetype_last_tick.get(arch_idx, -10_000)
+            if arch_age < 4:
+                cooldown_penalty_np[i] -= float(4 - arch_age) * 1.6
+            if preferred_arch is not None and arch_idx == preferred_arch:
+                cooldown_penalty_np[i] += 3.5
+            # Mild diversity bonus for active telemetry states (in_tunnel, airborne, in_water, shield_wall, burning, solo)
+            if (
+                b.get("in_tunnel")
+                or b.get("airborne")
+                or b.get("in_water")
+                or b.get("shield_wall_active")
+                or b.get("burning")
+                or b.get("squad_id") == 0
+            ):
+                cooldown_penalty_np[i] += 0.65
 
         # Pack bot coords, listener, optional human source, teams/cls, and CPU-computed combat salience into ONE single H2D upload!
         has_chat = human_chat is not None and bool(str(human_chat.get("text", "")).strip())
@@ -1875,13 +2507,14 @@ class LiveAcousticEngine:
             else:
                 nearest_opp_np[i] = float(i)
 
-        # Single compact H2D upload [N + 2, 6]: cols 0..3=xyz, 3=cls, 4=team, 5=combat_sal (row N=listener, row N+1=human_src)
-        meta_np = np.zeros((n_bots + 2, 7), dtype=np.float32)
+        # Single compact H2D upload [N + 2, 8]: cols 0..3=xyz, 3=cls, 4=team, 5=combat_sal, 6=nearest_opp, 7=cd_bias
+        meta_np = np.zeros((n_bots + 2, 8), dtype=np.float32)
         meta_np[:n_bots, :3] = bot_xyz_np
         meta_np[:n_bots, 3] = bot_cls_np
         meta_np[:n_bots, 4] = bot_teams_np
         meta_np[:n_bots, 5] = combat_sal_np
         meta_np[:n_bots, 6] = nearest_opp_np
+        meta_np[:n_bots, 7] = cooldown_penalty_np
         meta_np[n_bots, :3] = (lx, ly, lz)
         if has_chat:
             meta_np[n_bots + 1, :3] = (hx, hy, hz)
@@ -1894,6 +2527,7 @@ class LiveAcousticEngine:
         bot_teams_t = meta_t[:n_bots, 4]
         combat_sal = meta_t[:n_bots, 5]
         nearest_opp_t = meta_t[:n_bots, 6].long()
+        cd_bias_t = meta_t[:n_bots, 7]
 
         # 2. Sample Z_world ego-crops for all bots + listener in ONE single 5D grid_sample call!
         all_crops = self._sample_z_crops_fast(z_gpu, all_xyz)  # [N + 1, 48, 16, 16]
@@ -1916,7 +2550,7 @@ class LiveAcousticEngine:
             + 1.5 * w_bots[:, CH_FORCING].abs()
         )
 
-        sal_total = z_sal + phys_sal + 0.8 * combat_sal
+        sal_total = z_sal + phys_sal + 0.8 * combat_sal + cd_bias_t
         k = min(max(1, max_bubbles), n_bots)
         top1_idx = sal_total.argmax(dim=0, keepdim=True)  # [1]
         if k >= 2 and n_bots >= 2:
@@ -2024,24 +2658,38 @@ class LiveAcousticEngine:
             row = sp_np[idx_local]
             b_i = int(round(float(row[0])))
             b = alive_bots[b_i]
-            sp_name = str(b.get("name", SPEAKER_CLASSES[int(bot_cls_np[b_i])]))
+            arch_idx = int(bot_arch_np[b_i])
+            arch_name = ARCHETYPE_CLASSES[arch_idx]
+            bid_val = b.get("id", b_i)
+            sp_name = str(b.get("name", arch_name))
             src_layer = int(round(float(bot_xyz_np[b_i, 2])))
             sym_id = int(round(float(row[1])))
             vol_v = float(row[2])
             snr_v = float(row[3])
-            p_ev = int(round(float(row[4])))
-            p_sec = int(round(float(row[5])))
-            p_el = int(round(float(row[6])))
-            p_tac = int(round(float(row[7])))
+            p_ev = int(round(float(row[4]))) % len(EVENT_NAMES)
+            p_sec = int(round(float(row[5]))) % len(SECTOR_NAMES)
+            p_el = int(round(float(row[6]))) % len(ELEMENT_NAMES)
+            p_tac = int(round(float(row[7]))) % len(TACTIC_NAMES)
             p_urg = float(row[8])
             c_id = int(round(float(row[9])))
             w_cr = float(row[10])
             c_muf = bool(row[11] > 0.5)
 
-            txt, tier, cause_txt = render_speech_bubble(
+            sec_label = _pos_to_sector_name(float(bot_xyz_np[b_i, 0]), float(bot_xyz_np[b_i, 1]), W, H)
+            sem_key, clr_txt, part_txt, muf_txt = self._select_fresh_utterance(
+                speaker_id=bid_val,
+                archetype_idx=arch_idx,
                 pred_event=p_ev,
                 pred_sector=p_sec,
                 pred_elem=p_el,
+                sector_label=sec_label,
+                bot_ctx=b,
+                world_ctx=w_ctx,
+            )
+            txt, tier, cause_txt = format_snr_bubble(
+                clear_text=clr_txt,
+                partial_text=part_txt,
+                muffled_text=muf_txt,
                 snr_db=snr_v,
                 cause_id=c_id,
                 walls_crossed=w_cr,
@@ -2050,20 +2698,28 @@ class LiveAcousticEngine:
                 src_layer=src_layer,
                 volume=vol_v,
             )
+            norm_body = clr_txt.strip().lower()
+            self.recent_utterances.append((self._step_counter, sem_key, norm_body, bid_val))
+            self._speaker_last_tick[bid_val] = self._step_counter
+            self._archetype_last_tick[arch_idx] = self._step_counter
+            self._last_emitted_body = norm_body
+            self._last_emitted_key = sem_key
+
             speech_bubbles.append(
                 {
-                    "bot_id": b.get("id", b_i),
+                    "bot_id": bid_val,
                     "bot_name": sp_name,
                     "team": int(bot_teams_np[b_i]),
-                    "cls": SPEAKER_CLASSES[int(bot_cls_np[b_i])],
+                    "cls": arch_name,
+                    "archetype": arch_name,
                     "pos": [round(float(bot_xyz_np[b_i, 0]), 1), round(float(bot_xyz_np[b_i, 1]), 1), src_layer],
                     "symbol_id": sym_id,
                     "volume": round(vol_v, 3),
                     "snr_db": round(snr_v, 2),
                     "tier": tier,
                     "cause": cause_txt,
-                    "event": EVENT_NAMES[p_ev],
-                    "sector": SECTOR_NAMES[p_sec],
+                    "event": sem_key.split(":", 1)[0],
+                    "sector": sec_label,
                     "element": ELEMENT_NAMES[p_el],
                     "tactic": TACTIC_NAMES[p_tac],
                     "urgency": round(p_urg, 3),
@@ -2407,5 +3063,120 @@ def run_full_verification(
     return report
 
 
+def run_zero_spam_self_test(steps: int = 20) -> dict[str, Any]:
+    """
+    Lightweight self-test proving 20 consecutive steps produce ZERO duplicate consecutive
+    callouts, cover all 5 Frostmarsh physical archetypes, and preserve 4-tier physical SNR
+    degradation. Runs cleanly on CPU without requiring GPU or external checkpoints.
+    """
+    torch.manual_seed(17)
+    engine = LiveAcousticEngine(
+        ckpt_path=DEFAULT_CKPT_PATH,
+        device="cpu",
+        use_fp16=False,
+        auto_train=False,
+        allow_random_init=True,
+    )
+    engine.speaker_cooldown_ticks = 4
+
+    w_state = torch.zeros((4, 18, 64, 64), dtype=torch.float32)
+    w_state[1, S_WATER, 20:44, 28:36] = 0.85
+    w_state[1, S_OIL, 38:48, 12:22] = 0.75
+    w_state[1, CH_TEMP, 10:20, 44:54] = 2.6
+    z_world = torch.randn((4, 48, 64, 64), dtype=torch.float32) * 0.25
+
+    bots = [
+        {"id": 1, "name": "Frost-Strider-A1", "team": 0, "class_id": 0, "bot_class": "STRIDER", "x": 30.0, "y": 32.0, "layer": 1, "bot_z": 4.0, "hp": 0.90, "shield_wall_active": True},
+        {"id": 2, "name": "Ember-Skywing-A2", "team": 1, "class_id": 1, "bot_class": "SKYWING", "x": 34.0, "y": 28.0, "layer": 2, "bot_z": 11.0, "hp": 0.85, "airborne": True},
+        {"id": 3, "name": "Frost-Tidekin-A3", "team": 0, "class_id": 2, "bot_class": "TIDEKIN", "x": 31.0, "y": 24.0, "layer": 1, "bot_z": 3.0, "hp": 0.88, "in_water": True},
+        {"id": 4, "name": "Ember-Stalker-Solo4", "team": 1, "class_id": 3, "bot_class": "EMBERSTALKER", "x": 46.0, "y": 22.0, "layer": 1, "bot_z": 6.0, "hp": 0.72, "squad_id": 0},
+        {"id": 5, "name": "Frost-Terramole-A5", "team": 0, "class_id": 4, "bot_class": "BURROWER", "x": 32.0, "y": 36.0, "layer": 0, "bot_z": 2.5, "hp": 0.94, "in_tunnel": True},
+        {"id": 6, "name": "Ember-Strider-B6", "team": 1, "class_id": 0, "bot_class": "STRIDER", "x": 36.0, "y": 35.0, "layer": 1, "bot_z": 4.0, "hp": 0.40, "burning": True},
+        {"id": 7, "name": "Frost-Skywing-B7", "team": 0, "class_id": 1, "bot_class": "SKYWING", "x": 24.0, "y": 42.0, "layer": 2, "bot_z": 10.0, "hp": 0.95, "airborne": True},
+        {"id": 8, "name": "Ember-Tidekin-B8", "team": 1, "class_id": 2, "bot_class": "TIDEKIN", "x": 33.0, "y": 40.0, "layer": 1, "bot_z": 3.0, "hp": 0.91, "in_water": True},
+        {"id": 9, "name": "Frost-Stalker-Solo9", "team": 0, "class_id": 3, "bot_class": "EMBERSTALKER", "x": 18.0, "y": 18.0, "layer": 1, "bot_z": 5.0, "hp": 0.82, "squad_id": 0},
+        {"id": 10, "name": "Ember-Terramole-B10", "team": 1, "class_id": 4, "bot_class": "BURROWER", "x": 28.0, "y": 30.0, "layer": 0, "bot_z": 2.0, "hp": 0.93, "in_tunnel": True},
+    ]
+    event_script = [
+        [{"label": "SUBTERRANEAN BREACH!", "x": 32.0, "y": 32.0, "team": 0}],
+        [{"label": "AERIAL OIL-IGNITION!", "x": 34.0, "y": 28.0, "team": 1}],
+        [{"label": "TIDEKIN QUENCH RESCUE!", "x": 31.0, "y": 16.0, "team": 0}],
+        [{"label": "SHIELD WALL!", "x": 30.0, "y": 32.0, "team": 0}],
+        [{"label": "SOLO ASSASSINATION!", "x": 48.0, "y": 20.0, "team": 1}],
+        [{"label": "CRYO-BRIDGE FORGED!", "x": 32.0, "y": 30.0, "team": 0}],
+        [{"label": "BASALT BULWARK!", "x": 48.0, "y": 48.0, "team": 1}],
+        [{"label": "STASIS RESCUE!", "x": 28.0, "y": 32.0, "team": 0}],
+        [{"label": "EPOCH: EPOCH II: VOLCANIC", "x": 32.0, "y": 32.0, "team": 2}],
+        [],
+    ]
+
+    emitted_lines: list[str] = []
+    emitted_archetypes: set[str] = set()
+    emitted_events: set[str] = set()
+    consecutive_dups = 0
+    prev_body: str | None = None
+
+    for step_idx in range(steps):
+        evts = event_script[step_idx % len(event_script)]
+        ctx = {
+            "recent_events": evts,
+            "epoch": "EPOCH II: VOLCANIC" if step_idx >= 8 else "EPOCH I: PRISTINE",
+            "biome": "Nordic Viaduct",
+        }
+        res = engine.step_live(
+            w_state,
+            z_world,
+            bots,
+            listener_pos=(32.0, 32.0, 1.0),
+            max_bubbles=1,
+            world_context=ctx,
+        )
+        assert len(res["speech_bubbles"]) == 1, f"expected 1 bubble at step {step_idx}"
+        sb = res["speech_bubbles"][0]
+        body = sb["text"].split(' "', 1)[1][:-1] if ' "' in sb["text"] else sb["text"]
+        if prev_body is not None and body.strip().lower() == prev_body.strip().lower():
+            consecutive_dups += 1
+        prev_body = body
+        emitted_lines.append(sb["text"])
+        emitted_archetypes.add(sb["archetype"])
+        emitted_events.add(sb["event"])
+
+    # Verify 4-tier SNR degradation formatting explicitly
+    snr_tiers = {}
+    for snr_v in (14.0, 5.0, -2.0, -10.0):
+        txt, tier, _ = format_snr_bubble(
+            "Carved under Central Spire—erupting behind their shields!",
+            "Tunnel breach under Central Spire... erupting!",
+            "...carved under... [rumble] ...Central Spire...",
+            snr_db=snr_v,
+            cause_id=1,
+            walls_crossed=1.0,
+            ceiling_muffled=False,
+            speaker_name="Frost-Terramole-A5",
+            src_layer=0,
+            volume=0.82,
+        )
+        snr_tiers[tier] = txt
+    assert set(snr_tiers.keys()) == {"clear", "partial", "muffled", "inaudible"}
+    assert "inaudible" in snr_tiers["inaudible"]
+    assert consecutive_dups == 0, f"Found {consecutive_dups} duplicate consecutive callouts!"
+    assert len(emitted_archetypes) == 5, f"Expected all 5 archetypes, got {emitted_archetypes}"
+
+    return {
+        "steps": steps,
+        "consecutive_duplicates": consecutive_dups,
+        "unique_lines": len(set(emitted_lines)),
+        "archetypes_covered": sorted(emitted_archetypes),
+        "events_covered": sorted(emitted_events),
+        "snr_tiers_ok": True,
+        "sample_lines": emitted_lines[:6],
+    }
+
+
 if __name__ == "__main__":
-    run_full_verification(retrain=False)
+    import sys
+    if "--self-test" in sys.argv:
+        summary = run_zero_spam_self_test(20)
+        print(f"[live_acoustics self-test] PASS: {summary}")
+    else:
+        run_full_verification(retrain=False)

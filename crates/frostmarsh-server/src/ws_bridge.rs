@@ -187,6 +187,61 @@ pub fn encode_entities_payload(json: &str) -> Vec<u8> {
     out
 }
 
+/// Wave 17C: Additive tactical/synergy event entry streamed in the `0x02` live JSON `"events"` feed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WsTacticalEvent {
+    pub label: String,
+    pub team: u8,
+    pub x: f32,
+    pub y: f32,
+    pub tick: u64,
+}
+
+fn escape_ws_json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Append the additive `"events":[...]` JSON fragment (capped to the latest `max_events`,
+/// default 5) onto an open JSON object buffer. 100% backwards-compatible with existing clients.
+pub fn append_tactical_events_json(
+    json: &mut String,
+    events: &[WsTacticalEvent],
+    max_events: usize,
+) {
+    use std::fmt::Write as _;
+    json.push_str(",\"events\":[");
+    let start = events.len().saturating_sub(max_events);
+    for (i, ev) in events[start..].iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        let _ = write!(
+            json,
+            "{{\"label\":{},\"team\":{},\"x\":{:.2},\"y\":{:.2},\"tick\":{}}}",
+            escape_ws_json_str(&ev.label),
+            ev.team,
+            ev.x,
+            ev.y,
+            ev.tick
+        );
+    }
+    json.push(']');
+}
+
 // ---------------- Client Commands & Live Peer Registry ----------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -726,5 +781,43 @@ mod tests {
             Some(WsCommand::RequestFullSync { peer_id: 7 })
         );
         assert_eq!(parse_client_text_command(7, r#"{"type":"noop"}"#), None);
+    }
+
+    #[test]
+    fn test_wave17c_tactical_events_feed_0x02() {
+        let mut evs = Vec::new();
+        for i in 0..7u64 {
+            evs.push(WsTacticalEvent {
+                label: match i {
+                    0 => "OLD EVENT 0".to_string(),
+                    1 => "OLD EVENT 1".to_string(),
+                    2 => "TIDEKIN QUENCH RESCUE!".to_string(),
+                    3 => "SHIELD WALL!".to_string(),
+                    4 => "SUBTERRANEAN BREACH!".to_string(),
+                    5 => "CRYO-BRIDGE FORGED!".to_string(),
+                    _ => "BASALT BULWARK!".to_string(),
+                },
+                team: (i % 2) as u8,
+                x: 100.0 + i as f32,
+                y: 80.0 + i as f32,
+                tick: 100 + i,
+            });
+        }
+        let mut json = String::from(r#"{"tick":106,"players":[]"#);
+        append_tactical_events_json(&mut json, &evs, 5);
+        json.push('}');
+
+        let pkt = encode_entities_payload(&json);
+        assert_eq!(pkt[0], 0x02);
+        let body = std::str::from_utf8(&pkt[1..]).expect("utf8 json");
+        // Keeps only the latest 5 tactical events (drops OLD EVENT 0 and OLD EVENT 1)
+        assert!(!body.contains("OLD EVENT 0"));
+        assert!(!body.contains("OLD EVENT 1"));
+        assert!(body.contains("TIDEKIN QUENCH RESCUE!"));
+        assert!(body.contains("SHIELD WALL!"));
+        assert!(body.contains("SUBTERRANEAN BREACH!"));
+        assert!(body.contains("CRYO-BRIDGE FORGED!"));
+        assert!(body.contains("BASALT BULWARK!"));
+        assert!(body.contains("\"events\":["));
     }
 }

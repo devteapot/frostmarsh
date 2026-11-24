@@ -80,7 +80,7 @@ pub struct MeshSlice {
     pub index_count: u32,
 }
 
-pub const MESH_KIND_COUNT: usize = 18;
+pub const MESH_KIND_COUNT: usize = 19;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum MeshKind {
@@ -102,6 +102,7 @@ pub enum MeshKind {
     SkywingWingL = 15,
     SkywingWingR = 16,
     HeroBurrower = 17,
+    ShrineRuneRing = 18,
 }
 
 pub struct StaticMeshBank {
@@ -938,9 +939,26 @@ fn build_ring_mesh(
 ) {
     let total_ang = TAU * arc_frac;
     let start_ang = -total_ang * 0.5;
+    let mut push_q_uv = |p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, e0: [f32; 4], e1: [f32; 4], e2: [f32; 4], e3: [f32; 4]| {
+        let n = (p1 - p0).cross(p2 - p0).normalize_or(Vec3::Y);
+        let base = verts.len() as u32;
+        let cm = [col[0], col[1], col[2], mat];
+        let pts = [(p0, e0), (p1, e1), (p2, e2), (p3, e3)];
+        for (p, ex) in pts {
+            verts.push(MeshVertex {
+                pos: p.to_array(),
+                normal: n.to_array(),
+                color_mat: cm,
+                extra: ex,
+            });
+        }
+        idxs.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
     for i in 0..segs {
         let a0 = start_ang + (i as f32 / segs as f32) * total_ang;
         let a1 = start_ang + ((i + 1) as f32 / segs as f32) * total_ang;
+        let ang0 = (i as f32 / segs as f32) * total_ang;
+        let ang1 = ((i + 1) as f32 / segs as f32) * total_ang;
         let (c0, s0) = (a0.cos(), a0.sin());
         let (c1, s1) = (a1.cos(), a1.sin());
         let i0_t = Vec3::new(c0 * r_in, y1, s0 * r_in);
@@ -949,9 +967,21 @@ fn build_ring_mesh(
         let i1_t = Vec3::new(c1 * r_in, y1, s1 * r_in);
         let o0_b = Vec3::new(c0 * r_out, y0, s0 * r_out);
         let o1_b = Vec3::new(c1 * r_out, y0, s1 * r_out);
-        // Top band + outer wall
-        push_quad(verts, idxs, i0_t, i1_t, o1_t, o0_t, col, mat);
-        push_quad(verts, idxs, o0_b, o0_t, o1_t, o1_b, col, mat);
+        // Top band + outer wall (extra.x = angle_rad, extra.y = radial_t [0..1] for runic mat 13!)
+        push_q_uv(
+            i0_t, i1_t, o1_t, o0_t,
+            [ang0, 0.0, 0.0, 0.0],
+            [ang1, 0.0, 0.0, 0.0],
+            [ang1, 1.0, 0.0, 0.0],
+            [ang0, 1.0, 0.0, 0.0],
+        );
+        push_q_uv(
+            o0_b, o0_t, o1_t, o1_b,
+            [ang0, 1.0, 0.0, 0.0],
+            [ang0, 0.5, 0.0, 0.0],
+            [ang1, 0.5, 0.0, 0.0],
+            [ang1, 1.0, 0.0, 0.0],
+        );
     }
 }
 
@@ -1058,33 +1088,48 @@ impl StaticMeshBank {
         // 10: Marsh Deer (live ecosystem wildlife!)
         let marsh_deer = make_slice(&mut |v, i| build_marsh_deer(v, i, detail));
 
-        // 11: Crisp Faction Ground Ring
+        // 11: Crisp Faction Ground Ring (refined slender luminous ring)
         let ground_ring = make_slice(&mut |v, i| {
-            build_ring_mesh(v, i, 1.05, 1.40, 0.06, 0.16, 16, 1.0, [1.0, 1.0, 1.0], 5.0);
+            build_ring_mesh(v, i, 1.00, 1.14, 0.04, 0.12, 28, 1.0, [1.0, 1.0, 1.0], 5.0);
         });
 
         // 12: Tidekin (Amphibious Swimmer / Diver with hydrodynamic dorsal crest & bioluminescent trim!)
         let hero_tidekin = make_slice(&mut |v, i| build_parametric_tidekin(v, i, detail));
 
-        // 13: Capturable Elemental Shrine Obelisk (stepped stone plinth + glowing floating crystal!)
+        // 13: Capturable Elemental Shrine Obelisk (carved Nordic basalt plinth + tall floating crystal monolith!)
         let shrine_obelisk = make_slice(&mut |v, i| {
-            let stone = [0.36, 0.40, 0.52];
-            let stone_hi = [0.54, 0.58, 0.70];
-            // Stepped octagonal base
-            push_limb(v, i, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.55, 0.0), 2.35, 2.10, 8, stone, 1.0);
-            push_limb(v, i, Vec3::new(0.0, 0.55, 0.0), Vec3::new(0.0, 1.05, 0.0), 1.65, 1.40, 8, stone_hi, 1.0);
-            // Four corner rune pillars
+            let stone = [0.32, 0.36, 0.48];
+            let stone_hi = [0.50, 0.56, 0.68];
+            let gold = [0.92, 0.76, 0.36];
+            // Stepped octagonal Nordic basalt base + inlaid gold trim band
+            push_limb(v, i, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.48, 0.0), 2.15, 1.92, 8, stone, 1.0);
+            push_limb(v, i, Vec3::new(0.0, 0.48, 0.0), Vec3::new(0.0, 0.62, 0.0), 1.88, 1.80, 8, gold, 10.0);
+            push_limb(v, i, Vec3::new(0.0, 0.62, 0.0), Vec3::new(0.0, 1.12, 0.0), 1.52, 1.24, 8, stone_hi, 1.0);
+            // Four slender carved corner rune pillars with luminous crystal tips
             for k in 0..4 {
                 let a = k as f32 * PI * 0.5 + PI * 0.25;
-                let px = a.cos() * 1.45;
-                let pz = a.sin() * 1.45;
-                push_limb(v, i, Vec3::new(px, 0.5, pz), Vec3::new(px, 2.35, pz), 0.26, 0.18, 6, stone_hi, 1.0);
+                let px = a.cos() * 1.38;
+                let pz = a.sin() * 1.38;
+                push_limb(v, i, Vec3::new(px, 0.45, pz), Vec3::new(px, 2.35, pz), 0.24, 0.15, 6, stone_hi, 1.0);
+                let tip_base = v.len();
+                build_octahedron(v, i, 0.18, 0.38, 0.18, [1.0, 1.0, 1.0], 5.0);
+                for mv in &mut v[tip_base..] {
+                    mv.pos[0] += px;
+                    mv.pos[1] += 2.68;
+                    mv.pos[2] += pz;
+                }
             }
-            // Floating faction-colored crystal spire (mat 5 emissive + tinted by instance!)
+            // Lower levitating anchor shard (tall vertical crystal!)
+            let shard_base = v.len();
+            build_octahedron(v, i, 0.34, 0.72, 0.34, [1.0, 1.0, 1.0], 5.0);
+            for mv in &mut v[shard_base..] {
+                mv.pos[1] += 1.95;
+            }
+            // Towering floating faction-colored crystal monolith (tall vertical octahedron along Y!)
             let base = v.len();
-            build_octahedron(v, i, 0.85, 0.85, 2.15, [1.0, 1.0, 1.0], 5.0);
+            build_octahedron(v, i, 0.68, 2.15, 0.68, [1.0, 1.0, 1.0], 5.0);
             for mv in &mut v[base..] {
-                mv.pos[1] += 3.55;
+                mv.pos[1] += 4.35;
             }
         });
 
@@ -1097,6 +1142,11 @@ impl StaticMeshBank {
 
         // 17: Burrower (Subterranean Crystal-Plated Golem — twin conical drill-gauntlets + crystal dorsal spine!)
         let hero_burrower = make_slice(&mut |v, i| build_parametric_burrower(v, i, detail));
+
+        // 18: Delicate Animated Runic Energy Ring (mat 13 — open dashed runic glyphs so stone arch shines through!)
+        let shrine_rune_ring = make_slice(&mut |v, i| {
+            build_ring_mesh(v, i, 0.945, 1.00, 0.03, 0.11, 36, 1.0, [1.0, 1.0, 1.0], 13.0);
+        });
 
         Self {
             vertices: verts,
@@ -1120,6 +1170,7 @@ impl StaticMeshBank {
                 skywing_wing_l,
                 skywing_wing_r,
                 hero_burrower,
+                shrine_rune_ring,
             ],
         }
     }

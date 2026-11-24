@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Frostmarsh 3D — Wave 14D WebGPU 5-Archetypes + Live Beams + Evolving World</title>
+  <title>Frostmarsh 3D — Wave 18A WebGPU AAA Stylized + Live Tactical Feed</title>
   <style>
     :root {
       --bg: #080c14;
@@ -158,6 +158,105 @@
       align-items: center;
       gap: 8px;
       flex-wrap: wrap;
+    }
+
+    #hud-tactical-feed {
+      position: static;
+      padding: 9px 12px;
+      min-width: 270px;
+      max-width: 360px;
+      width: 100%;
+      pointer-events: none;
+    }
+
+    #hud-tactical-feed.feed-empty {
+      display: none;
+    }
+
+    .feed-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 7px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid rgba(148, 184, 232, 0.16);
+    }
+
+    .feed-title {
+      font-size: 10.5px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #dbeaff;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .feed-pulse {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      box-shadow: 0 0 8px rgba(88, 227, 154, 0.85);
+    }
+
+    .feed-list {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .feed-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 5px 8px;
+      border-radius: 7px;
+      background: rgba(16, 24, 42, 0.82);
+      border: 1px solid rgba(125, 170, 230, 0.22);
+      border-left: 3px solid var(--accent);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      color: #f0f6ff;
+      animation: feedSlideIn 0.22s ease-out;
+    }
+
+    .feed-item.feed-frost {
+      border-left-color: #3ae2ff;
+      background: rgba(14, 34, 56, 0.84);
+      color: #e4f9ff;
+    }
+
+    .feed-item.feed-ember {
+      border-left-color: #ffae4d;
+      background: rgba(46, 24, 16, 0.84);
+      color: #fff2e0;
+    }
+
+    .feed-item.feed-arcane {
+      border-left-color: #b68aff;
+      background: rgba(34, 20, 54, 0.84);
+      color: #f3eaff;
+    }
+
+    .feed-tag {
+      font-size: 9.5px;
+      font-weight: 600;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.10);
+      color: #d0e2ff;
+      flex-shrink: 0;
+    }
+
+    @keyframes feedSlideIn {
+      from { opacity: 0; transform: translateX(10px); }
+      to { opacity: 1; transform: translateX(0); }
     }
 
     .ws-input {
@@ -470,6 +569,14 @@
         <span class="kbd">F9</span> Evo Speed
       </button>
     </div>
+
+    <div id="hud-tactical-feed" class="hud-card feed-empty" aria-live="polite">
+      <div class="feed-header">
+        <span class="feed-title"><span class="feed-pulse"></span>Live Tactical Feed</span>
+        <span id="feed-count" class="badge green">0</span>
+      </div>
+      <div id="feed-list" class="feed-list"></div>
+    </div>
   </div>
 
   <div id="hud-controls" class="hud-card">
@@ -545,6 +652,9 @@
     const lblWs = document.getElementById("lbl-ws");
     const btnWsBiome = document.getElementById("btn-ws-biome");
     const btnWsEvo = document.getElementById("btn-ws-evo");
+    const hudTacticalFeed = document.getElementById("hud-tactical-feed");
+    const feedCount = document.getElementById("feed-count");
+    const feedList = document.getElementById("feed-list");
 
     const STYLE_LABELS = ["NORDIC", "VOLCANIC", "ARCANE", "EMERALD"];
     const DEPTH_PRESETS = [16, 24, 32];
@@ -722,6 +832,83 @@
       const textDecoder = new TextDecoder("utf-8");
       let liveWs = null;
       let wsStateText = "Offline";
+      let lastFeedSignature = "";
+
+      function classifyTacticalEvent(ev) {
+        if (ev.team === 0) return { cls: "feed-frost", tag: "FROST" };
+        if (ev.team === 1) return { cls: "feed-ember", tag: "EMBER" };
+        const up = ev.label.toUpperCase();
+        if (up.includes("TIDEKIN") || up.includes("CRYO") || up.includes("SHIELD") || up.includes("FROST")) {
+          return { cls: "feed-frost", tag: "FROST" };
+        }
+        if (up.includes("BREACH") || up.includes("EMBER") || up.includes("BASALT") || up.includes("VOLCANIC") || up.includes("MAGMA")) {
+          return { cls: "feed-ember", tag: "EMBER" };
+        }
+        return { cls: "feed-arcane", tag: "SYNERGY" };
+      }
+
+      function renderTacticalFeed(rawEvents) {
+        const items = [];
+        if (Array.isArray(rawEvents)) {
+          for (const entry of rawEvents) {
+            if (typeof entry === "string") {
+              const label = entry.trim();
+              if (label) items.push({ label, team: null, tick: null });
+            } else if (entry && typeof entry === "object") {
+              const rawLbl = entry.label || entry.text || entry.message || "";
+              const label = String(rawLbl).trim();
+              if (label) {
+                items.push({
+                  label,
+                  team: typeof entry.team === "number" ? entry.team : null,
+                  tick: typeof entry.tick === "number" ? entry.tick : null,
+                });
+              }
+            }
+          }
+        }
+        const visible = items.slice(-5).reverse();
+        const sig = visible.map((e) => `${e.label}|${e.team ?? ""}|${e.tick ?? ""}`).join("\n");
+        if (sig === lastFeedSignature) return;
+        lastFeedSignature = sig;
+
+        if (visible.length === 0) {
+          hudTacticalFeed.classList.add("feed-empty");
+          feedCount.textContent = "0";
+          feedList.replaceChildren();
+          return;
+        }
+
+        hudTacticalFeed.classList.remove("feed-empty");
+        feedCount.textContent = String(visible.length);
+        const frag = document.createDocumentFragment();
+        for (const ev of visible) {
+          const { cls, tag } = classifyTacticalEvent(ev);
+          const row = document.createElement("div");
+          row.className = `feed-item ${cls}`;
+          const lblSpan = document.createElement("span");
+          lblSpan.textContent = ev.label;
+          const tagSpan = document.createElement("span");
+          tagSpan.className = "feed-tag";
+          tagSpan.textContent = tag;
+          row.appendChild(lblSpan);
+          row.appendChild(tagSpan);
+          frag.appendChild(row);
+        }
+        feedList.replaceChildren(frag);
+      }
+
+      function handleLiveEventsFromJson(jsonStr) {
+        if (!jsonStr || !jsonStr.includes("\"events\"")) return;
+        try {
+          const payload = JSON.parse(jsonStr);
+          if (payload && Array.isArray(payload.events)) {
+            renderTacticalFeed(payload.events);
+          }
+        } catch {
+          // ignore non-JSON or partial frame
+        }
+      }
 
       function setWsUi(state, label) {
         wsStateText = label;
@@ -767,6 +954,7 @@
           }
           liveWs = null;
         }
+        renderTacticalFeed([]);
         setWsUi("", "Offline");
       }
 
@@ -790,6 +978,7 @@
             try {
               if (typeof ev.data === "string") {
                 app.apply_live_entities_json(ev.data);
+                handleLiveEventsFromJson(ev.data);
                 return;
               }
               if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength < 2) return;
@@ -810,6 +999,7 @@
                 // [u8=2, utf8_json_bytes...]
                 const jsonStr = textDecoder.decode(new Uint8Array(ev.data, 1));
                 app.apply_live_entities_json(jsonStr);
+                handleLiveEventsFromJson(jsonStr);
               }
             } catch (err) {
               console.warn("WS frame decode error:", err);
@@ -824,6 +1014,7 @@
           ws.onclose = () => {
             if (liveWs !== ws) return;
             liveWs = null;
+            renderTacticalFeed([]);
             setWsUi("", "Offline");
           };
         } catch (err) {

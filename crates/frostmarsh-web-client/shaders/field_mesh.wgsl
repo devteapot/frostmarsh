@@ -1,18 +1,16 @@
-// Pass 1: Wave 12C Smooth Surface-Nets 3D Isosurface Mesh Shader (WebGPU, Z=16..32)
+// Pass 1: Wave 18A AAA Stylized Smooth Surface-Nets 3D Isosurface Mesh Shader (WebGPU, Z=16..32)
 // Features:
+//   - Fast unrolled 6-tap 3D volumetric sun-ray shadow march + 4-tap 3D voxel contact AO in `density_tex`
 //   - Client-side WGSL 4-Style Neural Compute Transform (`Y`-key):
 //       0 = NORDIC, 1 = VOLCANIC EMBER, 2 = ARCANE THERMAL, 3 = EMERALD CAVERN
 //   - Triplanar Painterly Surface Micro-Detail (zero flat plastic!):
-//       * Stone masonry bevels, mortar courses & geological strata on steep faces/arches/caves
+//       * Multi-octave warped geological strata & carved Nordic ashlar stone-block masonry on arches/decks
 //       * Weathered timber plank seams & wood grain on horizontal decks
-//       * Alpine snow crystalline sparkle on bright upper ledges
+//       * Snow-dusted upward ledges (`N.y > 0.72`) with crystalline alpine sparkle
 //       * Wet shoreline pebble darkening & glossy Fresnel sheen
-//       * Molten ember cracks, arcane holographic contour scanlines, emerald bioluminescent veins
-//   - Smart 3D Cave Ceiling Cutaway (`C`-key Capsule Walk Mode):
-//       Smoothly Bayer-dithers away roof/ceiling fragments strictly above `player_y + 2.2`
-//       inside the camera-to-player line-of-sight cone!
-//   - Analytical trilinear ∇solid_density normals, 3D cave AO, 3D raymarched sun shadows,
-//     subterranean cavern lighting, and 3D local emissive bounce.
+//       * Incandescent molten fissure glow (`thermal > 0.55`) with charred obsidian rims
+//       * Cool cyan/turquoise & amethyst mineral crystal veins inside enclosed caves
+//   - Smart 3D Cave Ceiling Cutaway (`C`-key Capsule Walk Mode) with luminous rock cross-section rim!
 
 struct SceneUniforms {
     view_proj: mat4x4<f32>,
@@ -167,23 +165,21 @@ fn eval_sky(rd: vec3<f32>) -> vec3<f32> {
     return sky + u.sun_col.rgb * sun_halo * smoothstep(-0.05, 0.18, h);
 }
 
+// Fast 4-tap 3D voxel contact & crevice ambient occlusion in `density_tex`
 fn compute_ao_3d(p: vec3<f32>, n: vec3<f32>) -> f32 {
     let ref_v = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(n.y) < 0.9);
     let t = normalize(cross(n, ref_v));
-    let b = cross(n, t);
 
     var occ = 0.0;
-    occ += sample_density(p + n * 0.75).r * 0.30;
-    occ += sample_density(p + n * 1.85).r * 0.24;
-    occ += sample_density(p + n * 3.60).r * 0.16;
-    occ += sample_density(p + normalize(n + t * 0.75) * 2.2).r * 0.12;
-    occ += sample_density(p + normalize(n - t * 0.75) * 2.2).r * 0.12;
-    occ += sample_density(p + normalize(n + b * 0.75) * 2.6).r * 0.12;
-    occ += sample_density(p + normalize(n - b * 0.75) * 2.6).r * 0.12;
-    occ += sample_density(p + vec3<f32>(0.0, 4.2, 0.0)).r * 0.22;
-    return clamp(1.0 - occ * 0.90, 0.09, 1.0);
+    occ += sample_density(p + n * 0.72).r * 0.42;
+    occ += sample_density(p + n * 1.95).r * 0.30;
+    occ += sample_density(p + normalize(n + t * 0.80) * 1.85).r * 0.18;
+    occ += sample_density(p + vec3<f32>(0.0, 3.6, 0.0)).r * 0.28;
+    return clamp(1.0 - occ * 0.92, 0.14, 1.0);
 }
 
+// Unrolled 6-tap 3D volumetric sun-ray shadow march in `density_tex`:
+// Crisp, alias-free overhang, arched-bridge, cliff & cave occlusion at ultra-low GPU cost!
 fn compute_sun_shadow_3d(p: vec3<f32>, n: vec3<f32>) -> f32 {
     let l = u.sun_dir.xyz;
     let ndl = dot(n, l);
@@ -191,29 +187,21 @@ fn compute_sun_shadow_3d(p: vec3<f32>, n: vec3<f32>) -> f32 {
         return 0.0;
     }
     let dims = u.vol_dims.xyz;
-    let bdims = vec3<i32>(u.brick_dims.xyz);
-    let bsize = u.brick_dims.w;
+    let origin = p + n * 0.42;
+    let taps = array<f32, 6>(0.95, 2.15, 4.0, 6.8, 11.2, 16.8);
 
-    var t = 0.65;
     var vis = 1.0;
-    for (var i = 0; i < 28; i = i + 1) {
-        let sp = p + n * 0.35 + l * t;
+    for (var i = 0; i < 6; i = i + 1) {
+        let sp = origin + l * taps[i];
         if (sp.y >= dims.y || sp.x <= 0.0 || sp.x >= dims.x || sp.z <= 0.0 || sp.z >= dims.z) {
             break;
         }
-        let bc = clamp(vec3<i32>(floor(sp / bsize)), vec3<i32>(0), bdims - vec3<i32>(1));
-        let occ = textureLoad(brick_tex, bc, 0);
-        if (occ.r < 0.04) {
-            t += 2.2;
-            continue;
-        }
         let d = sample_density(sp).r;
-        if (d >= 0.5) {
+        let pen = smoothstep(0.54, 0.22, d);
+        vis = min(vis, pen);
+        if (vis < 0.04) {
             return 0.0;
         }
-        let margin = max(0.5 - d, 0.0);
-        vis = min(vis, clamp(margin * 4.5 + 0.12, 0.0, 1.0));
-        t += 0.55 + t * 0.08;
     }
     return vis;
 }
@@ -257,6 +245,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Smoothly Bayer-dithers away roof/ceiling fragments strictly above
     // `player_y + 2.2` inside the camera-to-player line-of-sight cone!
     // -------------------------------------------------------------------------
+    var cutaway_rim = 0.0;
     if (u.player_cutaway.w > 0.5) {
         let player_p = u.player_cutaway.xyz;
         let ceil_y = player_p.y + 2.2;
@@ -282,6 +271,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                         discard;
                     }
                 }
+                let outer_rim = 1.0 - smoothstep(cone_r * 0.78, cone_r + 0.90, perp_dist);
+                let inner_rim = smoothstep(cone_r * 0.44, cone_r * 0.76, perp_dist);
+                cutaway_rim = outer_rim * inner_rim * height_fade;
             }
         }
     }
@@ -297,9 +289,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n_base = sample_solid_normal(p);
     var alb_srgb = clamp(at.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     var glow = at.a;
+    let raw_thermal = at.a;
     let style_id = i32(round(u.sun_col.w));
     let stylized = u.sky_top.w;
     let sim_t = u.cam_pos.w;
+    let d_scale = max(u.vol_dims.y / 16.0, 1.0);
 
     // -------------------------------------------------------------------------
     // Live Client-Side WGSL 4-Style Neural Compute Transform (`Y`-key)
@@ -371,36 +365,87 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     );
 
     let luma_s = dot(alb_srgb, vec3<f32>(0.299, 0.587, 0.114));
-    let steep = smoothstep(0.76, 0.34, abs(n_base.y));
+    let steep = smoothstep(0.76, 0.30, abs(n_base.y));
+    let bridge_band = smoothstep(3.2, 4.4, p.y) * smoothstep(9.6 * d_scale, 7.6 * d_scale, p.y);
+    let sat_rg = abs(alb_srgb.r - alb_srgb.g) + abs(alb_srgb.g - alb_srgb.b);
+    let is_stone_like = smoothstep(0.28, 0.10, sat_rg) * (1.0 - is_greenish);
 
-    // (1) Stone masonry bevels, cut-stone mortar courses & geological strata on steep rock/bridge faces
+    // (1) Rich Triplanar Geological Rock/Cliff Stratification + Carved Nordic Ashlar Masonry
     if (steep > 0.04) {
-        let strata = sin(p.y * 4.4 + vnoise2(p.xz * 0.65) * 2.4) * 0.11;
+        let strata_warp = vnoise2(p.xz * 0.55) * 2.8 + macro_n * 1.4;
+        let strata_lo = sin(p.y * 3.8 + strata_warp);
+        let strata_hi = sin(p.y * 9.6 + strata_warp * 1.7) * 0.45;
+        let strata = (strata_lo * 0.65 + strata_hi * 0.35) * 0.16;
+
+        // Carved Nordic ashlar stone-block courses on bridge arches & stone walls
         let course_y = abs(fract(p.y * 0.85) - 0.5);
         let row_shift = floor(p.y * 0.85) * 0.5;
-        let course_x = abs(fract((p.x + p.z) * 0.42 + row_shift) - 0.5);
-        let mortar = smoothstep(0.42, 0.49, max(course_y, course_x));
-        let arch_band = smoothstep(3.0, 4.2, p.y) * smoothstep(9.5, 8.0, p.y);
-        let stone_mod = 1.0 + strata - mortar * 0.18 * arch_band;
-        alb_srgb = clamp(alb_srgb * mix(1.0, stone_mod, steep * 0.85), vec3<f32>(0.0), vec3<f32>(1.0));
-        n = normalize(n + vec3<f32>(strata * 0.26, -mortar * 0.22 * arch_band, -strata * 0.26) * steep);
+        let course_x = abs(fract((p.x + p.z) * 0.45 + row_shift) - 0.5);
+        let mortar = smoothstep(0.41, 0.49, max(course_y, course_x));
+        let bevel = smoothstep(0.34, 0.43, max(course_y, course_x)) * (1.0 - mortar);
+
+        let arch_w = bridge_band * (0.45 + 0.55 * is_stone_like);
+        let warm_ledge = vec3<f32>(0.05, 0.04, 0.02) * max(strata_lo, 0.0);
+        let cool_crev = vec3<f32>(-0.04, -0.02, 0.04) * max(-strata_lo, 0.0);
+        let stone_mod = 1.0 + strata + bevel * 0.10 * arch_w - mortar * 0.26 * arch_w;
+
+        alb_srgb = clamp(
+            alb_srgb * mix(1.0, stone_mod, steep * 0.90) + (warm_ledge + cool_crev) * steep,
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
+        n = normalize(n + vec3<f32>(strata * 0.38, -mortar * 0.32 * arch_w + bevel * 0.16 * arch_w, -strata * 0.38) * steep);
+    }
+
+    // (1B) Carved Nordic Ashlar Flagstone Paving on Bridge Spans (top deck)
+    let under_open = 1.0 - sample_density(p - vec3<f32>(0.0, 2.2, 0.0)).r;
+    let is_bridge_deck = bridge_band * smoothstep(0.68, 0.88, n_base.y) * smoothstep(0.25, 0.72, under_open) * (1.0 - is_greenish);
+    if (is_bridge_deck > 0.05) {
+        let bx = abs(fract(p.x * 0.55 + floor(p.z * 0.55) * 0.5) - 0.5);
+        let bz = abs(fract(p.z * 0.55) - 0.5);
+        let flag_mortar = smoothstep(0.43, 0.495, max(bx, bz));
+        let block_var = (hash2(floor(p.xz * 0.55)) - 0.5) * 0.14;
+        let deck_tint = vec3<f32>(0.54, 0.58, 0.66) * (0.94 + block_var);
+        alb_srgb = mix(alb_srgb, deck_tint * (1.0 - flag_mortar * 0.28), is_bridge_deck * 0.58);
+        n = normalize(n + vec3<f32>((bx - 0.25) * flag_mortar * 0.25, 0.0, (bz - 0.25) * flag_mortar * 0.25) * is_bridge_deck);
     }
 
     // (2) Warm weathered timber plank seams & wood grain on horizontal bridge decks
     let wood_deck = is_warm_wood * smoothstep(0.55, 0.82, n_base.y);
     if (wood_deck > 0.05) {
-        let grain = sin(p.z * 11.0 + vnoise2(p.xz * 2.8) * 3.2) * 0.08;
+        let grain = sin(p.z * 11.0 + vnoise2(p.xz * 2.8) * 3.2) * 0.09;
         let plank_seam = smoothstep(0.90, 0.99, abs(sin(p.x * 2.4)));
-        alb_srgb = clamp(alb_srgb * (1.0 + (grain - plank_seam * 0.20) * wood_deck), vec3<f32>(0.0), vec3<f32>(1.0));
+        alb_srgb = clamp(alb_srgb * (1.0 + (grain - plank_seam * 0.22) * wood_deck), vec3<f32>(0.0), vec3<f32>(1.0));
     }
 
-    // (3) Alpine snow crystalline sparkle on bright upper ledges (scales smoothly for Z=16..32)
-    let snow_w = smoothstep(0.58, 0.78, luma_s) * smoothstep(7.8, 9.8, p.y) * smoothstep(0.40, 0.80, n_base.y);
-    if (snow_w > 0.05) {
-        let speck = hash2(floor(p.xz * 6.5) + floor(p.y * 4.0));
-        let sparkle = step(0.91, speck) * 0.24 * snow_w;
-        alb_srgb = clamp(alb_srgb + vec3<f32>(sparkle), vec3<f32>(0.0), vec3<f32>(1.0));
-        rough = mix(rough, 0.28, snow_w * 0.45);
+    // (3) Snow-Dusted Upward-Facing Alpine Ledges (`N.y > 0.72`) + Crystalline Sparkle!
+    let overhead_rock = sample_density(p + vec3<f32>(0.0, 2.6, 0.0)).r
+                      + sample_density(p + vec3<f32>(0.0, 4.8, 0.0)).r;
+    let exposed_sky = 1.0 - smoothstep(0.30, 0.90, overhead_rock);
+    if (style_id == 0) {
+        let snow_ledge = smoothstep(0.72, 0.88, n_base.y)
+                       * smoothstep(0.46, 0.72, alt_norm + (macro_n - 0.5) * 0.22)
+                       * exposed_sky
+                       * (1.0 - is_bridge_deck * 0.92)
+                       * (1.0 - wood_deck * 0.92)
+                       * (1.0 - smoothstep(0.16, 0.40, glow));
+        let high_snow = smoothstep(0.62, 0.82, luma_s) * smoothstep(0.46, 0.64, alt_norm) * smoothstep(0.55, 0.82, n_base.y);
+        let snow_w = clamp(max(snow_ledge * 0.64, high_snow * 0.74), 0.0, 1.0);
+        if (snow_w > 0.04) {
+            let speck = hash2(floor(p.xz * 7.2) + floor(p.y * 4.5));
+            let sparkle = step(0.90, speck) * 0.24 * snow_w;
+            let snow_col = vec3<f32>(0.78, 0.87, 0.97) + vec3<f32>(sparkle);
+            alb_srgb = mix(alb_srgb, clamp(snow_col, vec3<f32>(0.0), vec3<f32>(1.0)), snow_w * 0.58);
+            rough = mix(rough, 0.28, snow_w * 0.45);
+        }
+    } else {
+        let snow_w = smoothstep(0.58, 0.78, luma_s) * smoothstep(0.48, 0.62, alt_norm) * smoothstep(0.40, 0.80, n_base.y);
+        if (snow_w > 0.05) {
+            let speck = hash2(floor(p.xz * 6.5) + floor(p.y * 4.0));
+            let sparkle = step(0.91, speck) * 0.24 * snow_w;
+            alb_srgb = clamp(alb_srgb + vec3<f32>(sparkle), vec3<f32>(0.0), vec3<f32>(1.0));
+            rough = mix(rough, 0.28, snow_w * 0.45);
+        }
     }
 
     // (4) Wet shoreline pebble darkening on low-roughness wet stone/banks
@@ -410,12 +455,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         alb_srgb = clamp(alb_srgb * (0.94 + pebble * wet_w), vec3<f32>(0.0), vec3<f32>(1.0));
     }
 
-    // (5) Incandescent molten ember cracks & glowing lava veins (hotspots + Style 1 Volcanic)
-    if (glow > 0.05 || (style_id == 1 && p.y < 6.0)) {
-        let crack_n = triplanar_fbm(p + vec3<f32>(0.0, -sim_t * 0.15, 0.0), n_base, 1.45);
-        let vein = smoothstep(0.43, 0.51, abs(crack_n - 0.5));
-        let crack_boost = select(0.0, (1.0 - vein) * 0.36 * u.style_weights_c.w * smoothstep(6.0, 1.8, p.y), style_id == 1);
-        glow = clamp(glow + crack_boost + glow * (1.0 - vein) * 0.35, 0.0, 1.0);
+    // (5) Incandescent Molten Fissure Glow (`thermal > 0.55`) & Volcanic Lava Veins
+    var magma_emit = vec3<f32>(0.0);
+    if (raw_thermal > 0.45 || glow > 0.05 || (style_id == 1 && alt_norm < 0.42)) {
+        let crack_n = triplanar_fbm(p + vec3<f32>(0.0, -sim_t * 0.16, 0.0), n_base, 1.55);
+        let crack_sharp = 1.0 - smoothstep(0.015, 0.085, abs(crack_n - 0.50));
+        let pulse = 0.82 + 0.18 * sin(sim_t * 3.4 + p.x * 0.5 + p.z * 0.5);
+        let hot_fissure = smoothstep(0.55, 0.74, raw_thermal);
+        let crack_boost = select(0.0, crack_sharp * 0.42 * u.style_weights_c.w * smoothstep(0.42, 0.12, alt_norm), style_id == 1);
+        if (hot_fissure > 0.02) {
+            let char_rim = smoothstep(0.14, 0.06, abs(crack_n - 0.50)) * (1.0 - crack_sharp);
+            alb_srgb = mix(alb_srgb, vec3<f32>(0.09, 0.06, 0.08), char_rim * hot_fissure * 0.65);
+            magma_emit = blackbody_ramp(clamp(0.55 + crack_sharp * 0.45, 0.0, 1.0), vec3<f32>(1.0, 0.48, 0.08), style_id)
+                       * crack_sharp * hot_fissure * pulse * 1.45;
+        }
+        glow = clamp(glow + crack_boost + glow * crack_sharp * 0.40, 0.0, 1.0);
     }
 
     // (6) Arcane Thermal holographic contour scanlines & subtle spatial grid (Style 2)
@@ -470,28 +524,41 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let direct = u.sun_col.rgb * light_scalar;
     let bounce_emit = compute_emissive_bounce_3d(p, n_base, style_id);
 
-    // Subterranean vaulted cavern lighting so caves & arches never crush to black
-    let overhead_rock = sample_density(p + vec3<f32>(0.0, 2.8, 0.0)).r
-                      + sample_density(p + vec3<f32>(0.0, 4.6, 0.0)).r;
-    let in_cave = smoothstep(0.40, 1.15, overhead_rock) * smoothstep(7.2, 4.0, p.y);
-    let cave_albedo = max(albedo, vec3<f32>(0.085, 0.095, 0.125));
-    let torch_dir = normalize(u.cam_pos.xyz - p + vec3<f32>(0.0, 0.8, 0.0));
-    let torch_att = 1.0 / (1.0 + hit_t * hit_t * 0.0022);
-    let torch_nd = max(dot(n, torch_dir), 0.15);
-    var cave_tint = vec3<f32>(0.92, 0.42, 0.16);
-    var cave_rim_col = vec3<f32>(0.22, 0.36, 0.62);
-    if (style_id == 2) {
-        cave_tint = vec3<f32>(0.34, 0.56, 0.96);
-        cave_rim_col = vec3<f32>(0.62, 0.24, 0.78);
-    } else if (style_id == 3) {
-        cave_tint = vec3<f32>(0.18, 0.86, 0.52);
-        cave_rim_col = vec3<f32>(0.12, 0.58, 0.62);
-    }
-    let magma_glow_amb = cave_tint * (0.28 + 0.52 * max(-n.y, 0.0) + 0.35 * torch_nd * torch_att);
-    let cavern_rim = cave_rim_col * (0.22 + 0.65 * pow(1.0 - ndv, 2.0));
-    let cave_lit = cave_albedo * (magma_glow_amb + cavern_rim + bounce_emit * 2.2) * in_cave;
+    // Subterranean vaulted cavern lighting + Cool Cyan/Amethyst Cavern Crystal Veins!
+    let in_cave = smoothstep(0.38, 1.12, overhead_rock) * smoothstep(7.2 * d_scale, 3.2 * d_scale, p.y);
+    var cave_lit = vec3<f32>(0.0);
+    if (in_cave > 0.02) {
+        let cave_albedo = max(albedo, vec3<f32>(0.085, 0.095, 0.125));
+        let torch_dir = normalize(u.cam_pos.xyz - p + vec3<f32>(0.0, 0.8, 0.0));
+        let torch_att = 1.0 / (1.0 + hit_t * hit_t * 0.0022);
+        let torch_nd = max(dot(n, torch_dir), 0.15);
+        var cave_tint = vec3<f32>(0.92, 0.42, 0.16);
+        var cave_rim_col = vec3<f32>(0.22, 0.36, 0.62);
+        if (style_id == 2) {
+            cave_tint = vec3<f32>(0.34, 0.56, 0.96);
+            cave_rim_col = vec3<f32>(0.62, 0.24, 0.78);
+        } else if (style_id == 3) {
+            cave_tint = vec3<f32>(0.18, 0.86, 0.52);
+            cave_rim_col = vec3<f32>(0.12, 0.58, 0.62);
+        }
+        let magma_glow_amb = cave_tint * (0.28 + 0.52 * max(-n.y, 0.0) + 0.35 * torch_nd * torch_att);
+        let cavern_rim = cave_rim_col * (0.22 + 0.65 * pow(1.0 - ndv, 2.0));
 
-    var hdr = albedo * (direct + ambient * 0.80 + bounce_emit) + cave_lit + u.sun_col.rgb * spec;
+        // Faceted glowing cyan/turquoise & amethyst subterranean mineral crystal veins
+        let cryst_n = triplanar_fbm(p * 0.85, n_base, 1.25);
+        let cryst_vein = 1.0 - smoothstep(0.015, 0.075, abs(cryst_n - 0.52));
+        let hue_sel = smoothstep(0.35, 0.65, triplanar_noise(p, n_base, 0.28));
+        let cyan_col = vec3<f32>(0.08, 0.90, 0.94);
+        let amet_col = vec3<f32>(0.68, 0.24, 1.00);
+        let cryst_col = mix(cyan_col, amet_col, hue_sel);
+        let cryst_pulse = 0.74 + 0.26 * sin(sim_t * 2.2 + p.x * 0.35 + p.z * 0.42);
+        let cryst_glint = pow(ndh, 28.0) * 0.80 + fresnel * 0.65;
+        let crystal_emit = cryst_col * cryst_vein * (0.55 + cryst_glint) * cryst_pulse;
+
+        cave_lit = (cave_albedo * (magma_glow_amb + cavern_rim + bounce_emit * 2.2) + crystal_emit * 1.15) * in_cave;
+    }
+
+    var hdr = albedo * (direct + ambient * 0.80 + bounce_emit) + cave_lit + magma_emit + u.sun_col.rgb * spec;
 
     // Signature stylized shadow/highlight ramp when Pixel-2xSS mode is active
     if (stylized > 0.5) {
@@ -508,13 +575,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             warm_hi = srgb_to_linear(vec3<f32>(0.76, 1.00, 0.84));
         }
         let shadow_t = clamp(1.0 - light_scalar * 1.45, 0.0, 1.0) * (1.0 - clamp(glow * 2.0, 0.0, 1.0));
-        hdr = mix(hdr, cool_ink * (0.25 + 0.55 * ao), shadow_t * 0.16);
-        let hi_t = clamp((light_scalar - 0.72) * 1.8, 0.0, 1.0);
-        hdr = mix(hdr, hdr * 0.82 + warm_hi * 0.22, hi_t * 0.24);
+        hdr = mix(hdr, cool_ink * (0.25 + 0.55 * ao), shadow_t * 0.18);
+        let hi_t = clamp((light_scalar - 0.70) * 1.8, 0.0, 1.0);
+        hdr = mix(hdr, hdr * 0.83 + warm_hi * 0.23, hi_t * 0.25);
     }
 
     if (glow > 0.04) {
         hdr += blackbody_ramp(glow, albedo, style_id);
+    }
+
+    // Soft glowing rock cross-section rim along Smart 3D Cave/Bridge Ceiling Cutaway edge
+    if (cutaway_rim > 0.01) {
+        var rim_col = vec3<f32>(0.68, 0.86, 1.05);
+        if (style_id == 1) {
+            rim_col = vec3<f32>(1.15, 0.56, 0.20);
+        } else if (style_id == 2) {
+            rim_col = vec3<f32>(0.42, 0.92, 1.25);
+        } else if (style_id == 3) {
+            rim_col = vec3<f32>(0.26, 1.08, 0.66);
+        }
+        hdr += rim_col * cutaway_rim * 0.65;
     }
 
     let fog_t = clamp((hit_t - 55.0) / 195.0, 0.0, 0.76);

@@ -89,11 +89,11 @@ export interface InitOutput {
     readonly frostmarshapp_toggle_capsule_mode: (a: number) => number;
     readonly frostmarshapp_toggle_pixel_style: (a: number) => number;
     readonly frostmarshapp_zoom_wheel: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_6603: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6624: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_831: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_831_22: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_831_23: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6604: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6625: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_832: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_832_22: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_832_23: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

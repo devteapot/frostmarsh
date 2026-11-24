@@ -838,6 +838,22 @@ impl Approach4Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
             ],
         });
 
@@ -2153,6 +2169,14 @@ impl Approach4Renderer {
                         binding: 5,
                         resource: wgpu::BindingResource::Sampler(&self.z16_vol_samp),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&self.shadow_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::Sampler(&self.shadow_samp),
+                    },
                 ],
             }))
         } else {
@@ -2312,7 +2336,14 @@ impl Approach4Renderer {
                 rp.set_vertex_buffer(0, self.static_vbuf.slice(..));
                 rp.set_index_buffer(self.static_ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 for (k, &(s, e)) in batch_ranges.iter().enumerate() {
-                    if e > s {
+                    // Skip luminous energy FX rings/halos/slashes so they never cast opaque shadows on bridges!
+                    if e > s
+                        && k != crate::mesh_gen::MeshKind::GroundRing as usize
+                        && k != crate::mesh_gen::MeshKind::ShrineRuneRing as usize
+                        && k != crate::mesh_gen::MeshKind::DashHalo as usize
+                        && k != crate::mesh_gen::MeshKind::MeleeArc as usize
+                        && k != crate::mesh_gen::MeshKind::ProjectileOrb as usize
+                    {
                         let sl = self.mesh_slices[k];
                         rp.draw_indexed(sl.first_index..sl.first_index + sl.index_count, 0, s..e);
                     }

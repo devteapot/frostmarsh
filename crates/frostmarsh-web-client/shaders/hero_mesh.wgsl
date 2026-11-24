@@ -1,5 +1,8 @@
-// Depth-Tested 3D Parametric Hero Knight & Live Projectile Orb Shader (WebGPU Linear HDR Output)
-// Receives exact 3D-texture raymarched sun shadows, 3D-texture cave AO, and style-aware local emissive bounce.
+// Wave 18A: Rim-Lit 5-Archetype 3D Parametric GPU Hero & Live Projectile Orb Shader (WebGPU Linear HDR)
+// Features:
+//   - View-dependent team-tinted Fresnel rim lighting (frost-cyan for Team 0, ember-gold for Team 1)
+//   - Crisp emissive core boosts on weapons, Skywing pinions, Tidekin tridents & spinning Burrower drills
+//   - Fast 6-tap 3D volumetric sun shadows, 3D cave AO, and style-aware local emissive bounce.
 
 struct SceneUniforms {
     view_proj: mat4x4<f32>,
@@ -39,6 +42,8 @@ struct VsOut {
     @location(1) world_normal: vec3<f32>,
     @location(2) albedo_rough: vec4<f32>,
     @location(3) emissive: f32,
+    @location(4) @interpolate(flat) rim_color: vec3<f32>,
+    @location(5) anim_flags: vec2<f32>, // x = wing_flap_weight, y = secondary_anim (1=hover, 2=drill_spin)
 };
 
 @vertex
@@ -104,12 +109,18 @@ fn vs_main(in: VsIn) -> VsOut {
 
     let base_col = mix(in.color_rough.rgb, in.color_rough.rgb * in.inst_faction_scale.rgb, in.flags.x);
 
+    // Team-tinted Fresnel rim color (frost-cyan for Team 0 blue/cyan, ember-gold for Team 1 red/amber)
+    let is_frost_team = in.inst_faction_scale.b > in.inst_faction_scale.r;
+    let rim_col = select(vec3<f32>(1.18, 0.52, 0.08), vec3<f32>(0.16, 0.90, 1.24), is_frost_team);
+
     var out: VsOut;
     out.clip_pos = u.view_proj * vec4<f32>(wp, 1.0);
     out.world_pos = wp;
     out.world_normal = wn;
     out.albedo_rough = vec4<f32>(base_col, in.color_rough.a);
     out.emissive = in.flags.y;
+    out.rim_color = rim_col;
+    out.anim_flags = in.flags.zw;
     return out;
 }
 
@@ -147,26 +158,19 @@ fn blackbody_ramp(temp: f32, tint: vec3<f32>, style_id: i32) -> vec3<f32> {
 fn compute_sun_shadow_hero(p: vec3<f32>) -> f32 {
     let l = u.sun_dir.xyz;
     let dims = u.vol_dims.xyz;
-    let bdims = vec3<i32>(u.brick_dims.xyz);
-    let bsize = u.brick_dims.w;
-    var t = 0.45;
+    let taps = array<f32, 6>(0.80, 1.95, 3.8, 6.6, 10.8, 16.0);
     var vis = 1.0;
-    for (var i = 0; i < 24; i = i + 1) {
-        let sp = p + l * t;
+    for (var i = 0; i < 6; i = i + 1) {
+        let sp = p + l * taps[i];
         if (sp.y >= dims.y || sp.x <= 0.0 || sp.x >= dims.x || sp.z <= 0.0 || sp.z >= dims.z) {
             break;
         }
-        let bc = clamp(vec3<i32>(floor(sp / bsize)), vec3<i32>(0), bdims - vec3<i32>(1));
-        if (textureLoad(brick_tex, bc, 0).r < 0.04) {
-            t += 2.2;
-            continue;
-        }
         let d = sample_density(sp).r;
-        if (d >= 0.5) {
+        let pen = smoothstep(0.54, 0.22, d);
+        vis = min(vis, pen);
+        if (vis < 0.04) {
             return 0.0;
         }
-        vis = min(vis, clamp((0.5 - d) * 4.5 + 0.15, 0.0, 1.0));
-        t += 0.6 + t * 0.08;
     }
     return vis;
 }
@@ -179,6 +183,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let l = u.sun_dir.xyz;
     let h = normalize(l + v);
     let style_id = i32(round(u.sun_col.w));
+    let sim_t = u.cam_pos.w;
 
     let lin_albedo = pow(clamp(in.albedo_rough.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
     if (in.emissive > 0.90) {
@@ -196,7 +201,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let shadow = compute_sun_shadow_hero(p + n * 0.2);
     let roof_occ = sample_density(p + vec3<f32>(0.0, 3.2, 0.0)).r * 0.45
         + sample_density(p + vec3<f32>(0.0, 5.2, 0.0)).r * 0.30;
-    let ao = clamp(1.0 - roof_occ, 0.28, 1.0);
+    let ao = clamp(1.0 - roof_occ, 0.32, 1.0);
 
     var bounce = vec3<f32>(0.0);
     let offsets = array<vec3<f32>, 4>(
@@ -213,15 +218,38 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     let sky_w = n.y * 0.5 + 0.5;
-    let ambient = mix(vec3<f32>(0.06, 0.08, 0.14), u.sky_top.rgb * 0.85 + u.sky_horizon.rgb * 0.30, sky_w) * ao;
-    let shininess = mix(110.0, 12.0, rough);
-    let spec_w = mix(0.95, 0.06, rough);
-    let spec = pow(ndh, shininess) * spec_w * ndl * (0.25 + 0.75 * shadow);
-    let rim = pow(1.0 - ndv, 3.2) * (u.sky_horizon.rgb * 0.28 * ao + bounce * 0.48);
+    // Guarantee crisp hero silhouette readability inside shadows & vaulted caverns
+    let ambient = max(
+        mix(vec3<f32>(0.08, 0.11, 0.18), u.sky_top.rgb * 0.88 + u.sky_horizon.rgb * 0.34, sky_w) * ao,
+        vec3<f32>(0.13, 0.16, 0.24),
+    );
+    let cam_fill = 0.16 * ndv;
+    let shininess = mix(115.0, 12.0, rough);
+    let spec_w = mix(1.05, 0.06, rough);
+    let blade_sheen = smoothstep(0.18, 0.10, rough) * 0.45;
+    let spec = pow(ndh, shininess) * (spec_w + blade_sheen) * (0.28 + 0.72 * ndl * (0.30 + 0.70 * shadow));
 
-    let accent_glow = lin_albedo * (in.emissive * 3.4);
-    let hdr = lin_albedo * (u.sun_col.rgb * ndl * shadow + ambient + bounce)
-        + u.sun_col.rgb * spec + rim + accent_glow;
+    // View-dependent team-tinted Fresnel rim lighting (frost-cyan Team 0, ember-gold Team 1)
+    let hero_fres = pow(1.0 - ndv, 2.15);
+    let top_accent = 0.55 + 0.45 * max(n.y, 0.0);
+    let team_rim = in.rim_color * hero_fres * top_accent * 1.12;
+    let env_rim = pow(1.0 - ndv, 3.0) * (u.sky_horizon.rgb * 0.26 * ao + bounce * 0.48);
+
+    // Crisp emissive core boosts on weapons, Skywing pinions, Tidekin tridents & spinning Burrower drills
+    var accent_glow = vec3<f32>(0.0);
+    if (in.emissive > 0.04) {
+        let is_drill = step(1.5, in.anim_flags.y);
+        let is_pinion = smoothstep(0.55, 0.95, in.anim_flags.x);
+        let is_weapon_core = smoothstep(0.52, 0.82, in.emissive);
+        let pulse_freq = select(4.8, 12.0, is_drill > 0.5);
+        let pulse = 0.88 + 0.16 * sin(sim_t * pulse_freq + p.x * 0.45 + p.z * 0.45);
+        let core_hot = mix(lin_albedo, vec3<f32>(1.0, 0.97, 0.90), 0.24 + 0.24 * pow(ndv, 1.5) * is_weapon_core);
+        let boost = 3.8 + is_pinion * 1.35 + is_drill * 1.65 + is_weapon_core * 0.95;
+        accent_glow = core_hot * (in.emissive * boost * pulse);
+    }
+
+    let hdr = lin_albedo * (u.sun_col.rgb * (ndl * shadow + cam_fill * 0.35) + ambient + bounce)
+        + u.sun_col.rgb * spec + team_rim + env_rim + accent_glow;
 
     return vec4<f32>(hdr, 1.0);
 }

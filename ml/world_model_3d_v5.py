@@ -1253,33 +1253,34 @@ def _apply_xy_boundary_replicate_(
     m_y1: torch.Tensor,
     m_x0: torch.Tensor,
     m_x1: torch.Tensor,
+    inplace: bool = False,
 ) -> torch.Tensor:
     """
     Exact outer-world boundary replicate fixup on 5D brick tensor `t [K, C, Zp, Hp, Wp]`
     before a valid `(1,3,3)` or `(3,3,3)` conv so edge bricks match dense replicate-pad bit-for-bit!
-    Only touches the single ghost row/col needed by the upcoming 3x3 stencil.
+    Zero GPU-CPU `.item()` syncs and updates only the narrow `rem_xy` ghost border strips.
     """
     if rem_xy <= 0:
         return t
+    if not inplace:
+        t = t.clone()
     # Valid interior spans y in [rem_xy, rem_xy + by - 1], x in [rem_xy, rem_xy + bx - 1]
-    if bool(m_y0.any().item()):
-        y_src = t[:, :, :, rem_xy : rem_xy + 1, :]
-        t = torch.where(m_y0, torch.cat([y_src.expand(-1, -1, -1, rem_xy, -1), t[:, :, :, rem_xy:, :]], dim=3), t)
-    if bool(m_y1.any().item()):
-        y_end = rem_xy + by
-        y_src = t[:, :, :, y_end - 1 : y_end, :]
-        rem_hi = t.shape[3] - y_end
-        if rem_hi > 0:
-            t = torch.where(m_y1, torch.cat([t[:, :, :, :y_end, :], y_src.expand(-1, -1, -1, rem_hi, -1)], dim=3), t)
-    if bool(m_x0.any().item()):
-        x_src = t[:, :, :, :, rem_xy : rem_xy + 1]
-        t = torch.where(m_x0, torch.cat([x_src.expand(-1, -1, -1, -1, rem_xy), t[:, :, :, :, rem_xy:]], dim=4), t)
-    if bool(m_x1.any().item()):
-        x_end = rem_xy + bx
-        x_src = t[:, :, :, :, x_end - 1 : x_end]
-        rem_hi = t.shape[4] - x_end
-        if rem_hi > 0:
-            t = torch.where(m_x1, torch.cat([t[:, :, :, :, :x_end], x_src.expand(-1, -1, -1, -1, rem_hi)], dim=4), t)
+    t[:, :, :, :rem_xy, :] = torch.where(
+        m_y0, t[:, :, :, rem_xy : rem_xy + 1, :], t[:, :, :, :rem_xy, :]
+    )
+    y_end = rem_xy + by
+    if t.shape[3] > y_end:
+        t[:, :, :, y_end:, :] = torch.where(
+            m_y1, t[:, :, :, y_end - 1 : y_end, :], t[:, :, :, y_end:, :]
+        )
+    t[:, :, :, :, :rem_xy] = torch.where(
+        m_x0, t[:, :, :, :, rem_xy : rem_xy + 1], t[:, :, :, :, :rem_xy]
+    )
+    x_end = rem_xy + bx
+    if t.shape[4] > x_end:
+        t[:, :, :, :, x_end:] = torch.where(
+            m_x1, t[:, :, :, :, x_end - 1 : x_end], t[:, :, :, :, x_end:]
+        )
     return t
 
 
@@ -1289,64 +1290,50 @@ def _apply_z_boundary_replicate_(
     bz: int,
     m_z0: torch.Tensor,
     m_z1: torch.Tensor,
+    inplace: bool = False,
 ) -> torch.Tensor:
     """
     Exact outer-world Z boundary replicate fixup on 5D brick tensor `t [K, C, Zp, Hp, Wp]`
     before a valid `(3,1,1)` or `(3,3,3)` conv so `tz == 0` and `tz == nz - 1` bricks match
     dense per-layer replicate padding bit-for-bit across ALL `L` strata!
+    Zero GPU-CPU `.item()` syncs.
     """
-    if rem_z_lo > 0 and bool(m_z0.any().item()):
-        z_src = t[:, :, rem_z_lo : rem_z_lo + 1, :, :]
-        t = torch.where(m_z0, torch.cat([z_src.expand(-1, -1, rem_z_lo, -1, -1), t[:, :, rem_z_lo:, :, :]], dim=2), t)
+    if not inplace:
+        t = t.clone()
+    if rem_z_lo > 0:
+        t[:, :, :rem_z_lo, :, :] = torch.where(
+            m_z0, t[:, :, rem_z_lo : rem_z_lo + 1, :, :], t[:, :, :rem_z_lo, :, :]
+        )
     z_end = rem_z_lo + bz
-    rem_z_hi = t.shape[2] - z_end
-    if rem_z_hi > 0 and bool(m_z1.any().item()):
-        z_src = t[:, :, z_end - 1 : z_end, :, :]
-        t = torch.where(m_z1, torch.cat([t[:, :, :z_end, :, :], z_src.expand(-1, -1, rem_z_hi, -1, -1)], dim=2), t)
+    if t.shape[2] > z_end:
+        t[:, :, z_end:, :, :] = torch.where(
+            m_z1, t[:, :, z_end - 1 : z_end, :, :], t[:, :, z_end:, :, :]
+        )
     return t
 
 
-def shrinking_halo_3d_brick_forward(
+def _shrinking_halo_3d_brick_core(
     wm: WorldModel3DV5,
     patches_x: torch.Tensor,
     patches_dt: torch.Tensor,
-    brick_coords: torch.Tensor,
-    grid_bricks: tuple[int, int, int],
+    m_z0: torch.Tensor,
+    m_z1: torch.Tensor,
+    m_y0: torch.Tensor,
+    m_y1: torch.Tensor,
+    m_x0: torch.Tensor,
+    m_x1: torch.Tensor,
     brick_size: tuple[int, int, int] = (8, 16, 16),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Exact mathematically identical shrinking-halo 3D brick forward for `WorldModel3DV5`!
-      Inputs:
-        - `patches_x`   : `[K, 18, Bz + 2*halo_z + 1, By + 2*halo_xy, Bx + 2*halo_xy]` (e.g. `[K, 18, 15, 28, 28]`)
-        - `patches_dt`  : `[K,  1, Bz + 2*halo_z + 1, By + 2*halo_xy, Bx + 2*halo_xy]`
-        - `brick_coords`: `[K, 3]` `(tz, ty, tx)` brick indices (for exact outer-world boundary fixup)
-        - `grid_bricks` : `(nz, ny, nx)`
-        - `brick_size`  : `(Bz, By, Bx)` = `(8, 16, 16)`
-      Outputs:
-        - `horiz` : `[K, Bz, 17, By, Bx]`
-        - `z_flux`: `[K, Bz,  5, By, Bx]` (interfaces `z <-> z+1`; last slice of top brick ignored by caller)
-        - `z_out` : `[K, Bz, 48, By, Bx]`
-    """
+    """Zero-sync, torch.compile-friendly core for shrinking-halo 3D brick forward."""
     K, C_in, Zp, Hp, Wp = patches_x.shape
     Bz, By, Bx = brick_size
-    nz, ny, nx = grid_bricks
     hz = wm.halo_z
     hxy = wm.halo_xy
-    assert Zp == Bz + 2 * hz + 1, f"Expected Zp={Bz + 2 * hz + 1}, got {Zp}"
-    assert Hp == By + 2 * hxy and Wp == Bx + 2 * hxy, f"Expected XY={(By + 2 * hxy, Bx + 2 * hxy)}, got {(Hp, Wp)}"
-
-    tz, ty, tx = brick_coords[:, 0], brick_coords[:, 1], brick_coords[:, 2]
-    m_z0 = (tz == 0).view(K, 1, 1, 1, 1)
-    m_z1 = (tz == (nz - 1)).view(K, 1, 1, 1, 1)
-    m_y0 = (ty == 0).view(K, 1, 1, 1, 1)
-    m_y1 = (ty == (ny - 1)).view(K, 1, 1, 1, 1)
-    m_x0 = (tx == 0).view(K, 1, 1, 1, 1)
-    m_x1 = (tx == (nx - 1)).view(K, 1, 1, 1, 1)
 
     # 1. Stem: valid (1, 3, 3) conv shrinks XY by 2: (Hp, Wp) -> (Hp-2, Wp-2); Z unchanged (Zp)
     rem_xy = hxy
     rem_z = hz
-    x_in = _apply_xy_boundary_replicate_(patches_x, rem_xy, By, Bx, m_y0, m_y1, m_x0, m_x1)
+    x_in = _apply_xy_boundary_replicate_(patches_x, rem_xy, By, Bx, m_y0, m_y1, m_x0, m_x1, inplace=False)
     x_in_2d = x_in.transpose(1, 2).reshape(K * Zp, C_in, Hp, Wp)
     h_2d = wm.stem(x_in_2d)
     rem_xy -= 1
@@ -1373,7 +1360,7 @@ def shrinking_halo_3d_brick_forward(
         if isinstance(blk, Factorized3DResBlock):
             h_mod = h * (1.0 + 0.5 * torch.tanh(gamma_f)) + beta_f
             act = F.gelu(h_mod)
-            act = _apply_xy_boundary_replicate_(act, rem_xy, By, Bx, m_y0, m_y1, m_x0, m_x1)
+            act = _apply_xy_boundary_replicate_(act, rem_xy, By, Bx, m_y0, m_y1, m_x0, m_x1, inplace=True)
             s_out = blk.spatial_conv(act.transpose(1, 2).reshape(K * Zc, wm.width, Hc, Wc))
             Hc -= 2
             Wc -= 2
@@ -1384,7 +1371,7 @@ def shrinking_halo_3d_brick_forward(
 
             if blk.use_vert and blk.vert_conv is not None and blk.gamma_z is not None:
                 v_in = F.gelu(h)
-                v_in = _apply_z_boundary_replicate_(v_in, rem_z, Bz, m_z0, m_z1)
+                v_in = _apply_z_boundary_replicate_(v_in, rem_z, Bz, m_z0, m_z1, inplace=True)
                 v_out = blk.vert_conv(v_in)
                 Zc -= 2
                 rem_z -= 1
@@ -1394,8 +1381,8 @@ def shrinking_halo_3d_brick_forward(
             assert isinstance(blk, Isotropic3x3x3ResBlock)
             h_mod = h * (1.0 + 0.5 * torch.tanh(gamma_f)) + beta_f
             u = F.gelu(blk.pw_in(F.gelu(h_mod)))
-            u = _apply_xy_boundary_replicate_(u, rem_xy, By, Bx, m_y0, m_y1, m_x0, m_x1)
-            u = _apply_z_boundary_replicate_(u, rem_z, Bz, m_z0, m_z1)
+            u = _apply_xy_boundary_replicate_(u, rem_xy, By, Bx, m_y0, m_y1, m_x0, m_x1, inplace=True)
+            u = _apply_z_boundary_replicate_(u, rem_z, Bz, m_z0, m_z1, inplace=True)
             u = F.gelu(blk.conv3d(u))
             Zc -= 2
             Hc -= 2
@@ -1412,7 +1399,7 @@ def shrinking_halo_3d_brick_forward(
     x_int = x_all[:, :Bz]
 
     # Exact center + 1-pixel east/south dt from patch halo (respecting world edge replicate!)
-    dt_pad_xy = _apply_xy_boundary_replicate_(patches_dt.clamp(min=0.0), hxy, By, Bx, m_y0, m_y1, m_x0, m_x1)
+    dt_pad_xy = _apply_xy_boundary_replicate_(patches_dt.clamp(min=0.0), hxy, By, Bx, m_y0, m_y1, m_x0, m_x1, inplace=True)
     dt_all = dt_pad_xy[:, :, hz : hz + Bz + 1, hxy:-hxy, hxy:-hxy].transpose(1, 2)  # [K, Bz+1, 1, By, Bx]
     dt_int = dt_all[:, :Bz]
     dt_e_nb = dt_pad_xy[:, :, hz : hz + Bz, hxy:-hxy, hxy + 1 : Wp - hxy + 1].transpose(1, 2)
@@ -1460,13 +1447,82 @@ def shrinking_halo_3d_brick_forward(
     return horiz, z_flux, z_out
 
 
+def shrinking_halo_3d_brick_forward(
+    wm: WorldModel3DV5,
+    patches_x: torch.Tensor,
+    patches_dt: torch.Tensor,
+    brick_coords: torch.Tensor,
+    grid_bricks: tuple[int, int, int],
+    brick_size: tuple[int, int, int] = (8, 16, 16),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Exact mathematically identical shrinking-halo 3D brick forward for `WorldModel3DV5`!
+      Inputs:
+        - `patches_x`   : `[K, 18, Bz + 2*halo_z + 1, By + 2*halo_xy, Bx + 2*halo_xy]` (e.g. `[K, 18, 15, 28, 28]`)
+        - `patches_dt`  : `[K,  1, Bz + 2*halo_z + 1, By + 2*halo_xy, Bx + 2*halo_xy]`
+        - `brick_coords`: `[K, 3]` `(tz, ty, tx)` brick indices (for exact outer-world boundary fixup)
+        - `grid_bricks` : `(nz, ny, nx)`
+        - `brick_size`  : `(Bz, By, Bx)` = `(8, 16, 16)`
+      Outputs:
+        - `horiz` : `[K, Bz, 17, By, Bx]`
+        - `z_flux`: `[K, Bz,  5, By, Bx]` (interfaces `z <-> z+1`; last slice of top brick ignored by caller)
+        - `z_out` : `[K, Bz, 48, By, Bx]`
+    """
+    K, _, Zp, Hp, Wp = patches_x.shape
+    Bz, By, Bx = brick_size
+    nz, ny, nx = grid_bricks
+    hz = wm.halo_z
+    hxy = wm.halo_xy
+    assert Zp == Bz + 2 * hz + 1, f"Expected Zp={Bz + 2 * hz + 1}, got {Zp}"
+    assert Hp == By + 2 * hxy and Wp == Bx + 2 * hxy, f"Expected XY={(By + 2 * hxy, Bx + 2 * hxy)}, got {(Hp, Wp)}"
+
+    tz, ty, tx = brick_coords[:, 0], brick_coords[:, 1], brick_coords[:, 2]
+    m_z0 = (tz == 0).view(K, 1, 1, 1, 1)
+    m_z1 = (tz == (nz - 1)).view(K, 1, 1, 1, 1)
+    m_y0 = (ty == 0).view(K, 1, 1, 1, 1)
+    m_y1 = (ty == (ny - 1)).view(K, 1, 1, 1, 1)
+    m_x0 = (tx == 0).view(K, 1, 1, 1, 1)
+    m_x1 = (tx == (nx - 1)).view(K, 1, 1, 1, 1)
+
+    return _shrinking_halo_3d_brick_core(
+        wm, patches_x, patches_dt, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1, brick_size=brick_size
+    )
+
+
+class _CompiledBrickModule(nn.Module):
+    """Thin nn.Module wrapper so `torch.compile(..., mode='reduce-overhead')` fuses sparse brick passes cleanly."""
+
+    def __init__(self, wm: WorldModel3DV5, brick_size: tuple[int, int, int]) -> None:
+        super().__init__()
+        self.wm = wm
+        self.brick_size = brick_size
+
+    def forward(
+        self,
+        patches_x: torch.Tensor,
+        patches_dt: torch.Tensor,
+        m_z0: torch.Tensor,
+        m_z1: torch.Tensor,
+        m_y0: torch.Tensor,
+        m_y1: torch.Tensor,
+        m_x0: torch.Tensor,
+        m_x1: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _shrinking_halo_3d_brick_core(
+            self.wm, patches_x, patches_dt, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1, brick_size=self.brick_size
+        )
+
+
 class SparseWorld3DV5Runner:
     """
     Production True 3D `16x16x8` Sparse Active-Brick Runner for `WorldModel3DV5`.
 
     Maintains persistent device caches (`_last_horiz`, `_last_z_flux_pad`, `_last_z`, `_last_x`, `_last_dt`)
     and evaluates ONLY dirty `16x16x8` 3D bricks `(tz, ty, tx)` via exact shrinking-halo valid convolutions
-    whenever `active_brick_frac < sparse_threshold` (with exact FP32 dense-vs-sparse parity `< 1e-5`!).
+    whenever `active_brick_frac < sparse_threshold` (default `0.42`).
+    - When `activity_eps == 0.0` (default): bit-exact FP32 dense-vs-sparse parity (`0.0`) on every voxel!
+    - When `activity_eps > 0.0` (e.g. `5e-4` for live evolving worlds): suppresses tiny ambient cooling /
+      quiescent bedrock ripples so live worlds stay in fast sparse execution instead of falling back to dense!
     """
 
     def __init__(
@@ -1476,8 +1532,9 @@ class SparseWorld3DV5Runner:
         use_fp16: bool = True,
         brick_xy: int = 16,
         brick_z: int = 8,
-        sparse_threshold: float = 0.55,
+        sparse_threshold: float = 0.42,
         diff_eps: float = 1e-4,
+        activity_eps: float = 0.0,
         bucket_size: int = 32,
     ) -> None:
         self.device = torch.device(device)
@@ -1487,6 +1544,7 @@ class SparseWorld3DV5Runner:
         self.brick_z = int(brick_z)
         self.sparse_threshold = float(sparse_threshold)
         self.diff_eps = float(diff_eps)
+        self.activity_eps = max(0.0, float(activity_eps))
         self.bucket_size = max(1, int(bucket_size))
 
         self.halo_xy = world_model.halo_xy
@@ -1499,11 +1557,16 @@ class SparseWorld3DV5Runner:
         for p in self._wm.parameters():
             p.requires_grad_(False)
         self._wm_dense: Any = self._wm
+        self._brick_mod: Any = _CompiledBrickModule(self._wm, (self.brick_z, self.brick_xy, self.brick_xy)).eval()
         if self.device.type == "cuda" and self.use_fp16 and hasattr(torch, "compile"):
             try:
                 self._wm_dense = torch.compile(self._wm, mode="reduce-overhead")
             except Exception:
                 self._wm_dense = self._wm
+            try:
+                self._brick_mod = torch.compile(self._brick_mod, mode="reduce-overhead")
+            except Exception:
+                pass
 
         self._last_horiz: torch.Tensor | None = None
         self._last_z_flux_pad: torch.Tensor | None = None
@@ -1534,7 +1597,7 @@ class SparseWorld3DV5Runner:
             return t.expand(L, 1, H, W).contiguous()
         raise ValueError(f"Unsupported local_dt shape {tuple(t.shape)}")
 
-    def _compute_brick_mask(
+    def active_brick_mask(
         self,
         x_cur: torch.Tensor,
         dt_cur: torch.Tensor,
@@ -1559,20 +1622,30 @@ class SparseWorld3DV5Runner:
 
         ref = prev_x.to(device=self.device, dtype=self.compute_dtype) if prev_x is not None else self._last_x
         assert ref is not None
-        d_sp = (x_cur[:, :10] - ref[:, :10]).abs().amax(dim=1) > max(self.diff_eps, 0.012)
-        d_tmp = (x_cur[:, 10] - ref[:, 10]).abs() > max(self.diff_eps * 4.0, 0.035)
-        has_force = (x_cur[:, 16].abs() > 0.01) | (x_cur[:, 17].abs() > 0.01)
-        diff_vox = (d_sp | d_tmp | has_force).to(dtype=self.compute_dtype)  # [L, H, W]
 
-        if self._last_dt is not None and self._last_dt.shape == dt_cur.shape:
-            dt_diff = (dt_cur[:, 0] - self._last_dt[:, 0]).abs() > 1e-3
-            diff_vox = torch.maximum(diff_vox, dt_diff.to(dtype=self.compute_dtype))
+        if self.activity_eps <= 0.0:
+            # Bit-exact mode: ANY non-zero change across all 18 channels or dt marks the voxel dirty!
+            diff_vox = ((x_cur - ref).abs().amax(dim=1) > 0.0).to(dtype=self.compute_dtype)
+            if self._last_dt is not None and self._last_dt.shape == dt_cur.shape:
+                dt_diff = (dt_cur[:, 0] - self._last_dt[:, 0]).abs() > 0.0
+                diff_vox = torch.maximum(diff_vox, dt_diff.to(dtype=self.compute_dtype))
+        else:
+            # Live-world mode: ignore tiny ambient cooling / sub-threshold noise in quiescent bedrock/air bricks!
+            eps = self.activity_eps
+            d_sp = (x_cur[:, :10] - ref[:, :10]).abs().amax(dim=1) > max(eps * 24.0, self.diff_eps, 0.012)
+            d_tmp = (x_cur[:, 10] - ref[:, 10]).abs() > max(eps * 70.0, self.diff_eps * 4.0, 0.035)
+            d_flow = (x_cur[:, 12:14] - ref[:, 12:14]).abs().amax(dim=1) > max(eps * 20.0, 0.010)
+            has_force = (x_cur[:, 16].abs() > max(eps, 0.01)) | (x_cur[:, 17].abs() > max(eps, 0.01))
+            diff_vox = (d_sp | d_tmp | d_flow | has_force).to(dtype=self.compute_dtype)
+            if self._last_dt is not None and self._last_dt.shape == dt_cur.shape:
+                dt_diff = (dt_cur[:, 0] - self._last_dt[:, 0]).abs() > 1e-3
+                diff_vox = torch.maximum(diff_vox, dt_diff.to(dtype=self.compute_dtype))
 
-        # Dilate dirty voxels by exact 3D receptive field (halo_z + 1 in Z, halo_xy in XY) OR pool into bricks!
-        # Note: when using automatic dirty detection, dilating by 1 brick in Z/XY ensures neighbor bricks
-        # seeing the changed voxel inside their halo also refresh for exact dense parity!
         pooled = F.max_pool3d(diff_vox.unsqueeze(0).unsqueeze(0), (Bz, By, Bx), (Bz, By, Bx))
         return pooled[0, 0] > 0.5
+
+    # Backward-compatible internal alias
+    _compute_brick_mask = active_brick_mask
 
     @torch.inference_mode()
     def step(
@@ -1614,7 +1687,7 @@ class SparseWorld3DV5Runner:
 
             nz, ny, nx = L // Bz, H // By, W // Bx
             total_bricks = nz * ny * nx
-            brick_active = self._compute_brick_mask(x_cur, dt_cur, prev_x, dirty_mask)  # [nz, ny, nx]
+            brick_active = self.active_brick_mask(x_cur, dt_cur, prev_x, dirty_mask)  # [nz, ny, nx]
             if dilate_halo_bricks:
                 ba_f = brick_active.to(dtype=self.compute_dtype).unsqueeze(0).unsqueeze(0)
                 brick_active = F.max_pool3d(ba_f, kernel_size=3, stride=1, padding=1)[0, 0] > 0.5
@@ -1644,7 +1717,7 @@ class SparseWorld3DV5Runner:
                 patches_x = ux.permute(1, 2, 3, 0, 4, 5, 6)[tz, ty, tx].contiguous()
                 patches_dt = udt.permute(1, 2, 3, 0, 4, 5, 6)[tz, ty, tx].contiguous()
 
-                # Bucket K to avoid cuDNN kernel thrashing on K +- 1 jitter
+                # Bucket K to avoid cuDNN/Inductor kernel thrashing on K +- 1 jitter
                 b = self.bucket_size
                 k_pad = min(((k + b - 1) // b) * b, total_bricks)
                 if k_pad > k:
@@ -1657,14 +1730,26 @@ class SparseWorld3DV5Runner:
                     patches_dt_run = patches_dt
                     coords_run = coords
 
-                y_horiz, y_z_flux, y_z = shrinking_halo_3d_brick_forward(
-                    self._wm,
-                    patches_x_run,
-                    patches_dt_run,
-                    coords_run,
-                    grid_bricks=(nz, ny, nx),
-                    brick_size=(Bz, By, Bx),
-                )
+                k_r = int(coords_run.shape[0])
+                rtz, rty, rtx = coords_run[:, 0], coords_run[:, 1], coords_run[:, 2]
+                m_z0 = (rtz == 0).view(k_r, 1, 1, 1, 1)
+                m_z1 = (rtz == (nz - 1)).view(k_r, 1, 1, 1, 1)
+                m_y0 = (rty == 0).view(k_r, 1, 1, 1, 1)
+                m_y1 = (rty == (ny - 1)).view(k_r, 1, 1, 1, 1)
+                m_x0 = (rtx == 0).view(k_r, 1, 1, 1, 1)
+                m_x1 = (rtx == (nx - 1)).view(k_r, 1, 1, 1, 1)
+
+                try:
+                    y_horiz, y_z_flux, y_z = self._brick_mod(
+                        patches_x_run, patches_dt_run, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1
+                    )
+                except Exception:
+                    self._brick_mod = _CompiledBrickModule(
+                        self._wm, (self.brick_z, self.brick_xy, self.brick_xy)
+                    ).eval()
+                    y_horiz, y_z_flux, y_z = self._brick_mod(
+                        patches_x_run, patches_dt_run, m_z0, m_z1, m_y0, m_y1, m_x0, m_x1
+                    )
                 if k_pad > k:
                     y_horiz = y_horiz[:k]
                     y_z_flux = y_z_flux[:k]

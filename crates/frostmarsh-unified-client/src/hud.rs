@@ -50,6 +50,7 @@ pub struct HudConfig<'a> {
     pub audio_available: bool,
     pub cave_enclosure: f32,
     pub show_squad_links: bool,
+    pub camera_preset_label: &'static str,
 }
 
 pub struct HudBatch {
@@ -1449,6 +1450,22 @@ pub fn build_hud(
             );
             b.text_shadow(sqd_x + 7.0 * ui, py + 6.0 * ui, sc, sqd_col, sqd_lbl);
             cursor_x = sqd_x;
+        }
+
+        // Subtle [F5] Camera Preset indicator pill (`TACTICAL` / `ACTION` / `OVERVIEW`)
+        let cam_col = match cfg.camera_preset_label {
+            "ACTION" => [1.00, 0.78, 0.28, 1.0],
+            "OVERVIEW" => [0.64, 0.84, 1.00, 1.0],
+            _ => [0.76, 0.86, 0.98, 1.0],
+        };
+        let cam_lbl = format!("[F5] CAM:{}", cfg.camera_preset_label);
+        let cam_w = HudBatch::text_width(&cam_lbl, sc) + 14.0 * ui;
+        let cam_x = cursor_x - cam_w - 8.0 * ui;
+        if cam_x > hx + hud_w + 8.0 * ui {
+            b.rect(cam_x, py, cam_w, pill_h, [0.06, 0.05, 0.14, 0.84]);
+            b.rect_outline(cam_x, py, cam_w, pill_h, 1.1 * ui, cam_col);
+            b.text_shadow(cam_x + 7.0 * ui, py + 6.0 * ui, sc, cam_col, &cam_lbl);
+            cursor_x = cam_x;
         }
 
         if cfg.z16_active {

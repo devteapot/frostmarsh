@@ -17,6 +17,7 @@ Serves low-latency GPU inference on TCP_NODELAY and optional Unix domain socket:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import inspect
 import json
 import math
@@ -103,6 +104,15 @@ EXPECTED_SPECS = {
     OP_WORLD_STEP: (18, 17),
     OP_ECO_STEP: (8, 4),
 }
+
+
+def resolve_default_world_model_v5(script_dir: Path = _SCRIPT_DIR) -> Path:
+    """Auto-prefer world_model_3d_v7.pt -> world_model_3d_v6.pt -> world_model_3d_v5.pt."""
+    for name in ("world_model_3d_v7.pt", "world_model_3d_v6.pt", "world_model_3d_v5.pt"):
+        cand = script_dir / name
+        if cand.is_file():
+            return cand
+    return script_dir / "world_model_3d_v5.pt"
 
 
 def _load_state_dict(path: Path) -> dict:
@@ -470,11 +480,13 @@ class _SparseWorld3DAdapter:
         self.host_out_np = self.host_out.numpy()
         self.host_in_u8 = self.host_in_np.view(np.uint8).ravel()
         self.host_out_bytes = memoryview(self.host_out_np).cast("B")
-        self.runner = runner_cls(
+        self.runner = _call_with_accepted_kwargs(
+            runner_cls,
             model_3d,
             device=device,
             use_fp16=use_fp16,
-            sparse_threshold=(0.42 if use_sparse else 0.0),
+            sparse_threshold=(0.30 if use_sparse else 0.0),
+            activity_eps=5e-4,
         )
 
     def infer_from_host_in(self) -> tuple[memoryview, torch.Tensor, torch.Tensor, float, int]:
@@ -541,12 +553,13 @@ class _SparseWorldDTAdapter:
         self.host_out_np = self.host_out.numpy()
         self.host_in_u8 = self.host_in_np.view(np.uint8).ravel()
         self.host_out_bytes = memoryview(self.host_out_np).cast("B")
-        sp_thresh = 0.22 if getattr(runner_cls, "__name__", "") == "SparseWorld3DV5Runner" else 0.42
-        self.runner = runner_cls(
+        self.runner = _call_with_accepted_kwargs(
+            runner_cls,
             model_dt,
             device=device,
             use_fp16=use_fp16,
-            sparse_threshold=(sp_thresh if use_sparse else 0.0),
+            sparse_threshold=(0.30 if use_sparse else 0.0),
+            activity_eps=5e-4,
         )
 
     def infer_from_host_in(self) -> tuple[memoryview, torch.Tensor, torch.Tensor, float, int]:
@@ -636,8 +649,14 @@ class _AsyncSystem2Bridge:
             try:
                 self._seed_counter += 1
                 b = item["bot"]
-                cls_id = int(b.get("class_id", b.get("cls", 0)))
-                bot_cls = {0: "Vanguard", 1: "Pyromancer", 2: "Cryo-Scout"}.get(cls_id, "Vanguard")
+                cls_id = int(b.get("class_id", b.get("cls", 0))) % 5
+                bot_cls = {
+                    0: "Strider",
+                    1: "Skywing",
+                    2: "Tidekin",
+                    3: "Emberstalker",
+                    4: "Burrower",
+                }.get(cls_id, "Strider")
                 hp_frac = float(b.get("hp_frac", b.get("hp", 1.0)))
                 hp_val = hp_frac * 100.0 if hp_frac <= 1.5 else hp_frac
                 bx = float(b.get("x", 128.0))
@@ -970,6 +989,8 @@ class InferenceEngine:
         self.last_sparse_eco_active_frac: float = 1.0
         self._acoustic_step_counter: int = 0
         self._last_auto_callout_ts: float = 0.0
+        self._fallback_recent_lines: deque[str] = deque(maxlen=45)
+        self._fallback_speaker_last: dict[int, int] = {}
 
         for (h, w) in warmup_shapes:
             for op in (OP_WORLD_STEP, OP_ECO_STEP):
@@ -1418,33 +1439,58 @@ class InferenceEngine:
                     }
                 )
 
-        # Periodic emergent tactical callout from an active bot (~every 1.8s)
+        # Periodic emergent tactical callout from an active bot (~every 1.8s) with per-speaker cooldown & dedupe
         now = time.monotonic()
         self._acoustic_step_counter += 1
         if bots and not bubbles and (now - self._last_auto_callout_ts) >= 1.8:
             self._last_auto_callout_ts = now
-            b = bots[self._acoustic_step_counter % len(bots)]
+            # Pick speaker not on cooldown
+            picked_bot = bots[self._acoustic_step_counter % len(bots)]
+            for off in range(len(bots)):
+                cand = bots[(self._acoustic_step_counter + off) % len(bots)]
+                cid = int(cand.get("id", off))
+                if self._acoustic_step_counter - self._fallback_speaker_last.get(cid, -1000) >= 6:
+                    picked_bot = cand
+                    break
+            b = picked_bot
+            bid_sel = int(b.get("id", 0))
+            self._fallback_speaker_last[bid_sel] = self._acoustic_step_counter
             bx = float(b.get("x", gw * 0.5))
             by = float(b.get("y", gh * 0.5))
             bz = float(b.get("z", 1.0))
+            cls_id = int(b.get("class_id", b.get("cls", 0))) % 5
             snr_l = self._compute_physical_snr_db(bx, by, bz, lx, ly, lz, 0.82, ws_cpu)
-            callouts = [
-                (1, "HOLDING HIGH GROUND!"),
-                (2, "FREEZING FJORD CROSSING!"),
-                (3, "OIL SLICK ON FLANK!"),
-                (4, "PUSHING CENTRAL SPIRE!"),
-                (5, "WATERFALL CHOKE HOT!"),
-                (6, "WATCH SKYBRIDGE ARCH!"),
-            ]
-            sym_id, msg = callouts[self._acoustic_step_counter % len(callouts)]
-            layers_fb = int(ws_cpu.shape[0]) if (ws_cpu is not None and ws_cpu.ndim == 4) else int(req.get("grid_d", 4))
-            if _remap_z_to_4_strata(bz, layers_fb) >= 1.55:
-                sym_id, msg = 1, "HIGH GROUND OVERWATCH!"
+            recent_events = req.get("recent_events") or []
+            epoch_s = str(req.get("epoch", "")).strip()
+            arch_lines = {
+                0: ["SHIELD WALL LOCKED — HOLD VANGUARD!", "CARVING CRYO COVER FOR SQUAD!"],
+                1: [f"RIDING UPDRAFT AT +{int(round(bz))}M — OIL PASS!", "AERIAL OVERWATCH ON THEIR VANGUARD!"],
+                2: ["QUENCHING BURNING ALLY — PUSH THE STEAM!", "HYDRO SURGE THROUGH THE CHANNEL!"],
+                3: ["ISOLATED TARGET — CLOSING IN SMOKE VEIL!", "SOLO FLANK ABOVE EAST RIDGE!"],
+                4: ["CARVED UNDER SHRINE — ERUPTING BEHIND SHIELDS!", "SEISMIC TUNNEL BREACH INCOMING!"],
+            }
+            cand_msgs: list[tuple[int, str]] = []
+            for ev in recent_events:
+                lbl = str(ev.get("label", ev) if isinstance(ev, dict) else ev).strip()
+                if lbl:
+                    cand_msgs.append((cls_id + 1, f"{lbl} — PRESS ADVANTAGE!"))
+            if epoch_s:
+                cand_msgs.append((5, f"TERRAIN SHIFTING — {epoch_s}!"))
+            for m in arch_lines.get(cls_id, arch_lines[0]):
+                cand_msgs.append((cls_id + 1, m))
+            sym_id, msg = cand_msgs[0]
+            for s_i, m_txt in cand_msgs:
+                if m_txt not in self._fallback_recent_lines:
+                    sym_id, msg = s_i, m_txt
+                    break
+            if snr_l < -6.0:
+                msg = "[inaudible — drowned out by terrain]"
             elif snr_l < 0.0:
-                msg = "...STATIC ON RIDGE..."
+                msg = "...muffled callout through static..."
+            self._fallback_recent_lines.append(msg)
             bubbles.append(
                 {
-                    "speaker_id": int(b.get("id", 0)),
+                    "speaker_id": bid_sel,
                     "speaker_name": str(b.get("name", "BOT")),
                     "team": int(b.get("team", 0)),
                     "x": bx,
@@ -1492,10 +1538,21 @@ class InferenceEngine:
                                 "name": str(b.get("name", f"BOT-{bid}")),
                                 "team": int(b.get("team", 0)),
                                 "cls": int(b.get("class_id", b.get("cls", 0))),
+                                "class_id": int(b.get("class_id", b.get("cls", 0))),
+                                "bot_class": b.get("bot_class", int(b.get("class_id", b.get("cls", 0)))),
+                                "squad_id": int(b.get("squad_id", 0)),
                                 "x": bx,
                                 "y": by,
+                                "z": bz,
+                                "bot_z": float(b.get("bot_z", bz)),
                                 "layer": band_z if num_layers > 4 else int(round(bz)),
                                 "hp": float(b.get("hp_frac", b.get("hp", 1.0))),
+                                "bot_hp": float(b.get("bot_hp", b.get("hp_frac", b.get("hp", 1.0)))),
+                                "in_tunnel": bool(b.get("in_tunnel", False)),
+                                "in_water": bool(b.get("in_water", False)),
+                                "airborne": bool(b.get("airborne", False)),
+                                "shield_wall_active": bool(b.get("shield_wall_active", False)),
+                                "burning": bool(b.get("burning", False)),
                             }
                         )
                     lis = req.get("listener") or [128.0, 128.0, 1.0]
@@ -1515,12 +1572,21 @@ class InferenceEngine:
                         chat_4 = dict(chat)
                         if num_layers > 4 and "layer" in chat_4:
                             chat_4["layer"] = _remap_z_to_4_strata(float(chat_4["layer"]), num_layers)
-                    raw_res = self.acoustic_engine.step_live(
+                    world_ctx = {
+                        "recent_events": req.get("recent_events") or [],
+                        "epoch": str(req.get("epoch", "")),
+                        "biome": str(req.get("biome", "")),
+                        "grid_w": int(req.get("grid_w", w_state_4.shape[3])),
+                        "grid_h": int(req.get("grid_h", w_state_4.shape[2])),
+                    }
+                    raw_res = _call_with_accepted_kwargs(
+                        self.acoustic_engine.step_live,
                         w_state=w_state_4,
                         z_world=z_world_4,
                         bot_states=bot_states,
                         listener_pos=listener_pos_4,
                         human_chat=chat_4,
+                        world_context=world_ctx,
                     )
                     now_ts = time.perf_counter()
                     has_chat = chat_4 is not None
@@ -2233,12 +2299,8 @@ def main() -> None:
     parser.add_argument(
         "--world-model-v5",
         type=Path,
-        default=(
-            _SCRIPT_DIR / "world_model_3d_v6.pt"
-            if (_SCRIPT_DIR / "world_model_3d_v6.pt").is_file()
-            else _SCRIPT_DIR / "world_model_3d_v5.pt"
-        ),
-        help="Optional conservation-distilled WorldModel3D-v6/v5 checkpoint (auto-overrides op=8/op=9 with 16x16x8 3D sparse bricks!)",
+        default=resolve_default_world_model_v5(_SCRIPT_DIR),
+        help="Optional conservation-distilled WorldModel3D-v7/v6/v5 checkpoint (auto-prefers v7 -> v6 -> v5 and overrides op=8/op=9 with 16x16x8 3D sparse bricks!)",
     )
     parser.add_argument(
         "--system2-slm",

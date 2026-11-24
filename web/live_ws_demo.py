@@ -28,7 +28,7 @@ import json
 import math
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +41,14 @@ DEMO_BIOMES = [
     ("Sinkhole Caverns", (42, 224, 255)),
 ]
 EVO_SPEEDS = [1, 4, 12, 0]
+TACTICAL_EVENT_ROTATION = [
+    "TIDEKIN QUENCH RESCUE!",
+    "SUBTERRANEAN BREACH!",
+    "SHIELD WALL!",
+    "CRYO-BRIDGE FORGED!",
+    "SKYWING THERMAL UPDRAFT!",
+    "BASALT BULWARK!",
+]
 
 
 @dataclass
@@ -48,19 +56,36 @@ class DemoState:
     biome_idx: int = 0
     evo_speed_idx: int = 0
     evo_accum: float = 0.0
+    event_accum: float = 0.0
+    event_cursor: int = 2
     epoch: int = 1
     basalt: int = 24
     trees: int = 18
     glaciers: int = 9
     erosion: int = 42
+    events: list[str] = field(
+        default_factory=lambda: [
+            "TIDEKIN QUENCH RESCUE!",
+            "SUBTERRANEAN BREACH!",
+        ]
+    )
+
+    def push_event(self, label: str) -> None:
+        self.events.append(label)
+        if len(self.events) > 5:
+            self.events = self.events[-5:]
 
     def cycle_biome(self) -> str:
         self.biome_idx = (self.biome_idx + 1) % len(DEMO_BIOMES)
-        return DEMO_BIOMES[self.biome_idx][0]
+        biome = DEMO_BIOMES[self.biome_idx][0]
+        self.push_event(f"BIOME SHIFT: {biome.upper()}!")
+        return biome
 
     def cycle_evo(self) -> int:
         self.evo_speed_idx = (self.evo_speed_idx + 1) % len(EVO_SPEEDS)
-        return EVO_SPEEDS[self.evo_speed_idx]
+        spd = EVO_SPEEDS[self.evo_speed_idx]
+        self.push_event(f"WORLD EVO: {spd}X!" if spd > 0 else "WORLD EVO PAUSED!")
+        return spd
 
     @property
     def biome_name(self) -> str:
@@ -75,6 +100,13 @@ class DemoState:
         return EVO_SPEEDS[self.evo_speed_idx]
 
     def step_evolution(self, dt: float) -> None:
+        self.event_accum += dt
+        if self.event_accum >= 2.4:
+            self.event_accum -= 2.4
+            evt = TACTICAL_EVENT_ROTATION[self.event_cursor % len(TACTICAL_EVENT_ROTATION)]
+            self.event_cursor += 1
+            self.push_event(evt)
+
         spd = self.evo_speed
         if spd <= 0:
             return
@@ -366,6 +398,7 @@ def build_live_entities_payload(
             "glaciers": st.glaciers,
             "erosion": st.erosion,
         },
+        "events": list(st.events),
         "telemetry": {
             "server_tps": round(fps, 1),
             "online_players": len(players),

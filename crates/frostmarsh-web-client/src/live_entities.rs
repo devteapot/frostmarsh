@@ -50,6 +50,13 @@ pub struct EvolutionStats {
     pub erosion: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TacticalEvent {
+    pub label: String,
+    pub team: Option<u8>,
+    pub tick: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LiveEntitiesUpdate {
     pub tick: u64,
@@ -60,6 +67,8 @@ pub struct LiveEntitiesUpdate {
     pub projectiles: Vec<HeroInstance>,
     pub beams: Vec<LiveBeam>,
     pub evolution: Option<EvolutionStats>,
+    pub events: Vec<TacticalEvent>,
+    pub has_events: bool,
     pub server_tps: f32,
     pub online_players: usize,
     pub status: Option<String>,
@@ -313,7 +322,7 @@ fn parse_rgb(obj: &JsonVal, default: [f32; 3]) -> [f32; 3] {
     {
         return [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)];
     }
-    if let Some(fid) = obj.get("faction").and_then(JsonVal::as_u64) {
+    if let Some(fid) = obj.get("faction").or_else(|| obj.get("team")).and_then(JsonVal::as_u64) {
         return match fid % 4 {
             0 => [0.16, 0.54, 0.98],
             1 => [0.94, 0.24, 0.24],
@@ -537,6 +546,41 @@ pub fn parse_live_entities_json(json_str: &str) -> Result<LiveEntitiesUpdate, St
                 .and_then(JsonVal::as_u64)
                 .unwrap_or(0),
         });
+    }
+
+    if let Some(arr) = root.get("events").and_then(JsonVal::as_arr) {
+        out.has_events = true;
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    out.events.push(TacticalEvent {
+                        label: trimmed.to_string(),
+                        team: None,
+                        tick: None,
+                    });
+                }
+            } else if item.is_obj()
+                && let Some(lbl) = item
+                    .get("label")
+                    .or_else(|| item.get("text"))
+                    .or_else(|| item.get("message"))
+                    .and_then(JsonVal::as_str)
+            {
+                let trimmed = lbl.trim();
+                if !trimmed.is_empty() {
+                    out.events.push(TacticalEvent {
+                        label: trimmed.to_string(),
+                        team: item.get("team").and_then(JsonVal::as_u64).map(|t| t as u8),
+                        tick: item.get("tick").and_then(JsonVal::as_u64),
+                    });
+                }
+            }
+        }
+        if out.events.len() > 8 {
+            let drain_n = out.events.len() - 8;
+            out.events.drain(0..drain_n);
+        }
     }
 
     out.online_players = out.heroes.len();

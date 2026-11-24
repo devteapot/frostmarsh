@@ -1,6 +1,48 @@
-//! Rotatable MOBA Camera with Floating-Origin GPU Math & 2048px Texel-Snapped Shadow Frustum.
+//! Rotatable MOBA Camera with Dynamic F5 Presets, Floating-Origin GPU Math & 2048px Texel-Snapped Shadow Frustum.
 
 use glam::{Mat4, Vec3};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CameraPreset {
+    Tactical,
+    ActionCloseUp,
+    Overview,
+}
+
+impl CameraPreset {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Tactical => Self::ActionCloseUp,
+            Self::ActionCloseUp => Self::Overview,
+            Self::Overview => Self::Tactical,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tactical => "TACTICAL",
+            Self::ActionCloseUp => "ACTION",
+            Self::Overview => "OVERVIEW",
+        }
+    }
+
+    /// Returns `(dist, pitch_rad, fov_y_rad)` tuned for true-3D Z16 or L4 arenas.
+    pub fn params(self, z16_active: bool) -> (f32, f32, f32) {
+        if z16_active {
+            match self {
+                Self::Tactical => (40.0, 0.56, 38.0_f32.to_radians()),
+                Self::ActionCloseUp => (24.0, 0.32, 40.0_f32.to_radians()),
+                Self::Overview => (82.0, 0.68, 40.0_f32.to_radians()),
+            }
+        } else {
+            match self {
+                Self::Tactical => (46.0, 0.64, 38.0_f32.to_radians()),
+                Self::ActionCloseUp => (26.0, 0.38, 40.0_f32.to_radians()),
+                Self::Overview => (96.0, 0.72, 40.0_f32.to_radians()),
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct MobaCamera {

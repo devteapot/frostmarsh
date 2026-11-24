@@ -1,9 +1,11 @@
-// Approach 4 Primary Pass for Live Neural Frostmarsh
-// - 2048x2048 4-tap PCF directional shadows + hemisphere bounce
-// - 9-step Cool-Indigo (#261e48) / Warm-Cream (#fff4d6) Hue-Shifted Tone Ramp
-// - Live 1 KB Animated `flash()` Palette Texture (256x1 RGBA8) for wildfires, embers, frost & flowing river
-// - Dynamic 8-slot Firelight / Spell / Relic Point Lights
-// - Compositional A+ terrain vertex shading (temperature, flow direction, burning, freezing, oil sheen, ice shimmer)
+// Wave 17B: Approach 4 Primary Pass for Live Neural Frostmarsh
+// Features:
+//   - 2048x2048 4-tap PCF directional shadows + hemisphere bounce
+//   - View-dependent team-tinted Fresnel rim lighting on all 5-archetype heroes (frost-cyan / ember-gold)
+//     + high-contrast emissive visor/weapon/wing/drill core accents for instant tactical readability!
+//   - Material 13: Sleek Animated Dashed Runic Energy Rings (transparent gaps via discard so stone viaducts
+//     shine cleanly through instead of flat opaque debug discs!)
+//   - Live 1 KB Animated `flash()` Palette Texture (256x1 RGBA8) + 8 Dynamic Point Lights
 
 struct SceneUniforms {
     view: mat4x4<f32>,
@@ -18,7 +20,7 @@ struct SceneUniforms {
     sun_col: vec4<f32>,         // rgb = sun color, w = shadow_strength
     sky_col: vec4<f32>,         // rgb = sky fill, w = fog_start
     bounce_col: vec4<f32>,      // rgb = bounce fill, w = fog_end
-    fog_col: vec4<f32>,         // rgb = haze/bg color, w = unused
+    fog_col: vec4<f32>,         // rgb = haze/bg color, w = wind_drift
     point_pos: array<vec4<f32>, 8>,
     point_col: array<vec4<f32>, 8>,
 };
@@ -27,7 +29,7 @@ struct MeshInstance {
     pos_yaw: vec4<f32>,         // camera-relative xyz, w = yaw
     scale_pitch: vec4<f32>,     // xyz = scale, w = pitch
     tint_glow: vec4<f32>,       // rgb = tint multiplier, w = extra glow
-    flags: vec4<f32>,           // x = mat_override (<0 keep vertex), y = selective_tint (>0.5 only mat 12), z = roll (rad), w = reserved
+    flags: vec4<f32>,           // x = mat_override (<0 keep vertex), y = selective_tint (>0.5 hero), z = roll (rad), w = ring_seg_count/reserved
 };
 
 @group(0) @binding(0) var<uniform> u: SceneUniforms;
@@ -42,7 +44,8 @@ struct VsOut {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
     @location(3) @interpolate(flat) mat_glow: vec2<f32>, // x = mat_id, y = inst glow
-    @location(4) extra: vec4<f32>, // x = temp_norm [0..1], y = burn_intensity [0..1], z = flow_x, w = flow_z
+    @location(4) extra: vec4<f32>, // terrain: (temp, burn, fx, fz); ring: (angle_rad, radial_01, segs, phase)
+    @location(5) @interpolate(flat) hero_rim: vec4<f32>, // rgb = team-tinted Fresnel rim color, w = is_hero (1.0/0.0)
 };
 
 fn hash2(p: vec2<f32>) -> f32 {
@@ -124,9 +127,14 @@ fn vs_main(
     ));
 
     let mat_id = select(color_mat.w, inst.flags.x, inst.flags.x >= 0.0);
+    let is_hero = inst.flags.y > 0.5;
     // Selective tint mode (flags.y > 0.5): ONLY mat 12 (faction cloth) receives tint_glow.rgb
-    let use_tint = (inst.flags.y < 0.5) || (abs(mat_id - 12.0) < 0.5);
+    let use_tint = (!is_hero) || (abs(mat_id - 12.0) < 0.5);
     let final_col = select(color_mat.rgb, color_mat.rgb * inst.tint_glow.rgb, use_tint);
+
+    // Team-tinted Fresnel rim color for heroes (West Frost cyan vs East Ember gold-crimson)
+    let is_frost_team = inst.tint_glow.b > inst.tint_glow.r;
+    let rim_rgb = select(vec3<f32>(1.00, 0.68, 0.24), vec3<f32>(0.36, 0.92, 1.00), is_frost_team);
 
     var out: VsOut;
     out.clip_pos = u.vp * vec4<f32>(rel_p, 1.0);
@@ -134,7 +142,8 @@ fn vs_main(
     out.normal = world_n;
     out.color = final_col;
     out.mat_glow = vec2<f32>(mat_id, inst.tint_glow.w);
-    out.extra = extra;
+    out.extra = vec4<f32>(extra.x, extra.y, select(extra.z, inst.flags.w, abs(mat_id - 13.0) < 0.5), extra.w);
+    out.hero_rim = vec4<f32>(rim_rgb, select(0.0, 1.0, is_hero));
     return out;
 }
 
@@ -148,6 +157,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let wp = in.rel_pos + u.origin_time.xyz;
     let t = u.origin_time.w;
 
+    // === MATERIAL 13: SLEEK ANIMATED RUNIC ENERGY RING (Shrines & Time Domes — stone shines cleanly through!) ===
+    if (mat_id == 13) {
+        let ang = in.extra.x;
+        let rad_t = in.extra.y;
+        let segs = max(in.extra.z, 8.0);
+        let seg_u = fract((ang / 6.2831853) * segs);
+        // Delicate runic dash + central glyph dot; open gaps discard cleanly so the stone bridge arch shines through!
+        let in_dash = seg_u > 0.14 && seg_u < 0.72;
+        let in_dot = abs(seg_u - 0.86) < 0.045;
+        let is_core_line = abs(rad_t - 0.50) < 0.24;
+        if (!in_dash && !in_dot) {
+            discard;
+        }
+        let wave = 0.76 + 0.24 * sin(ang * 3.0 - t * 3.2);
+        let core_boost = select(0.95, 1.45, is_core_line || in_dot);
+        let runic_col = mix(alb, vec3<f32>(1.0, 0.96, 0.86), select(0.22, 0.55, is_core_line || in_dot)) * core_boost * wave;
+        return vec4<f32>(clamp(runic_col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    }
+
     let temp_n = in.extra.x;
     let burn_t = in.extra.y;
     let flow_v = in.extra.zw;
@@ -159,19 +187,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let tuft = hash2(floor(wp.xz * 4.2));
         let speck = hash2(floor(wp.xz * 7.5));
 
-        // Fast single-octave procedural normal bump for crisp ground/turf/rock relief at 70+ FPS
         let h_x = vnoise((wp.xz + vec2<f32>(0.25, 0.0)) * 0.95) - detail_n;
         let h_z = vnoise((wp.xz + vec2<f32>(0.0, 0.25)) * 0.95) - detail_n;
         n = normalize(n + vec3<f32>(-h_x * 0.42, 0.0, -h_z * 0.42));
 
-        // Rich painterly macro + micro biome variation over compositional A+ ground albedo
         alb = clamp(
             alb * (0.84 + patch_l * 0.24 + (detail_n - 0.5) * 0.16 + (tuft - 0.5) * 0.08),
             vec3<f32>(0.0),
             vec3<f32>(1.0),
         );
 
-        // Damp dark shoreline bank & pebble sheen right above water level
         let shore_t = smoothstep(0.56, 0.14, wp.y);
         if (shore_t > 0.02) {
             let wet_bank = vec3<f32>(0.18, 0.22, 0.24) * (0.85 + detail_n * 0.30);
@@ -179,7 +204,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             metallic = max(metallic, shore_t * 0.28);
         }
 
-        // Cliff / riverbank slope rock strata on steep faces
         let slope = smoothstep(0.89, 0.62, n.y);
         if (slope > 0.02) {
             let strata = sin(wp.y * 5.8 + vnoise(wp.xz * 0.55) * 2.6) * 0.16;
@@ -192,7 +216,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             n = normalize(n + vec3<f32>(strata * 0.42, 0.0, -strata * 0.42));
         }
 
-        // High-elevation alpine snow dusting on flat upper ridges
         let alpine_snow = smoothstep(3.4, 4.3, wp.y) * smoothstep(0.68, 0.90, n.y);
         if (alpine_snow > 0.02) {
             let snow_spark = step(0.93, speck) * 0.18;
@@ -200,7 +223,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             metallic = max(metallic, alpine_snow * 0.25);
         }
 
-        // Frost / freezing shimmer when cold (temp_n < 0.075 => below freezing!)
         let frost_t = smoothstep(0.088, 0.044, temp_n);
         if (frost_t > 0.05) {
             let ice_flash = flash_pal(34);
@@ -210,7 +232,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             metallic = max(metallic, frost_t * 0.52);
         }
 
-        // Live wildfire / molten ember glow with glowing lava/charcoal crack veins!
         if (burn_t > 0.04 || temp_n > 0.24) {
             let heat = max(burn_t, smoothstep(0.24, 0.62, temp_n));
             let flame_n = fbm2(wp.xz * 1.45 + vec2<f32>(t * 0.9, -t * 1.6));
@@ -225,7 +246,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             glow = max(glow, mix_f * (0.72 + crack * 0.40) * max(ember_p.a, core_p.a));
         }
     } else if (mat_id == 3) {
-        // === MATERIAL 3: LIVE FLOWING RIVER & WATERFALL (caustics + Fresnel sky reflection + foam!) ===
         let fdir = select(vec2<f32>(0.0, 1.0), normalize(flow_v), length(flow_v) > 0.05);
         let speed = 0.95 + clamp(length(flow_v), 0.0, 2.2) * 0.72;
         let is_waterfall = abs(in.normal.y) < 0.45;
@@ -254,13 +274,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             glow = max(glow, 0.16);
         }
 
-        // Subtle steam glow when water is heated
         if (temp_n > 0.24) {
             let boil = smoothstep(0.24, 0.55, temp_n);
             alb = mix(alb, vec3<f32>(0.78, 0.90, 0.98), boil * 0.35);
         }
     } else if (mat_id == 6) {
-        // === MATERIAL 6: CARVED ICE RAFT / GLACIAL BRIDGE (subsurface cyan + crystalline facets) ===
         let ice_p = flash_pal(35);
         let sp = hash2(floor(wp.xz * 4.8));
         let facet = vnoise(wp.xz * 2.2);
@@ -271,22 +289,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         n = normalize(n + vec3<f32>((facet - 0.5) * 0.22, 0.0, (sp - 0.5) * 0.14));
         metallic = 0.74;
     } else if (mat_id == 5) {
-        // Emissive crystal / glowing relic / fire core / dash halo
-        let pulse = flash_pal(35).a;
-        glow = max(glow, 0.85 * (0.85 + 0.15 * pulse));
+        // Emissive crystal / hero visor / weapon / wing / drill core / glowing relic
+        let pulse = 0.88 + 0.12 * sin(t * 4.5 + wp.x * 0.4 + wp.z * 0.4);
+        glow = max(glow, 0.92 * pulse);
     } else if (mat_id == 1) {
-        // Rock / stone pillar masonry & chiseled bevel
         let strata = sin(wp.y * 4.8 + vnoise(wp.xz * 0.8) * 2.2) * 0.12;
         let grit = (vnoise(wp.xz * 3.4) - 0.5) * 0.18;
         alb = clamp(alb * (0.98 + strata + grit), vec3<f32>(0.0), vec3<f32>(1.0));
         n = normalize(n + vec3<f32>(strata * 0.24, 0.0, grit * 0.24));
     } else if (mat_id == 4) {
-        // Wood bark / weathered bridge planks
         let grain = sin((wp.x + wp.z) * 14.0 + vnoise(wp.xz * 3.8) * 2.4) * 0.09;
         let plank_seam = smoothstep(0.92, 0.99, abs(sin(wp.x * 3.14159)));
         alb = clamp(alb * (1.0 + grain - plank_seam * 0.18), vec3<f32>(0.0), vec3<f32>(1.0));
     } else if (mat_id == 10) {
-        // Polished steel / royal gold armor & relic metal
         metallic = 1.0;
     }
 
@@ -300,38 +315,51 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let away = max(0.0, -dot(n.xz, normalize(u.sun_dir.xz + vec2<f32>(0.0001, 0.0))));
     fill += u.bounce_col.rgb * horiz * (0.26 + 0.54 * away);
 
+    let is_hero = in.hero_rim.w > 0.5;
+    if (is_hero) {
+        // Guarantee crisp hero readability even inside twilight/dusk shadows & caverns!
+        fill = max(fill, vec3<f32>(0.34, 0.38, 0.52));
+    }
+
     let ndl = max(dot(n, u.sun_dir.xyz), 0.0) * sh;
-    var light_scalar = ndl + 0.08 * max(dot(n, view_dir), 0.0);
+    var light_scalar = ndl + select(0.08, 0.20, is_hero) * max(dot(n, view_dir), 0.0);
     if (u.viewport.z > 0.5) {
-        // Smooth-bevel stylized cel ramp (55% stepped + 45% continuous lighting for rich form!)
         let q_l = round(light_scalar * u.viewport.z) / u.viewport.z;
-        light_scalar = mix(light_scalar, q_l, 0.55);
+        light_scalar = mix(light_scalar, q_l, 0.52);
     }
 
     var col = alb * (fill + u.sun_col.rgb * light_scalar) * u.sun_dir.w;
 
-    // Subtle Cool-Indigo shadow pull + Warm-Cream highlight push
     let cool_ink = vec3<f32>(0.149, 0.118, 0.282);
     let warm_hi = vec3<f32>(1.000, 0.957, 0.839);
     let shadow_t = clamp(1.0 - light_scalar * 1.45, 0.0, 1.0);
-    col = mix(col, cool_ink, shadow_t * 0.17);
+    col = mix(col, cool_ink, shadow_t * select(0.17, 0.10, is_hero));
     let hi_t = clamp((light_scalar - 0.78) * 1.8, 0.0, 1.0);
-    col = mix(col, warm_hi, hi_t * 0.13);
+    col = mix(col, warm_hi, hi_t * 0.14);
 
     let ndv = max(dot(n, view_dir), 0.0);
-    let fresnel = pow(1.0 - ndv, 3.2);
+    let fresnel = pow(1.0 - ndv, 3.0);
 
     // Metallic armor / gold / ice specular glint + rim
     if (metallic > 0.2) {
         let hv = normalize(u.sun_dir.xyz + view_dir);
         let spec = pow(max(dot(n, hv), 0.0), 28.0) * sh;
-        col += (u.sun_col.rgb * spec * 0.74 + u.sky_col.rgb * fresnel * 0.48) * metallic;
-    } else if (mat_id != 9 && mat_id != 3) {
-        // Crisp hero & prop readability rim light against dark terrain / night scenes
+        col += (u.sun_col.rgb * spec * 0.82 + u.sky_col.rgb * fresnel * 0.52) * metallic;
+    }
+
+    // Crisp Team-Tinted View-Dependent Fresnel Rim Lighting on ALL 5-Archetype Heroes!
+    if (is_hero) {
+        let hero_fres = pow(1.0 - ndv, 2.05);
+        let top_accent = 0.55 + 0.45 * max(n.y, 0.0);
+        col += in.hero_rim.rgb * hero_fres * top_accent * 0.86;
+        // Subtle crisp faction cloth vibrancy boost so silhouettes pop at tactical distance
+        if (mat_id == 12) {
+            col += alb * 0.18;
+        }
+    } else if (metallic <= 0.2 && mat_id != 9 && mat_id != 3) {
         col += (u.sky_col.rgb * 0.55 + u.sun_col.rgb * 0.35) * fresnel * 0.28;
     }
 
-    // Water Fresnel sky reflection + crisp sun sparkle (keeps rich Nordic fjord azure!)
     if (mat_id == 3) {
         let hv = normalize(u.sun_dir.xyz + view_dir);
         let spec = pow(max(dot(n, hv), 0.0), 72.0) * sh;
@@ -340,7 +368,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         col += u.sun_col.rgb * spec * 1.30;
     }
 
-    // Up to 8 local dynamic point lights (live wildfires, fire/frost bolts, golden relic!)
+    // Up to 8 local dynamic point lights
     for (var i: u32 = 0u; i < 8u; i = i + 1u) {
         let lp = u.point_pos[i];
         if (lp.w > 0.0) {
@@ -355,11 +383,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     if (glow > 0.05) {
-        col = mix(col, alb * 1.50, clamp(glow, 0.0, 1.0));
+        // High-contrast glowing core accents (hero visors, weapons, wings, drills, floating shrine monoliths!)
+        let hot_core = mix(alb * 1.58, alb * 1.85 + vec3<f32>(0.22, 0.20, 0.16), select(0.15, 0.45, mat_id == 5));
+        col = mix(col, hot_core, clamp(glow, 0.0, 1.0));
     }
 
     // Directional sun-scattered atmospheric perspective fog
-    let fog_t = 0.62 * smoothstep(u.sky_col.w, u.bounce_col.w, dist);
+    let fog_t = 0.60 * smoothstep(u.sky_col.w, u.bounce_col.w, dist);
     let sun_scatter = pow(max(dot(-view_dir, u.sun_dir.xyz), 0.0), 5.0);
     let atmo_fog = u.fog_col.rgb + u.sun_col.rgb * sun_scatter * 0.26;
     col = mix(col, atmo_fog, fog_t * (1.0 - clamp(glow, 0.0, 1.0) * 0.85));

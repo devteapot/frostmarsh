@@ -1600,35 +1600,58 @@ pub fn assemble_live_frame(
                 [0.98, 0.86, 0.44]
             };
             let shrine_scale = if let Some(z16w) = z16 {
-                (z16w.width as f32 / 192.0).clamp(0.68, 1.0) * 1.65
+                (z16w.width as f32 / 192.0).clamp(0.68, 1.0) * 1.52
             } else {
-                1.85
+                1.72
             };
-            let ring_scale = if let Some(z16w) = z16 {
-                (z16w.width as f32 / 256.0 * 7.2).clamp(3.8, 7.5)
-            } else {
-                8.5
-            };
+            let pulse = 0.88 + 0.12 * (sim_time * 2.8 + s.id as f32 * 1.7).sin();
             mesh_batches[MeshKind::ShrineObelisk as usize].push(MeshInstance {
                 pos_yaw: [rel.x, rel.y, rel.z, sim_time * 0.35 + s.id as f32],
                 scale_pitch: [shrine_scale, shrine_scale, shrine_scale, 0.0],
-                tint_glow: [scol[0], scol[1], scol[2], 0.35],
+                tint_glow: [scol[0], scol[1], scol[2], 0.42],
                 flags: [-1.0, 0.0, 0.0, 0.0],
             });
-            // Capture radius ring on ground
-            mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
-                pos_yaw: [rel.x, rel.y + 0.15, rel.z, 0.0],
-                scale_pitch: [ring_scale, 1.0, ring_scale, 0.0],
-                tint_glow: [scol[0], scol[1], scol[2], 0.55],
-                flags: [-1.0, 0.0, 0.0, 0.0],
+            // Sleek double counter-rotating animated runic energy rings tightly hugging the shrine pedestal!
+            // Open runic gaps discard cleanly so the stone viaduct arch beneath shines right through!
+            let inner_r = shrine_scale * 2.18;
+            let outer_r = shrine_scale * 3.05;
+            mesh_batches[MeshKind::ShrineRuneRing as usize].push(MeshInstance {
+                pos_yaw: [rel.x, rel.y + 0.10, rel.z, sim_time * 0.55 + s.id as f32],
+                scale_pitch: [inner_r, 0.90, inner_r, 0.0],
+                tint_glow: [scol[0] * pulse, scol[1] * pulse, scol[2] * pulse, 0.88],
+                flags: [-1.0, 0.0, 0.0, 12.0],
             });
-            // Glowing shrine aura volumetric wisp
+            mesh_batches[MeshKind::ShrineRuneRing as usize].push(MeshInstance {
+                pos_yaw: [rel.x, rel.y + 0.13, rel.z, -sim_time * 0.36 + s.id as f32 * 2.1],
+                scale_pitch: [outer_r, 0.78, outer_r, 0.0],
+                tint_glow: [scol[0] * 0.92 * pulse, scol[1] * 0.92 * pulse, scol[2] * 0.92 * pulse, 0.72],
+                flags: [-1.0, 0.0, 0.0, 18.0],
+            });
+            // Delicate tilted runic halo orbiting the floating crystal monolith!
+            let crystal_y = rel.y + 4.35 * shrine_scale;
+            mesh_batches[MeshKind::ShrineRuneRing as usize].push(MeshInstance {
+                pos_yaw: [rel.x, crystal_y, rel.z, sim_time * 1.15 + s.id as f32],
+                scale_pitch: [shrine_scale * 1.25, 0.70, shrine_scale * 1.25, 0.32],
+                tint_glow: [
+                    (scol[0] * 0.8 + 0.25) * pulse,
+                    (scol[1] * 0.8 + 0.25) * pulse,
+                    (scol[2] * 0.8 + 0.25) * pulse,
+                    0.95,
+                ],
+                flags: [-1.0, 0.0, 0.18, 10.0],
+            });
+            // Soft translucent additive-feel ground light & floating crystal monolith aura!
             vol_splats.push(VolSplat {
-                pos_rad: [rel.x, rel.y + 7.2, rel.z, 1.95],
-                color_alpha: [scol[0] * 1.1, scol[1] * 1.1, scol[2] * 1.1, 0.62],
-                params: [1.35, 3.0, s.id as f32 * 3.1, 0.0],
+                pos_rad: [rel.x, rel.y + 0.45, rel.z, outer_r * 0.85],
+                color_alpha: [scol[0] * 0.95, scol[1] * 0.95, scol[2] * 0.95, 0.36 * pulse],
+                params: [0.45, 6.0, s.id as f32 * 2.7, 0.0],
             });
-            push_light(Vec3::new(wx, gy + 6.5, wz), 20.0, [scol[0] * 0.9, scol[1] * 0.9, scol[2] * 0.9]);
+            vol_splats.push(VolSplat {
+                pos_rad: [rel.x, crystal_y + 0.35, rel.z, 1.55 * shrine_scale],
+                color_alpha: [scol[0] * 1.15, scol[1] * 1.15, scol[2] * 1.15, 0.56 * pulse],
+                params: [1.55, 3.0, s.id as f32 * 3.1, 0.0],
+            });
+            push_light(Vec3::new(wx, gy + 5.8, wz), 22.0, [scol[0] * 1.05, scol[1] * 1.05, scol[2] * 1.05]);
         }
 
         // Carved `CellBody` Ice Rafts
@@ -1924,29 +1947,40 @@ pub fn assemble_live_frame(
                         flags: [-1.0, 0.0, 0.0, 0.0],
                     });
 
-                    // Subtle rising thermal ring + warm-cyan thermal trail when soaring high!
-                    if soaring_high {
-                        let t_cyc = (sim_time * 1.35 + phase * 0.37).fract();
-                        let th_y = gy - 1.25 + t_cyc * 1.15;
-                        let th_s = 0.92 + t_cyc * 0.85;
-                        let th_rel = Vec3::new(wx, th_y, wz) - origin;
-                        let th_glow = (1.0 - t_cyc) * 0.72;
-                        mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
-                            pos_yaw: [th_rel.x, th_rel.y, th_rel.z, sim_time * 1.8 + phase],
-                            scale_pitch: [th_s, 0.65, th_s, 0.0],
-                            tint_glow: [1.0, 0.84, 0.42, th_glow],
-                            flags: [-1.0, 0.0, 0.0, 0.0],
-                        });
-                        // Soft rising thermal trail wisp behind/beneath the glider
-                        let trail_rel = Vec3::new(
-                            wx - p.vx * 0.08,
-                            gy - 0.35 + t_cyc * 0.45,
-                            wz - p.vy * 0.08,
-                        ) - origin;
-                        vol_splats.push(VolSplat {
-                            pos_rad: [trail_rel.x, trail_rel.y, trail_rel.z, 0.48 + (1.0 - t_cyc) * 0.25],
-                            color_alpha: [1.05, 0.88, 0.48, 0.34 * (1.0 - t_cyc * 0.65)],
-                            params: [1.25, 3.0, phase, 0.2],
+                    // Visible rising helical Thermal Updraft column under soaring Skywings!
+                    if soaring_high || airborne {
+                        let col_h = (gy - ground_y).clamp(1.4, 7.5);
+                        for k in 0..3 {
+                            let t_cyc = (sim_time * 1.30 + phase * 0.37 + k as f32 * 0.333).fract();
+                            let th_y = ground_y + 0.35 + t_cyc * col_h;
+                            let spiral_a = sim_time * 3.4 + phase + t_cyc * 5.0;
+                            let spiral_r = (0.28 + (1.0 - t_cyc) * 0.32) * (k as f32 * 0.25 + 0.65);
+                            let th_rel = Vec3::new(
+                                wx + spiral_a.cos() * spiral_r - p.vx * 0.05 * (1.0 - t_cyc),
+                                th_y,
+                                wz + spiral_a.sin() * spiral_r - p.vy * 0.05 * (1.0 - t_cyc),
+                            ) - origin;
+                            let fade_up = (t_cyc * std::f32::consts::PI).sin().clamp(0.15, 1.0);
+                            vol_splats.push(VolSplat {
+                                pos_rad: [th_rel.x, th_rel.y, th_rel.z, 0.62 + (1.0 - t_cyc) * 0.42],
+                                color_alpha: [
+                                    0.82 + 0.32 * (1.0 - t_cyc),
+                                    0.94,
+                                    0.58 + 0.50 * t_cyc,
+                                    0.44 * fade_up,
+                                ],
+                                params: [0.68, 6.0, phase + k as f32 * 2.1, 0.2],
+                            });
+                        }
+                        let t_ring = (sim_time * 1.45 + phase * 0.37).fract();
+                        let ring_y = ground_y + 0.45 + t_ring * col_h;
+                        let ring_s = 0.85 + t_ring * 0.95;
+                        let th_rel = Vec3::new(wx, ring_y, wz) - origin;
+                        mesh_batches[MeshKind::ShrineRuneRing as usize].push(MeshInstance {
+                            pos_yaw: [th_rel.x, th_rel.y, th_rel.z, sim_time * 2.4 + phase],
+                            scale_pitch: [ring_s, 0.65, ring_s, 0.0],
+                            tint_glow: [1.0, 0.88, 0.48, (1.0 - t_ring) * 0.82],
+                            flags: [-1.0, 0.0, 0.0, 10.0],
                         });
                     }
                 }
@@ -2006,31 +2040,44 @@ pub fn assemble_live_frame(
                         tint_glow: [0.98, 0.58, 0.26, 0.80],
                         flags: [-1.0, 0.0, 0.0, 0.0],
                     });
-                    // Orbiting crystal dust & subterranean rock-spark wake splats around treads/drills
+                    // Crystalline dirt dust + crisp amber & amethyst drill sparks around tunneling Burrowers!
                     let active_drill = speed > 0.9 || p.melee_active || p.dashing;
-                    let spark_r = if active_drill { 0.96 } else { 0.72 };
-                    let ang0 = sim_time * if active_drill { 6.2 } else { 2.8 } + phase;
+                    let spark_r = if active_drill { 1.05 } else { 0.74 };
+                    let ang0 = sim_time * if active_drill { 7.4 } else { 3.1 } + phase;
                     let dust_rel = Vec3::new(
                         wx + ang0.cos() * spark_r - p.vx * 0.04,
-                        gy + 0.28 + (sim_time * 7.0 + phase).sin().abs() * 0.26,
+                        gy + 0.30 + (sim_time * 7.6 + phase).sin().abs() * 0.32,
                         wz + ang0.sin() * spark_r - p.vy * 0.04,
                     ) - origin;
                     vol_splats.push(VolSplat {
-                        pos_rad: [dust_rel.x, dust_rel.y, dust_rel.z, if active_drill { 0.44 } else { 0.30 }],
-                        color_alpha: [1.18, 0.68, 0.28, if active_drill { 0.56 } else { 0.36 }],
-                        params: [0.95, 2.0, phase + 1.3, 0.25],
+                        pos_rad: [dust_rel.x, dust_rel.y, dust_rel.z, if active_drill { 0.48 } else { 0.32 }],
+                        color_alpha: [1.28, 0.72, 0.24, if active_drill { 0.78 } else { 0.46 }],
+                        params: [1.05, 4.0, phase + 1.3, 0.25],
                     });
-                    let ang1 = ang0 + std::f32::consts::PI;
+                    let ang1 = ang0 + 2.094;
                     let crystal_rel = Vec3::new(
-                        wx + ang1.cos() * (spark_r * 0.85),
-                        gy + 0.36 + (sim_time * 8.4 + phase + 1.2).sin().abs() * 0.32,
-                        wz + ang1.sin() * (spark_r * 0.85),
+                        wx + ang1.cos() * (spark_r * 0.90),
+                        gy + 0.44 + (sim_time * 9.2 + phase + 1.2).sin().abs() * 0.42,
+                        wz + ang1.sin() * (spark_r * 0.90),
                     ) - origin;
                     vol_splats.push(VolSplat {
-                        pos_rad: [crystal_rel.x, crystal_rel.y, crystal_rel.z, if active_drill { 0.34 } else { 0.24 }],
-                        color_alpha: [0.96, 0.42, 1.24, if active_drill { 0.54 } else { 0.34 }],
-                        params: [1.10, 3.0, phase + 3.7, 0.15],
+                        pos_rad: [crystal_rel.x, crystal_rel.y, crystal_rel.z, if active_drill { 0.38 } else { 0.26 }],
+                        color_alpha: [0.98, 0.42, 1.35, if active_drill { 0.74 } else { 0.44 }],
+                        params: [1.15, 4.0, phase + 3.7, 0.15],
                     });
+                    if active_drill {
+                        let ang2 = ang0 + 4.188;
+                        let dirt_rel = Vec3::new(
+                            wx + ang2.cos() * (spark_r * 1.12),
+                            gy + 0.22 + (sim_time * 5.8 + phase).sin().abs() * 0.25,
+                            wz + ang2.sin() * (spark_r * 1.12),
+                        ) - origin;
+                        vol_splats.push(VolSplat {
+                            pos_rad: [dirt_rel.x, dirt_rel.y, dirt_rel.z, 0.46],
+                            color_alpha: [0.68, 0.42, 0.26, 0.48],
+                            params: [0.85, 2.0, phase + 5.1, 0.30],
+                        });
+                    }
                 }
                 _ => {
                     // CLASS_EMBERSTALKER (3): Compact Solo-Raider ember ground ring + ember aura!
@@ -2253,60 +2300,60 @@ pub fn assemble_live_frame(
             let perp_u = beam_dir.cross(up_ref).normalize_or(Vec3::X);
             let perp_v = perp_u.cross(beam_dir).normalize_or(Vec3::Y);
 
-            // 1. Focused Heat Beam (thermal_flux > 0.2): orange-gold 3D diagonal plasma beam + glowing core impact sphere
+            // 1. Focused Heat Beam (thermal_flux > 0.2): vivid white-hot core + fiery orange-gold 3D diagonal plasma beam!
             if pulse.thermal_flux > 0.2 {
                 let inten = pulse.thermal_flux.clamp(0.2, 1.0);
-                let steps = ((beam_len / 1.15).ceil() as usize).clamp(5, 22);
+                let steps = ((beam_len / 0.95).ceil() as usize).clamp(6, 26);
                 for s in 0..=steps {
                     let t = s as f32 / steps as f32;
                     let wpos = p0.lerp(p1, t);
                     let rel = wpos - origin;
-                    let rad = (0.32 + 0.24 * inten) * (0.68 + 0.50 * t);
+                    let rad = (0.34 + 0.22 * inten) * (0.72 + 0.42 * t);
                     vol_splats.push(VolSplat {
                         pos_rad: [rel.x, rel.y, rel.z, rad],
-                        color_alpha: [1.45, 0.72 + 0.22 * (1.0 - t), 0.14, (0.66 + 0.22 * inten).min(0.90)],
-                        params: [1.15, 0.0, seed + s as f32 * 1.7, 0.35],
+                        color_alpha: [1.55, 0.62 + 0.26 * (1.0 - t), 0.12, (0.78 + 0.18 * inten).min(0.95)],
+                        params: [1.05, 4.0, seed + s as f32 * 1.7, 0.25],
                     });
                 }
                 let rel_end = p1 - origin;
                 // Outer scorching flare scaled by focus_radius
                 vol_splats.push(VolSplat {
-                    pos_rad: [rel_end.x, rel_end.y + 0.25, rel_end.z, focus_r * (0.44 + 0.18 * inten)],
-                    color_alpha: [1.40, 0.54, 0.10, (0.64 + 0.18 * inten).min(0.86)],
-                    params: [1.30, 0.0, seed + 21.0, 0.2],
+                    pos_rad: [rel_end.x, rel_end.y + 0.25, rel_end.z, focus_r * (0.48 + 0.18 * inten)],
+                    color_alpha: [1.48, 0.50, 0.08, (0.70 + 0.18 * inten).min(0.90)],
+                    params: [1.25, 0.0, seed + 21.0, 0.2],
                 });
-                // Glowing incandescent impact core sphere
+                // White-hot incandescent impact core sphere
                 vol_splats.push(VolSplat {
-                    pos_rad: [rel_end.x, rel_end.y + 0.20, rel_end.z, focus_r * (0.24 + 0.10 * inten)],
-                    color_alpha: [1.35, 0.96, 0.44, 0.88],
-                    params: [1.0, 3.0, seed + 31.0, 0.0],
+                    pos_rad: [rel_end.x, rel_end.y + 0.20, rel_end.z, focus_r * (0.28 + 0.10 * inten)],
+                    color_alpha: [1.50, 0.92, 0.36, 0.94],
+                    params: [1.0, 4.0, seed + 31.0, 0.0],
                 });
                 push_light(
                     p1 + Vec3::new(0.0, 0.8, 0.0),
                     (focus_r * 2.8).clamp(8.0, 18.0),
-                    [1.15 * inten, 0.56 * inten, 0.16 * inten],
+                    [1.20 * inten, 0.58 * inten, 0.16 * inten],
                 );
             }
 
-            // 2. Cryo Field (thermal_flux < -0.2): crisp ice-cyan 3D diagonal crystalline cone & cloud splats
+            // 2. Cryo Field (thermal_flux < -0.2): razor-bright white-ice core + electric cyan 3D diagonal beam & crystals!
             if pulse.thermal_flux < -0.2 {
                 let inten = (-pulse.thermal_flux).clamp(0.2, 1.0);
-                let steps = ((beam_len / 1.40).ceil() as usize).clamp(5, 18);
+                let steps = ((beam_len / 1.15).ceil() as usize).clamp(6, 22);
                 for s in 0..=steps {
                     let t = s as f32 / steps as f32;
                     let ang = seed + s as f32 * 2.39996;
-                    let cone_spread = focus_r * 0.40 * t;
-                    let jitter = perp_u * (ang.cos() * cone_spread) + perp_v * (ang.sin() * cone_spread * 0.52);
+                    let cone_spread = focus_r * 0.28 * t;
+                    let jitter = perp_u * (ang.cos() * cone_spread) + perp_v * (ang.sin() * cone_spread * 0.45);
                     let rel = (p0.lerp(p1, t) + jitter) - origin;
                     let is_crystal = s % 2 == 0;
                     vol_splats.push(VolSplat {
-                        pos_rad: [rel.x, rel.y, rel.z, (0.32 + focus_r * 0.17 * t) * (0.75 + 0.30 * inten)],
+                        pos_rad: [rel.x, rel.y, rel.z, (0.34 + focus_r * 0.14 * t) * (0.78 + 0.26 * inten)],
                         color_alpha: if is_crystal {
-                            [0.40, 0.92, 1.20, (0.60 + 0.24 * inten).min(0.86)]
+                            [0.32, 0.94, 1.38, (0.74 + 0.20 * inten).min(0.94)]
                         } else {
-                            [0.68, 0.96, 1.08, (0.48 + 0.20 * inten).min(0.72)]
+                            [0.64, 0.96, 1.24, (0.56 + 0.20 * inten).min(0.80)]
                         },
-                        params: [if is_crystal { 1.15 } else { 0.90 }, if is_crystal { 3.0 } else { 2.0 }, seed + s as f32 * 1.9, 0.2],
+                        params: [if is_crystal { 1.10 } else { 0.92 }, if is_crystal { 4.0 } else { 3.0 }, seed + s as f32 * 1.9, 0.15],
                     });
                 }
                 // Crystalline impact cloud ring scaled by focus_radius around true 3D impact point p1
@@ -2316,33 +2363,33 @@ pub fn assemble_live_frame(
                     let wpos = p1 + Vec3::new(ang.cos() * rr, 0.25 + (k % 2) as f32 * 0.35, ang.sin() * rr);
                     let rel = wpos - origin;
                     vol_splats.push(VolSplat {
-                        pos_rad: [rel.x, rel.y, rel.z, focus_r * (0.24 + 0.10 * inten)],
-                        color_alpha: [0.46, 0.94, 1.18, (0.54 + 0.22 * inten).min(0.80)],
-                        params: [1.05, if k % 2 == 0 { 3.0 } else { 2.0 }, seed + k as f32 * 2.3, 0.15],
+                        pos_rad: [rel.x, rel.y, rel.z, focus_r * (0.26 + 0.10 * inten)],
+                        color_alpha: [0.38, 0.96, 1.32, (0.64 + 0.22 * inten).min(0.88)],
+                        params: [1.05, if k % 2 == 0 { 4.0 } else { 2.0 }, seed + k as f32 * 2.3, 0.15],
                     });
                 }
                 push_light(
                     p1 + Vec3::new(0.0, 0.8, 0.0),
                     (focus_r * 2.6).clamp(8.0, 16.0),
-                    [0.34 * inten, 0.82 * inten, 1.15 * inten],
+                    [0.36 * inten, 0.86 * inten, 1.20 * inten],
                 );
             }
 
-            // 3A. Matter Stream — Oil (sp_oil > 0.2): dark-violet glossy droplets along true 3D arc
+            // 3A. Matter Stream — Oil (sp_oil > 0.2): luminous ultraviolet/magenta core + dark glossy oil arc
             if pulse.sp_oil > 0.2 {
                 let inten = pulse.sp_oil.clamp(0.2, 1.0);
-                let steps = ((beam_len / 1.55).ceil() as usize).clamp(4, 14);
+                let steps = ((beam_len / 1.35).ceil() as usize).clamp(5, 16);
                 let horiz_factor = (1.0 - beam_dir.y.abs()).clamp(0.25, 1.0);
                 for s in 1..=steps {
                     let t = s as f32 / steps as f32;
                     let arc_y = (t * std::f32::consts::PI).sin() * (1.1 + beam_len * 0.07) * horiz_factor;
-                    let wobble = (seed + s as f32 * 3.1).sin() * (0.25 + focus_r * 0.10 * t);
+                    let wobble = (seed + s as f32 * 3.1).sin() * (0.22 + focus_r * 0.09 * t);
                     let wpos = p0.lerp(p1, t) + Vec3::new(0.0, arc_y, 0.0) + perp_u * wobble;
                     let rel = wpos - origin;
                     vol_splats.push(VolSplat {
-                        pos_rad: [rel.x, rel.y, rel.z, 0.34 + 0.26 * inten],
-                        color_alpha: [0.34, 0.12, 0.54, (0.70 + 0.18 * inten).min(0.88)],
-                        params: [1.0, 3.0, seed + s as f32 * 2.7, 0.0],
+                        pos_rad: [rel.x, rel.y, rel.z, 0.36 + 0.24 * inten],
+                        color_alpha: [0.68, 0.22, 1.12, (0.76 + 0.16 * inten).min(0.92)],
+                        params: [1.0, 4.0, seed + s as f32 * 2.7, 0.0],
                     });
                 }
                 for k in 0..4 {
@@ -2351,7 +2398,7 @@ pub fn assemble_live_frame(
                     let rel = (p1 + Vec3::new(ang.cos() * rr, 0.15, ang.sin() * rr)) - origin;
                     vol_splats.push(VolSplat {
                         pos_rad: [rel.x, rel.y, rel.z, 0.42 + focus_r * 0.12],
-                        color_alpha: [0.28, 0.10, 0.46, (0.68 + 0.18 * inten).min(0.86)],
+                        color_alpha: [0.42, 0.14, 0.72, (0.72 + 0.18 * inten).min(0.88)],
                         params: [0.85, 3.0, seed + k as f32 * 4.1, 0.0],
                     });
                 }
@@ -2440,54 +2487,57 @@ pub fn assemble_live_frame(
             };
 
             let r = dome.radius.clamp(6.0, 28.0);
-            // 1. Ground perimeter ring + 2 elevated glowing dome latitude rings
+            // 1. Sleek counter-rotating runic latitude rings framing the Time-Dilation Dome hemisphere!
             let ring_tiers = [
-                (0.0f32, 1.00f32, 0.88f32 * fade),
-                (r * 0.24, 0.86, 0.68 * fade),
-                (r * 0.46, 0.58, 0.56 * fade),
+                (0.0f32, 1.00f32, 0.92f32 * fade, 24.0f32),
+                (r * 0.25, 0.88, 0.78 * fade, 18.0f32),
+                (r * 0.48, 0.62, 0.66 * fade, 14.0f32),
             ];
-            for (ti, &(dy, r_mul, glow_a)) in ring_tiers.iter().enumerate() {
-                let s = r * r_mul * 0.88;
+            for (ti, &(dy, r_mul, glow_a, segs)) in ring_tiers.iter().enumerate() {
+                let s = r * r_mul;
                 let dir = if ti % 2 == 0 { 1.0 } else { -1.0 };
-                mesh_batches[MeshKind::GroundRing as usize].push(MeshInstance {
+                mesh_batches[MeshKind::ShrineRuneRing as usize].push(MeshInstance {
                     pos_yaw: [rel_base.x, rel_base.y + dy, rel_base.z, spin * dir],
-                    scale_pitch: [s, 1.25, s, 0.0],
+                    scale_pitch: [s, 1.15, s, 0.0],
                     tint_glow: [ring_col[0] * pulse, ring_col[1] * pulse, ring_col[2] * pulse, glow_a],
-                    flags: [-1.0, 0.0, 0.0, 0.0],
+                    flags: [-1.0, 0.0, 0.0, segs],
                 });
             }
 
-            // 2. Suspended translucent volumetric shimmer wisps forming the 3D hemisphere canopy
-            let hemi_h = r * 0.62;
-            let bands: [(usize, f32, f32); 2] = [(12, 0.28, 1.35), (6, 0.64, 1.55)];
+            // 2. Pulsing Hexagonal Energy-Grid Volumetric Shell (`kind = 5.0`) forming a structured 3D geodesic dome!
+            let hemi_h = r * 0.66;
+            let bands: [(usize, f32, f32); 3] = [
+                (14, 0.16, r * 0.22),
+                (10, 0.44, r * 0.24),
+                (6, 0.72, r * 0.25),
+            ];
             for (bi, &(cnt, el_frac, rad_w)) in bands.iter().enumerate() {
                 let el = el_frac * std::f32::consts::FRAC_PI_2;
                 let ring_r = r * el.cos();
-                let band_y = gy + 0.65 + hemi_h * el.sin();
+                let band_y = gy + 0.55 + hemi_h * el.sin();
                 for k in 0..cnt {
                     let az = (k as f32 / cnt as f32) * std::f32::consts::TAU
-                        + spin * (0.45 + bi as f32 * 0.35);
-                    let bob = 0.24 * (sim_time * if is_stasis { 1.2 } else { 4.8 } + k as f32 * 1.7 + dome.id as f32).sin();
-                    let wpos = Vec3::new(wx + az.cos() * ring_r, band_y + bob, wz + az.sin() * ring_r);
+                        + spin * (0.35 + bi as f32 * 0.22);
+                    let wpos = Vec3::new(wx + az.cos() * ring_r, band_y, wz + az.sin() * ring_r);
                     let rel = wpos - origin;
                     vol_splats.push(VolSplat {
-                        pos_rad: [rel.x, rel.y, rel.z, rad_w],
+                        pos_rad: [rel.x, rel.y, rel.z, rad_w.clamp(1.2, 3.8)],
                         color_alpha: [
-                            wisp_col[0],
-                            wisp_col[1],
-                            wisp_col[2],
-                            (if is_stasis { 0.30 } else { 0.36 }) * fade,
+                            wisp_col[0] * pulse,
+                            wisp_col[1] * pulse,
+                            wisp_col[2] * pulse,
+                            (if is_stasis { 0.54 } else { 0.62 }) * fade,
                         ],
-                        params: [1.15, 3.0, dome.id as f32 * 2.3 + k as f32 * 1.1, 0.0],
+                        params: [1.05, 5.0, dome.id as f32 * 2.3 + k as f32 * 1.1 + bi as f32 * 0.7, 0.0],
                     });
                 }
             }
-            // Zenith crown shimmer wisp
-            let crown_rel = Vec3::new(wx, gy + 0.9 + hemi_h, wz) - origin;
+            // Zenith hexagonal crown energy seal
+            let crown_rel = Vec3::new(wx, gy + 0.75 + hemi_h, wz) - origin;
             vol_splats.push(VolSplat {
-                pos_rad: [crown_rel.x, crown_rel.y, crown_rel.z, 2.35],
-                color_alpha: [wisp_col[0], wisp_col[1], wisp_col[2], 0.44 * fade],
-                params: [0.85, 3.0, dome.id as f32 * 4.1, 0.0],
+                pos_rad: [crown_rel.x, crown_rel.y, crown_rel.z, (r * 0.28).clamp(1.8, 4.4)],
+                color_alpha: [wisp_col[0] * pulse, wisp_col[1] * pulse, wisp_col[2] * pulse, 0.64 * fade],
+                params: [0.85, 5.0, dome.id as f32 * 4.1, 0.0],
             });
             push_light(
                 Vec3::new(wx, gy + 4.8, wz),
@@ -2830,6 +2880,7 @@ mod tests {
                     audio_available: true,
                     cave_enclosure: 0.0,
                     show_squad_links: true,
+                    camera_preset_label: "TACTICAL",
                 },
             );
             assert!(!hud_batch.vertices.is_empty());

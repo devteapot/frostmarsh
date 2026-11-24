@@ -28,7 +28,7 @@ mod world_bridge;
 mod z16_world;
 
 use crate::audio::{SfxKind, SpatialAudioEngine};
-use crate::camera::MobaCamera;
+use crate::camera::{CameraPreset, MobaCamera};
 use crate::hud::{build_hud, HudConfig};
 use crate::mesh_gen::{StaticMeshBank, CLASS_BURROWER};
 use crate::net::QuicClientHandle;
@@ -370,6 +370,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 audio_available: false,
                 cave_enclosure: 0.0,
                 show_squad_links: true,
+                camera_preset_label: CameraPreset::Tactical.label(),
             },
         );
         let (p50, p99, mean) = renderer.benchmark_gpu(
@@ -435,6 +436,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             audio_available: false,
             cave_enclosure: 0.0,
             show_squad_links: true,
+            camera_preset_label: CameraPreset::Tactical.label(),
         },
     );
     let (rgba_main, _, _) = renderer.render_to_rgba(
@@ -566,6 +568,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     audio_available: false,
                     cave_enclosure: 0.0,
                     show_squad_links: true,
+                    camera_preset_label: CameraPreset::Tactical.label(),
                 },
             ))
         } else {
@@ -577,6 +580,140 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     renderer.set_z16_mode(z16_active, 0);
     let grid = compose_2x2_grid([&panels[0], &panels[1], &panels[2], &panels[3]], 960, 540);
     save_rgba_png(&args.out_dir.join("unified_orbit_4view.png"), 1920, 1080, &grid)?;
+
+    // Capture 3: Dramatic Close-Up 3/4 Action View (`unified_closeup_action_1080p.png`, dist ~24m)
+    // Automatically centers on the densest active multi-archetype skirmish near the bridge & river!
+    let closeup_target = {
+        let default_ty = if z16_active { (gd as f32 * 0.34).clamp(5.4, 10.5) } else { 2.0 };
+        let mut best_pos = Vec3::new(0.0, default_ty, -2.0);
+        let mut best_score = -1.0f32;
+        if let Some(ref ent) = entities {
+            let to_wpos = |gx: f32, gy: f32, gz: f32| -> Vec3 {
+                if let Some(ref z16w) = z16_world {
+                    let (wx, wz) = z16w.grid_to_world_xz(gx, gy);
+                    Vec3::new(wx, gz.max(z16w.sample_surface_y(gx, gy)), wz)
+                } else {
+                    let (wx, wz) = world.grid_to_world_xz(gx, gy);
+                    Vec3::new(wx, world.sample_3d_y(gx, gy, gz), wz)
+                }
+            };
+            for p in &ent.players {
+                if p.hp <= 0 {
+                    continue;
+                }
+                let wp = to_wpos(p.x, p.y, p.z);
+                let mut arch_mask = 1u8 << (p.class_id.min(4));
+                let mut team_mask = 1u8 << (p.team.min(1));
+                let mut neighbors = 0.0f32;
+                let mut centroid = wp;
+                let mut w_sum = 1.0f32;
+                for q in &ent.players {
+                    if q.id == p.id || q.hp <= 0 {
+                        continue;
+                    }
+                    let qp = to_wpos(q.x, q.y, q.z);
+                    let d = wp.distance(qp);
+                    if d < 18.0 {
+                        let w = (1.0 - d / 18.0).max(0.1);
+                        neighbors += w;
+                        centroid += qp * w;
+                        w_sum += w;
+                        arch_mask |= 1u8 << (q.class_id.min(4));
+                        team_mask |= 1u8 << (q.team.min(1));
+                    }
+                }
+                let mut pulse_bonus = 0.0f32;
+                for pulse in &ent.actuator_pulses {
+                    let (px, pz) = if let Some(ref z16w) = z16_world {
+                        z16w.grid_to_world_xz((pulse.x0 + pulse.x1) * 0.5, (pulse.y0 + pulse.y1) * 0.5)
+                    } else {
+                        world.grid_to_world_xz((pulse.x0 + pulse.x1) * 0.5, (pulse.y0 + pulse.y1) * 0.5)
+                    };
+                    if (px - wp.x).hypot(pz - wp.z) < 20.0 {
+                        pulse_bonus += 2.5;
+                    }
+                }
+                // Strongly favor skirmishes on/near the iconic central arched bridge, Spire & fjord river!
+                let dist_center = wp.x.hypot(wp.z + 2.0);
+                let bridge_prox = (1.0 - (dist_center / 34.0)).clamp(0.0, 1.0);
+                let score = neighbors * 1.35
+                    + (arch_mask.count_ones() as f32) * 1.6
+                    + if team_mask == 0b11 { 3.2 } else { 0.0 }
+                    + pulse_bonus
+                    + bridge_prox * 14.0;
+                if score > best_score {
+                    best_score = score;
+                    let c = centroid / w_sum;
+                    best_pos = Vec3::new(c.x, c.y + 1.0, c.z);
+                }
+            }
+        }
+        best_pos
+    };
+    let cam_closeup = MobaCamera {
+        target: closeup_target,
+        yaw: 0.46,
+        pitch: 0.34,
+        dist: 26.0,
+        fov_y: 40.0_f32.to_radians(),
+        ortho: false,
+    };
+    let mats_closeup = cam_closeup.compute_matrices(1920.0, 1080.0, sun_dir);
+    let frame_closeup = assemble_live_frame(
+        &world,
+        z16_world.as_ref(),
+        entities.as_ref(),
+        &surfels,
+        &mats_closeup,
+        cam_closeup.target,
+        cam_closeup.dist,
+        sim_time,
+        0,
+        None,
+        true,
+    );
+    let hud_closeup = build_hud(
+        1920.0,
+        1080.0,
+        &world,
+        z16_world.as_ref(),
+        entities.as_ref(),
+        &mats_closeup,
+        &HudConfig {
+            show_hud: true,
+            show_telemetry: true,
+            show_brain_inspector: true,
+            brain_selected_idx: None,
+            selected_element: 0,
+            focus_radius: 4.0,
+            style_label: style_main.label,
+            z16_active,
+            z16_style_label: z16_style_label(0),
+            fps: fps_1080,
+            rtt_ms: 1.2,
+            chat_open: false,
+            chat_input: "",
+            chat_shout: true,
+            show_scoreboard: false,
+            audio_muted: true,
+            audio_available: false,
+            cave_enclosure: 0.0,
+            show_squad_links: true,
+            camera_preset_label: CameraPreset::ActionCloseUp.label(),
+        },
+    );
+    let (rgba_closeup, _, _) = renderer.render_to_rgba(
+        1920,
+        1080,
+        &style_main,
+        atmo,
+        &cam_closeup,
+        &mats_closeup,
+        sim_time,
+        &frame_closeup,
+        Some(&hud_closeup),
+    );
+    save_rgba_png(&args.out_dir.join("unified_closeup_action_1080p.png"), 1920, 1080, &rgba_closeup)?;
 
     let tel = entities.as_ref().map(|e| e.telemetry.clone());
     let mesh_inst_cnt: usize = frame_main.mesh_batches.iter().map(|b| b.len()).sum();
@@ -617,7 +754,7 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     let json = serde_json::to_string_pretty(&metrics)?;
     std::fs::write(args.out_dir.join("unified_metrics.json"), &json)?;
-    println!("[Unified] Saved unified_live_1080p_hud.png, unified_orbit_4view.png, unified_metrics.json");
+    println!("[Unified] Saved unified_live_1080p_hud.png, unified_orbit_4view.png, unified_closeup_action_1080p.png, unified_metrics.json");
     Ok(())
 }
 
@@ -843,6 +980,8 @@ struct InteractiveApp {
     cave_enclosure_ema: f32,
     cutaway_weight: f32,
     camera: MobaCamera,
+    camera_preset: CameraPreset,
+    camera_preset_easing: bool,
     style_clean: bool,
     layer_slice_mode: u8,
     show_hud: bool,
@@ -930,6 +1069,8 @@ impl InteractiveApp {
                 fov_y: 38.0_f32.to_radians(),
                 ortho: false,
             },
+            camera_preset: CameraPreset::Tactical,
+            camera_preset_easing: false,
             style_clean,
             layer_slice_mode: 0,
             show_hud: true,
@@ -990,13 +1131,29 @@ impl InteractiveApp {
         self.fps_ema = self.fps_ema * 0.90 + inst_fps * 0.10;
         let sim_time = self.start_time.elapsed().as_secs_f32();
 
-        // Camera keyboard orbit (locked while typing in acoustic chat!)
+        // Camera keyboard orbit + smooth F5 CameraPreset easing (locked while typing in acoustic chat!)
         if !self.chat_open {
             if self.keys.contains(&KeyCode::KeyQ) {
                 self.camera.yaw -= 1.6 * dt;
             }
             if self.keys.contains(&KeyCode::KeyZ) {
                 self.camera.yaw += 1.6 * dt;
+            }
+        }
+        if self.camera_preset_easing {
+            let (tgt_dist, tgt_pitch, tgt_fov) = self.camera_preset.params(self.z16_active);
+            let ease = 1.0 - (-9.5 * dt).exp();
+            self.camera.dist += (tgt_dist - self.camera.dist) * ease;
+            self.camera.pitch += (tgt_pitch - self.camera.pitch) * ease;
+            self.camera.fov_y += (tgt_fov - self.camera.fov_y) * ease;
+            if (self.camera.dist - tgt_dist).abs() < 0.08
+                && (self.camera.pitch - tgt_pitch).abs() < 0.004
+                && (self.camera.fov_y - tgt_fov).abs() < 0.002
+            {
+                self.camera.dist = tgt_dist;
+                self.camera.pitch = tgt_pitch;
+                self.camera.fov_y = tgt_fov;
+                self.camera_preset_easing = false;
             }
         }
 
@@ -1768,6 +1925,7 @@ impl InteractiveApp {
                 audio_available: self.audio.is_some(),
                 cave_enclosure: self.cave_enclosure_ema,
                 show_squad_links: self.show_squad_links,
+                camera_preset_label: self.camera_preset.label(),
             },
         );
 
@@ -1884,6 +2042,7 @@ impl ApplicationHandler for InteractiveApp {
                     if let Some((lx, ly)) = self.last_mouse_drag {
                         self.camera.yaw -= (nx - lx) * 0.006;
                         self.camera.pitch = (self.camera.pitch + (ny - ly) * 0.005).clamp(0.22, 1.32);
+                        self.camera_preset_easing = false;
                     }
                     self.last_mouse_drag = Some((nx, ny));
                 } else {
@@ -1923,6 +2082,7 @@ impl ApplicationHandler for InteractiveApp {
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.08,
                 };
                 self.camera.dist = (self.camera.dist - dy).clamp(14.0, 180.0);
+                self.camera_preset_easing = false;
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -2139,8 +2299,19 @@ impl ApplicationHandler for InteractiveApp {
                                     }
                                 }
                                 KeyCode::F5 => {
-                                    if let Some(ref q) = self.quic {
-                                        q.send_reliable_detached(ClientReliable::ResetWorld);
+                                    let shift_held = self.keys.contains(&KeyCode::ShiftLeft)
+                                        || self.keys.contains(&KeyCode::ShiftRight);
+                                    if shift_held {
+                                        if let Some(ref q) = self.quic {
+                                            q.send_reliable_detached(ClientReliable::ResetWorld);
+                                        }
+                                    } else {
+                                        self.camera_preset = self.camera_preset.next();
+                                        self.camera_preset_easing = true;
+                                        println!(
+                                            "[Unified] Camera preset -> {} [F5]",
+                                            self.camera_preset.label()
+                                        );
                                     }
                                 }
                                 KeyCode::F7 => {

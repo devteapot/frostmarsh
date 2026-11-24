@@ -121,9 +121,10 @@ fn add_lobe(
 fn build_scalloped_pine(out: &mut Vec<SplatProto>, snowy: bool) {
     let mut v = ParamVolume::new(12.0, 16.0, 12.0, 1);
     let (dark, mid, hi) = if snowy {
-        (v.color(0x1e3c52), v.color(0x6c9eb8), v.color(0xf0f8ff))
+        // Lush deep Nordic spruce beneath crisp frosted snow tips (not solid white snowcones!)
+        (v.color(0x16423a), v.color(0x286852), v.color(0xe4f4ff))
     } else {
-        (v.color(0x122d29), v.color(0x286442), v.color(0x7cc956))
+        (v.color(0x18483c), v.color(0x2d7e52), v.color(0x6ec668))
     };
     let c = 6.0f32;
     let tiers: [(f32, f32, f32); 4] = [
@@ -144,11 +145,11 @@ fn build_scalloped_pine(out: &mut Vec<SplatProto>, snowy: bool) {
             if d > rr {
                 return 0;
             }
-            if t < 0.18 {
+            if t < 0.20 {
                 return dark;
             }
             if snowy {
-                if t > 0.34 || wave > 0.18 {
+                if t > 0.64 || (t > 0.48 && wave > 0.35) {
                     return hi;
                 }
                 return mid;

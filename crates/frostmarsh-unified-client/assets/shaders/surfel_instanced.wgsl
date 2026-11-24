@@ -1,6 +1,9 @@
-// Approach 4 GPU-Instanced Hard-Z Foliage & Flame Surfel Pass
-// Prototypes (PineCanopy, SnowPine, MarshBrush, RiverReeds, WildfireFlame, SmokePlume) live in VRAM.
-// Dynamic A+ live forest updates swap placement buffers in <0.5ms as wildfires burn trees away!
+// Wave 17B: Lush Snow-Dusted Nordic Pine & Foliage Hard-Z GPU-Instanced Surfel Pass
+// Features:
+//   - Warm directional sun highlights with subsurface wrap lighting on sun-facing pine needles
+//   - Snow-frosted upper tips (`n.y > 0.55`) dusted across evergreen tiers
+//   - Deep emerald-teal midtones with lifted sky-bounce so forests never crush to flat black blobs
+//   - Crisp sky-blue Fresnel rim fill separating every tree silhouette cleanly!
 
 struct SceneUniforms {
     view: mat4x4<f32>,
@@ -93,7 +96,8 @@ fn vs_main(
     }
 
     let ln = pr.local_norm_flags.xyz;
-    var n = normalize(vec3<f32>(ln.x * c - ln.z * s, ln.y, ln.x * s + ln.z * c));
+    let n_orig = normalize(vec3<f32>(ln.x * c - ln.z * s, ln.y, ln.x * s + ln.z * c));
+    var n = n_orig;
     let to_cam = select(u.cam_pos.xyz - rel_pos, -u.cam_fwd.xyz, u.cam_fwd.w > 0.5);
     let dist = max(length(u.cam_pos.xyz - rel_pos), 0.001);
     let view_dir = normalize(to_cam);
@@ -151,8 +155,24 @@ fn vs_main(
         return out;
     }
 
-    let alb = clamp(pr.color_glow.rgb * pl.tint_scale.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    var alb = clamp(pr.color_glow.rgb * pl.tint_scale.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     let glow = clamp(pr.color_glow.w * pl.lod_phase.z, 0.0, 1.0);
+
+    // Lush emerald-teal Nordic evergreens with delicate snow-frosted upper tips (`n_orig.y > 0.70`)!
+    if (glow < 0.05) {
+        let crown_h = clamp((pr.local_pos_rad.y - 0.8) / 3.8, 0.0, 1.0);
+        let is_snow_pine = smoothstep(0.55, 0.82, dot(alb, vec3<f32>(0.33, 0.34, 0.33)));
+        // Rich deep Nordic spruce-emerald foliage midtones (never pale whitewash, never black blob!)
+        let emerald_deep = vec3<f32>(0.10, 0.36, 0.28);
+        let emerald_mid = vec3<f32>(0.18, 0.52, 0.34);
+        let spruce_col = mix(emerald_deep, emerald_mid, 0.35 + 0.65 * crown_h);
+        alb = mix(alb, mix(alb, spruce_col, 0.52), 1.0 - is_snow_pine * 0.65);
+
+        // Delicate frost dusting strictly on upward-facing upper bough tips (`n_orig.y > 0.70`)
+        let snow_cap = smoothstep(0.68, 0.90, n_orig.y) * smoothstep(0.20, 0.88, crown_h);
+        let frost_snow = vec3<f32>(0.80, 0.90, 0.98);
+        alb = mix(alb, frost_snow, snow_cap * mix(0.32, 0.48, is_snow_pine));
+    }
 
     var sh = 1.0;
     let lclip = u.light_vp * vec4<f32>(rel_pos + n * 0.25, 1.0);
@@ -160,22 +180,42 @@ fn vs_main(
     let luv = vec2<f32>(lndc.x * 0.5 + 0.5, 0.5 - lndc.y * 0.5);
     if (luv.x > 0.01 && luv.x < 0.99 && luv.y > 0.01 && luv.y < 0.99 && lndc.z > 0.0 && lndc.z < 1.0) {
         let s_raw = textureSampleCompareLevel(shadow_tex, shadow_samp, luv, lndc.z - u.viewport.w * 1.5);
-        sh = mix(1.0, select(s_raw, 0.55 + 0.45 * s_raw, two_sided), u.sun_col.w);
+        sh = mix(1.0, select(s_raw, 0.58 + 0.42 * s_raw, two_sided), u.sun_col.w);
     }
 
-    let fill = mix(u.bounce_col.rgb, u.sky_col.rgb, n.y * 0.5 + 0.5);
-    let ndl = max(dot(n, u.sun_dir.xyz), 0.0) * sh;
-    var light_scalar = ndl + 0.14 * max(facing, 0.0);
+    // Painterly foliage hemisphere fill + directional sun subsurface wrap lighting (rich contrast, no black silhouettes!)
+    let sky_bounce = max(u.sky_col.rgb, vec3<f32>(0.20, 0.34, 0.52));
+    let ground_bounce = max(u.bounce_col.rgb, vec3<f32>(0.08, 0.19, 0.20));
+    let fill = mix(ground_bounce, sky_bounce, n_orig.y * 0.5 + 0.5) * 0.96;
+
+    let raw_ndl = dot(n_orig, u.sun_dir.xyz);
+    let wrap_ndl = max((raw_ndl + 0.34) / 1.34, 0.0) * (0.32 + 0.68 * sh);
+    let direct_ndl = max(dot(n, u.sun_dir.xyz), 0.0) * sh;
+    var light_scalar = mix(wrap_ndl, direct_ndl, 0.50) + 0.12 * max(abs(facing), 0.0);
     if (u.viewport.z > 0.5) {
-        light_scalar = round(light_scalar * u.viewport.z) / u.viewport.z;
+        let q_l = round(light_scalar * u.viewport.z) / u.viewport.z;
+        light_scalar = mix(light_scalar, q_l, 0.48);
     }
-    var col = alb * (fill + u.sun_col.rgb * light_scalar) * u.sun_dir.w;
-    let cool_ink = vec3<f32>(0.149, 0.118, 0.282);
+
+    let sun_key = max(u.sun_col.rgb, vec3<f32>(0.58, 0.64, 0.76));
+    var col = alb * (fill + sun_key * light_scalar * 1.08) * clamp(u.sun_dir.w, 0.88, 1.08);
+
+    // Warm sunlit golden-emerald needle highlight on sun-facing upper crowns + crisp sky-blue rim fill!
+    if (glow < 0.05) {
+        let sun_hi = smoothstep(0.42, 0.92, raw_ndl) * sh * smoothstep(0.15, 0.78, n_orig.y);
+        col += vec3<f32>(0.28, 0.40, 0.16) * sun_hi * 0.46;
+
+        let rim = pow(1.0 - clamp(abs(facing), 0.0, 1.0), 2.4);
+        let rim_col = mix(vec3<f32>(0.24, 0.56, 0.86), sky_bounce * 1.25, 0.5);
+        col += rim_col * rim * (0.22 + 0.24 * max(n_orig.y, 0.0));
+    }
+
+    let cool_ink = vec3<f32>(0.12, 0.20, 0.34);
     let warm_hi = vec3<f32>(1.000, 0.957, 0.839);
     let shadow_t = clamp(1.0 - light_scalar * 1.45, 0.0, 1.0);
-    col = mix(col, cool_ink, shadow_t * 0.18);
-    let hi_t = clamp((light_scalar - 0.78) * 1.8, 0.0, 1.0);
-    col = mix(col, warm_hi, hi_t * 0.14);
+    col = mix(col, cool_ink, shadow_t * 0.12);
+    let hi_t = clamp((light_scalar - 0.75) * 1.8, 0.0, 1.0);
+    col = mix(col, warm_hi, hi_t * 0.16);
 
     for (var k: u32 = 0u; k < 8u; k = k + 1u) {
         let lp_u = u.point_pos[k];
@@ -190,7 +230,7 @@ fn vs_main(
     }
 
     if (glow > 0.05) { col = mix(col, alb * 1.52, glow); }
-    let fog_t = 0.60 * smoothstep(u.sky_col.w, u.bounce_col.w, dist);
+    let fog_t = 0.58 * smoothstep(u.sky_col.w, u.bounce_col.w, dist);
     col = mix(col, u.fog_col.rgb, fog_t * (1.0 - glow * 0.85));
 
     var corners = array<vec2<f32>, 6>(

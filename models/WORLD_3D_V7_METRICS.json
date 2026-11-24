@@ -1,0 +1,551 @@
+{
+  "wave": "17A",
+  "model_class": "WorldModel3DV5 (v7 Thermal-Conduction-Fixed & Smooth-Firewall Distilled)",
+  "params": 158374,
+  "steps": 1000,
+  "train_seconds": 285.3,
+  "device": "NVIDIA L4",
+  "root_cause_fixed": {
+    "firewall_l1_kink_heat_collapse": "Non-smooth L1 abs() in conservation_firewall_loss_3d x out_scale=10.0 exerted 5.8x stronger weight grad and 55x stronger bias grad than horiz_loss, crushing h_out.weight[8:10] to 0.017 and |pred|/|tgt| to 0.003 (R2=0.0015).",
+    "vertical_heat_1250x_grad_explosion": "z_out_scale[:,4]=10.0 / ch_scale[4]=0.008 amplified v_out[4] by 1250x (grad norm 527..4450), starving horizontal heads via clip_grad_norm_(2.0).",
+    "horiz_heat_div10_starvation": "Dividing heat by 10.0 in active_face_horiz_loss shrunk heat MSE gradient by 100x relative to flux."
+  },
+  "eval_z16": {
+    "world_model_3d_v7": {
+      "grid": "96x96x16",
+      "proj_active_pct": 1.429,
+      "proj_flux_pct": 0.22,
+      "proj_heat_pct": 0.838,
+      "proj_rxn_pct": 0.528,
+      "horiz_flux_r2": 0.8918,
+      "horiz_heat_r2": 0.9534,
+      "horiz_rxn_r2": 0.9344,
+      "horiz_mean_r2": 0.9265,
+      "vert_water_r2": 0.9942,
+      "vert_steam_r2": 0.9805,
+      "vert_smoke_r2": 0.9864,
+      "per_biome": {
+        "nordic_viaduct": {
+          "proj_active_pct": 1.449,
+          "horiz_flux_r2": 0.9239,
+          "horiz_heat_r2": 0.8834,
+          "horiz_rxn_r2": 0.8644,
+          "vert_water_r2": 0.9809,
+          "vert_steam_r2": 0.843,
+          "vert_smoke_r2": 0.9877
+        },
+        "volcanic_caldera": {
+          "proj_active_pct": 2.506,
+          "horiz_flux_r2": 0.7363,
+          "horiz_heat_r2": 0.9589,
+          "horiz_rxn_r2": 0.8288,
+          "vert_water_r2": 0.972,
+          "vert_steam_r2": 0.9743,
+          "vert_smoke_r2": 0.9889
+        },
+        "sinkhole_caverns": {
+          "proj_active_pct": 1.164,
+          "horiz_flux_r2": 0.8811,
+          "horiz_heat_r2": 0.9635,
+          "horiz_rxn_r2": 0.9596,
+          "vert_water_r2": 0.9939,
+          "vert_steam_r2": 0.9754,
+          "vert_smoke_r2": -15.0302
+        },
+        "shattered_glacier_gorge": {
+          "proj_active_pct": 0.924,
+          "horiz_flux_r2": 0.838,
+          "horiz_heat_r2": 0.9472,
+          "horiz_rxn_r2": 0.8962,
+          "vert_water_r2": 0.9867,
+          "vert_steam_r2": 0.7805,
+          "vert_smoke_r2": 0.0
+        },
+        "geothermal_mist_basin": {
+          "proj_active_pct": 1.102,
+          "horiz_flux_r2": 0.945,
+          "horiz_heat_r2": 0.9577,
+          "horiz_rxn_r2": 0.9697,
+          "vert_water_r2": 0.9974,
+          "vert_steam_r2": 0.9933,
+          "vert_smoke_r2": -681569.0225
+        }
+      }
+    },
+    "world_model_3d_v6": {
+      "grid": "96x96x16",
+      "proj_active_pct": 7.687,
+      "proj_flux_pct": 0.611,
+      "proj_heat_pct": 0.0,
+      "proj_rxn_pct": 7.22,
+      "horiz_flux_r2": 0.7524,
+      "horiz_heat_r2": 0.0015,
+      "horiz_rxn_r2": 0.4782,
+      "horiz_mean_r2": 0.4107,
+      "vert_water_r2": 0.9905,
+      "vert_steam_r2": 0.9721,
+      "vert_smoke_r2": 0.9855,
+      "per_biome": {
+        "nordic_viaduct": {
+          "proj_active_pct": 3.982,
+          "horiz_flux_r2": 0.8376,
+          "horiz_heat_r2": 0.0017,
+          "horiz_rxn_r2": 0.8672,
+          "vert_water_r2": 0.9571,
+          "vert_steam_r2": -0.3483,
+          "vert_smoke_r2": 0.9813
+        },
+        "volcanic_caldera": {
+          "proj_active_pct": 8.972,
+          "horiz_flux_r2": 0.5208,
+          "horiz_heat_r2": 0.0014,
+          "horiz_rxn_r2": 0.2766,
+          "vert_water_r2": 0.9662,
+          "vert_steam_r2": 0.9711,
+          "vert_smoke_r2": 0.9893
+        },
+        "sinkhole_caverns": {
+          "proj_active_pct": 3.68,
+          "horiz_flux_r2": 0.5651,
+          "horiz_heat_r2": 0.0013,
+          "horiz_rxn_r2": 0.4803,
+          "vert_water_r2": 0.9883,
+          "vert_steam_r2": 0.9426,
+          "vert_smoke_r2": -18.1693
+        },
+        "shattered_glacier_gorge": {
+          "proj_active_pct": 5.145,
+          "horiz_flux_r2": 0.6283,
+          "horiz_heat_r2": 0.0015,
+          "horiz_rxn_r2": 0.8971,
+          "vert_water_r2": 0.9868,
+          "vert_steam_r2": 0.2679,
+          "vert_smoke_r2": 0.0
+        },
+        "geothermal_mist_basin": {
+          "proj_active_pct": 16.658,
+          "horiz_flux_r2": 0.8747,
+          "horiz_heat_r2": 0.002,
+          "horiz_rxn_r2": 0.4887,
+          "vert_water_r2": 0.9952,
+          "vert_steam_r2": 0.9875,
+          "vert_smoke_r2": -1026230.8961
+        }
+      }
+    },
+    "world_model_3d_v5": {
+      "grid": "96x96x16",
+      "proj_active_pct": 1.076,
+      "proj_flux_pct": 0.04,
+      "proj_heat_pct": 0.0,
+      "proj_rxn_pct": 1.041,
+      "horiz_flux_r2": 0.4113,
+      "horiz_heat_r2": 0.001,
+      "horiz_rxn_r2": 0.0395,
+      "horiz_mean_r2": 0.1506,
+      "vert_water_r2": 0.9823,
+      "vert_steam_r2": 0.9575,
+      "vert_smoke_r2": 0.9769,
+      "per_biome": {
+        "nordic_viaduct": {
+          "proj_active_pct": 0.177,
+          "horiz_flux_r2": 0.4668,
+          "horiz_heat_r2": 0.001,
+          "horiz_rxn_r2": 0.0387,
+          "vert_water_r2": 0.9463,
+          "vert_steam_r2": -1.1547,
+          "vert_smoke_r2": 0.9697
+        },
+        "volcanic_caldera": {
+          "proj_active_pct": 2.269,
+          "horiz_flux_r2": 0.3389,
+          "horiz_heat_r2": 0.0011,
+          "horiz_rxn_r2": 0.0394,
+          "vert_water_r2": 0.9417,
+          "vert_steam_r2": 0.9783,
+          "vert_smoke_r2": 0.9808
+        },
+        "sinkhole_caverns": {
+          "proj_active_pct": 0.492,
+          "horiz_flux_r2": 0.344,
+          "horiz_heat_r2": 0.0008,
+          "horiz_rxn_r2": 0.0425,
+          "vert_water_r2": 0.9838,
+          "vert_steam_r2": 0.9038,
+          "vert_smoke_r2": -19.2238
+        },
+        "shattered_glacier_gorge": {
+          "proj_active_pct": 0.007,
+          "horiz_flux_r2": 0.4888,
+          "horiz_heat_r2": 0.0008,
+          "horiz_rxn_r2": 0.0399,
+          "vert_water_r2": 0.965,
+          "vert_steam_r2": 0.1295,
+          "vert_smoke_r2": 0.0
+        },
+        "geothermal_mist_basin": {
+          "proj_active_pct": 2.435,
+          "horiz_flux_r2": 0.3774,
+          "horiz_heat_r2": 0.0006,
+          "horiz_rxn_r2": 0.0285,
+          "vert_water_r2": 0.9878,
+          "vert_steam_r2": 0.9399,
+          "vert_smoke_r2": -1014860.2618
+        }
+      }
+    }
+  },
+  "eval_z32": {
+    "world_model_3d_v7": {
+      "grid": "64x64x32",
+      "proj_active_pct": 1.793,
+      "proj_flux_pct": 0.289,
+      "proj_heat_pct": 1.165,
+      "proj_rxn_pct": 0.533,
+      "horiz_flux_r2": 0.8691,
+      "horiz_heat_r2": 0.9439,
+      "horiz_rxn_r2": 0.9153,
+      "horiz_mean_r2": 0.9094,
+      "vert_water_r2": 0.9917,
+      "vert_steam_r2": 0.991,
+      "vert_smoke_r2": 0.986,
+      "per_biome": {
+        "nordic_viaduct": {
+          "proj_active_pct": 2.639,
+          "horiz_flux_r2": 0.892,
+          "horiz_heat_r2": 0.8923,
+          "horiz_rxn_r2": 0.9063,
+          "vert_water_r2": 0.988,
+          "vert_steam_r2": 0.8574,
+          "vert_smoke_r2": 0.9842
+        },
+        "volcanic_caldera": {
+          "proj_active_pct": 2.771,
+          "horiz_flux_r2": 0.7456,
+          "horiz_heat_r2": 0.9525,
+          "horiz_rxn_r2": 0.7837,
+          "vert_water_r2": 0.9619,
+          "vert_steam_r2": 0.9921,
+          "vert_smoke_r2": 0.9881
+        },
+        "sinkhole_caverns": {
+          "proj_active_pct": 1.25,
+          "horiz_flux_r2": 0.8348,
+          "horiz_heat_r2": 0.9503,
+          "horiz_rxn_r2": 0.9669,
+          "vert_water_r2": 0.981,
+          "vert_steam_r2": 0.9814,
+          "vert_smoke_r2": 0.0
+        },
+        "shattered_glacier_gorge": {
+          "proj_active_pct": 1.217,
+          "horiz_flux_r2": 0.8284,
+          "horiz_heat_r2": 0.9002,
+          "horiz_rxn_r2": 0.7661,
+          "vert_water_r2": 0.9925,
+          "vert_steam_r2": 0.9185,
+          "vert_smoke_r2": 0.0
+        },
+        "geothermal_mist_basin": {
+          "proj_active_pct": 1.089,
+          "horiz_flux_r2": 0.9421,
+          "horiz_heat_r2": 0.9578,
+          "horiz_rxn_r2": 0.9741,
+          "vert_water_r2": 0.997,
+          "vert_steam_r2": 0.9918,
+          "vert_smoke_r2": -250.4754
+        }
+      }
+    },
+    "world_model_3d_v6": {
+      "grid": "64x64x32",
+      "proj_active_pct": 7.36,
+      "proj_flux_pct": 0.863,
+      "proj_heat_pct": 0.0,
+      "proj_rxn_pct": 6.778,
+      "horiz_flux_r2": 0.6854,
+      "horiz_heat_r2": 0.0015,
+      "horiz_rxn_r2": 0.2925,
+      "horiz_mean_r2": 0.3265,
+      "vert_water_r2": 0.9888,
+      "vert_steam_r2": 0.9858,
+      "vert_smoke_r2": 0.9836,
+      "per_biome": {
+        "nordic_viaduct": {
+          "proj_active_pct": 7.082,
+          "horiz_flux_r2": 0.7716,
+          "horiz_heat_r2": 0.0014,
+          "horiz_rxn_r2": 0.8908,
+          "vert_water_r2": 0.977,
+          "vert_steam_r2": 0.1841,
+          "vert_smoke_r2": 0.9689
+        },
+        "volcanic_caldera": {
+          "proj_active_pct": 8.649,
+          "horiz_flux_r2": 0.4808,
+          "horiz_heat_r2": 0.0015,
+          "horiz_rxn_r2": 0.0455,
+          "vert_water_r2": 0.9459,
+          "vert_steam_r2": 0.9931,
+          "vert_smoke_r2": 0.9859
+        },
+        "sinkhole_caverns": {
+          "proj_active_pct": 3.943,
+          "horiz_flux_r2": 0.5037,
+          "horiz_heat_r2": 0.0012,
+          "horiz_rxn_r2": 0.3306,
+          "vert_water_r2": 0.9908,
+          "vert_steam_r2": 0.9597,
+          "vert_smoke_r2": 0.0
+        },
+        "shattered_glacier_gorge": {
+          "proj_active_pct": 6.147,
+          "horiz_flux_r2": 0.5318,
+          "horiz_heat_r2": 0.0014,
+          "horiz_rxn_r2": 0.7448,
+          "vert_water_r2": 0.9886,
+          "vert_steam_r2": 0.7433,
+          "vert_smoke_r2": 0.0
+        },
+        "geothermal_mist_basin": {
+          "proj_active_pct": 10.979,
+          "horiz_flux_r2": 0.8352,
+          "horiz_heat_r2": 0.0021,
+          "horiz_rxn_r2": 0.3034,
+          "vert_water_r2": 0.9944,
+          "vert_steam_r2": 0.9838,
+          "vert_smoke_r2": -222.5381
+        }
+      }
+    },
+    "world_model_3d_v5": {
+      "grid": "64x64x32",
+      "proj_active_pct": 1.851,
+      "proj_flux_pct": 0.127,
+      "proj_heat_pct": 0.0,
+      "proj_rxn_pct": 1.734,
+      "horiz_flux_r2": 0.4057,
+      "horiz_heat_r2": 0.0011,
+      "horiz_rxn_r2": 0.0179,
+      "horiz_mean_r2": 0.1416,
+      "vert_water_r2": 0.9756,
+      "vert_steam_r2": 0.9654,
+      "vert_smoke_r2": 0.9501,
+      "per_biome": {
+        "nordic_viaduct": {
+          "proj_active_pct": 0.84,
+          "horiz_flux_r2": 0.4672,
+          "horiz_heat_r2": 0.0007,
+          "horiz_rxn_r2": 0.0403,
+          "vert_water_r2": 0.9642,
+          "vert_steam_r2": -0.401,
+          "vert_smoke_r2": 0.9756
+        },
+        "volcanic_caldera": {
+          "proj_active_pct": 4.053,
+          "horiz_flux_r2": 0.2855,
+          "horiz_heat_r2": 0.0012,
+          "horiz_rxn_r2": -0.0203,
+          "vert_water_r2": 0.8409,
+          "vert_steam_r2": 0.9782,
+          "vert_smoke_r2": 0.9497
+        },
+        "sinkhole_caverns": {
+          "proj_active_pct": 0.629,
+          "horiz_flux_r2": 0.3686,
+          "horiz_heat_r2": 0.0009,
+          "horiz_rxn_r2": 0.0369,
+          "vert_water_r2": 0.978,
+          "vert_steam_r2": 0.9226,
+          "vert_smoke_r2": 0.0
+        },
+        "shattered_glacier_gorge": {
+          "proj_active_pct": 0.214,
+          "horiz_flux_r2": 0.4768,
+          "horiz_heat_r2": 0.0005,
+          "horiz_rxn_r2": 0.0341,
+          "vert_water_r2": 0.9645,
+          "vert_steam_r2": 0.6948,
+          "vert_smoke_r2": 0.0
+        },
+        "geothermal_mist_basin": {
+          "proj_active_pct": 3.517,
+          "horiz_flux_r2": 0.38,
+          "horiz_heat_r2": 0.0007,
+          "horiz_rxn_r2": 0.0212,
+          "vert_water_r2": 0.9883,
+          "vert_steam_r2": 0.9578,
+          "vert_smoke_r2": -301.0006
+        }
+      }
+    }
+  },
+  "fp32_sparse_parity_z16": {
+    "L": 16,
+    "H": 64,
+    "W": 64,
+    "active_brick_frac": 0.5625,
+    "max_abs_diff_horiz": 2.3283064365386963e-10,
+    "max_abs_diff_z_flux": 0.0,
+    "max_abs_diff_z_world": 0.0,
+    "max_abs_diff_all": 2.3283064365386963e-10
+  },
+  "fp32_sparse_parity_z32": {
+    "L": 32,
+    "H": 64,
+    "W": 64,
+    "active_brick_frac": 0.5625,
+    "max_abs_diff_horiz": 2.3283064365386963e-10,
+    "max_abs_diff_z_flux": 0.0,
+    "max_abs_diff_z_world": 0.0,
+    "max_abs_diff_all": 2.3283064365386963e-10
+  },
+  "sparse_brick_benchmark_fp16": {
+    "256x256x16_1.05M": {
+      "L": 16,
+      "H": 256,
+      "W": 256,
+      "voxels": 1048576,
+      "total_bricks_16x16x8": 512,
+      "gpu": "NVIDIA L4",
+      "by_active_pct": {
+        "sparse_10pct": {
+          "p50_ms": 25.261,
+          "p95_ms": 25.439,
+          "mean_ms": 25.238,
+          "hz": 39.6,
+          "active_bricks": 51,
+          "total_bricks": 512,
+          "actual_active_pct": 9.96,
+          "speedup_vs_dense_x": 2.63
+        },
+        "sparse_25pct": {
+          "p50_ms": 54.11,
+          "p95_ms": 54.334,
+          "mean_ms": 54.097,
+          "hz": 18.5,
+          "active_bricks": 128,
+          "total_bricks": 512,
+          "actual_active_pct": 25.0,
+          "speedup_vs_dense_x": 1.23
+        },
+        "sparse_40pct": {
+          "p50_ms": 96.794,
+          "p95_ms": 97.172,
+          "mean_ms": 96.79,
+          "hz": 10.3,
+          "active_bricks": 205,
+          "total_bricks": 512,
+          "actual_active_pct": 40.04,
+          "speedup_vs_dense_x": 0.69
+        },
+        "dense_100pct": {
+          "p50_ms": 66.407,
+          "p95_ms": 66.935,
+          "mean_ms": 66.469,
+          "hz": 15.1,
+          "active_bricks": 512,
+          "total_bricks": 512,
+          "actual_active_pct": 100.0,
+          "speedup_vs_dense_x": 1.0
+        }
+      }
+    },
+    "256x256x32_2.10M": {
+      "L": 32,
+      "H": 256,
+      "W": 256,
+      "voxels": 2097152,
+      "total_bricks_16x16x8": 1024,
+      "gpu": "NVIDIA L4",
+      "by_active_pct": {
+        "sparse_10pct": {
+          "p50_ms": 55.078,
+          "p95_ms": 55.392,
+          "mean_ms": 55.07,
+          "hz": 18.2,
+          "active_bricks": 102,
+          "total_bricks": 1024,
+          "actual_active_pct": 9.96,
+          "speedup_vs_dense_x": 2.7
+        },
+        "sparse_25pct": {
+          "p50_ms": 110.319,
+          "p95_ms": 110.675,
+          "mean_ms": 110.287,
+          "hz": 9.1,
+          "active_bricks": 256,
+          "total_bricks": 1024,
+          "actual_active_pct": 25.0,
+          "speedup_vs_dense_x": 1.35
+        },
+        "sparse_40pct": {
+          "p50_ms": 180.42,
+          "p95_ms": 181.152,
+          "mean_ms": 180.524,
+          "hz": 5.5,
+          "active_bricks": 410,
+          "total_bricks": 1024,
+          "actual_active_pct": 40.04,
+          "speedup_vs_dense_x": 0.82
+        },
+        "dense_100pct": {
+          "p50_ms": 148.47,
+          "p95_ms": 148.901,
+          "mean_ms": 148.314,
+          "hz": 6.7,
+          "active_bricks": 1024,
+          "total_bricks": 1024,
+          "actual_active_pct": 100.0,
+          "speedup_vs_dense_x": 1.0
+        }
+      }
+    }
+  },
+  "history": [
+    {
+      "step": 250,
+      "elapsed_s": 44.9,
+      "horiz_heat_r2": 0.9458,
+      "horiz_flux_r2": 0.8654,
+      "horiz_rxn_r2": 0.8893,
+      "vert_water_r2": 0.9925,
+      "vert_steam_r2": 0.9757,
+      "vert_smoke_r2": 0.9826,
+      "proj_active_pct": 3.609
+    },
+    {
+      "step": 500,
+      "elapsed_s": 81.5,
+      "horiz_heat_r2": 0.9475,
+      "horiz_flux_r2": 0.8741,
+      "horiz_rxn_r2": 0.895,
+      "vert_water_r2": 0.9925,
+      "vert_steam_r2": 0.9704,
+      "vert_smoke_r2": 0.9806,
+      "proj_active_pct": 2.594
+    },
+    {
+      "step": 750,
+      "elapsed_s": 117.2,
+      "horiz_heat_r2": 0.9491,
+      "horiz_flux_r2": 0.8759,
+      "horiz_rxn_r2": 0.8945,
+      "vert_water_r2": 0.9931,
+      "vert_steam_r2": 0.9772,
+      "vert_smoke_r2": 0.9832,
+      "proj_active_pct": 1.979
+    },
+    {
+      "step": 1000,
+      "elapsed_s": 153.9,
+      "horiz_heat_r2": 0.9485,
+      "horiz_flux_r2": 0.8783,
+      "horiz_rxn_r2": 0.897,
+      "vert_water_r2": 0.9933,
+      "vert_steam_r2": 0.9763,
+      "vert_smoke_r2": 0.9828,
+      "proj_active_pct": 1.797
+    }
+  ]
+}

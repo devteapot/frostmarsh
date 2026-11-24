@@ -45,6 +45,87 @@ pub const fn biome_name(id: u8) -> &'static str {
     }
 }
 
+pub const WORLD_LAW_STANDARD: u8 = 0;
+pub const WORLD_LAW_FREEZE_OUT: u8 = 1;
+pub const WORLD_LAW_RISING_FLOOD: u8 = 2;
+pub const WORLD_LAW_LOW_G_MAGMA: u8 = 3;
+pub const NUM_WORLD_LAW_PRESETS: u8 = 4;
+
+/// Live 6-float world-law parameter vector governing gravity, ambient temperature shift,
+/// combustion volatility, fluid viscosity, hydrologic precipitation, and thermal conductivity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldLaws {
+    pub gravity_g: f32,
+    pub ambient_temp_shift: f32,
+    pub volatility: f32,
+    pub viscosity: f32,
+    pub precipitation: f32,
+    pub thermal_cond: f32,
+}
+
+impl Default for WorldLaws {
+    fn default() -> Self {
+        Self::from_preset(WORLD_LAW_STANDARD)
+    }
+}
+
+impl WorldLaws {
+    pub const fn from_preset(preset_id: u8) -> Self {
+        match preset_id % NUM_WORLD_LAW_PRESETS {
+            WORLD_LAW_FREEZE_OUT => Self {
+                gravity_g: 1.0,
+                ambient_temp_shift: -5500.0,
+                volatility: 1.2,
+                viscosity: 1.1,
+                precipitation: 1.4,
+                thermal_cond: 1.3,
+            },
+            WORLD_LAW_RISING_FLOOD => Self {
+                gravity_g: 1.15,
+                ambient_temp_shift: -600.0,
+                volatility: 0.6,
+                viscosity: 0.55,
+                precipitation: 2.6,
+                thermal_cond: 1.0,
+            },
+            WORLD_LAW_LOW_G_MAGMA => Self {
+                gravity_g: 0.35,
+                ambient_temp_shift: 5500.0,
+                volatility: 2.2,
+                viscosity: 1.6,
+                precipitation: 0.25,
+                thermal_cond: 1.5,
+            },
+            _ => Self {
+                gravity_g: 1.0,
+                ambient_temp_shift: 0.0,
+                volatility: 1.0,
+                viscosity: 1.0,
+                precipitation: 1.0,
+                thermal_cond: 1.0,
+            },
+        }
+    }
+
+    pub const fn preset_name(preset_id: u8) -> &'static str {
+        match preset_id % NUM_WORLD_LAW_PRESETS {
+            WORLD_LAW_FREEZE_OUT => "FREEZE-OUT",
+            WORLD_LAW_RISING_FLOOD => "RISING FLOOD",
+            WORLD_LAW_LOW_G_MAGMA => "LOW-G MAGMA",
+            _ => "STANDARD",
+        }
+    }
+
+    pub fn is_standard(&self) -> bool {
+        (self.gravity_g - 1.0).abs() <= 1e-4
+            && self.ambient_temp_shift.abs() <= 1e-2
+            && (self.volatility - 1.0).abs() <= 1e-4
+            && (self.viscosity - 1.0).abs() <= 1e-4
+            && (self.precipitation - 1.0).abs() <= 1e-4
+            && (self.thermal_cond - 1.0).abs() <= 1e-4
+    }
+}
+
 pub const MOBILE_SPECIES: [usize; NUM_MOBILE] = [SP_WATER, SP_STEAM, SP_SMOKE, SP_OIL];
 
 #[derive(Clone, Copy, Debug)]
@@ -1723,9 +1804,18 @@ pub struct VolumeField {
     pub initial_total_energy: i64,
     pub tick: u64,
     pub evolution_stats: WorldEvolutionStats,
+    pub world_laws: WorldLaws,
+    pub world_law_preset: u8,
 }
 
 impl VolumeField {
+    /// Set the active live `WorldLaws` preset (`0=STANDARD, 1=FREEZE-OUT, 2=RISING FLOOD, 3=LOW-G MAGMA`).
+    pub fn set_world_law_preset(&mut self, preset_id: u8) {
+        let p = preset_id % NUM_WORLD_LAW_PRESETS;
+        self.world_law_preset = p;
+        self.world_laws = WorldLaws::from_preset(p);
+    }
+
     /// Build **Shattered Reach 3D** (`W × H × depth`, `depth >= 4` recommended):
     /// true multi-level 3D world with under-bridge rivers, overhanging timber & stone skybridges,
     /// highland alpine glacial lakes feeding live 3D waterfalls, and an upper atmospheric plume layer!
@@ -1760,6 +1850,8 @@ impl VolumeField {
                 initial_total_energy: 0,
                 tick: 0,
                 evolution_stats: WorldEvolutionStats::default(),
+                world_laws: WorldLaws::default(),
+                world_law_preset: WORLD_LAW_STANDARD,
             };
             vf.init_biome_3d(b_id, seed);
             return vf;
@@ -1894,6 +1986,8 @@ impl VolumeField {
             initial_total_energy: 0,
             tick: 0,
             evolution_stats: WorldEvolutionStats::default(),
+            world_laws: WorldLaws::default(),
+            world_law_preset: WORLD_LAW_STANDARD,
         };
         vf.snapshot_conservation_baseline();
         vf.snapshot_prev_sensors();
@@ -2500,14 +2594,17 @@ impl VolumeField {
         let len = w * h;
         let mut collapse_moved = 0i64;
 
-        // 1. Closed 3D Hydrologic Condensation in upper troposphere (`z >= depth - 3`):
+        // 1. Closed 3D Hydrologic Condensation in upper troposphere (`z >= depth - 3`, or deeper under high precipitation):
         //    High-altitude SP_STEAM radiatively cools (faucet_energy accounted cleanly -> energy_error == 0)
         //    and condenses into SP_WATER (or SP_ICE when T < 273.15 K) with exact dm_steam == dm_condensed!
-        let z_cloud_lo = d.saturating_sub(3);
+        let precip = self.world_laws.precipitation.clamp(0.1, 4.0);
+        let amb_shift_sky = (self.world_laws.ambient_temp_shift * 0.5).round() as i64;
+        let cloud_layers = if precip > 1.5 { 5usize } else { 3usize };
+        let z_cloud_lo = d.saturating_sub(cloud_layers);
         let is_glacial = self.biome_id == BIOME_GLACIER_GORGE;
         for z in z_cloud_lo..d {
             let z_from_top = (d - 1) - z;
-            let t_sky: i64 = if is_glacial {
+            let base_sky: i64 = if is_glacial {
                 match z_from_top {
                     0 => 25_600,
                     1 => 26_400,
@@ -2519,6 +2616,12 @@ impl VolumeField {
                     1 => 29_800,
                     _ => 32_800,
                 }
+            };
+            let t_sky = if precip > 1.5 && self.world_laws.ambient_temp_shift > -2000.0 {
+                // High-precipitation temperate deluge: clouds condense into heavy liquid rain
+                (base_sky + amb_shift_sky).max(28_200).clamp(T_MIN, T_MAX)
+            } else {
+                (base_sky + amb_shift_sky).clamp(T_MIN, T_MAX)
             };
             let f = &mut self.layers[z];
             for idx in 0..len {
@@ -2545,7 +2648,12 @@ impl VolumeField {
                 let t_now = f.cell_temp_ck(idx);
                 if t_now < 37_000 {
                     let target_sp = if t_now < 27_315 { SP_ICE } else { SP_WATER };
-                    let dm = ((steam / 2).max(1)).min(steam);
+                    let dm = if (precip - 1.0).abs() <= 1e-4 {
+                        ((steam / 2).max(1)).min(steam)
+                    } else {
+                        let frac = (0.50 * precip).clamp(0.05, 0.95);
+                        ((steam as f32 * frac).round() as u16).max(1).min(steam)
+                    };
                     if dm > 0 {
                         let e_before = f.energy[idx];
                         f.mass[SP_STEAM][idx] -= dm;
@@ -2669,6 +2777,16 @@ impl VolumeField {
             grav_moved += self.step_hydrologic_and_collapse_3d();
         }
         let grav_min_mass: u16 = if self.depth >= 12 { 8 } else { 20 };
+        let laws = self.world_laws;
+        let standard_laws = laws.is_standard();
+        let grav_fall_frac =
+            (0.3333 * (laws.gravity_g.clamp(0.15, 2.5) / laws.viscosity.clamp(0.25, 4.0)))
+                .clamp(0.08, 0.85);
+        let buoy_rise_frac = (0.3333
+            * (1.0 / laws.gravity_g.clamp(0.25, 2.5)).sqrt()
+            * (1.0 + (laws.ambient_temp_shift.max(0.0) / 11_000.0)))
+        .clamp(0.10, 0.85);
+        let cond_scale = laws.thermal_cond.clamp(0.25, 4.0);
 
         for z in 0..(self.depth - 1) {
             let (lo_slice, hi_slice) = self.layers.split_at_mut(z + 1);
@@ -2689,7 +2807,14 @@ impl VolumeField {
                         let avail = hi.mass[sp][idx];
                         if avail > grav_min_mass {
                             let room = H_CAP.saturating_sub(lo.cell_volume(idx)) as u16;
-                            let q = ((avail / 3).max(1)).min(room);
+                            let q = if standard_laws {
+                                ((avail / 3).max(1)).min(room)
+                            } else {
+                                ((avail as f32 * grav_fall_frac).round() as u16)
+                                    .max(1)
+                                    .min(avail)
+                                    .min(room)
+                            };
                             if q > 0 {
                                 let c_hi = hi.cell_heat_capacity(idx).max(1);
                                 let t_hi = (hi.energy[idx] / c_hi).clamp(T_MIN, T_MAX);
@@ -2711,7 +2836,14 @@ impl VolumeField {
                         let avail = lo.mass[sp][idx];
                         if avail > 12 {
                             let room = H_CAP.saturating_sub(hi.cell_volume(idx)) as u16;
-                            let q = ((avail / 3).max(1)).min(room);
+                            let q = if standard_laws {
+                                ((avail / 3).max(1)).min(room)
+                            } else {
+                                ((avail as f32 * buoy_rise_frac).round() as u16)
+                                    .max(1)
+                                    .min(avail)
+                                    .min(room)
+                            };
                             if q > 0 {
                                 let c_lo = lo.cell_heat_capacity(idx).max(1);
                                 let t_lo = (lo.energy[idx] / c_lo).clamp(T_MIN, T_MAX);
@@ -2736,7 +2868,12 @@ impl VolumeField {
                     let dt = t_lo - t_hi;
                     if dt.abs() > 1500 {
                         // Rising heat conducts faster upward than downward (convective bias)
-                        let rate = if dt > 0 { 22 } else { 64 };
+                        let base_rate = if dt > 0 { 22.0 } else { 64.0 };
+                        let rate = if standard_laws {
+                            if dt > 0 { 22 } else { 64 }
+                        } else {
+                            ((base_rate / cond_scale).round() as i64).max(6)
+                        };
                         let g_raw = (dt * c_lo.min(c_hi)) / rate;
                         let g = if g_raw > 0 {
                             let avail = (lo.energy[idx] - c_lo * T_MIN).max(0) / 4;
@@ -3410,6 +3547,36 @@ impl VolumeField {
         self.step_3d_with_neural_z(raw_layers, None)
     }
 
+    /// Apply gentle conservation-exact ambient climate relaxation (`world_laws.ambient_temp_shift`),
+    /// updating `faucet_energy` so `mass_error == 0 && energy_error == 0` holds strictly on every tick.
+    fn apply_world_law_ambient_relaxation_3d(&mut self) {
+        let shift = self.world_laws.ambient_temp_shift;
+        if !shift.is_finite() || shift.abs() <= 1.0 {
+            return;
+        }
+        let t_target = (T_AMB + shift.round() as i64).clamp(T_MIN, T_MAX);
+        let len = self.width * self.height;
+        for f in &mut self.layers {
+            for idx in 0..len {
+                let c = f.cell_heat_capacity(idx);
+                if c <= 0 {
+                    continue;
+                }
+                let t = f.cell_temp_ck(idx);
+                let step_ck = (t_target - t) / 8;
+                if step_ck != 0 {
+                    let e_cur = f.energy[idx];
+                    let e_next = (e_cur + step_ck * c).clamp(c * T_MIN, c * T_MAX);
+                    let delta = e_next - e_cur;
+                    if delta != 0 {
+                        f.energy[idx] = e_next;
+                        f.faucet_energy += delta;
+                    }
+                }
+            }
+        }
+    }
+
     /// Apply all `L` horizontal layer steps + either neural `WorldModel3D` v4 vertical interface fluxes
     /// (`Some(z_flux_f32)` of layout `[depth - 1, 5, H, W]`) or analytic `step_vertical_exchange_3d` (`None`),
     /// then re-hash dirty chunks and report exact 3D mass & energy conservation errors.
@@ -3419,13 +3586,54 @@ impl VolumeField {
         z_flux_f32: Option<&[f32]>,
     ) -> VolumeStepStats {
         self.snapshot_prev_sensors();
+        let laws = self.world_laws;
+        let scale_raw = (laws.viscosity - 1.0).abs() > 1e-3
+            || (laws.volatility - 1.0).abs() > 1e-3
+            || (laws.thermal_cond - 1.0).abs() > 1e-3
+            || (laws.precipitation - 1.0).abs() > 1e-3;
+        let liq_mul = (1.0 / laws.viscosity.clamp(0.25, 4.0)).clamp(0.25, 4.0);
+        let cond_mul = laws.thermal_cond.clamp(0.25, 4.0);
+        let vol_mul = laws.volatility.clamp(0.2, 4.0);
+        let precip_mul = laws.precipitation.clamp(0.1, 4.0);
+
         let mut proj_sum = 0.0f32;
         for (z, l) in self.layers.iter_mut().enumerate() {
             if let Some(raw) = raw_layers.get(z) {
-                let st = l.project_and_apply(raw);
+                let st = if scale_raw {
+                    let mut scaled = raw.clone();
+                    let area = scaled.width * scaled.height;
+                    for &c in &[0usize, 3, 4, 7] {
+                        let base = c * area;
+                        for v in &mut scaled.data[base..base + area] {
+                            *v *= liq_mul;
+                        }
+                    }
+                    for &c in &[8usize, 9] {
+                        let base = c * area;
+                        for v in &mut scaled.data[base..base + area] {
+                            *v *= cond_mul;
+                        }
+                    }
+                    {
+                        let base = 13 * area;
+                        for v in &mut scaled.data[base..base + area] {
+                            *v *= precip_mul;
+                        }
+                    }
+                    for &c in &[14usize, 15, 16] {
+                        let base = c * area;
+                        for v in &mut scaled.data[base..base + area] {
+                            *v *= vol_mul;
+                        }
+                    }
+                    l.project_and_apply(&scaled)
+                } else {
+                    l.project_and_apply(raw)
+                };
                 proj_sum += st.proj_active_pct;
             }
         }
+        self.apply_world_law_ambient_relaxation_3d();
         let (grav, buoy) = if let Some(zf) = z_flux_f32 {
             self.apply_neural_3d_vertical_fluxes(zf)
         } else {
@@ -5246,7 +5454,7 @@ impl VolumeField {
         height: f32,
         dt: f32,
     ) -> ((f32, f32, f32), (f32, f32, f32), bool) {
-        const GRAVITY: f32 = 18.0;
+        let gravity: f32 = 18.0 * self.world_laws.gravity_g.clamp(0.15, 2.5);
         if self.width < 4 || self.height < 4 || self.depth < 2 || dt <= 0.0 {
             return (pos, vel, false);
         }
@@ -5265,7 +5473,7 @@ impl VolumeField {
         let max_z = (self.depth as f32 - height - 0.1).max(0.5);
 
         for _ in 0..substeps {
-            vz -= GRAVITY * sub_dt;
+            vz -= gravity * sub_dt;
             px = (px + vx * sub_dt).clamp(min_x, max_x);
             py = (py + vy * sub_dt).clamp(min_y, max_y);
             pz = (pz + vz * sub_dt).clamp(0.5, max_z);
@@ -6340,5 +6548,107 @@ mod tests {
         let st = vf.step_3d(&raws);
         assert_eq!(st.mass_error, 0, "post-carve step_3d mass_error != 0");
         assert_eq!(st.energy_error, 0, "post-carve step_3d energy_error != 0");
+    }
+
+    #[test]
+    fn test_world_law_presets_exact_conservation() {
+        assert_eq!(WorldLaws::preset_name(WORLD_LAW_STANDARD), "STANDARD");
+        assert_eq!(WorldLaws::preset_name(WORLD_LAW_FREEZE_OUT), "FREEZE-OUT");
+        assert_eq!(WorldLaws::preset_name(WORLD_LAW_RISING_FLOOD), "RISING FLOOD");
+        assert_eq!(WorldLaws::preset_name(WORLD_LAW_LOW_G_MAGMA), "LOW-G MAGMA");
+
+        let std_laws = WorldLaws::from_preset(0);
+        let frz_laws = WorldLaws::from_preset(1);
+        let fld_laws = WorldLaws::from_preset(2);
+        let mag_laws = WorldLaws::from_preset(3);
+        assert!((std_laws.gravity_g - 1.0).abs() < 1e-6 && std_laws.ambient_temp_shift == 0.0);
+        assert!((frz_laws.ambient_temp_shift + 5500.0).abs() < 1e-3 && (frz_laws.precipitation - 1.4).abs() < 1e-4);
+        assert!((fld_laws.gravity_g - 1.15).abs() < 1e-4 && (fld_laws.precipitation - 2.6).abs() < 1e-4);
+        assert!((mag_laws.gravity_g - 0.35).abs() < 1e-4 && (mag_laws.ambient_temp_shift - 5500.0).abs() < 1e-3);
+
+        // Run all 4 presets from the exact same 32x32x16 seeded state and compare physical outcomes
+        let mut final_ice = [0u64; 4];
+        let mut final_water = [0u64; 4];
+        let mut mean_temp_ck = [0i64; 4];
+        let mut total_buoy = [0i64; 4];
+
+        for preset in 0..4u8 {
+            let mut vf = VolumeField::new_biome_3d(32, 32, 16, BIOME_NORDIC_VIADUCT, 7);
+            // Seed uniform water pool at z=5 and hot steam cloud at z=11..14 so all 4 presets diverge cleanly
+            for y in 10..22 {
+                for x in 10..22 {
+                    let idx = vf.layers[5].idx(x, y);
+                    for s in 0..NUM_SPECIES {
+                        vf.layers[5].mass[s][idx] = 0;
+                    }
+                    vf.layers[5].mass[SP_WATER][idx] = 900;
+                    vf.layers[5].set_cell_temp(idx, 28_000);
+
+                    for z in 11..=14 {
+                        let cidx = vf.layers[z].idx(x, y);
+                        for s in 0..NUM_SPECIES {
+                            vf.layers[z].mass[s][cidx] = 0;
+                        }
+                        vf.layers[z].mass[SP_STEAM][cidx] = 600;
+                        vf.layers[z].set_cell_temp(cidx, 38_200);
+                    }
+                }
+            }
+            vf.snapshot_conservation_baseline();
+            vf.set_world_law_preset(preset);
+            assert_eq!(vf.world_law_preset, preset);
+
+            for tick in 0..10 {
+                let raws = vf.refsim_raw_outputs_all();
+                let st = vf.step_3d(&raws);
+                assert_eq!(st.mass_error, 0, "preset {} mass_error != 0 at tick {}", preset, tick);
+                assert_eq!(st.energy_error, 0, "preset {} energy_error != 0 at tick {}", preset, tick);
+                total_buoy[preset as usize] += st.vertical_buoyancy_mass;
+            }
+
+            let mut ice_sum = 0u64;
+            let mut water_sum = 0u64;
+            let mut t_sum = 0i64;
+            let mut t_cnt = 0i64;
+            for z in 0..16 {
+                for &m in &vf.layers[z].mass[SP_WATER] {
+                    water_sum += m as u64;
+                }
+                for &m in &vf.layers[z].mass[SP_ICE] {
+                    ice_sum += m as u64;
+                }
+            }
+            for y in 10..22 {
+                for x in 10..22 {
+                    let idx = vf.layers[5].idx(x, y);
+                    t_sum += vf.layers[5].cell_temp_ck(idx);
+                    t_cnt += 1;
+                }
+            }
+            final_ice[preset as usize] = ice_sum;
+            final_water[preset as usize] = water_sum;
+            mean_temp_ck[preset as usize] = t_sum / t_cnt.max(1);
+        }
+
+        assert!(
+            final_ice[1] > final_ice[0] && final_ice[1] > final_ice[3],
+            "FREEZE-OUT must produce strictly more SP_ICE than STANDARD and LOW-G MAGMA: {:?}",
+            final_ice
+        );
+        assert!(
+            final_water[2] > final_water[0] && final_water[2] > final_water[3],
+            "RISING FLOOD must condense strictly more SP_WATER than STANDARD and LOW-G MAGMA: {:?}",
+            final_water
+        );
+        assert!(
+            mean_temp_ck[3] > mean_temp_ck[0] && mean_temp_ck[0] > mean_temp_ck[1],
+            "LOW-G MAGMA must stay hotter than STANDARD, and STANDARD hotter than FREEZE-OUT: {:?}",
+            mean_temp_ck
+        );
+        assert!(
+            total_buoy[3] > total_buoy[0],
+            "LOW-G MAGMA must exhibit higher vertical buoyancy transport than STANDARD: {:?}",
+            total_buoy
+        );
     }
 }

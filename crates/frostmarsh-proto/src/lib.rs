@@ -41,6 +41,17 @@ pub const MATCH_PHASE_WEST_VICTORY: u8 = 1;
 pub const MATCH_PHASE_EAST_VICTORY: u8 = 2;
 pub const MATCH_PHASE_DRAW: u8 = 3;
 
+pub const fn world_law_preset_name(preset_id: u8) -> &'static str {
+    match preset_id % 4 {
+        1 => "FREEZE-OUT",
+        2 => "RISING FLOOD",
+        3 => "LOW-G MAGMA",
+        _ => "STANDARD",
+    }
+}
+
+pub type ClientControl = ClientReliable;
+
 #[inline]
 pub fn chunks_for_dim(dim: usize) -> usize {
     dim.div_ceil(CHUNK_SIZE)
@@ -75,6 +86,8 @@ pub enum ClientReliable {
     CycleBiome,
     /// Cycle the evolving 3D world speed (`1x -> 4x -> 12x -> 1x`).
     CycleEvolutionSpeed,
+    /// Cycle the live 6-float World-Law preset (`0=STANDARD -> 1=FREEZE-OUT -> 2=RISING FLOOD -> 3=LOW-G MAGMA -> 0`).
+    CycleWorldLaw,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -339,6 +352,8 @@ pub enum ServerDatagram {
         mvp_score: u32,
         #[serde(default)]
         time_domes: Vec<TimeDomeSnap>,
+        #[serde(default)]
+        world_law_preset: u8,
     },
     /// 10 Hz single dirty 16×16×1 `A+` volumetric chunk at vertical layer `layer` (`0..grid_d`).
     APlusChunk {
@@ -456,6 +471,83 @@ mod tests {
             decode_msg::<ClientReliable>(&ce_wire),
             Some(ClientReliable::CycleEvolutionSpeed)
         ));
+        let wl_wire = encode_msg(&ClientControl::CycleWorldLaw);
+        assert!(matches!(
+            decode_msg::<ClientControl>(&wl_wire),
+            Some(ClientControl::CycleWorldLaw)
+        ));
+        assert_eq!(world_law_preset_name(0), "STANDARD");
+        assert_eq!(world_law_preset_name(1), "FREEZE-OUT");
+        assert_eq!(world_law_preset_name(2), "RISING FLOOD");
+        assert_eq!(world_law_preset_name(3), "LOW-G MAGMA");
+
+        // Verify EntitySnapshot with world_law_preset round-trips cleanly over LZ4 datagram
+        let snap = ServerDatagram::EntitySnapshot {
+            sim_tick: 77,
+            match_time_secs: 12,
+            your_player_id: 1,
+            echo_client_time_ms: 42,
+            relic_x: 128.0,
+            relic_y: 128.0,
+            players: Vec::new(),
+            projectiles: Vec::new(),
+            bodies: Vec::new(),
+            shrines: Vec::new(),
+            events: Vec::new(),
+            telemetry: TelemetrySnap {
+                mode: "refsim".to_string(),
+                backend: "cpu".to_string(),
+                ecosystem_on: true,
+                grid_w: 256,
+                grid_h: 256,
+                grid_d: 16,
+                field_tick: 77,
+                infer_ms_last: 1.0,
+                infer_ms_p99: 1.2,
+                eco_infer_ms: 0.2,
+                proj_active_pct: 10.0,
+                mass_error: 0,
+                energy_error: 0,
+                wire_kbps: 50.0,
+                aoi_chunks_sent: 4,
+                total_chunks: 256,
+                active_bots: 0,
+                neural_bots_on: false,
+                bot_infer_ms: 0.0,
+                weather_kind: 0,
+                day_time: 0.5,
+                wind_x: 0.0,
+                wind_y: 0.0,
+                score_west: 0,
+                score_east: 0,
+                acoustic_ms: 0.0,
+                world_sparse_pct: 100.0,
+                physics_native: true,
+                time_scale: 1.0,
+                world_day: 1,
+                neural_3d_vertical: false,
+                active_time_domes: 0,
+                system2_slm_active: false,
+            },
+            bot_brains: Vec::new(),
+            kill_feed: Vec::new(),
+            speech_bubbles: Vec::new(),
+            actuator_pulses: Vec::new(),
+            match_phase: 0,
+            match_time_left_s: 180,
+            mvp_name: String::new(),
+            mvp_score: 0,
+            time_domes: Vec::new(),
+            world_law_preset: 3,
+        };
+        let snap_wire = encode_server_datagram(&snap);
+        match decode_server_datagram(&snap_wire).expect("decode EntitySnapshot") {
+            ServerDatagram::EntitySnapshot { world_law_preset, sim_tick, .. } => {
+                assert_eq!(sim_tick, 77);
+                assert_eq!(world_law_preset, 3);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
         assert_eq!(CLASS_WARDEN, CLASS_STRIDER);
         assert_eq!(CLASS_ALCHEMIST, CLASS_SKYWING);
         assert_eq!(CLASS_RANGER, CLASS_TIDEKIN);

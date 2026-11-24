@@ -1,0 +1,1878 @@
+{
+  "model": "MorphologyActuatorNet",
+  "wave": "20B",
+  "params": 315386,
+  "world_latent_mode": "world_model_3d_v7",
+  "device": "cuda",
+  "peak_vram_gb": 2.392,
+  "train_seconds": 647.1,
+  "grid": [
+    48,
+    48,
+    16
+  ],
+  "num_arenas": 18,
+  "num_agents_per_arena": 6,
+  "rollout_steps": 56,
+  "iters": 180,
+  "eval_episodes_per_game": 24,
+  "morphology_names": [
+    "mass",
+    "wing_lift",
+    "buoyancy",
+    "climb_grip",
+    "bore_torque",
+    "thermal_insul"
+  ],
+  "world_law_names": [
+    "gravity_g",
+    "ambient_temp_offset",
+    "precip_rate",
+    "thermal_dissipation",
+    "friction_coeff",
+    "vent_flux"
+  ],
+  "game_theta_world": {
+    "FREEZE_OUT_SURVIVAL": [
+      1.0,
+      -0.55,
+      0.0,
+      0.14,
+      1.0,
+      0.85
+    ],
+    "RISING_FLOOD_ESCAPE": [
+      1.0,
+      -0.05,
+      2.6,
+      0.05,
+      1.0,
+      0.25
+    ],
+    "PHYSICS_CORE_HEIST": [
+      1.0,
+      0.0,
+      0.0,
+      0.05,
+      0.9,
+      0.45
+    ]
+  },
+  "held_out_morphologies": {
+    "amphibious_glider": [
+      0.35,
+      0.85,
+      0.9,
+      0.2,
+      0.1,
+      0.4
+    ],
+    "insulated_heavy_excavator": [
+      0.9,
+      0.05,
+      0.2,
+      0.5,
+      0.95,
+      0.9
+    ]
+  },
+  "min_training_to_holdout_l2": 0.3508,
+  "evaluation": {
+    "per_game": {
+      "FREEZE_OUT_SURVIVAL": {
+        "universal_full": {
+          "episodes": 24,
+          "mean_return": 6.477,
+          "survival_rate": 0.8403,
+          "thermal_survival_ticks": 51.38,
+          "hearth_ignitions": 56.12,
+          "vent_control_ticks": 0.0,
+          "cryo_bridges_forged": 0.02,
+          "high_ground_ascents": 50.92,
+          "aerial_flights": 0.08,
+          "wall_climbs": 5.79,
+          "tunnels_bored": 20.04,
+          "core_displacement_m": 0.0,
+          "core_deliveries": 0.0,
+          "oil_ice_slide_combos": 0.0
+        },
+        "morphology_blind_ablation": {
+          "episodes": 24,
+          "mean_return": 0.546,
+          "survival_rate": 0.1458,
+          "thermal_survival_ticks": 30.91,
+          "hearth_ignitions": 49.26,
+          "vent_control_ticks": 0.0,
+          "cryo_bridges_forged": 0.01,
+          "high_ground_ascents": 22.17,
+          "aerial_flights": 0.15,
+          "wall_climbs": 5.38,
+          "tunnels_bored": 16.75,
+          "core_displacement_m": 0.0,
+          "core_deliveries": 0.0,
+          "oil_ice_slide_combos": 0.0
+        },
+        "random_3d": {
+          "episodes": 24,
+          "mean_return": -1.045,
+          "survival_rate": 0.0139,
+          "thermal_survival_ticks": 21.25,
+          "hearth_ignitions": 22.99,
+          "vent_control_ticks": 0.83,
+          "cryo_bridges_forged": 46.32,
+          "high_ground_ascents": 4.22,
+          "aerial_flights": 3.53,
+          "wall_climbs": 6.71,
+          "tunnels_bored": 2.88,
+          "core_displacement_m": 0.0,
+          "core_deliveries": 0.0,
+          "oil_ice_slide_combos": 0.0
+        },
+        "ablation_return_delta": 5.931,
+        "vs_random_return_delta": 7.522
+      },
+      "RISING_FLOOD_ESCAPE": {
+        "universal_full": {
+          "episodes": 24,
+          "mean_return": 8.677,
+          "survival_rate": 0.8958,
+          "thermal_survival_ticks": 53.08,
+          "hearth_ignitions": 0.39,
+          "vent_control_ticks": 0.04,
+          "cryo_bridges_forged": 33.21,
+          "high_ground_ascents": 60.01,
+          "aerial_flights": 2.47,
+          "wall_climbs": 5.42,
+          "tunnels_bored": 17.08,
+          "core_displacement_m": 0.0,
+          "core_deliveries": 0.0,
+          "oil_ice_slide_combos": 0.0
+        },
+        "morphology_blind_ablation": {
+          "episodes": 24,
+          "mean_return": 8.718,
+          "survival_rate": 0.9028,
+          "thermal_survival_ticks": 53.61,
+          "hearth_ignitions": 2.99,
+          "vent_control_ticks": 1.71,
+          "cryo_bridges_forged": 35.12,
+          "high_ground_ascents": 57.9,
+          "aerial_flights": 3.25,
+          "wall_climbs": 5.46,
+          "tunnels_bored": 14.0,
+          "core_displacement_m": 0.0,
+          "core_deliveries": 0.0,
+          "oil_ice_slide_combos": 0.0
+        },
+        "random_3d": {
+          "episodes": 24,
+          "mean_return": 2.117,
+          "survival_rate": 0.6042,
+          "thermal_survival_ticks": 44.5,
+          "hearth_ignitions": 127.07,
+          "vent_control_ticks": 9.17,
+          "cryo_bridges_forged": 157.27,
+          "high_ground_ascents": 9.99,
+          "aerial_flights": 18.42,
+          "wall_climbs": 7.5,
+          "tunnels_bored": 4.04,
+          "core_displacement_m": 0.0,
+          "core_deliveries": 0.0,
+          "oil_ice_slide_combos": 0.0
+        },
+        "ablation_return_delta": -0.041,
+        "vs_random_return_delta": 6.56
+      },
+      "PHYSICS_CORE_HEIST": {
+        "universal_full": {
+          "episodes": 24,
+          "mean_return": 8.948,
+          "survival_rate": 0.9722,
+          "thermal_survival_ticks": 55.35,
+          "hearth_ignitions": 86.72,
+          "vent_control_ticks": 0.0,
+          "cryo_bridges_forged": 4.21,
+          "high_ground_ascents": 6.88,
+          "aerial_flights": 9.54,
+          "wall_climbs": 2.92,
+          "tunnels_bored": 8.33,
+          "core_displacement_m": 3.09,
+          "core_deliveries": 0.125,
+          "oil_ice_slide_combos": 1.5
+        },
+        "morphology_blind_ablation": {
+          "episodes": 24,
+          "mean_return": 7.026,
+          "survival_rate": 0.8819,
+          "thermal_survival_ticks": 52.1,
+          "hearth_ignitions": 79.62,
+          "vent_control_ticks": 0.04,
+          "cryo_bridges_forged": 0.71,
+          "high_ground_ascents": 25.41,
+          "aerial_flights": 3.27,
+          "wall_climbs": 3.46,
+          "tunnels_bored": 13.58,
+          "core_displacement_m": 3.7,
+          "core_deliveries": 0.042,
+          "oil_ice_slide_combos": 0.08
+        },
+        "random_3d": {
+          "episodes": 24,
+          "mean_return": 6.029,
+          "survival_rate": 0.8542,
+          "thermal_survival_ticks": 52.08,
+          "hearth_ignitions": 143.27,
+          "vent_control_ticks": 10.58,
+          "cryo_bridges_forged": 140.99,
+          "high_ground_ascents": 4.95,
+          "aerial_flights": 17.1,
+          "wall_climbs": 6.92,
+          "tunnels_bored": 5.79,
+          "core_displacement_m": 4.86,
+          "core_deliveries": 0.042,
+          "oil_ice_slide_combos": 9.08
+        },
+        "ablation_return_delta": 1.922,
+        "vs_random_return_delta": 2.919
+      }
+    },
+    "zero_shot_hybrids": {
+      "amphibious_glider": {
+        "phi_body": [
+          0.35,
+          0.85,
+          0.9,
+          0.2,
+          0.1,
+          0.4
+        ],
+        "games": {
+          "FREEZE_OUT_SURVIVAL": {
+            "zero_shot_full": {
+              "episodes": 24,
+              "mean_return": 5.764,
+              "survival_rate": 1.0,
+              "thermal_survival_ticks": 56.0,
+              "hearth_ignitions": 21.8,
+              "vent_control_ticks": 0.0,
+              "cryo_bridges_forged": 0.0,
+              "high_ground_ascents": 72.59,
+              "aerial_flights": 0.0,
+              "wall_climbs": 0.0,
+              "tunnels_bored": 0.0,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "morphology_blind": {
+              "episodes": 24,
+              "mean_return": -0.789,
+              "survival_rate": 0.0,
+              "thermal_survival_ticks": 21.11,
+              "hearth_ignitions": 38.66,
+              "vent_control_ticks": 0.0,
+              "cryo_bridges_forged": 0.0,
+              "high_ground_ascents": 17.69,
+              "aerial_flights": 0.06,
+              "wall_climbs": 0.0,
+              "tunnels_bored": 0.0,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "random_3d": {
+              "episodes": 24,
+              "mean_return": -1.218,
+              "survival_rate": 0.0,
+              "thermal_survival_ticks": 16.72,
+              "hearth_ignitions": 18.26,
+              "vent_control_ticks": 0.54,
+              "cryo_bridges_forged": 34.99,
+              "high_ground_ascents": 8.38,
+              "aerial_flights": 10.98,
+              "wall_climbs": 0.0,
+              "tunnels_bored": 0.0,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "morph_adaptation_gain": 6.553
+          },
+          "RISING_FLOOD_ESCAPE": {
+            "zero_shot_full": {
+              "episodes": 24,
+              "mean_return": 10.262,
+              "survival_rate": 1.0,
+              "thermal_survival_ticks": 56.0,
+              "hearth_ignitions": 0.0,
+              "vent_control_ticks": 0.33,
+              "cryo_bridges_forged": 19.58,
+              "high_ground_ascents": 76.67,
+              "aerial_flights": 10.89,
+              "wall_climbs": 0.0,
+              "tunnels_bored": 0.0,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "morphology_blind": {
+              "episodes": 24,
+              "mean_return": 10.063,
+              "survival_rate": 1.0,
+              "thermal_survival_ticks": 56.0,
+              "hearth_ignitions": 4.06,
+              "vent_control_ticks": 1.0,
+              "cryo_bridges_forged": 20.0,
+              "high_ground_ascents": 77.74,
+              "aerial_flights": 10.57,
+              "wall_climbs": 0.0,
+              "tunnels_bored": 0.0,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "random_3d": {
+              "episodes": 24,
+              "mean_return": 4.446,
+              "survival_rate": 0.9931,
+              "thermal_survival_ticks": 55.97,
+              "hearth_ignitions": 142.83,
+              "vent_control_ticks": 19.12,
+              "cryo_bridges_forged": 165.02,
+              "high_ground_ascents": 18.35,
+              "aerial_flights": 49.83,
+              "wall_climbs": 0.0,
+              "tunnels_bored": 0.0,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "morph_adaptation_gain": 0.199
+          },
+          "PHYSICS_CORE_HEIST": {
+            "zero_shot_full": {
+              "episodes": 24,
+              "mean_return": 3.863,
+              "survival_rate": 1.0,
+              "thermal_survival_ticks": 56.0,
+              "hearth_ignitions": 73.85,
+              "vent_control_ticks": 0.0,
+              "cryo_bridges_forged": 0.52,
+              "high_ground_ascents": 5.66,
+              "aerial_flights": 1.38,
+              "wall_climbs": 0.0,
+              "tunnels_bored": 0.0,
+              "core_displacement_m": 0.82,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "morphology_blind": {
+              "episodes": 24,
+              "mean_return": 9.36,
+              "survival_rate": 0.9514,
+              "thermal_survival_ticks": 55.81,
+              "hearth_ignitions": 123.51,
+              "vent_control_ticks": 0.04,
+              "cryo_bridges_forged": 0.07,
+              "high_ground_ascents": 49.36,
+              "aerial_flights": 9.43,
+              "wall_climbs": 0.0,
+              "tunnels_bored": 0.0,
+              "core_displacement_m": 3.37,
+              "core_deliveries": 0.083,
+              "oil_ice_slide_combos": 0.08
+            },
+            "random_3d": {
+              "episodes": 24,
+              "mean_return": 4.445,
+              "survival_rate": 0.9931,
+              "thermal_survival_ticks": 55.8,
+              "hearth_ignitions": 146.47,
+              "vent_control_ticks": 19.38,
+              "cryo_bridges_forged": 144.12,
+              "high_ground_ascents": 11.09,
+              "aerial_flights": 50.52,
+              "wall_climbs": 0.0,
+              "tunnels_bored": 0.0,
+              "core_displacement_m": 2.83,
+              "core_deliveries": 0.042,
+              "oil_ice_slide_combos": 4.92
+            },
+            "morph_adaptation_gain": -5.497
+          }
+        }
+      },
+      "insulated_heavy_excavator": {
+        "phi_body": [
+          0.9,
+          0.05,
+          0.2,
+          0.5,
+          0.95,
+          0.9
+        ],
+        "games": {
+          "FREEZE_OUT_SURVIVAL": {
+            "zero_shot_full": {
+              "episodes": 24,
+              "mean_return": 7.608,
+              "survival_rate": 0.9861,
+              "thermal_survival_ticks": 55.91,
+              "hearth_ignitions": 127.92,
+              "vent_control_ticks": 0.0,
+              "cryo_bridges_forged": 0.18,
+              "high_ground_ascents": 35.91,
+              "aerial_flights": 0.0,
+              "wall_climbs": 14.79,
+              "tunnels_bored": 88.83,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "morphology_blind": {
+              "episodes": 24,
+              "mean_return": 4.363,
+              "survival_rate": 0.6736,
+              "thermal_survival_ticks": 51.03,
+              "hearth_ignitions": 79.91,
+              "vent_control_ticks": 0.0,
+              "cryo_bridges_forged": 0.07,
+              "high_ground_ascents": 32.15,
+              "aerial_flights": 0.0,
+              "wall_climbs": 15.54,
+              "tunnels_bored": 66.0,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "random_3d": {
+              "episodes": 24,
+              "mean_return": -0.261,
+              "survival_rate": 0.1597,
+              "thermal_survival_ticks": 39.76,
+              "hearth_ignitions": 47.77,
+              "vent_control_ticks": 2.38,
+              "cryo_bridges_forged": 83.88,
+              "high_ground_ascents": 3.33,
+              "aerial_flights": 0.0,
+              "wall_climbs": 29.46,
+              "tunnels_bored": 11.12,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "morph_adaptation_gain": 3.245
+          },
+          "RISING_FLOOD_ESCAPE": {
+            "zero_shot_full": {
+              "episodes": 24,
+              "mean_return": 8.455,
+              "survival_rate": 0.9028,
+              "thermal_survival_ticks": 53.7,
+              "hearth_ignitions": 6.38,
+              "vent_control_ticks": 0.0,
+              "cryo_bridges_forged": 31.02,
+              "high_ground_ascents": 52.93,
+              "aerial_flights": 0.0,
+              "wall_climbs": 20.29,
+              "tunnels_bored": 82.79,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "morphology_blind": {
+              "episodes": 24,
+              "mean_return": 8.045,
+              "survival_rate": 0.8611,
+              "thermal_survival_ticks": 52.18,
+              "hearth_ignitions": 2.42,
+              "vent_control_ticks": 0.25,
+              "cryo_bridges_forged": 34.33,
+              "high_ground_ascents": 49.16,
+              "aerial_flights": 0.0,
+              "wall_climbs": 24.17,
+              "tunnels_bored": 56.83,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "random_3d": {
+              "episodes": 24,
+              "mean_return": -0.223,
+              "survival_rate": 0.0833,
+              "thermal_survival_ticks": 27.22,
+              "hearth_ignitions": 85.69,
+              "vent_control_ticks": 3.12,
+              "cryo_bridges_forged": 100.23,
+              "high_ground_ascents": 1.4,
+              "aerial_flights": 0.0,
+              "wall_climbs": 16.5,
+              "tunnels_bored": 10.0,
+              "core_displacement_m": 0.0,
+              "core_deliveries": 0.0,
+              "oil_ice_slide_combos": 0.0
+            },
+            "morph_adaptation_gain": 0.41
+          },
+          "PHYSICS_CORE_HEIST": {
+            "zero_shot_full": {
+              "episodes": 24,
+              "mean_return": 15.8,
+              "survival_rate": 1.0,
+              "thermal_survival_ticks": 56.0,
+              "hearth_ignitions": 50.52,
+              "vent_control_ticks": 0.0,
+              "cryo_bridges_forged": 10.08,
+              "high_ground_ascents": 0.02,
+              "aerial_flights": 0.0,
+              "wall_climbs": 7.38,
+              "tunnels_bored": 10.0,
+              "core_displacement_m": 5.57,
+              "core_deliveries": 0.333,
+              "oil_ice_slide_combos": 3.42
+            },
+            "morphology_blind": {
+              "episodes": 24,
+              "mean_return": 11.075,
+              "survival_rate": 0.9028,
+              "thermal_survival_ticks": 52.05,
+              "hearth_ignitions": 71.35,
+              "vent_control_ticks": 0.08,
+              "cryo_bridges_forged": 2.02,
+              "high_ground_ascents": 6.7,
+              "aerial_flights": 0.0,
+              "wall_climbs": 15.88,
+              "tunnels_bored": 19.46,
+              "core_displacement_m": 5.72,
+              "core_deliveries": 0.125,
+              "oil_ice_slide_combos": 0.12
+            },
+            "random_3d": {
+              "episodes": 24,
+              "mean_return": 3.324,
+              "survival_rate": 0.8194,
+              "thermal_survival_ticks": 52.38,
+              "hearth_ignitions": 144.99,
+              "vent_control_ticks": 13.71,
+              "cryo_bridges_forged": 154.44,
+              "high_ground_ascents": 0.06,
+              "aerial_flights": 0.0,
+              "wall_climbs": 26.83,
+              "tunnels_bored": 16.96,
+              "core_displacement_m": 5.28,
+              "core_deliveries": 0.125,
+              "oil_ice_slide_combos": 7.75
+            },
+            "morph_adaptation_gain": 4.725
+          }
+        }
+      }
+    }
+  },
+  "history": [
+    {
+      "iter": 1,
+      "loss": -0.1245,
+      "g0_freeze_ret": -1.54,
+      "g1_flood_ret": 4.122,
+      "g2_heist_ret": -1.434,
+      "eval_composite": 0.228,
+      "eval_g0_surv": 0.0,
+      "eval_g1_surv": 0.1528,
+      "eval_g2_disp": 0.92
+    },
+    {
+      "iter": 2,
+      "loss": -0.0366,
+      "g0_freeze_ret": -1.59,
+      "g1_flood_ret": 3.161,
+      "g2_heist_ret": 0.738
+    },
+    {
+      "iter": 3,
+      "loss": -0.0003,
+      "g0_freeze_ret": -1.6,
+      "g1_flood_ret": 3.457,
+      "g2_heist_ret": -1.343
+    },
+    {
+      "iter": 4,
+      "loss": 0.0427,
+      "g0_freeze_ret": -1.539,
+      "g1_flood_ret": 3.388,
+      "g2_heist_ret": 0.527
+    },
+    {
+      "iter": 5,
+      "loss": 0.0275,
+      "g0_freeze_ret": -1.468,
+      "g1_flood_ret": 3.954,
+      "g2_heist_ret": 2.766
+    },
+    {
+      "iter": 6,
+      "loss": 0.0102,
+      "g0_freeze_ret": -1.408,
+      "g1_flood_ret": 4.423,
+      "g2_heist_ret": 0.23
+    },
+    {
+      "iter": 7,
+      "loss": -0.0803,
+      "g0_freeze_ret": -1.336,
+      "g1_flood_ret": 4.799,
+      "g2_heist_ret": -0.511
+    },
+    {
+      "iter": 8,
+      "loss": -0.0137,
+      "g0_freeze_ret": -1.304,
+      "g1_flood_ret": 5.678,
+      "g2_heist_ret": 0.227
+    },
+    {
+      "iter": 9,
+      "loss": 0.0102,
+      "g0_freeze_ret": -1.303,
+      "g1_flood_ret": 6.52,
+      "g2_heist_ret": 5.903
+    },
+    {
+      "iter": 10,
+      "loss": -0.0247,
+      "g0_freeze_ret": -1.27,
+      "g1_flood_ret": 7.469,
+      "g2_heist_ret": 3.267,
+      "eval_composite": 7.244,
+      "eval_g0_surv": 0.0,
+      "eval_g1_surv": 0.6944,
+      "eval_g2_disp": 1.99
+    },
+    {
+      "iter": 11,
+      "loss": 0.0659,
+      "g0_freeze_ret": -1.154,
+      "g1_flood_ret": 7.732,
+      "g2_heist_ret": 8.407
+    },
+    {
+      "iter": 12,
+      "loss": -0.0533,
+      "g0_freeze_ret": -1.026,
+      "g1_flood_ret": 7.844,
+      "g2_heist_ret": 3.063
+    },
+    {
+      "iter": 13,
+      "loss": -0.0537,
+      "g0_freeze_ret": -1.18,
+      "g1_flood_ret": 8.038,
+      "g2_heist_ret": 3.935
+    },
+    {
+      "iter": 14,
+      "loss": -0.0265,
+      "g0_freeze_ret": -0.71,
+      "g1_flood_ret": 7.245,
+      "g2_heist_ret": 3.141
+    },
+    {
+      "iter": 15,
+      "loss": 0.0158,
+      "g0_freeze_ret": -1.158,
+      "g1_flood_ret": 6.471,
+      "g2_heist_ret": 5.317
+    },
+    {
+      "iter": 16,
+      "loss": -0.0085,
+      "g0_freeze_ret": -1.185,
+      "g1_flood_ret": 6.366,
+      "g2_heist_ret": 3.336
+    },
+    {
+      "iter": 17,
+      "loss": -0.0519,
+      "g0_freeze_ret": -1.0,
+      "g1_flood_ret": 6.311,
+      "g2_heist_ret": 2.651
+    },
+    {
+      "iter": 18,
+      "loss": 0.0269,
+      "g0_freeze_ret": -1.146,
+      "g1_flood_ret": 8.276,
+      "g2_heist_ret": 7.736
+    },
+    {
+      "iter": 19,
+      "loss": -0.0479,
+      "g0_freeze_ret": -1.192,
+      "g1_flood_ret": 7.42,
+      "g2_heist_ret": 3.946
+    },
+    {
+      "iter": 20,
+      "loss": -0.0322,
+      "g0_freeze_ret": -1.016,
+      "g1_flood_ret": 7.076,
+      "g2_heist_ret": 3.91,
+      "eval_composite": 6.651,
+      "eval_g0_surv": 0.0139,
+      "eval_g1_surv": 0.75,
+      "eval_g2_disp": 1.1
+    },
+    {
+      "iter": 21,
+      "loss": -0.0088,
+      "g0_freeze_ret": -0.932,
+      "g1_flood_ret": 7.865,
+      "g2_heist_ret": 6.308
+    },
+    {
+      "iter": 22,
+      "loss": -0.0861,
+      "g0_freeze_ret": -0.866,
+      "g1_flood_ret": 7.155,
+      "g2_heist_ret": 12.697
+    },
+    {
+      "iter": 23,
+      "loss": -0.0264,
+      "g0_freeze_ret": -0.897,
+      "g1_flood_ret": 7.739,
+      "g2_heist_ret": 3.246
+    },
+    {
+      "iter": 24,
+      "loss": -0.0352,
+      "g0_freeze_ret": -1.137,
+      "g1_flood_ret": 6.771,
+      "g2_heist_ret": 4.016
+    },
+    {
+      "iter": 25,
+      "loss": -0.0262,
+      "g0_freeze_ret": -0.589,
+      "g1_flood_ret": 8.224,
+      "g2_heist_ret": 5.186
+    },
+    {
+      "iter": 26,
+      "loss": -0.0757,
+      "g0_freeze_ret": -0.939,
+      "g1_flood_ret": 7.293,
+      "g2_heist_ret": 4.965
+    },
+    {
+      "iter": 27,
+      "loss": -0.0376,
+      "g0_freeze_ret": -0.939,
+      "g1_flood_ret": 8.372,
+      "g2_heist_ret": 4.132
+    },
+    {
+      "iter": 28,
+      "loss": -0.0648,
+      "g0_freeze_ret": -1.099,
+      "g1_flood_ret": 7.696,
+      "g2_heist_ret": 3.2
+    },
+    {
+      "iter": 29,
+      "loss": -0.0341,
+      "g0_freeze_ret": -0.866,
+      "g1_flood_ret": 6.759,
+      "g2_heist_ret": 2.461
+    },
+    {
+      "iter": 30,
+      "loss": -0.0816,
+      "g0_freeze_ret": 0.102,
+      "g1_flood_ret": 8.18,
+      "g2_heist_ret": 3.394
+    },
+    {
+      "iter": 31,
+      "loss": 0.0185,
+      "g0_freeze_ret": -0.885,
+      "g1_flood_ret": 7.591,
+      "g2_heist_ret": 3.305
+    },
+    {
+      "iter": 32,
+      "loss": -0.049,
+      "g0_freeze_ret": -0.464,
+      "g1_flood_ret": 7.339,
+      "g2_heist_ret": 2.615
+    },
+    {
+      "iter": 33,
+      "loss": -0.0804,
+      "g0_freeze_ret": -0.918,
+      "g1_flood_ret": 7.323,
+      "g2_heist_ret": 5.061
+    },
+    {
+      "iter": 34,
+      "loss": -0.0555,
+      "g0_freeze_ret": 0.155,
+      "g1_flood_ret": 6.795,
+      "g2_heist_ret": 2.963
+    },
+    {
+      "iter": 35,
+      "loss": -0.0047,
+      "g0_freeze_ret": 0.264,
+      "g1_flood_ret": 6.678,
+      "g2_heist_ret": 2.833
+    },
+    {
+      "iter": 36,
+      "loss": -0.0083,
+      "g0_freeze_ret": 0.915,
+      "g1_flood_ret": 7.165,
+      "g2_heist_ret": 9.2
+    },
+    {
+      "iter": 37,
+      "loss": -0.0639,
+      "g0_freeze_ret": 0.55,
+      "g1_flood_ret": 6.39,
+      "g2_heist_ret": 4.773
+    },
+    {
+      "iter": 38,
+      "loss": -0.0625,
+      "g0_freeze_ret": 0.788,
+      "g1_flood_ret": 7.538,
+      "g2_heist_ret": 4.368
+    },
+    {
+      "iter": 39,
+      "loss": -0.0324,
+      "g0_freeze_ret": 0.391,
+      "g1_flood_ret": 6.71,
+      "g2_heist_ret": 7.385
+    },
+    {
+      "iter": 40,
+      "loss": -0.1191,
+      "g0_freeze_ret": 0.048,
+      "g1_flood_ret": 7.28,
+      "g2_heist_ret": 3.399,
+      "eval_composite": 7.57,
+      "eval_g0_surv": 0.2222,
+      "eval_g1_surv": 0.75,
+      "eval_g2_disp": 1.15
+    },
+    {
+      "iter": 41,
+      "loss": -0.0508,
+      "g0_freeze_ret": 1.357,
+      "g1_flood_ret": 7.9,
+      "g2_heist_ret": 4.078
+    },
+    {
+      "iter": 42,
+      "loss": -0.0405,
+      "g0_freeze_ret": 2.062,
+      "g1_flood_ret": 7.96,
+      "g2_heist_ret": 3.182
+    },
+    {
+      "iter": 43,
+      "loss": -0.1034,
+      "g0_freeze_ret": 2.148,
+      "g1_flood_ret": 6.879,
+      "g2_heist_ret": 3.273
+    },
+    {
+      "iter": 44,
+      "loss": -0.0417,
+      "g0_freeze_ret": 0.945,
+      "g1_flood_ret": 7.3,
+      "g2_heist_ret": 4.184
+    },
+    {
+      "iter": 45,
+      "loss": -0.0162,
+      "g0_freeze_ret": 1.83,
+      "g1_flood_ret": 7.259,
+      "g2_heist_ret": 2.572
+    },
+    {
+      "iter": 46,
+      "loss": -0.0927,
+      "g0_freeze_ret": 1.408,
+      "g1_flood_ret": 7.906,
+      "g2_heist_ret": 3.439
+    },
+    {
+      "iter": 47,
+      "loss": -0.0542,
+      "g0_freeze_ret": 2.054,
+      "g1_flood_ret": 7.529,
+      "g2_heist_ret": 2.439
+    },
+    {
+      "iter": 48,
+      "loss": -0.0081,
+      "g0_freeze_ret": 2.44,
+      "g1_flood_ret": 7.518,
+      "g2_heist_ret": 3.513
+    },
+    {
+      "iter": 49,
+      "loss": -0.0798,
+      "g0_freeze_ret": 1.923,
+      "g1_flood_ret": 7.506,
+      "g2_heist_ret": 3.794
+    },
+    {
+      "iter": 50,
+      "loss": -0.0662,
+      "g0_freeze_ret": 1.886,
+      "g1_flood_ret": 7.832,
+      "g2_heist_ret": 2.177
+    },
+    {
+      "iter": 51,
+      "loss": 0.0051,
+      "g0_freeze_ret": 2.198,
+      "g1_flood_ret": 7.779,
+      "g2_heist_ret": 4.363
+    },
+    {
+      "iter": 52,
+      "loss": -0.065,
+      "g0_freeze_ret": 1.757,
+      "g1_flood_ret": 6.637,
+      "g2_heist_ret": 2.756
+    },
+    {
+      "iter": 53,
+      "loss": -0.0733,
+      "g0_freeze_ret": 2.429,
+      "g1_flood_ret": 8.154,
+      "g2_heist_ret": 4.939
+    },
+    {
+      "iter": 54,
+      "loss": -0.0025,
+      "g0_freeze_ret": 2.173,
+      "g1_flood_ret": 8.809,
+      "g2_heist_ret": 7.219
+    },
+    {
+      "iter": 55,
+      "loss": -0.0041,
+      "g0_freeze_ret": 2.676,
+      "g1_flood_ret": 8.202,
+      "g2_heist_ret": 5.015
+    },
+    {
+      "iter": 56,
+      "loss": -0.0623,
+      "g0_freeze_ret": 2.611,
+      "g1_flood_ret": 7.479,
+      "g2_heist_ret": 3.368
+    },
+    {
+      "iter": 57,
+      "loss": -0.1046,
+      "g0_freeze_ret": 1.569,
+      "g1_flood_ret": 7.765,
+      "g2_heist_ret": 4.128
+    },
+    {
+      "iter": 58,
+      "loss": -0.0912,
+      "g0_freeze_ret": 3.191,
+      "g1_flood_ret": 8.447,
+      "g2_heist_ret": 3.008
+    },
+    {
+      "iter": 59,
+      "loss": -0.0981,
+      "g0_freeze_ret": 1.936,
+      "g1_flood_ret": 7.367,
+      "g2_heist_ret": 5.444
+    },
+    {
+      "iter": 60,
+      "loss": -0.0591,
+      "g0_freeze_ret": 3.531,
+      "g1_flood_ret": 6.871,
+      "g2_heist_ret": 3.11,
+      "eval_composite": 10.799,
+      "eval_g0_surv": 0.4722,
+      "eval_g1_surv": 0.8056,
+      "eval_g2_disp": 2.15
+    },
+    {
+      "iter": 61,
+      "loss": -0.0269,
+      "g0_freeze_ret": 1.599,
+      "g1_flood_ret": 7.561,
+      "g2_heist_ret": 5.669
+    },
+    {
+      "iter": 62,
+      "loss": -0.0117,
+      "g0_freeze_ret": 2.689,
+      "g1_flood_ret": 8.136,
+      "g2_heist_ret": 9.83
+    },
+    {
+      "iter": 63,
+      "loss": -0.0945,
+      "g0_freeze_ret": 3.617,
+      "g1_flood_ret": 8.057,
+      "g2_heist_ret": 3.051
+    },
+    {
+      "iter": 64,
+      "loss": -0.1207,
+      "g0_freeze_ret": 3.163,
+      "g1_flood_ret": 7.855,
+      "g2_heist_ret": 2.899
+    },
+    {
+      "iter": 65,
+      "loss": -0.0414,
+      "g0_freeze_ret": 2.41,
+      "g1_flood_ret": 8.516,
+      "g2_heist_ret": 8.061
+    },
+    {
+      "iter": 66,
+      "loss": -0.0821,
+      "g0_freeze_ret": 3.007,
+      "g1_flood_ret": 8.603,
+      "g2_heist_ret": 3.453
+    },
+    {
+      "iter": 67,
+      "loss": -0.0311,
+      "g0_freeze_ret": 3.467,
+      "g1_flood_ret": 7.401,
+      "g2_heist_ret": 14.235
+    },
+    {
+      "iter": 68,
+      "loss": -0.073,
+      "g0_freeze_ret": 3.554,
+      "g1_flood_ret": 8.912,
+      "g2_heist_ret": 5.321
+    },
+    {
+      "iter": 69,
+      "loss": -0.1398,
+      "g0_freeze_ret": 3.15,
+      "g1_flood_ret": 9.634,
+      "g2_heist_ret": 6.306
+    },
+    {
+      "iter": 70,
+      "loss": -0.0983,
+      "g0_freeze_ret": 3.784,
+      "g1_flood_ret": 7.948,
+      "g2_heist_ret": 3.505
+    },
+    {
+      "iter": 71,
+      "loss": -0.0262,
+      "g0_freeze_ret": 5.227,
+      "g1_flood_ret": 8.013,
+      "g2_heist_ret": 4.61
+    },
+    {
+      "iter": 72,
+      "loss": -0.0584,
+      "g0_freeze_ret": 3.759,
+      "g1_flood_ret": 8.274,
+      "g2_heist_ret": 3.963
+    },
+    {
+      "iter": 73,
+      "loss": -0.0545,
+      "g0_freeze_ret": 3.455,
+      "g1_flood_ret": 8.447,
+      "g2_heist_ret": 6.674
+    },
+    {
+      "iter": 74,
+      "loss": -0.0328,
+      "g0_freeze_ret": 3.826,
+      "g1_flood_ret": 8.893,
+      "g2_heist_ret": 4.462
+    },
+    {
+      "iter": 75,
+      "loss": -0.0329,
+      "g0_freeze_ret": 3.488,
+      "g1_flood_ret": 9.289,
+      "g2_heist_ret": 4.361
+    },
+    {
+      "iter": 76,
+      "loss": -0.0872,
+      "g0_freeze_ret": 3.18,
+      "g1_flood_ret": 8.187,
+      "g2_heist_ret": 3.585
+    },
+    {
+      "iter": 77,
+      "loss": -0.0432,
+      "g0_freeze_ret": 4.058,
+      "g1_flood_ret": 8.388,
+      "g2_heist_ret": 4.316
+    },
+    {
+      "iter": 78,
+      "loss": -0.0303,
+      "g0_freeze_ret": 4.209,
+      "g1_flood_ret": 8.614,
+      "g2_heist_ret": 6.252
+    },
+    {
+      "iter": 79,
+      "loss": -0.1603,
+      "g0_freeze_ret": 3.655,
+      "g1_flood_ret": 8.276,
+      "g2_heist_ret": 2.536
+    },
+    {
+      "iter": 80,
+      "loss": -0.022,
+      "g0_freeze_ret": 3.368,
+      "g1_flood_ret": 8.354,
+      "g2_heist_ret": 3.482,
+      "eval_composite": 12.577,
+      "eval_g0_surv": 0.5694,
+      "eval_g1_surv": 0.875,
+      "eval_g2_disp": 1.53
+    },
+    {
+      "iter": 81,
+      "loss": -0.1305,
+      "g0_freeze_ret": 2.328,
+      "g1_flood_ret": 8.845,
+      "g2_heist_ret": 2.866
+    },
+    {
+      "iter": 82,
+      "loss": -0.1042,
+      "g0_freeze_ret": 3.216,
+      "g1_flood_ret": 9.372,
+      "g2_heist_ret": 5.273
+    },
+    {
+      "iter": 83,
+      "loss": -0.0344,
+      "g0_freeze_ret": 2.332,
+      "g1_flood_ret": 7.731,
+      "g2_heist_ret": 2.817
+    },
+    {
+      "iter": 84,
+      "loss": -0.0302,
+      "g0_freeze_ret": 4.692,
+      "g1_flood_ret": 9.345,
+      "g2_heist_ret": 4.749
+    },
+    {
+      "iter": 85,
+      "loss": -0.0533,
+      "g0_freeze_ret": 3.216,
+      "g1_flood_ret": 7.222,
+      "g2_heist_ret": 2.765
+    },
+    {
+      "iter": 86,
+      "loss": 0.0032,
+      "g0_freeze_ret": 2.531,
+      "g1_flood_ret": 8.761,
+      "g2_heist_ret": 2.408
+    },
+    {
+      "iter": 87,
+      "loss": -0.0531,
+      "g0_freeze_ret": 3.244,
+      "g1_flood_ret": 8.142,
+      "g2_heist_ret": 6.596
+    },
+    {
+      "iter": 88,
+      "loss": -0.0387,
+      "g0_freeze_ret": 4.861,
+      "g1_flood_ret": 9.182,
+      "g2_heist_ret": 5.144
+    },
+    {
+      "iter": 89,
+      "loss": 0.0348,
+      "g0_freeze_ret": 3.46,
+      "g1_flood_ret": 6.658,
+      "g2_heist_ret": 4.027
+    },
+    {
+      "iter": 90,
+      "loss": -0.0247,
+      "g0_freeze_ret": 4.217,
+      "g1_flood_ret": 9.262,
+      "g2_heist_ret": 4.027
+    },
+    {
+      "iter": 91,
+      "loss": -0.0231,
+      "g0_freeze_ret": 4.289,
+      "g1_flood_ret": 8.224,
+      "g2_heist_ret": 9.736
+    },
+    {
+      "iter": 92,
+      "loss": -0.0966,
+      "g0_freeze_ret": 4.266,
+      "g1_flood_ret": 7.536,
+      "g2_heist_ret": 4.817
+    },
+    {
+      "iter": 93,
+      "loss": 0.022,
+      "g0_freeze_ret": 3.822,
+      "g1_flood_ret": 8.288,
+      "g2_heist_ret": 4.991
+    },
+    {
+      "iter": 94,
+      "loss": -0.075,
+      "g0_freeze_ret": 4.307,
+      "g1_flood_ret": 7.891,
+      "g2_heist_ret": 6.262
+    },
+    {
+      "iter": 95,
+      "loss": -0.0133,
+      "g0_freeze_ret": 4.291,
+      "g1_flood_ret": 8.341,
+      "g2_heist_ret": 3.212
+    },
+    {
+      "iter": 96,
+      "loss": -0.0417,
+      "g0_freeze_ret": 3.262,
+      "g1_flood_ret": 8.828,
+      "g2_heist_ret": 2.392
+    },
+    {
+      "iter": 97,
+      "loss": -0.0637,
+      "g0_freeze_ret": 4.864,
+      "g1_flood_ret": 8.095,
+      "g2_heist_ret": 9.023
+    },
+    {
+      "iter": 98,
+      "loss": -0.0629,
+      "g0_freeze_ret": 3.565,
+      "g1_flood_ret": 9.159,
+      "g2_heist_ret": 3.736
+    },
+    {
+      "iter": 99,
+      "loss": 0.0389,
+      "g0_freeze_ret": 4.238,
+      "g1_flood_ret": 8.282,
+      "g2_heist_ret": 3.255
+    },
+    {
+      "iter": 100,
+      "loss": -0.0759,
+      "g0_freeze_ret": 4.46,
+      "g1_flood_ret": 8.734,
+      "g2_heist_ret": 2.576,
+      "eval_composite": 14.794,
+      "eval_g0_surv": 0.75,
+      "eval_g1_surv": 0.8333,
+      "eval_g2_disp": 2.0
+    },
+    {
+      "iter": 101,
+      "loss": -0.0273,
+      "g0_freeze_ret": 4.433,
+      "g1_flood_ret": 8.056,
+      "g2_heist_ret": 5.043
+    },
+    {
+      "iter": 102,
+      "loss": -0.0855,
+      "g0_freeze_ret": 4.815,
+      "g1_flood_ret": 9.134,
+      "g2_heist_ret": 3.149
+    },
+    {
+      "iter": 103,
+      "loss": -0.0171,
+      "g0_freeze_ret": 5.842,
+      "g1_flood_ret": 8.823,
+      "g2_heist_ret": 2.894
+    },
+    {
+      "iter": 104,
+      "loss": -0.0746,
+      "g0_freeze_ret": 4.866,
+      "g1_flood_ret": 8.409,
+      "g2_heist_ret": 4.036
+    },
+    {
+      "iter": 105,
+      "loss": -0.0243,
+      "g0_freeze_ret": 4.747,
+      "g1_flood_ret": 8.909,
+      "g2_heist_ret": 3.996
+    },
+    {
+      "iter": 106,
+      "loss": -0.0603,
+      "g0_freeze_ret": 4.384,
+      "g1_flood_ret": 8.306,
+      "g2_heist_ret": 3.186
+    },
+    {
+      "iter": 107,
+      "loss": -0.0471,
+      "g0_freeze_ret": 5.125,
+      "g1_flood_ret": 9.705,
+      "g2_heist_ret": 4.124
+    },
+    {
+      "iter": 108,
+      "loss": -0.0699,
+      "g0_freeze_ret": 5.243,
+      "g1_flood_ret": 9.276,
+      "g2_heist_ret": 3.399
+    },
+    {
+      "iter": 109,
+      "loss": -0.1413,
+      "g0_freeze_ret": 5.33,
+      "g1_flood_ret": 8.974,
+      "g2_heist_ret": 4.652
+    },
+    {
+      "iter": 110,
+      "loss": -0.0921,
+      "g0_freeze_ret": 5.091,
+      "g1_flood_ret": 8.79,
+      "g2_heist_ret": 4.212
+    },
+    {
+      "iter": 111,
+      "loss": -0.0966,
+      "g0_freeze_ret": 4.7,
+      "g1_flood_ret": 8.745,
+      "g2_heist_ret": 3.342
+    },
+    {
+      "iter": 112,
+      "loss": -0.0644,
+      "g0_freeze_ret": 5.342,
+      "g1_flood_ret": 9.982,
+      "g2_heist_ret": 3.682
+    },
+    {
+      "iter": 113,
+      "loss": -0.0823,
+      "g0_freeze_ret": 5.335,
+      "g1_flood_ret": 8.251,
+      "g2_heist_ret": 3.366
+    },
+    {
+      "iter": 114,
+      "loss": 0.0206,
+      "g0_freeze_ret": 5.044,
+      "g1_flood_ret": 8.261,
+      "g2_heist_ret": 8.16
+    },
+    {
+      "iter": 115,
+      "loss": -0.0108,
+      "g0_freeze_ret": 4.661,
+      "g1_flood_ret": 9.095,
+      "g2_heist_ret": 8.341
+    },
+    {
+      "iter": 116,
+      "loss": -0.0613,
+      "g0_freeze_ret": 5.638,
+      "g1_flood_ret": 9.05,
+      "g2_heist_ret": 4.98
+    },
+    {
+      "iter": 117,
+      "loss": 0.0269,
+      "g0_freeze_ret": 6.533,
+      "g1_flood_ret": 9.592,
+      "g2_heist_ret": 4.449
+    },
+    {
+      "iter": 118,
+      "loss": -0.0377,
+      "g0_freeze_ret": 5.201,
+      "g1_flood_ret": 8.14,
+      "g2_heist_ret": 2.78
+    },
+    {
+      "iter": 119,
+      "loss": 0.0387,
+      "g0_freeze_ret": 4.711,
+      "g1_flood_ret": 9.406,
+      "g2_heist_ret": 9.684
+    },
+    {
+      "iter": 120,
+      "loss": -0.1517,
+      "g0_freeze_ret": 4.653,
+      "g1_flood_ret": 8.916,
+      "g2_heist_ret": 5.192,
+      "eval_composite": 17.348,
+      "eval_g0_surv": 0.8194,
+      "eval_g1_surv": 0.8889,
+      "eval_g2_disp": 2.27
+    },
+    {
+      "iter": 121,
+      "loss": -0.0704,
+      "g0_freeze_ret": 5.514,
+      "g1_flood_ret": 8.782,
+      "g2_heist_ret": 3.988
+    },
+    {
+      "iter": 122,
+      "loss": 0.0035,
+      "g0_freeze_ret": 6.453,
+      "g1_flood_ret": 9.077,
+      "g2_heist_ret": 3.157
+    },
+    {
+      "iter": 123,
+      "loss": -0.0068,
+      "g0_freeze_ret": 4.85,
+      "g1_flood_ret": 8.562,
+      "g2_heist_ret": 7.557
+    },
+    {
+      "iter": 124,
+      "loss": 0.0467,
+      "g0_freeze_ret": 5.149,
+      "g1_flood_ret": 8.677,
+      "g2_heist_ret": 4.099
+    },
+    {
+      "iter": 125,
+      "loss": -0.1143,
+      "g0_freeze_ret": 4.778,
+      "g1_flood_ret": 9.581,
+      "g2_heist_ret": 4.344
+    },
+    {
+      "iter": 126,
+      "loss": -0.0335,
+      "g0_freeze_ret": 5.706,
+      "g1_flood_ret": 8.111,
+      "g2_heist_ret": 7.236
+    },
+    {
+      "iter": 127,
+      "loss": 0.0174,
+      "g0_freeze_ret": 6.222,
+      "g1_flood_ret": 8.507,
+      "g2_heist_ret": 2.974
+    },
+    {
+      "iter": 128,
+      "loss": -0.0119,
+      "g0_freeze_ret": 5.383,
+      "g1_flood_ret": 9.631,
+      "g2_heist_ret": 5.277
+    },
+    {
+      "iter": 129,
+      "loss": -0.0431,
+      "g0_freeze_ret": 6.222,
+      "g1_flood_ret": 9.203,
+      "g2_heist_ret": 7.468
+    },
+    {
+      "iter": 130,
+      "loss": -0.0529,
+      "g0_freeze_ret": 7.418,
+      "g1_flood_ret": 8.394,
+      "g2_heist_ret": 4.795
+    },
+    {
+      "iter": 131,
+      "loss": -0.1055,
+      "g0_freeze_ret": 6.14,
+      "g1_flood_ret": 8.137,
+      "g2_heist_ret": 5.369
+    },
+    {
+      "iter": 132,
+      "loss": -0.0474,
+      "g0_freeze_ret": 5.312,
+      "g1_flood_ret": 9.256,
+      "g2_heist_ret": 11.168
+    },
+    {
+      "iter": 133,
+      "loss": -0.1783,
+      "g0_freeze_ret": 6.554,
+      "g1_flood_ret": 8.979,
+      "g2_heist_ret": 4.663
+    },
+    {
+      "iter": 134,
+      "loss": -0.0156,
+      "g0_freeze_ret": 6.288,
+      "g1_flood_ret": 9.042,
+      "g2_heist_ret": 3.032
+    },
+    {
+      "iter": 135,
+      "loss": -0.057,
+      "g0_freeze_ret": 6.983,
+      "g1_flood_ret": 7.963,
+      "g2_heist_ret": 3.137
+    },
+    {
+      "iter": 136,
+      "loss": 0.0219,
+      "g0_freeze_ret": 4.66,
+      "g1_flood_ret": 8.707,
+      "g2_heist_ret": 7.092
+    },
+    {
+      "iter": 137,
+      "loss": 0.009,
+      "g0_freeze_ret": 6.321,
+      "g1_flood_ret": 7.817,
+      "g2_heist_ret": 7.489
+    },
+    {
+      "iter": 138,
+      "loss": 0.0668,
+      "g0_freeze_ret": 5.808,
+      "g1_flood_ret": 8.828,
+      "g2_heist_ret": 9.182
+    },
+    {
+      "iter": 139,
+      "loss": -0.0482,
+      "g0_freeze_ret": 6.221,
+      "g1_flood_ret": 9.282,
+      "g2_heist_ret": 2.88
+    },
+    {
+      "iter": 140,
+      "loss": -0.1141,
+      "g0_freeze_ret": 6.246,
+      "g1_flood_ret": 9.276,
+      "g2_heist_ret": 11.321,
+      "eval_composite": 17.961,
+      "eval_g0_surv": 0.8333,
+      "eval_g1_surv": 0.9306,
+      "eval_g2_disp": 2.21
+    },
+    {
+      "iter": 141,
+      "loss": -0.0184,
+      "g0_freeze_ret": 5.449,
+      "g1_flood_ret": 8.467,
+      "g2_heist_ret": 4.564
+    },
+    {
+      "iter": 142,
+      "loss": -0.059,
+      "g0_freeze_ret": 6.315,
+      "g1_flood_ret": 9.77,
+      "g2_heist_ret": 6.048
+    },
+    {
+      "iter": 143,
+      "loss": -0.0052,
+      "g0_freeze_ret": 5.654,
+      "g1_flood_ret": 8.71,
+      "g2_heist_ret": 6.18
+    },
+    {
+      "iter": 144,
+      "loss": -0.0653,
+      "g0_freeze_ret": 5.9,
+      "g1_flood_ret": 8.117,
+      "g2_heist_ret": 5.109
+    },
+    {
+      "iter": 145,
+      "loss": 0.0526,
+      "g0_freeze_ret": 6.79,
+      "g1_flood_ret": 10.021,
+      "g2_heist_ret": 9.419
+    },
+    {
+      "iter": 146,
+      "loss": -0.0065,
+      "g0_freeze_ret": 6.685,
+      "g1_flood_ret": 8.676,
+      "g2_heist_ret": 7.372
+    },
+    {
+      "iter": 147,
+      "loss": 0.0201,
+      "g0_freeze_ret": 5.719,
+      "g1_flood_ret": 8.947,
+      "g2_heist_ret": 8.299
+    },
+    {
+      "iter": 148,
+      "loss": -0.0262,
+      "g0_freeze_ret": 6.129,
+      "g1_flood_ret": 8.875,
+      "g2_heist_ret": 5.32
+    },
+    {
+      "iter": 149,
+      "loss": -0.0388,
+      "g0_freeze_ret": 5.199,
+      "g1_flood_ret": 8.233,
+      "g2_heist_ret": 3.474
+    },
+    {
+      "iter": 150,
+      "loss": -0.1134,
+      "g0_freeze_ret": 6.276,
+      "g1_flood_ret": 9.247,
+      "g2_heist_ret": 4.886
+    },
+    {
+      "iter": 151,
+      "loss": 0.0433,
+      "g0_freeze_ret": 5.077,
+      "g1_flood_ret": 9.216,
+      "g2_heist_ret": 3.153
+    },
+    {
+      "iter": 152,
+      "loss": 0.0364,
+      "g0_freeze_ret": 5.588,
+      "g1_flood_ret": 9.364,
+      "g2_heist_ret": 4.514
+    },
+    {
+      "iter": 153,
+      "loss": -0.0727,
+      "g0_freeze_ret": 6.954,
+      "g1_flood_ret": 9.389,
+      "g2_heist_ret": 5.725
+    },
+    {
+      "iter": 154,
+      "loss": -0.0949,
+      "g0_freeze_ret": 6.787,
+      "g1_flood_ret": 8.705,
+      "g2_heist_ret": 12.953
+    },
+    {
+      "iter": 155,
+      "loss": -0.0548,
+      "g0_freeze_ret": 6.606,
+      "g1_flood_ret": 8.522,
+      "g2_heist_ret": 3.253
+    },
+    {
+      "iter": 156,
+      "loss": -0.0035,
+      "g0_freeze_ret": 7.029,
+      "g1_flood_ret": 9.155,
+      "g2_heist_ret": 6.724
+    },
+    {
+      "iter": 157,
+      "loss": -0.0262,
+      "g0_freeze_ret": 6.37,
+      "g1_flood_ret": 8.705,
+      "g2_heist_ret": 3.568
+    },
+    {
+      "iter": 158,
+      "loss": -0.029,
+      "g0_freeze_ret": 6.789,
+      "g1_flood_ret": 8.929,
+      "g2_heist_ret": 13.766
+    },
+    {
+      "iter": 159,
+      "loss": 0.0158,
+      "g0_freeze_ret": 6.633,
+      "g1_flood_ret": 8.125,
+      "g2_heist_ret": 4.368
+    },
+    {
+      "iter": 160,
+      "loss": 0.015,
+      "g0_freeze_ret": 6.497,
+      "g1_flood_ret": 8.982,
+      "g2_heist_ret": 3.006,
+      "eval_composite": 17.155,
+      "eval_g0_surv": 0.8194,
+      "eval_g1_surv": 0.9028,
+      "eval_g2_disp": 1.95
+    },
+    {
+      "iter": 161,
+      "loss": -0.0394,
+      "g0_freeze_ret": 6.461,
+      "g1_flood_ret": 7.921,
+      "g2_heist_ret": 5.174
+    },
+    {
+      "iter": 162,
+      "loss": -0.0479,
+      "g0_freeze_ret": 7.029,
+      "g1_flood_ret": 8.925,
+      "g2_heist_ret": 4.069
+    },
+    {
+      "iter": 163,
+      "loss": -0.0629,
+      "g0_freeze_ret": 6.545,
+      "g1_flood_ret": 9.266,
+      "g2_heist_ret": 3.265
+    },
+    {
+      "iter": 164,
+      "loss": -0.0494,
+      "g0_freeze_ret": 5.877,
+      "g1_flood_ret": 8.791,
+      "g2_heist_ret": 4.485
+    },
+    {
+      "iter": 165,
+      "loss": 0.0193,
+      "g0_freeze_ret": 6.155,
+      "g1_flood_ret": 9.727,
+      "g2_heist_ret": 5.028
+    },
+    {
+      "iter": 166,
+      "loss": 0.0348,
+      "g0_freeze_ret": 6.312,
+      "g1_flood_ret": 9.324,
+      "g2_heist_ret": 5.023
+    },
+    {
+      "iter": 167,
+      "loss": -0.0199,
+      "g0_freeze_ret": 6.567,
+      "g1_flood_ret": 9.4,
+      "g2_heist_ret": 8.817
+    },
+    {
+      "iter": 168,
+      "loss": -0.0266,
+      "g0_freeze_ret": 6.214,
+      "g1_flood_ret": 9.305,
+      "g2_heist_ret": 4.983
+    },
+    {
+      "iter": 169,
+      "loss": 0.0098,
+      "g0_freeze_ret": 7.152,
+      "g1_flood_ret": 8.819,
+      "g2_heist_ret": 8.339
+    },
+    {
+      "iter": 170,
+      "loss": -0.0627,
+      "g0_freeze_ret": 6.779,
+      "g1_flood_ret": 8.758,
+      "g2_heist_ret": 4.94
+    },
+    {
+      "iter": 171,
+      "loss": -0.0856,
+      "g0_freeze_ret": 6.943,
+      "g1_flood_ret": 9.138,
+      "g2_heist_ret": 5.828
+    },
+    {
+      "iter": 172,
+      "loss": -0.037,
+      "g0_freeze_ret": 6.65,
+      "g1_flood_ret": 8.877,
+      "g2_heist_ret": 5.604
+    },
+    {
+      "iter": 173,
+      "loss": -0.0821,
+      "g0_freeze_ret": 6.474,
+      "g1_flood_ret": 8.817,
+      "g2_heist_ret": 6.942
+    },
+    {
+      "iter": 174,
+      "loss": 0.0057,
+      "g0_freeze_ret": 5.687,
+      "g1_flood_ret": 9.111,
+      "g2_heist_ret": 7.065
+    },
+    {
+      "iter": 175,
+      "loss": 0.0073,
+      "g0_freeze_ret": 6.16,
+      "g1_flood_ret": 8.626,
+      "g2_heist_ret": 3.104
+    },
+    {
+      "iter": 176,
+      "loss": -0.0234,
+      "g0_freeze_ret": 6.719,
+      "g1_flood_ret": 8.542,
+      "g2_heist_ret": 3.594
+    },
+    {
+      "iter": 177,
+      "loss": -0.122,
+      "g0_freeze_ret": 6.81,
+      "g1_flood_ret": 8.54,
+      "g2_heist_ret": 5.654
+    },
+    {
+      "iter": 178,
+      "loss": -0.0497,
+      "g0_freeze_ret": 7.102,
+      "g1_flood_ret": 8.602,
+      "g2_heist_ret": 6.08
+    },
+    {
+      "iter": 179,
+      "loss": -0.001,
+      "g0_freeze_ret": 5.567,
+      "g1_flood_ret": 9.046,
+      "g2_heist_ret": 8.11
+    },
+    {
+      "iter": 180,
+      "loss": 0.0634,
+      "g0_freeze_ret": 6.258,
+      "g1_flood_ret": 8.971,
+      "g2_heist_ret": 5.243,
+      "eval_composite": 18.062,
+      "eval_g0_surv": 0.875,
+      "eval_g1_surv": 0.875,
+      "eval_g2_disp": 2.38
+    }
+  ]
+}

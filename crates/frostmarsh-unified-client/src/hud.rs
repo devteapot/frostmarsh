@@ -1422,6 +1422,25 @@ pub fn build_hud(
         b.rect_outline(sfx_x, py, sfx_w, pill_h, 1.2 * ui, sfx_col);
         b.text_shadow(sfx_x + 7.0 * ui, py + 6.0 * ui, sc, sfx_col, sfx_lbl);
 
+        // Live [F11] World-Law preset pill directly above bottom-right status row (zero overlap!)
+        let law_id = crate::net::current_world_law_preset();
+        let law_name = world_law_preset_name(law_id);
+        let law_col = match law_id % 4 {
+            1 => [0.42, 0.92, 1.00, 1.0], // FREEZE-OUT
+            2 => [0.24, 0.76, 1.00, 1.0], // RISING FLOOD
+            3 => [1.00, 0.48, 0.18, 1.0], // LOW-G MAGMA
+            _ => [0.76, 0.86, 0.98, 1.0], // STANDARD
+        };
+        let law_lbl = format!("[F11] LAW:{}", law_name);
+        let law_w = HudBatch::text_width(&law_lbl, sc) + 14.0 * ui;
+        let law_x = sw - law_w - 14.0 * ui;
+        let law_y = py - pill_h - 6.0 * ui;
+        if law_x > hx + hud_w + 8.0 * ui {
+            b.rect(law_x, law_y, law_w, pill_h, [0.06, 0.05, 0.14, 0.86]);
+            b.rect_outline(law_x, law_y, law_w, pill_h, 1.2 * ui, law_col);
+            b.text_shadow(law_x + 7.0 * ui, law_y + 6.0 * ui, sc, law_col, &law_lbl);
+        }
+
         let tab_lbl = "[TAB] SCORE";
         let tab_w = HudBatch::text_width(tab_lbl, sc) + 14.0 * ui;
         let mut cursor_x = sfx_x - tab_w - 8.0 * ui;

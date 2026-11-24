@@ -1,0 +1,845 @@
+{
+  "wave": "20A",
+  "model_class": "WorldModel3DV8 (Law-Conditioned Universal 3D Physics World Model)",
+  "params": 164622,
+  "base_v7_params": 158374,
+  "extra_law_params": 6248,
+  "steps": 2400,
+  "train_seconds": 424.5,
+  "device": "NVIDIA A100-SXM4-40GB",
+  "law_names": [
+    "gravity_g",
+    "ambient_temp_shift",
+    "volatility",
+    "viscosity",
+    "precipitation",
+    "thermal_cond"
+  ],
+  "default_world_laws": [
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "world_law_presets": {
+    "frostmarsh_standard": [
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "freeze_out_survival": [
+      1.0,
+      -5500.0,
+      1.2,
+      1.1,
+      1.4,
+      1.3
+    ],
+    "rising_flood_canyon": [
+      1.15,
+      -600.0,
+      0.6,
+      0.55,
+      2.6,
+      1.0
+    ],
+    "low_g_magma_crucible": [
+      0.35,
+      5500.0,
+      2.2,
+      1.6,
+      0.25,
+      1.5
+    ]
+  },
+  "canonical_teacher_identity": {
+    "canonical_diff_horiz": 0.0,
+    "canonical_diff_z_flux": 0.0,
+    "canonical_diff_mass": 0.0,
+    "canonical_diff_energy": 0.0,
+    "conservation": {
+      "frostmarsh_standard": {
+        "mass_rel_err": 2.473602484538985e-10,
+        "energy_rel_err": 7.714574259139592e-10
+      },
+      "freeze_out_survival": {
+        "mass_rel_err": 5.968694383419632e-10,
+        "energy_rel_err": 3.279065358775828e-09
+      },
+      "rising_flood_canyon": {
+        "mass_rel_err": 6.526446320158124e-10,
+        "energy_rel_err": 1.152326386043915e-09
+      },
+      "low_g_magma_crucible": {
+        "mass_rel_err": 1.3011212416855794e-10,
+        "energy_rel_err": 9.965354406486627e-09
+      }
+    }
+  },
+  "v7_step0_warmstart_identity": {
+    "max_abs_diff_horiz": 0.0,
+    "max_abs_diff_z_flux": 0.0,
+    "max_abs_diff_z_world": 0.0
+  },
+  "eval_z16": {
+    "frostmarsh_standard": {
+      "world_laws": [
+        1.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "grid": "96x96x16",
+      "world_model_3d_v8": {
+        "proj_active_pct": 1.177,
+        "proj_flux_pct": 0.192,
+        "proj_heat_pct": 0.601,
+        "proj_rxn_pct": 0.534,
+        "horiz_flux_r2": 0.9069,
+        "horiz_heat_r2": 0.9563,
+        "horiz_rxn_r2": 0.9463,
+        "horiz_mean_r2": 0.9365,
+        "vert_water_r2": 0.9942,
+        "vert_oil_r2": 0.0631,
+        "vert_steam_r2": 0.9775,
+        "vert_smoke_r2": 0.987,
+        "vert_heat_r2": 0.4931,
+        "vert_mean_r2": 0.9862,
+        "overall_mean_r2": 0.9614
+      },
+      "world_model_3d_v7": {
+        "proj_active_pct": 1.429,
+        "proj_flux_pct": 0.22,
+        "proj_heat_pct": 0.838,
+        "proj_rxn_pct": 0.528,
+        "horiz_flux_r2": 0.8918,
+        "horiz_heat_r2": 0.9534,
+        "horiz_rxn_r2": 0.9344,
+        "horiz_mean_r2": 0.9265,
+        "vert_water_r2": 0.9942,
+        "vert_oil_r2": -0.1003,
+        "vert_steam_r2": 0.9805,
+        "vert_smoke_r2": 0.9864,
+        "vert_heat_r2": 0.6784,
+        "vert_mean_r2": 0.987,
+        "overall_mean_r2": 0.9568
+      }
+    },
+    "freeze_out_survival": {
+      "world_laws": [
+        1.0,
+        -5500.0,
+        1.2,
+        1.1,
+        1.4,
+        1.3
+      ],
+      "grid": "96x96x16",
+      "world_model_3d_v8": {
+        "proj_active_pct": 1.417,
+        "proj_flux_pct": 0.104,
+        "proj_heat_pct": 0.871,
+        "proj_rxn_pct": 0.554,
+        "horiz_flux_r2": 0.9074,
+        "horiz_heat_r2": 0.9322,
+        "horiz_rxn_r2": 0.5056,
+        "horiz_mean_r2": 0.7817,
+        "vert_water_r2": 0.986,
+        "vert_oil_r2": 0.4354,
+        "vert_steam_r2": 0.985,
+        "vert_smoke_r2": 0.982,
+        "vert_heat_r2": 0.3472,
+        "vert_mean_r2": 0.9843,
+        "overall_mean_r2": 0.883
+      },
+      "world_model_3d_v7": {
+        "proj_active_pct": 1.587,
+        "proj_flux_pct": 0.156,
+        "proj_heat_pct": 0.93,
+        "proj_rxn_pct": 0.632,
+        "horiz_flux_r2": 0.8872,
+        "horiz_heat_r2": 0.8785,
+        "horiz_rxn_r2": 0.4276,
+        "horiz_mean_r2": 0.7311,
+        "vert_water_r2": 0.9866,
+        "vert_oil_r2": 0.3764,
+        "vert_steam_r2": 0.9777,
+        "vert_smoke_r2": 0.9731,
+        "vert_heat_r2": 0.5938,
+        "vert_mean_r2": 0.9791,
+        "overall_mean_r2": 0.8551
+      }
+    },
+    "rising_flood_canyon": {
+      "world_laws": [
+        1.15,
+        -600.0,
+        0.6,
+        0.55,
+        2.6,
+        1.0
+      ],
+      "grid": "96x96x16",
+      "world_model_3d_v8": {
+        "proj_active_pct": 2.173,
+        "proj_flux_pct": 0.739,
+        "proj_heat_pct": 1.303,
+        "proj_rxn_pct": 0.453,
+        "horiz_flux_r2": 0.6603,
+        "horiz_heat_r2": 0.9287,
+        "horiz_rxn_r2": 0.827,
+        "horiz_mean_r2": 0.8053,
+        "vert_water_r2": 0.8478,
+        "vert_oil_r2": -3.6147,
+        "vert_steam_r2": 0.9758,
+        "vert_smoke_r2": 0.976,
+        "vert_heat_r2": 0.5027,
+        "vert_mean_r2": 0.9332,
+        "overall_mean_r2": 0.8693
+      },
+      "world_model_3d_v7": {
+        "proj_active_pct": 2.59,
+        "proj_flux_pct": 0.421,
+        "proj_heat_pct": 1.937,
+        "proj_rxn_pct": 0.516,
+        "horiz_flux_r2": 0.3339,
+        "horiz_heat_r2": 0.9369,
+        "horiz_rxn_r2": 0.597,
+        "horiz_mean_r2": 0.6226,
+        "vert_water_r2": 0.8131,
+        "vert_oil_r2": -3.0765,
+        "vert_steam_r2": 0.9626,
+        "vert_smoke_r2": 0.9649,
+        "vert_heat_r2": 0.6919,
+        "vert_mean_r2": 0.9135,
+        "overall_mean_r2": 0.7681
+      }
+    },
+    "low_g_magma_crucible": {
+      "world_laws": [
+        0.35,
+        5500.0,
+        2.2,
+        1.6,
+        0.25,
+        1.5
+      ],
+      "grid": "96x96x16",
+      "world_model_3d_v8": {
+        "proj_active_pct": 1.538,
+        "proj_flux_pct": 0.069,
+        "proj_heat_pct": 1.182,
+        "proj_rxn_pct": 0.442,
+        "horiz_flux_r2": 0.8349,
+        "horiz_heat_r2": 0.9124,
+        "horiz_rxn_r2": 0.8372,
+        "horiz_mean_r2": 0.8615,
+        "vert_water_r2": 0.9875,
+        "vert_oil_r2": 0.0202,
+        "vert_steam_r2": 0.9748,
+        "vert_smoke_r2": 0.9677,
+        "vert_heat_r2": 0.4053,
+        "vert_mean_r2": 0.9767,
+        "overall_mean_r2": 0.9191
+      },
+      "world_model_3d_v7": {
+        "proj_active_pct": 1.744,
+        "proj_flux_pct": 0.24,
+        "proj_heat_pct": 1.184,
+        "proj_rxn_pct": 0.527,
+        "horiz_flux_r2": -0.389,
+        "horiz_heat_r2": 0.8177,
+        "horiz_rxn_r2": -1.5897,
+        "horiz_mean_r2": -0.387,
+        "vert_water_r2": -4.5586,
+        "vert_oil_r2": -8.7608,
+        "vert_steam_r2": -2.7842,
+        "vert_smoke_r2": -2.1711,
+        "vert_heat_r2": 0.5863,
+        "vert_mean_r2": -3.1713,
+        "overall_mean_r2": -1.7792
+      }
+    }
+  },
+  "eval_z32": {
+    "frostmarsh_standard": {
+      "world_laws": [
+        1.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "grid": "64x64x32",
+      "world_model_3d_v8": {
+        "proj_active_pct": 1.521,
+        "proj_flux_pct": 0.256,
+        "proj_heat_pct": 0.898,
+        "proj_rxn_pct": 0.565,
+        "horiz_flux_r2": 0.8856,
+        "horiz_heat_r2": 0.9507,
+        "horiz_rxn_r2": 0.9328,
+        "horiz_mean_r2": 0.923,
+        "vert_water_r2": 0.9929,
+        "vert_oil_r2": 0.6599,
+        "vert_steam_r2": 0.991,
+        "vert_smoke_r2": 0.9842,
+        "vert_heat_r2": 0.336,
+        "vert_mean_r2": 0.9893,
+        "overall_mean_r2": 0.9562
+      },
+      "world_model_3d_v7": {
+        "proj_active_pct": 1.793,
+        "proj_flux_pct": 0.289,
+        "proj_heat_pct": 1.165,
+        "proj_rxn_pct": 0.533,
+        "horiz_flux_r2": 0.8691,
+        "horiz_heat_r2": 0.9439,
+        "horiz_rxn_r2": 0.9152,
+        "horiz_mean_r2": 0.9094,
+        "vert_water_r2": 0.9917,
+        "vert_oil_r2": 0.6142,
+        "vert_steam_r2": 0.991,
+        "vert_smoke_r2": 0.986,
+        "vert_heat_r2": 0.5968,
+        "vert_mean_r2": 0.9896,
+        "overall_mean_r2": 0.9495
+      }
+    },
+    "freeze_out_survival": {
+      "world_laws": [
+        1.0,
+        -5500.0,
+        1.2,
+        1.1,
+        1.4,
+        1.3
+      ],
+      "grid": "64x64x32",
+      "world_model_3d_v8": {
+        "proj_active_pct": 2.012,
+        "proj_flux_pct": 0.16,
+        "proj_heat_pct": 1.303,
+        "proj_rxn_pct": 0.721,
+        "horiz_flux_r2": 0.902,
+        "horiz_heat_r2": 0.9374,
+        "horiz_rxn_r2": 0.5398,
+        "horiz_mean_r2": 0.7931,
+        "vert_water_r2": 0.9881,
+        "vert_oil_r2": 0.781,
+        "vert_steam_r2": 0.988,
+        "vert_smoke_r2": 0.9839,
+        "vert_heat_r2": 0.502,
+        "vert_mean_r2": 0.9867,
+        "overall_mean_r2": 0.8899
+      },
+      "world_model_3d_v7": {
+        "proj_active_pct": 1.873,
+        "proj_flux_pct": 0.213,
+        "proj_heat_pct": 1.102,
+        "proj_rxn_pct": 0.732,
+        "horiz_flux_r2": 0.8823,
+        "horiz_heat_r2": 0.8841,
+        "horiz_rxn_r2": 0.4811,
+        "horiz_mean_r2": 0.7491,
+        "vert_water_r2": 0.9854,
+        "vert_oil_r2": 0.7383,
+        "vert_steam_r2": 0.9821,
+        "vert_smoke_r2": 0.977,
+        "vert_heat_r2": 0.683,
+        "vert_mean_r2": 0.9815,
+        "overall_mean_r2": 0.8653
+      }
+    },
+    "rising_flood_canyon": {
+      "world_laws": [
+        1.15,
+        -600.0,
+        0.6,
+        0.55,
+        2.6,
+        1.0
+      ],
+      "grid": "64x64x32",
+      "world_model_3d_v8": {
+        "proj_active_pct": 2.545,
+        "proj_flux_pct": 0.972,
+        "proj_heat_pct": 1.474,
+        "proj_rxn_pct": 0.539,
+        "horiz_flux_r2": 0.6485,
+        "horiz_heat_r2": 0.9263,
+        "horiz_rxn_r2": 0.72,
+        "horiz_mean_r2": 0.765,
+        "vert_water_r2": 0.8176,
+        "vert_oil_r2": 0.3585,
+        "vert_steam_r2": 0.9833,
+        "vert_smoke_r2": 0.9751,
+        "vert_heat_r2": 0.3563,
+        "vert_mean_r2": 0.9253,
+        "overall_mean_r2": 0.8451
+      },
+      "world_model_3d_v7": {
+        "proj_active_pct": 2.751,
+        "proj_flux_pct": 0.535,
+        "proj_heat_pct": 2.064,
+        "proj_rxn_pct": 0.516,
+        "horiz_flux_r2": 0.3389,
+        "horiz_heat_r2": 0.929,
+        "horiz_rxn_r2": 0.5723,
+        "horiz_mean_r2": 0.6134,
+        "vert_water_r2": 0.7844,
+        "vert_oil_r2": 0.3742,
+        "vert_steam_r2": 0.9735,
+        "vert_smoke_r2": 0.9716,
+        "vert_heat_r2": 0.6232,
+        "vert_mean_r2": 0.9098,
+        "overall_mean_r2": 0.7616
+      }
+    },
+    "low_g_magma_crucible": {
+      "world_laws": [
+        0.35,
+        5500.0,
+        2.2,
+        1.6,
+        0.25,
+        1.5
+      ],
+      "grid": "64x64x32",
+      "world_model_3d_v8": {
+        "proj_active_pct": 2.112,
+        "proj_flux_pct": 0.098,
+        "proj_heat_pct": 1.768,
+        "proj_rxn_pct": 0.478,
+        "horiz_flux_r2": 0.7942,
+        "horiz_heat_r2": 0.9117,
+        "horiz_rxn_r2": 0.7981,
+        "horiz_mean_r2": 0.8346,
+        "vert_water_r2": 0.988,
+        "vert_oil_r2": 0.5744,
+        "vert_steam_r2": 0.9833,
+        "vert_smoke_r2": 0.967,
+        "vert_heat_r2": 0.4389,
+        "vert_mean_r2": 0.9794,
+        "overall_mean_r2": 0.907
+      },
+      "world_model_3d_v7": {
+        "proj_active_pct": 2.347,
+        "proj_flux_pct": 0.377,
+        "proj_heat_pct": 1.837,
+        "proj_rxn_pct": 0.573,
+        "horiz_flux_r2": -0.3824,
+        "horiz_heat_r2": 0.8164,
+        "horiz_rxn_r2": -0.8727,
+        "horiz_mean_r2": -0.1463,
+        "vert_water_r2": -3.409,
+        "vert_oil_r2": -3.5677,
+        "vert_steam_r2": -2.9066,
+        "vert_smoke_r2": -2.2158,
+        "vert_heat_r2": 0.5824,
+        "vert_mean_r2": -2.8438,
+        "overall_mean_r2": -1.495
+      }
+    }
+  },
+  "fp32_sparse_parity": {
+    "frostmarsh_standard_z16": {
+      "L": 16,
+      "H": 64,
+      "W": 64,
+      "world_laws": [
+        1.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "active_brick_frac": 0.5625,
+      "max_abs_diff_horiz": 9.313225746154785e-10,
+      "max_abs_diff_z_flux": 0.0,
+      "max_abs_diff_z_world": 0.0,
+      "max_abs_diff_all": 9.313225746154785e-10
+    },
+    "frostmarsh_standard_z32": {
+      "L": 32,
+      "H": 64,
+      "W": 64,
+      "world_laws": [
+        1.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "active_brick_frac": 0.5625,
+      "max_abs_diff_horiz": 4.656612873077393e-10,
+      "max_abs_diff_z_flux": 0.0,
+      "max_abs_diff_z_world": 0.0,
+      "max_abs_diff_all": 4.656612873077393e-10
+    },
+    "rising_flood_canyon_z16": {
+      "L": 16,
+      "H": 64,
+      "W": 64,
+      "world_laws": [
+        1.15,
+        -600.0,
+        0.6,
+        0.55,
+        2.6,
+        1.0
+      ],
+      "active_brick_frac": 0.5625,
+      "max_abs_diff_horiz": 4.656612873077393e-10,
+      "max_abs_diff_z_flux": 0.0,
+      "max_abs_diff_z_world": 0.0,
+      "max_abs_diff_all": 4.656612873077393e-10
+    },
+    "rising_flood_canyon_z32": {
+      "L": 32,
+      "H": 64,
+      "W": 64,
+      "world_laws": [
+        1.15,
+        -600.0,
+        0.6,
+        0.55,
+        2.6,
+        1.0
+      ],
+      "active_brick_frac": 0.5625,
+      "max_abs_diff_horiz": 4.656612873077393e-10,
+      "max_abs_diff_z_flux": 0.0,
+      "max_abs_diff_z_world": 0.0,
+      "max_abs_diff_all": 4.656612873077393e-10
+    },
+    "low_g_magma_crucible_z16": {
+      "L": 16,
+      "H": 64,
+      "W": 64,
+      "world_laws": [
+        0.35,
+        5500.0,
+        2.2,
+        1.6,
+        0.25,
+        1.5
+      ],
+      "active_brick_frac": 0.5625,
+      "max_abs_diff_horiz": 2.3283064365386963e-10,
+      "max_abs_diff_z_flux": 0.0,
+      "max_abs_diff_z_world": 0.0,
+      "max_abs_diff_all": 2.3283064365386963e-10
+    },
+    "low_g_magma_crucible_z32": {
+      "L": 32,
+      "H": 64,
+      "W": 64,
+      "world_laws": [
+        0.35,
+        5500.0,
+        2.2,
+        1.6,
+        0.25,
+        1.5
+      ],
+      "active_brick_frac": 0.5625,
+      "max_abs_diff_horiz": 9.313225746154785e-10,
+      "max_abs_diff_z_flux": 0.0,
+      "max_abs_diff_z_world": 0.0,
+      "max_abs_diff_all": 9.313225746154785e-10
+    }
+  },
+  "history": [
+    {
+      "step": 250,
+      "elapsed_s": 51.1,
+      "frostmarsh_standard": {
+        "horiz_mean_r2": 0.8779,
+        "vert_mean_r2": 0.8239,
+        "overall_mean_r2": 0.8509,
+        "proj_active_pct": 2.237
+      },
+      "freeze_out_survival": {
+        "horiz_mean_r2": 0.7085,
+        "vert_mean_r2": 0.8139,
+        "overall_mean_r2": 0.7612,
+        "proj_active_pct": 1.826
+      },
+      "rising_flood_canyon": {
+        "horiz_mean_r2": 0.6368,
+        "vert_mean_r2": 0.722,
+        "overall_mean_r2": 0.6794,
+        "proj_active_pct": 4.596
+      },
+      "low_g_magma_crucible": {
+        "horiz_mean_r2": 0.6761,
+        "vert_mean_r2": 0.9221,
+        "overall_mean_r2": 0.7991,
+        "proj_active_pct": 2.586
+      }
+    },
+    {
+      "step": 500,
+      "elapsed_s": 92.6,
+      "frostmarsh_standard": {
+        "horiz_mean_r2": 0.8717,
+        "vert_mean_r2": 0.9656,
+        "overall_mean_r2": 0.9187,
+        "proj_active_pct": 2.107
+      },
+      "freeze_out_survival": {
+        "horiz_mean_r2": 0.7089,
+        "vert_mean_r2": 0.9384,
+        "overall_mean_r2": 0.8236,
+        "proj_active_pct": 2.099
+      },
+      "rising_flood_canyon": {
+        "horiz_mean_r2": 0.6483,
+        "vert_mean_r2": 0.8847,
+        "overall_mean_r2": 0.7665,
+        "proj_active_pct": 3.186
+      },
+      "low_g_magma_crucible": {
+        "horiz_mean_r2": 0.6343,
+        "vert_mean_r2": 0.9596,
+        "overall_mean_r2": 0.7969,
+        "proj_active_pct": 2.477
+      }
+    },
+    {
+      "step": 750,
+      "elapsed_s": 133.4,
+      "frostmarsh_standard": {
+        "horiz_mean_r2": 0.9,
+        "vert_mean_r2": 0.9821,
+        "overall_mean_r2": 0.9411,
+        "proj_active_pct": 1.992
+      },
+      "freeze_out_survival": {
+        "horiz_mean_r2": 0.7463,
+        "vert_mean_r2": 0.9645,
+        "overall_mean_r2": 0.8554,
+        "proj_active_pct": 1.849
+      },
+      "rising_flood_canyon": {
+        "horiz_mean_r2": 0.6877,
+        "vert_mean_r2": 0.9027,
+        "overall_mean_r2": 0.7952,
+        "proj_active_pct": 3.468
+      },
+      "low_g_magma_crucible": {
+        "horiz_mean_r2": 0.7359,
+        "vert_mean_r2": 0.9388,
+        "overall_mean_r2": 0.8374,
+        "proj_active_pct": 2.053
+      }
+    },
+    {
+      "step": 1000,
+      "elapsed_s": 174.3,
+      "frostmarsh_standard": {
+        "horiz_mean_r2": 0.9033,
+        "vert_mean_r2": 0.9808,
+        "overall_mean_r2": 0.9421,
+        "proj_active_pct": 1.839
+      },
+      "freeze_out_survival": {
+        "horiz_mean_r2": 0.7535,
+        "vert_mean_r2": 0.967,
+        "overall_mean_r2": 0.8603,
+        "proj_active_pct": 1.935
+      },
+      "rising_flood_canyon": {
+        "horiz_mean_r2": 0.7163,
+        "vert_mean_r2": 0.9079,
+        "overall_mean_r2": 0.8121,
+        "proj_active_pct": 3.404
+      },
+      "low_g_magma_crucible": {
+        "horiz_mean_r2": 0.7536,
+        "vert_mean_r2": 0.9708,
+        "overall_mean_r2": 0.8622,
+        "proj_active_pct": 1.698
+      }
+    },
+    {
+      "step": 1250,
+      "elapsed_s": 214.7,
+      "frostmarsh_standard": {
+        "horiz_mean_r2": 0.9022,
+        "vert_mean_r2": 0.9811,
+        "overall_mean_r2": 0.9416,
+        "proj_active_pct": 1.723
+      },
+      "freeze_out_survival": {
+        "horiz_mean_r2": 0.7629,
+        "vert_mean_r2": 0.9733,
+        "overall_mean_r2": 0.8681,
+        "proj_active_pct": 1.797
+      },
+      "rising_flood_canyon": {
+        "horiz_mean_r2": 0.7369,
+        "vert_mean_r2": 0.9071,
+        "overall_mean_r2": 0.822,
+        "proj_active_pct": 3.152
+      },
+      "low_g_magma_crucible": {
+        "horiz_mean_r2": 0.7798,
+        "vert_mean_r2": 0.9695,
+        "overall_mean_r2": 0.8747,
+        "proj_active_pct": 1.766
+      }
+    },
+    {
+      "step": 1500,
+      "elapsed_s": 255.2,
+      "frostmarsh_standard": {
+        "horiz_mean_r2": 0.9092,
+        "vert_mean_r2": 0.982,
+        "overall_mean_r2": 0.9456,
+        "proj_active_pct": 1.642
+      },
+      "freeze_out_survival": {
+        "horiz_mean_r2": 0.7752,
+        "vert_mean_r2": 0.9764,
+        "overall_mean_r2": 0.8758,
+        "proj_active_pct": 1.857
+      },
+      "rising_flood_canyon": {
+        "horiz_mean_r2": 0.7482,
+        "vert_mean_r2": 0.9065,
+        "overall_mean_r2": 0.8273,
+        "proj_active_pct": 3.255
+      },
+      "low_g_magma_crucible": {
+        "horiz_mean_r2": 0.7915,
+        "vert_mean_r2": 0.9724,
+        "overall_mean_r2": 0.882,
+        "proj_active_pct": 1.492
+      }
+    },
+    {
+      "step": 1750,
+      "elapsed_s": 295.8,
+      "frostmarsh_standard": {
+        "horiz_mean_r2": 0.9152,
+        "vert_mean_r2": 0.9826,
+        "overall_mean_r2": 0.9489,
+        "proj_active_pct": 1.592
+      },
+      "freeze_out_survival": {
+        "horiz_mean_r2": 0.7809,
+        "vert_mean_r2": 0.9814,
+        "overall_mean_r2": 0.8812,
+        "proj_active_pct": 1.819
+      },
+      "rising_flood_canyon": {
+        "horiz_mean_r2": 0.7579,
+        "vert_mean_r2": 0.9104,
+        "overall_mean_r2": 0.8342,
+        "proj_active_pct": 3.014
+      },
+      "low_g_magma_crucible": {
+        "horiz_mean_r2": 0.817,
+        "vert_mean_r2": 0.9681,
+        "overall_mean_r2": 0.8925,
+        "proj_active_pct": 1.567
+      }
+    },
+    {
+      "step": 2000,
+      "elapsed_s": 335.6,
+      "frostmarsh_standard": {
+        "horiz_mean_r2": 0.9175,
+        "vert_mean_r2": 0.9818,
+        "overall_mean_r2": 0.9497,
+        "proj_active_pct": 1.463
+      },
+      "freeze_out_survival": {
+        "horiz_mean_r2": 0.7795,
+        "vert_mean_r2": 0.9818,
+        "overall_mean_r2": 0.8806,
+        "proj_active_pct": 1.523
+      },
+      "rising_flood_canyon": {
+        "horiz_mean_r2": 0.7636,
+        "vert_mean_r2": 0.9125,
+        "overall_mean_r2": 0.838,
+        "proj_active_pct": 2.797
+      },
+      "low_g_magma_crucible": {
+        "horiz_mean_r2": 0.8221,
+        "vert_mean_r2": 0.9723,
+        "overall_mean_r2": 0.8972,
+        "proj_active_pct": 1.673
+      }
+    },
+    {
+      "step": 2250,
+      "elapsed_s": 376.1,
+      "frostmarsh_standard": {
+        "horiz_mean_r2": 0.9198,
+        "vert_mean_r2": 0.9837,
+        "overall_mean_r2": 0.9517,
+        "proj_active_pct": 1.453
+      },
+      "freeze_out_survival": {
+        "horiz_mean_r2": 0.7839,
+        "vert_mean_r2": 0.9833,
+        "overall_mean_r2": 0.8836,
+        "proj_active_pct": 1.568
+      },
+      "rising_flood_canyon": {
+        "horiz_mean_r2": 0.7814,
+        "vert_mean_r2": 0.916,
+        "overall_mean_r2": 0.8487,
+        "proj_active_pct": 2.907
+      },
+      "low_g_magma_crucible": {
+        "horiz_mean_r2": 0.8282,
+        "vert_mean_r2": 0.9722,
+        "overall_mean_r2": 0.9002,
+        "proj_active_pct": 1.634
+      }
+    },
+    {
+      "step": 2400,
+      "elapsed_s": 403.1,
+      "frostmarsh_standard": {
+        "horiz_mean_r2": 0.921,
+        "vert_mean_r2": 0.9832,
+        "overall_mean_r2": 0.9521,
+        "proj_active_pct": 1.434
+      },
+      "freeze_out_survival": {
+        "horiz_mean_r2": 0.7844,
+        "vert_mean_r2": 0.9826,
+        "overall_mean_r2": 0.8835,
+        "proj_active_pct": 1.609
+      },
+      "rising_flood_canyon": {
+        "horiz_mean_r2": 0.7889,
+        "vert_mean_r2": 0.919,
+        "overall_mean_r2": 0.8539,
+        "proj_active_pct": 2.932
+      },
+      "low_g_magma_crucible": {
+        "horiz_mean_r2": 0.8342,
+        "vert_mean_r2": 0.9715,
+        "overall_mean_r2": 0.9029,
+        "proj_active_pct": 1.671
+      }
+    }
+  ]
+}

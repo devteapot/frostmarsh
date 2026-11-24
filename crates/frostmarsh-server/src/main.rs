@@ -18,8 +18,9 @@ mod ws_bridge;
 use bytes::Bytes;
 use clap::Parser;
 use field_core::{
-    biome_name, EntityVoxelPhysics, Field, INPUT_CHANNELS, NUM_BIOMES, OUTPUT_CHANNELS,
-    RawStepOutput, SP_ICE, SP_OIL, SP_PLANT, SP_ROCK, SP_STEAM, SP_WATER, SP_WOOD, VolumeField,
+    biome_name, EntityVoxelPhysics, Field, INPUT_CHANNELS, NUM_BIOMES, NUM_WORLD_LAW_PRESETS,
+    OUTPUT_CHANNELS, RawStepOutput, SP_ICE, SP_OIL, SP_PLANT, SP_ROCK, SP_STEAM, SP_WATER,
+    SP_WOOD, VolumeField, WorldLaws,
 };
 use frostmarsh_proto::*;
 #[cfg(feature = "onnx")]
@@ -694,6 +695,67 @@ impl EcosystemState {
 }
 
 // ---------------- 3D Game State ----------------
+
+/// Physical body morphology parameters derived from each archetype to couple locomotion,
+/// flight/glide, aquatic buoyancy, climbing, boring, knockback resistance, and thermal insulation
+/// directly to the live `WorldLaws` & volumetric voxel field.
+#[derive(Clone, Copy, Debug)]
+struct BodyMorphology {
+    mass: f32,
+    wing_lift: f32,
+    buoyancy: f32,
+    climb_grip: f32,
+    bore_torque: f32,
+    thermal_insul: f32,
+}
+
+impl BodyMorphology {
+    fn from_archetype(class_id: u8) -> Self {
+        match class_id % 5 {
+            CLASS_STRIDER => Self {
+                mass: 2.4,
+                wing_lift: 0.0,
+                buoyancy: 0.15,
+                climb_grip: 0.15,
+                bore_torque: 0.0,
+                thermal_insul: 0.35,
+            },
+            CLASS_SKYWING => Self {
+                mass: 0.85,
+                wing_lift: 0.85,
+                buoyancy: 0.10,
+                climb_grip: 0.10,
+                bore_torque: 0.0,
+                thermal_insul: 0.25,
+            },
+            CLASS_TIDEKIN => Self {
+                mass: 1.05,
+                wing_lift: 0.0,
+                buoyancy: 1.0,
+                climb_grip: 0.25,
+                bore_torque: 0.0,
+                thermal_insul: 0.72,
+            },
+            CLASS_EMBERSTALKER => Self {
+                mass: 0.95,
+                wing_lift: 0.12,
+                buoyancy: 0.20,
+                climb_grip: 0.95,
+                bore_torque: 0.0,
+                thermal_insul: 0.48,
+            },
+            _ => Self {
+                // CLASS_BURROWER (Terramole)
+                mass: 2.2,
+                wing_lift: 0.0,
+                buoyancy: 0.12,
+                climb_grip: 0.30,
+                bore_torque: 1.0,
+                thermal_insul: 0.55,
+            },
+        }
+    }
+}
 
 #[derive(Clone)]
 struct PlayerEntity {
@@ -1974,16 +2036,21 @@ impl GameState {
                 p.dash_until = tick + 6;
                 p.dash_cd = tick + dash_cd_ticks;
                 let (ddx, ddy) = if mlen > 0.01 { (dx, dy) } else { (p.aim_x, p.aim_y) };
+                let morph = BodyMorphology::from_archetype(p.class_id);
+                let grav_g = self.volume.world_laws.gravity_g.clamp(0.20, 2.5);
+                let low_g_boost = (1.0 / grav_g).powf(0.35).clamp(0.75, 1.65);
                 p.vx = ddx * 42.0;
                 p.vy = ddy * 42.0;
-                p.vz = match (self.grid_d >= 16, p.class_id) {
-                    (true, CLASS_SKYWING) => 8.5,      // Skywing wing-surge aloft!
-                    (true, CLASS_TIDEKIN) => 9.2,      // Tidekin breach launch out of water!
-                    (true, CLASS_EMBERSTALKER) => 7.6, // Emberstalker vault!
-                    (true, CLASS_BURROWER) => 5.4,     // Terramole tunnel lunge!
-                    (true, _) => 6.2,
-                    (false, CLASS_SKYWING) => 2.8,
-                    (false, _) => 1.8,
+                p.vz = if self.grid_d >= 16 {
+                    let base_leap = 5.4 / morph.mass.sqrt()
+                        + morph.wing_lift * 2.9
+                        + morph.buoyancy * 3.4
+                        + morph.climb_grip * 1.9
+                        + morph.bore_torque * 1.4;
+                    (base_leap * low_g_boost).clamp(4.8, 14.5)
+                } else {
+                    let base_leap = 1.6 + morph.wing_lift * 1.3 + morph.buoyancy * 0.4 + morph.climb_grip * 0.3;
+                    (base_leap * low_g_boost).clamp(1.4, 4.6)
                 };
             } else if tick >= p.dash_until {
                 let mut speed = if p.carrying_relic { base_spd * 0.78 } else { base_spd };
@@ -3279,6 +3346,37 @@ impl GameState {
         self.push_event(5, mx, my, 0, 2, lbl);
     }
 
+    fn cycle_world_law(&mut self) {
+        let next = (self.volume.world_law_preset + 1) % NUM_WORLD_LAW_PRESETS;
+        self.volume.set_world_law_preset(next);
+        let laws = self.volume.world_laws;
+        let name = WorldLaws::preset_name(next);
+        let (mx, my) = (self.grid_w as f32 * 0.5, self.grid_h as f32 * 0.5);
+        let banner = format!("WORLD LAW: {}!", name);
+        self.push_event(5, mx, my, 0, 2, banner.clone());
+        self.tactical_events.push_back(ws_bridge::WsTacticalEvent {
+            label: banner,
+            team: 2,
+            x: mx,
+            y: my,
+            tick: self.sim_tick,
+        });
+        while self.tactical_events.len() > 16 {
+            self.tactical_events.pop_front();
+        }
+        log::info!(
+            "World Law Preset -> {} ({}) [g={:.2} dT={:+.0} vol={:.2} visc={:.2} precip={:.2} k={:.2}]",
+            next,
+            name,
+            laws.gravity_g,
+            laws.ambient_temp_shift,
+            laws.volatility,
+            laws.viscosity,
+            laws.precipitation,
+            laws.thermal_cond
+        );
+    }
+
     fn step_bots(&mut self) {
         if self.neural_bots_on && self.step_bots_neural_z() {
             return;
@@ -4467,9 +4565,14 @@ impl GameState {
                 && (phys.smoke_opacity > 0.15
                     || (is_z16 && self.volume.measure_vertical_clearance_3d((px, py, pz)) < 6.0));
 
-            // Detect Thermal Updraft column (`T > 340 K` = `34_000 cK`) beneath Skywings
+            let laws = self.volume.world_laws;
+            let morph = BodyMorphology::from_archetype(class_id);
+            let grav_g = laws.gravity_g.clamp(0.15, 2.5);
+            let visc = laws.viscosity.clamp(0.25, 4.0);
+
+            // Detect Thermal Updraft column (`T > 340 K` = `34_000 cK`) beneath winged bodies
             let mut thermal_updraft_ck = 0i64;
-            if class_id == CLASS_SKYWING {
+            if morph.wing_lift > 0.30 {
                 let z_lo = cur_layer.saturating_sub(if is_z16 { 6 } else { 2 });
                 for zs in z_lo..=cur_layer {
                     let t_s = self.volume.layers[zs].cell_temp_ck(idx_c);
@@ -4480,34 +4583,38 @@ impl GameState {
             }
 
             let mut mult = 1.0f32;
-            if class_id == CLASS_TIDEKIN && in_water {
-                // Tidekin Passive Hydrodynamic Surge: 2.0x move speed in water/rivers/sinkholes, zero chill penalty!
-                mult *= 2.0;
+            if morph.buoyancy >= 0.70 && in_water {
+                // High-buoyancy hydrodynamic propulsion coupled to fluid viscosity!
+                let visc_bonus = (1.0 / visc).clamp(0.70, 1.35);
+                mult *= (1.0 + morph.buoyancy * visc_bonus).clamp(1.4, 2.35);
             } else if physics_native {
-                // Locomotion emerges directly from voxel ice_frac (glide), oil_frac (slip), water_frac (drag)
-                if on_raft.is_none() && class_id != CLASS_SKYWING && phys.water_frac > 0.05 && phys.ice_frac < 0.30 {
-                    mult *= (1.0 - 0.42 * phys.water_frac).clamp(0.45, 1.0);
+                // Locomotion emerges directly from BodyMorphology × voxel fluid/ice/oil/temp × world_laws
+                if on_raft.is_none() && morph.wing_lift < 0.50 && phys.water_frac > 0.05 && phys.ice_frac < 0.30 {
+                    let drag = (0.46 * (1.0 - morph.buoyancy * 0.65) * visc.sqrt()).clamp(0.12, 0.72);
+                    mult *= (1.0 - drag * phys.water_frac).clamp(0.38, 1.0);
                 }
                 if phys.ice_frac > 0.10 {
                     mult *= 1.0 + 0.24 * phys.ice_frac;
                 }
                 if phys.oil_frac > 0.10 {
-                    mult *= 1.0 - 0.12 * phys.oil_frac;
+                    mult *= 1.0 - (0.12 * visc.sqrt()).min(0.26) * phys.oil_frac;
                 }
-                if phys.temp_c < -15.0 && tick >= dash_until && class_id != CLASS_TIDEKIN {
-                    let cold_slow = ((-15.0 - phys.temp_c) / 80.0).clamp(0.0, 0.32);
+                if phys.temp_c < -15.0 && tick >= dash_until && morph.thermal_insul < 0.70 {
+                    let cold_slow = (((-15.0 - phys.temp_c) / 80.0) * (1.0 - morph.thermal_insul)).clamp(0.0, 0.32);
                     mult *= 1.0 - cold_slow;
                 }
                 // Low-friction glide on ice / oil preserves momentum via kb_vx/kb_vy slip term
                 let slip = (phys.ice_frac * 0.72).max(phys.oil_frac * 0.55).clamp(0.0, 0.78);
-                if slip > 0.12 && class_id != CLASS_SKYWING {
+                if slip > 0.12 && morph.wing_lift < 0.50 {
                     kb_vx = kb_vx * (0.78 + 0.16 * slip) + vx * mult * (0.14 * slip);
                     kb_vy = kb_vy * (0.78 + 0.16 * slip) + vy * mult * (0.14 * slip);
                 }
             } else {
-                if on_raft.is_none() && class_id != CLASS_SKYWING && (hz_here & (1 << 4)) != 0 { mult *= 0.60; }
-                if ((hz_here & (1 << 3)) != 0 || tick < chilled_until) && tick >= dash_until && class_id != CLASS_TIDEKIN {
-                    mult *= 0.68;
+                if on_raft.is_none() && morph.wing_lift < 0.50 && (hz_here & (1 << 4)) != 0 {
+                    mult *= (0.60 + 0.25 * morph.buoyancy).min(0.95);
+                }
+                if ((hz_here & (1 << 3)) != 0 || tick < chilled_until) && tick >= dash_until && morph.thermal_insul < 0.70 {
+                    mult *= 0.68 + 0.22 * morph.thermal_insul;
                 }
             }
             if in_smoke_veil {
@@ -4525,107 +4632,105 @@ impl GameState {
             let (fx, fy, fz);
             if is_z16 {
                 let max_alt = (self.grid_d as f32 - 2.0).max(2.0);
-                match class_id {
-                    CLASS_SKYWING => {
-                        // True 3D Flight & Thermal Glider:
-                        // Smooth glide (gravity * 0.22), passive Thermal Updraft lift (+vz over T > 340 K), free soaring up to depth - 2.0!
-                        vz += 18.0 * 0.78 * dt; // Counteract 78% of step_capsule_3d's 18.0 m/s^2 gravity -> 0.22x glide!
+                let eff_grav = 18.0 * grav_g;
+                let low_g_lift = (1.0 / grav_g).sqrt().clamp(0.65, 1.85);
+                // 1. Winged flight / low-G aerodynamic glide coupled to BodyMorphology.wing_lift × world_laws.gravity_g
+                if morph.wing_lift > 0.05 {
+                    let lift_frac = (morph.wing_lift * 0.92).clamp(0.05, 0.84);
+                    vz += eff_grav * lift_frac * dt;
+                    if morph.wing_lift >= 0.50 {
                         if thermal_updraft_ck > 34_000 {
                             let updraft_gain = ((thermal_updraft_ck - 34_000) as f32 / 12_000.0).clamp(0.45, 2.2);
-                            vz = (vz + 15.0 * updraft_gain * dt).min(8.5);
+                            vz = (vz + 15.0 * morph.wing_lift * low_g_lift * updraft_gain * dt).min(9.5);
                         }
                         if desired_vz.abs() > 0.05 {
-                            vz = (vz + (desired_vz - vz) * 4.5 * dt).clamp(-3.6, 8.5);
+                            vz = (vz + (desired_vz - vz) * 4.5 * dt).clamp(-3.6, 8.5 * low_g_lift.min(1.3));
                         } else if vx_s.hypot(vy_s) > 2.0 && pz < max_alt {
-                            // Human Skywing horizontal flight maintains gentle gliding lift when airborne
-                            vz = vz.max(-2.6);
+                            vz = vz.max(-2.6 * grav_g.sqrt());
                         }
-                        vz = vz.clamp(-3.8, 9.0);
+                        vz = vz.clamp(-3.8, 9.5);
                     }
-                    CLASS_TIDEKIN => {
-                        // Amphibious Swimmer & Diver: neutral buoyancy in water, dive/breach freely!
-                        if in_water {
-                            vz += 18.0 * dt; // Neutral buoyancy in water
-                            vz = (vz + (desired_vz - vz) * 5.0 * dt).clamp(-5.5, 9.5);
-                            // Breach upward out of water when pushing against a riverbank/ledge
-                            let spd_h = vx_s.hypot(vy_s);
-                            if spd_h > 2.5 {
-                                let nx_d = vx_s / spd_h;
-                                let ny_d = vy_s / spd_h;
-                                if self.volume.sample_solid_density_3d(px + nx_d * 0.9, py + ny_d * 0.9, pz + 0.5) >= 0.45 {
-                                    vz = vz.max(8.5);
-                                }
+                }
+                // 2. Aquatic buoyancy coupled to BodyMorphology.buoyancy × world_laws.gravity_g
+                if morph.buoyancy >= 0.65 && in_water {
+                    vz += eff_grav * morph.buoyancy * dt;
+                    vz = (vz + (desired_vz - vz) * 5.0 * dt).clamp(-5.5, 9.5 * low_g_lift.min(1.3));
+                    let spd_h = vx_s.hypot(vy_s);
+                    if spd_h > 2.5 {
+                        let nx_d = vx_s / spd_h;
+                        let ny_d = vy_s / spd_h;
+                        if self.volume.sample_solid_density_3d(px + nx_d * 0.9, py + ny_d * 0.9, pz + 0.5) >= 0.45 {
+                            vz = vz.max(8.5 * low_g_lift.min(1.25));
+                        }
+                    }
+                }
+                // 3. Wall/ledge climbing coupled to BodyMorphology.climb_grip × world_laws.gravity_g
+                if morph.climb_grip >= 0.65 {
+                    let spd_h = vx_s.hypot(vy_s);
+                    if spd_h > 2.0 {
+                        let nx_d = vx_s / spd_h;
+                        let ny_d = vy_s / spd_h;
+                        let max_ledge = (1.6 + morph.climb_grip * 2.0) * low_g_lift.min(1.35);
+                        let wall_ahead = self
+                            .volume
+                            .sample_solid_density_3d(px + nx_d * 0.95, py + ny_d * 0.95, pz + 0.55)
+                            >= 0.45;
+                        let can_top_out = self
+                            .volume
+                            .sample_solid_density_3d(px + nx_d * 0.95, py + ny_d * 0.95, (pz + max_ledge).min(max_alt))
+                            < 0.50;
+                        let headroom_ok = self.volume.sample_solid_density_3d(px, py, (pz + 2.0).min(max_alt)) < 0.50;
+                        if wall_ahead && can_top_out && headroom_ok && pz < max_alt {
+                            let climb_v = (26.0 * morph.climb_grip * low_g_lift.min(1.3)).clamp(16.0, 34.0);
+                            vz = (vz + climb_v * dt).clamp(6.8, 10.8);
+                        }
+                    }
+                }
+                // 4. Conservative subterranean tunnel boring coupled to BodyMorphology.bore_torque
+                if morph.bore_torque >= 0.50 {
+                    let spd_h = vx_s.hypot(vy_s);
+                    if spd_h > 1.5 {
+                        let nx_d = vx_s / spd_h;
+                        let ny_d = vy_s / spd_h;
+                        let probe_x = (px + nx_d * 1.10).clamp(3.0, gw - 4.0);
+                        let probe_y = (py + ny_d * 1.10).clamp(3.0, gh - 4.0);
+                        let d_low = self.volume.sample_solid_density_3d(probe_x, probe_y, (pz + 0.35).clamp(1.0, max_alt));
+                        let d_mid = self.volume.sample_solid_density_3d(probe_x, probe_y, (pz + 0.95).clamp(1.0, max_alt));
+                        let d_hi = self.volume.sample_solid_density_3d(probe_x, probe_y, (pz + 1.55).clamp(1.0, max_alt));
+                        if d_low >= 0.35 || d_mid >= 0.35 || d_hi >= 0.35 {
+                            let bore_r = (1.20 + 0.75 * morph.bore_torque).clamp(1.4, 2.2);
+                            let moved = self.volume.carve_tunnel_3d(
+                                probe_x,
+                                probe_y,
+                                (pz + 0.85).clamp(1.2, max_alt),
+                                nx_d,
+                                ny_d,
+                                bore_r,
+                            );
+                            if moved > 0 {
+                                self.tunnels_carved = self.tunnels_carved.saturating_add(1);
+                                self.tunnel_mass_displaced =
+                                    self.tunnel_mass_displaced.saturating_add(moved as u64);
+                                burrow_ambush_until = tick + 90;
+                            }
+                        } else if tick <= burrow_ambush_until
+                            && self.volume.measure_vertical_clearance_3d((px, py, pz)) >= 4.5
+                        {
+                            let enemy_near = self.players.values().any(|o| {
+                                o.team != team && (o.x - px).hypot(o.y - py) < 14.0
+                            });
+                            if enemy_near {
+                                named_combo_callouts.push((2, px, py, team, "TUNNEL AMBUSH!"));
+                                burrow_ambush_until = 0;
                             }
                         }
                     }
-                    CLASS_EMBERSTALKER => {
-                        // Solo Cavern Climber: Passive High-Wall Climb up to 3.5m vertical ledges & cave walls!
-                        let spd_h = vx_s.hypot(vy_s);
-                        if spd_h > 2.0 {
-                            let nx_d = vx_s / spd_h;
-                            let ny_d = vy_s / spd_h;
-                            let wall_ahead = self
-                                .volume
-                                .sample_solid_density_3d(px + nx_d * 0.95, py + ny_d * 0.95, pz + 0.55)
-                                >= 0.45;
-                            let can_top_out = self
-                                .volume
-                                .sample_solid_density_3d(px + nx_d * 0.95, py + ny_d * 0.95, (pz + 3.5).min(max_alt))
-                                < 0.50;
-                            let headroom_ok = self.volume.sample_solid_density_3d(px, py, (pz + 2.0).min(max_alt)) < 0.50;
-                            if wall_ahead && can_top_out && headroom_ok && pz < max_alt {
-                                vz = (vz + 26.0 * dt).clamp(6.8, 10.2);
-                            }
-                        }
-                    }
-                    CLASS_BURROWER => {
-                        // Terramole: Grounded Subterranean Tunnel-Carver — conservatively bores through solid
-                        // soil & rock hills/cliffs whenever moving into terrain walls (preserving z >= 1 bedrock)!
-                        let spd_h = vx_s.hypot(vy_s);
-                        if spd_h > 1.5 {
-                            let nx_d = vx_s / spd_h;
-                            let ny_d = vy_s / spd_h;
-                            let probe_x = (px + nx_d * 1.10).clamp(3.0, gw - 4.0);
-                            let probe_y = (py + ny_d * 1.10).clamp(3.0, gh - 4.0);
-                            let d_low = self.volume.sample_solid_density_3d(probe_x, probe_y, (pz + 0.35).clamp(1.0, max_alt));
-                            let d_mid = self.volume.sample_solid_density_3d(probe_x, probe_y, (pz + 0.95).clamp(1.0, max_alt));
-                            let d_hi = self.volume.sample_solid_density_3d(probe_x, probe_y, (pz + 1.55).clamp(1.0, max_alt));
-                            if d_low >= 0.35 || d_mid >= 0.35 || d_hi >= 0.35 {
-                                let moved = self.volume.carve_tunnel_3d(
-                                    probe_x,
-                                    probe_y,
-                                    (pz + 0.85).clamp(1.2, max_alt),
-                                    nx_d,
-                                    ny_d,
-                                    1.95,
-                                );
-                                if moved > 0 {
-                                    self.tunnels_carved = self.tunnels_carved.saturating_add(1);
-                                    self.tunnel_mass_displaced =
-                                        self.tunnel_mass_displaced.saturating_add(moved as u64);
-                                    burrow_ambush_until = tick + 90;
-                                }
-                            } else if tick <= burrow_ambush_until
-                                && self.volume.measure_vertical_clearance_3d((px, py, pz)) >= 4.5
-                            {
-                                // Emerging from a freshly carved subterranean tunnel near an enemy!
-                                let enemy_near = self.players.values().any(|o| {
-                                    o.team != team && (o.x - px).hypot(o.y - py) < 14.0
-                                });
-                                if enemy_near {
-                                    named_combo_callouts.push((2, px, py, team, "TUNNEL AMBUSH!"));
-                                    burrow_ambush_until = 0;
-                                }
-                            }
-                        }
-                    }
-                    _ => {} // CLASS_STRIDER: Heavy Grounded Walker via step_capsule_3d
                 }
                 let ((nx, ny, nz), (_nvx, _nvy, nvz), _grounded) =
                     self.volume.step_capsule_3d((px, py, pz), (vx_s, vy_s, vz), 0.55, 1.80, dt);
                 fx = nx;
                 fy = ny;
-                fz = if class_id == CLASS_SKYWING {
+                fz = if morph.wing_lift >= 0.50 {
                     nz.clamp(0.5, max_alt)
                 } else {
                     nz.clamp(0.0, (self.grid_d as f32) - 0.5)
@@ -4637,7 +4742,7 @@ impl GameState {
                 let dashing_now = tick < dash_until;
                 let mut mx = (px + vx_s * dt).clamp(3.5, gw - 3.5);
                 let mut my = (py + vy_s * dt).clamp(3.5, gh - 3.5);
-                if class_id == CLASS_BURROWER
+                if morph.bore_torque >= 0.50
                     && vx_s.hypot(vy_s) > 1.5
                     && self.sample_capsule_density(mx, my, coll_layer, false) > 0.35
                 {
@@ -4648,7 +4753,7 @@ impl GameState {
                         (pz.round()).max(1.0),
                         vx_s / spd_h,
                         vy_s / spd_h,
-                        1.85,
+                        (1.15 + 0.70 * morph.bore_torque).clamp(1.4, 2.1),
                     );
                     if moved > 0 {
                         self.tunnels_carved = self.tunnels_carved.saturating_add(1);
@@ -4659,8 +4764,8 @@ impl GameState {
                 }
                 let capsule_at = |tx: f32, ty: f32| -> f32 {
                     let allow_water = dashing_now
-                        || class_id == CLASS_SKYWING
-                        || class_id == CLASS_TIDEKIN
+                        || morph.wing_lift >= 0.50
+                        || morph.buoyancy >= 0.65
                         || on_raft.is_some()
                         || (pz < 1.35
                             && self.rafts.iter().any(|b| {
@@ -4722,12 +4827,13 @@ impl GameState {
                             && ((nx_norm - 0.76).powi(2) + (ny_norm - 0.66).powi(2)).sqrt() < 0.11));
 
                 let mut mz = pz;
-                if class_id == CLASS_SKYWING {
-                    // Skywing 3D flight & thermal glide on L=4!
+                let eff_grav_l4 = 8.5 * grav_g;
+                if morph.wing_lift >= 0.50 {
+                    // Winged 3D flight & thermal glide on L=4 coupled to world_laws.gravity_g!
                     let max_l4_z = (self.grid_d as f32 - 0.6).max(2.6);
-                    vz -= (8.5 * 0.22) * dt;
+                    vz -= eff_grav_l4 * (1.0 - morph.wing_lift * 0.92).clamp(0.14, 0.85) * dt;
                     if thermal_updraft_ck > 34_000 {
-                        vz = (vz + 4.5 * dt).min(3.0);
+                        vz = (vz + 4.5 * morph.wing_lift * dt).min(3.2);
                     }
                     if desired_vz.abs() > 0.05 {
                         vz = (vz + (desired_vz.clamp(-1.5, 2.2) - vz) * 4.0 * dt).clamp(-1.5, 2.8);
@@ -4736,17 +4842,14 @@ impl GameState {
                     if mz <= surf_z {
                         vz = 0.0;
                     }
-                } else if l2_deck && (pz >= 1.45 || on_ramp || class_id == CLASS_EMBERSTALKER) {
-                    // Emberstalkers can climb directly onto Layer 2 cliffs & bridges without ramps!
-                    mz = (pz + 3.8 * dt).min(2.0);
+                } else if l2_deck && (pz >= 1.45 || on_ramp || morph.climb_grip >= 0.65) {
+                    mz = (pz + (3.8 * (0.6 + 0.5 * morph.climb_grip)) * dt).min(2.0);
                     vz = 0.0;
-                } else if class_id == CLASS_TIDEKIN && in_water {
-                    // Tidekin buoyant swim on surface/riverbed
+                } else if morph.buoyancy >= 0.65 && in_water {
                     mz = (mz + (surf_z - mz) * 4.0 * dt).max(surf_z);
                     vz = 0.0;
                 } else {
-                    // Apply gravity toward surface layer
-                    vz -= 8.5 * dt;
+                    vz -= eff_grav_l4 * dt;
                     mz += vz * dt;
                     if mz <= surf_z {
                         mz = surf_z;
@@ -4767,7 +4870,7 @@ impl GameState {
 
             let mut new_last_blast_ft = last_blast_ft;
             let shield_wall_on = tick < self.players[&pid].shield_wall_until;
-            let mut kb_res = if class_id == CLASS_STRIDER || class_id == CLASS_BURROWER { 0.40 } else { 1.0 };
+            let mut kb_res = (1.0 / morph.mass.max(0.5)).clamp(0.35, 1.25);
             if shield_wall_on {
                 kb_res *= 0.30;
             }
@@ -4789,7 +4892,9 @@ impl GameState {
                 // 1. Emergent Blast Damage & Knockback from combustion (delta_temp_spike) & flash-boil (delta_steam_burst)
                 if field_tick != last_blast_ft {
                     if phys.delta_temp_spike > 18.0 {
-                        let dmg = ((phys.delta_temp_spike - 15.0) * 0.42).round().clamp(6.0, 38.0) as i16;
+                        let dmg = ((phys.delta_temp_spike - 15.0) * 0.42 * (1.0 - 0.35 * morph.thermal_insul))
+                            .round()
+                            .clamp(4.0, 38.0) as i16;
                         let (bx, by) = self.voxel_blast_dir(fx, fy, cur_layer, false);
                         let push = (phys.delta_temp_spike.min(120.0) * 0.34).clamp(8.0, 42.0) * kb_res;
                         kb_vx = (kb_vx + bx * push).clamp(-48.0, 48.0);
@@ -4807,7 +4912,9 @@ impl GameState {
                         }
                         new_last_blast_ft = field_tick;
                     } else if phys.delta_steam_burst > 0.06 {
-                        let dmg = (phys.delta_steam_burst * 95.0).round().clamp(5.0, 32.0) as i16;
+                        let dmg = (phys.delta_steam_burst * 95.0 * (1.0 - 0.30 * morph.thermal_insul))
+                            .round()
+                            .clamp(4.0, 32.0) as i16;
                         let (bx, by) = self.voxel_blast_dir(fx, fy, cur_layer, true);
                         let push = (phys.delta_steam_burst * 72.0).clamp(8.0, 38.0) * kb_res;
                         kb_vx = (kb_vx + bx * push).clamp(-48.0, 48.0);
@@ -4829,16 +4936,20 @@ impl GameState {
                         new_last_blast_ft = field_tick;
                     }
                 }
-                // 2. Scorch / Hypothermia damage from temp_c extremes (>120°C or <-25°C), dilated inside TimeDomes!
+                // 2. Scorch / Hypothermia damage from temp_c extremes (>120°C or <-25°C), attenuated by BodyMorphology.thermal_insul!
                 let dome_dt_p = self.sample_time_dome_scale(fx, fy);
                 let scorch_cadence: u64 = if dome_dt_p < 0.5 { 36 } else if dome_dt_p > 1.5 { 2 } else { 6 };
+                let insul_mul = (1.0 - morph.thermal_insul).clamp(0.15, 1.0);
                 if tick % scorch_cadence == 0 {
                     if phys.temp_c > 120.0 {
-                        let dmg = (((phys.temp_c - 120.0) / 45.0).ceil() as i16).clamp(2, 16);
+                        let dmg = (((phys.temp_c - 120.0) / 45.0).ceil() * insul_mul)
+                            .round()
+                            .clamp(1.0, 16.0) as i16;
                         phys_dmg_events.push((owner, pid, dmg, "SCORCH", 0));
-                    } else if phys.temp_c < -25.0 && class_id != CLASS_TIDEKIN {
-                        // Tidekin are immune to aquatic chill & hypothermia!
-                        let dmg = (((-25.0 - phys.temp_c) / 22.0).ceil() as i16).clamp(1, 10);
+                    } else if phys.temp_c < -25.0 && morph.thermal_insul < 0.70 {
+                        let dmg = (((-25.0 - phys.temp_c) / 22.0).ceil() * insul_mul)
+                            .round()
+                            .clamp(1.0, 10.0) as i16;
                         phys_dmg_events.push((owner, pid, dmg, "HYPO", 1));
                     }
                 }
@@ -4861,6 +4972,9 @@ impl GameState {
             p.airborne = airborne_now;
             if local_temp_hot {
                 p.status_burn_until = p.status_burn_until.max(tick + 60);
+            } else if in_water && phys.temp_c < 85.0 && tick < p.status_burn_until {
+                // Cool voxel water physically quenches burning agents alongside Tidekin Quench Rescue!
+                p.status_burn_until = 0;
             }
             p.mana = (p.mana + 9.5 * regen_mul * dt).min(p.max_mana);
             p.stamina = (p.stamina + 16.0 * regen_mul * dt).min(p.max_stamina);
@@ -5202,6 +5316,10 @@ impl GameState {
                     self.cycle_evolution_speed();
                     world_changed = true;
                 }
+                ws_bridge::WsCommand::CycleLaws => {
+                    self.cycle_world_law();
+                    world_changed = true;
+                }
                 ws_bridge::WsCommand::ResetWorld => {
                     self.reset_match();
                     world_changed = true;
@@ -5331,6 +5449,15 @@ impl GameState {
         let tactical_slice: Vec<ws_bridge::WsTacticalEvent> =
             self.tactical_events.iter().cloned().collect();
         ws_bridge::append_tactical_events_json(&mut json, &tactical_slice, 5);
+        let laws = self.volume.world_laws;
+        ws_bridge::append_world_law_json(
+            &mut json,
+            self.volume.world_law_preset,
+            WorldLaws::preset_name(self.volume.world_law_preset),
+            laws.gravity_g,
+            laws.ambient_temp_shift,
+            laws.precipitation,
+        );
         json.push('}');
         json
     }
@@ -5550,6 +5677,7 @@ impl GameState {
                 mvp_name: self.mvp_name.clone(),
                 mvp_score: self.mvp_score,
                 time_domes: time_domes.clone(),
+                world_law_preset: self.volume.world_law_preset,
             };
             let raw = encode_server_datagram(&msg);
             total_bytes += raw.len() as u64;
@@ -6441,6 +6569,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ClientReliable::CycleEvolutionSpeed => {
                                 gs.cycle_evolution_speed();
                             }
+                            ClientReliable::CycleWorldLaw => {
+                                gs.cycle_world_law();
+                            }
                         }
                     }
                 }
@@ -6718,5 +6849,88 @@ mod tests {
         let ws_parsed = JsonParser::parse(&ws_json).expect("valid 0x02 WS JSON");
         let ws_events = ws_parsed.get("events").and_then(|v| v.as_arr()).expect("0x02 events array");
         assert!(!ws_events.is_empty() && ws_events.len() <= 5);
+    }
+
+    #[tokio::test]
+    async fn test_wave20c_world_laws_and_body_morphology() {
+        let mut gs = GameState::new(
+            "refsim".to_string(),
+            "127.0.0.1:14449".to_string(),
+            64,
+            16,
+            0,
+            1,
+            10,
+            4,
+        );
+        // 1. Live World-Law cycling 0 -> 1 -> 2 -> 3 -> 0 + additive 0x02 JSON `"world_law"` block
+        assert_eq!(gs.volume.world_law_preset, 0);
+        gs.cycle_world_law();
+        assert_eq!(gs.volume.world_law_preset, 1);
+        gs.cycle_world_law();
+        assert_eq!(gs.volume.world_law_preset, 2);
+        gs.cycle_world_law();
+        assert_eq!(gs.volume.world_law_preset, 3);
+        let ws_json = gs.build_ws_entities_json();
+        let ws_parsed = JsonParser::parse(&ws_json).expect("valid 0x02 WS JSON");
+        let wl = ws_parsed.get("world_law").expect("world_law JSON field");
+        assert_eq!(wl.get("id").and_then(|v| v.as_i64()), Some(3));
+        assert_eq!(wl.get("name").and_then(|v| v.as_str()), Some("LOW-G MAGMA"));
+        assert!((wl.get("gravity_g").and_then(|v| v.as_f32()).unwrap_or(0.0) - 0.35).abs() < 1e-2);
+        assert!((wl.get("ambient_shift").and_then(|v| v.as_f32()).unwrap_or(0.0) - 5500.0).abs() < 1e-1);
+        assert!((wl.get("precipitation").and_then(|v| v.as_f32()).unwrap_or(0.0) - 0.25).abs() < 1e-2);
+        gs.cycle_world_law();
+        assert_eq!(gs.volume.world_law_preset, 0);
+
+        // 2. BodyMorphology physical differentiation & Low-G leap coupling
+        let strider = BodyMorphology::from_archetype(CLASS_STRIDER);
+        let skywing = BodyMorphology::from_archetype(CLASS_SKYWING);
+        let tidekin = BodyMorphology::from_archetype(CLASS_TIDEKIN);
+        let stalker = BodyMorphology::from_archetype(CLASS_EMBERSTALKER);
+        let burrower = BodyMorphology::from_archetype(CLASS_BURROWER);
+        assert!(strider.mass > skywing.mass * 2.0);
+        assert!(skywing.wing_lift > 0.8);
+        assert!(tidekin.buoyancy >= 0.99 && tidekin.thermal_insul > 0.70);
+        assert!(stalker.climb_grip > 0.9);
+        assert!(burrower.bore_torque > 0.9);
+
+        // Compare dash launch vertical velocity under STANDARD (g=1.0) vs LOW-G MAGMA (g=0.35)
+        let pid = *gs.players.keys().next().unwrap();
+        let inp = ClientInputDatagram {
+            seq: 1,
+            move_x: 1.0,
+            move_y: 0.0,
+            aim_x: 1.0,
+            aim_y: 0.0,
+            dash: true,
+            melee: false,
+            cast_bolt: false,
+            bolt_element: 0,
+            carve_ice: false,
+            cast_ability_e: false,
+            cast_ultimate_r: false,
+            client_time_ms: 100,
+        };
+        gs.volume.set_world_law_preset(field_core::WORLD_LAW_STANDARD);
+        if let Some(p) = gs.players.get_mut(&pid) {
+            p.dash_cd = 0;
+            p.stamina = p.max_stamina;
+        }
+        gs.apply_input(pid, &inp);
+        let vz_std = gs.players[&pid].vz;
+
+        gs.volume.set_world_law_preset(field_core::WORLD_LAW_LOW_G_MAGMA);
+        if let Some(p) = gs.players.get_mut(&pid) {
+            p.dash_cd = 0;
+            p.stamina = p.max_stamina;
+        }
+        gs.apply_input(pid, &inp);
+        let vz_low_g = gs.players[&pid].vz;
+        assert!(
+            vz_low_g > vz_std * 1.25,
+            "LOW-G MAGMA should boost leap velocity ({} vs {})",
+            vz_low_g,
+            vz_std
+        );
     }
 }

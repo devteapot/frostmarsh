@@ -57,6 +57,15 @@ pub struct TacticalEvent {
     pub tick: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorldLawInfo {
+    pub id: u8,
+    pub name: String,
+    pub gravity_g: f32,
+    pub ambient_shift: f32,
+    pub precipitation: f32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LiveEntitiesUpdate {
     pub tick: u64,
@@ -69,6 +78,7 @@ pub struct LiveEntitiesUpdate {
     pub evolution: Option<EvolutionStats>,
     pub events: Vec<TacticalEvent>,
     pub has_events: bool,
+    pub world_law: Option<WorldLawInfo>,
     pub server_tps: f32,
     pub online_players: usize,
     pub status: Option<String>,
@@ -581,6 +591,36 @@ pub fn parse_live_entities_json(json_str: &str) -> Result<LiveEntitiesUpdate, St
             let drain_n = out.events.len() - 8;
             out.events.drain(0..drain_n);
         }
+    }
+
+    if let Some(wl) = root.get("world_law")
+        && wl.is_obj()
+    {
+        let id = wl.get("id").and_then(JsonVal::as_u64).unwrap_or(0) as u8;
+        let name = wl
+            .get("name")
+            .and_then(JsonVal::as_str)
+            .unwrap_or("STANDARD")
+            .to_string();
+        let gravity_g = wl
+            .get("gravity_g")
+            .and_then(JsonVal::as_f32)
+            .unwrap_or(1.0);
+        let ambient_shift = wl
+            .get("ambient_shift")
+            .and_then(JsonVal::as_f32)
+            .unwrap_or(0.0);
+        let precipitation = wl
+            .get("precipitation")
+            .and_then(JsonVal::as_f32)
+            .unwrap_or(1.0);
+        out.world_law = Some(WorldLawInfo {
+            id,
+            name,
+            gravity_g,
+            ambient_shift,
+            precipitation,
+        });
     }
 
     out.online_players = out.heroes.len();

@@ -107,8 +107,13 @@ EXPECTED_SPECS = {
 
 
 def resolve_default_world_model_v5(script_dir: Path = _SCRIPT_DIR) -> Path:
-    """Auto-prefer world_model_3d_v7.pt -> world_model_3d_v6.pt -> world_model_3d_v5.pt."""
-    for name in ("world_model_3d_v7.pt", "world_model_3d_v6.pt", "world_model_3d_v5.pt"):
+    """Auto-prefer world_model_3d_v8.pt -> world_model_3d_v7.pt -> world_model_3d_v6.pt -> world_model_3d_v5.pt."""
+    for name in (
+        "world_model_3d_v8.pt",
+        "world_model_3d_v7.pt",
+        "world_model_3d_v6.pt",
+        "world_model_3d_v5.pt",
+    ):
         cand = script_dir / name
         if cand.is_file():
             return cand
@@ -903,12 +908,56 @@ class InferenceEngine:
         if dt_candidate is not None and dt_candidate.exists():
             try:
                 sd_dt = _load_state_dict(dt_candidate)
+                is_v8_cand = "v8" in dt_candidate.name.lower() or any(
+                    k.startswith(("law_", "world_law", "film_")) for k in sd_dt
+                )
                 is_v5 = any(k.startswith("blocks.4.conv3d.") or k.startswith("h_lat_in.") for k in sd_dt)
-                if is_v5:
+                loaded_v8 = False
+                if is_v8_cand:
+                    try:
+                        from world_model_3d_v5 import SparseWorld3DV5Runner  # noqa: E402
+                        from world_model_3d_v8 import WorldModel3DV8  # noqa: E402
+
+                        try:
+                            from world_model_3d_v8 import SparseWorld3DV8Runner as _V8Runner  # noqa: E402
+                        except Exception:
+                            _V8Runner = SparseWorld3DV5Runner
+
+                        wmv8 = _call_with_accepted_kwargs(
+                            WorldModel3DV8,
+                            in_ch=18,
+                            out_ch=17,
+                            width=48,
+                            z_flux_ch=Z_FLUX_CH,
+                        ).eval()
+                        wmv8.load_state_dict(sd_dt, strict=False)
+                        wmv8.to(self.device)
+                        self.world_model_dt = wmv8
+                        self._sparse_dt_runner_cls = _V8Runner
+                        self.world_model_v5_active = True
+                        # Also back op=8 with WorldModel3DV8 when loaded
+                        self.world_model_3d = wmv8
+                        self._sparse_3d_runner_cls = _V8Runner
+                        if self.device.type == "cuda" and use_sparse_world:
+                            torch.backends.cudnn.benchmark = False
+                        print(
+                            f"[gpu_infer_daemon] Loaded WorldModel3D-v8 (16x16x8 3D sparse!) from {dt_candidate}",
+                            flush=True,
+                        )
+                        loaded_v8 = True
+                    except Exception as exc_v8:
+                        print(
+                            f"[gpu_infer_daemon] WorldModel3D-v8 load fallback ({exc_v8}); trying WorldModel3DV5",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                if loaded_v8:
+                    pass
+                elif is_v5 or is_v8_cand:
                     from world_model_3d_v5 import SparseWorld3DV5Runner, WorldModel3DV5  # noqa: E402
 
                     wmv5 = WorldModel3DV5(in_ch=18, out_ch=17, width=48, z_flux_ch=Z_FLUX_CH).eval()
-                    wmv5.load_state_dict(sd_dt)
+                    wmv5.load_state_dict(sd_dt, strict=not is_v8_cand)
                     wmv5.to(self.device)
                     self.world_model_dt = wmv5
                     self._sparse_dt_runner_cls = SparseWorld3DV5Runner

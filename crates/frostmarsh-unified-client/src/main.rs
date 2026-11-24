@@ -2326,6 +2326,12 @@ impl ApplicationHandler for InteractiveApp {
                                         println!("[Unified] Cycling Evolving World speed [F9]");
                                     }
                                 }
+                                KeyCode::F11 => {
+                                    if let Some(ref q) = self.quic {
+                                        q.send_reliable_detached(ClientReliable::CycleWorldLaw);
+                                        println!("[Unified] Cycling World Law preset [F11]");
+                                    }
+                                }
                                 _ => {}
                             }
                         }

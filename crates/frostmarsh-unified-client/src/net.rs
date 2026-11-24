@@ -8,8 +8,16 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+static CURRENT_WORLD_LAW_PRESET: AtomicU8 = AtomicU8::new(0);
+
+#[inline]
+pub fn current_world_law_preset() -> u8 {
+    CURRENT_WORLD_LAW_PRESET.load(Ordering::Relaxed)
+}
 
 #[derive(Debug)]
 struct SkipServerVerification;
@@ -114,6 +122,7 @@ pub struct LiveWorldState {
     pub bytes_rx: u64,
     pub start_instant: Instant,
     pub rtt_ms: f32,
+    pub world_law_preset: u8,
 }
 
 #[allow(dead_code)]
@@ -149,6 +158,7 @@ impl LiveWorldState {
             bytes_rx: 0,
             start_instant: Instant::now(),
             rtt_ms: 0.0,
+            world_law_preset: 0,
         }
     }
 
@@ -403,7 +413,10 @@ impl QuicClientHandle {
                               match_time_left_s: u16,
                               mvp_name: String,
                               mvp_score: u32,
-                              time_domes: Vec<TimeDomeSnap>| {
+                              time_domes: Vec<TimeDomeSnap>,
+                              world_law_preset: u8| {
+            st.world_law_preset = world_law_preset;
+            CURRENT_WORLD_LAW_PRESET.store(world_law_preset, Ordering::Relaxed);
             st.resize_if_needed(
                 telemetry.grid_w as usize,
                 telemetry.grid_h as usize,
@@ -476,6 +489,7 @@ impl QuicClientHandle {
                                     mvp_name,
                                     mvp_score,
                                     time_domes,
+                                    world_law_preset,
                                 } => {
                                     let mut st = st_rel.lock().unwrap();
                                     apply_snapshot(
@@ -502,6 +516,7 @@ impl QuicClientHandle {
                                         mvp_name,
                                         mvp_score,
                                         time_domes,
+                                        world_law_preset,
                                     );
                                 }
                                 ServerDatagram::APlusChunk {
@@ -579,6 +594,7 @@ impl QuicClientHandle {
                         mvp_name,
                         mvp_score,
                         time_domes,
+                        world_law_preset,
                     } => {
                         let mut st = st_dg.lock().unwrap();
                         apply_snapshot(
@@ -605,6 +621,7 @@ impl QuicClientHandle {
                             mvp_name,
                             mvp_score,
                             time_domes,
+                            world_law_preset,
                         );
                     }
                     ServerDatagram::VolumetricBrick3D(brick) => {

@@ -99,6 +99,18 @@
       border-color: rgba(88, 227, 154, 0.35);
     }
 
+    .badge.amber {
+      background: rgba(255, 174, 77, 0.16);
+      color: var(--accent-amber);
+      border-color: rgba(255, 174, 77, 0.42);
+    }
+
+    .badge.violet {
+      background: rgba(182, 138, 255, 0.16);
+      color: var(--accent-violet);
+      border-color: rgba(182, 138, 255, 0.40);
+    }
+
     .stat-grid {
       display: grid;
       grid-template-columns: auto 1fr;
@@ -507,6 +519,9 @@
       <span class="stat-label">Live WS</span>
       <span id="stat-ws" class="stat-val">Offline</span>
 
+      <span class="stat-label">World Law</span>
+      <span id="stat-world-law" class="stat-val"><span id="badge-world-law" class="badge">STANDARD · 1.00g</span></span>
+
       <span class="stat-label">Archetypes</span>
       <span id="stat-archetypes" class="stat-val arch-val">5 classes</span>
 
@@ -568,6 +583,9 @@
       <button id="btn-ws-evo" class="btn ws-live-only active-amber" title="Cycle Live Evolving-World Simulation Speed over WebSocket (F9)">
         <span class="kbd">F9</span> Evo Speed
       </button>
+      <button id="btn-ws-laws" class="btn ws-live-only active-green" title="Cycle Live World-Law Preset over WebSocket (F11)">
+        <span class="kbd">F11</span> Laws
+      </button>
     </div>
 
     <div id="hud-tactical-feed" class="hud-card feed-empty" aria-live="polite">
@@ -592,6 +610,7 @@
     <span><span class="kbd">Z</span> Depth 16..32</span>
     <span><span class="kbd">F7</span> WS Biome</span>
     <span><span class="kbd">F9</span> WS Evo Speed</span>
+    <span><span class="kbd">F11</span> WS Laws</span>
     <span><span class="kbd">Drop .bin</span> FM3D</span>
   </div>
 
@@ -624,6 +643,7 @@
     const statStyle = document.getElementById("stat-style");
     const statWalk = document.getElementById("stat-walk");
     const statWs = document.getElementById("stat-ws");
+    const badgeWorldLaw = document.getElementById("badge-world-law");
     const statArchetypes = document.getElementById("stat-archetypes");
     const lblEvoEpoch = document.getElementById("lbl-evo-epoch");
     const statEvoEpoch = document.getElementById("stat-evo-epoch");
@@ -652,6 +672,7 @@
     const lblWs = document.getElementById("lbl-ws");
     const btnWsBiome = document.getElementById("btn-ws-biome");
     const btnWsEvo = document.getElementById("btn-ws-evo");
+    const btnWsLaws = document.getElementById("btn-ws-laws");
     const hudTacticalFeed = document.getElementById("hud-tactical-feed");
     const feedCount = document.getElementById("feed-count");
     const feedList = document.getElementById("feed-list");
@@ -1033,6 +1054,7 @@
 
       btnWsBiome.addEventListener("click", () => sendWsCommand("cycle_biome", btnWsBiome));
       btnWsEvo.addEventListener("click", () => sendWsCommand("cycle_evo", btnWsEvo));
+      btnWsLaws.addEventListener("click", () => sendWsCommand("cycle_laws", btnWsLaws));
 
       wsUrlInput.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
@@ -1076,6 +1098,9 @@
           } else if (e.code === "F9") {
             e.preventDefault();
             sendWsCommand("cycle_evo", btnWsEvo);
+          } else if (e.code === "F11") {
+            e.preventDefault();
+            sendWsCommand("cycle_laws", btnWsLaws);
           }
         }
       });
@@ -1185,6 +1210,13 @@
           } else {
             statWs.textContent = wsStateText;
           }
+          const wlName = s.world_law_name || "STANDARD";
+          const wlG = typeof s.world_law_g === "number" ? s.world_law_g : 1.0;
+          const wlId = (s.world_law_id || 0) % 4;
+          badgeWorldLaw.textContent = `${wlName} · ${wlG.toFixed(2)}g`;
+          badgeWorldLaw.className =
+            wlId === 3 ? "badge amber" : wlId === 1 ? "badge violet" : wlId === 2 ? "badge green" : "badge";
+
           const ac = s.archetype_counts || [0, 0, 0, 0, 0];
           statArchetypes.textContent = `${s.archetype_types || 0}/5 · S${ac[0]} W${ac[1]} T${ac[2]} E${ac[3]} B${ac[4]}`;
           statArchetypes.title = `Strider: ${ac[0]}, Skywing: ${ac[1]}, Tidekin: ${ac[2]}, Emberstalker: ${ac[3]}, Burrower: ${ac[4]}`;

@@ -41,6 +41,12 @@ DEMO_BIOMES = [
     ("Sinkhole Caverns", (42, 224, 255)),
 ]
 EVO_SPEEDS = [1, 4, 12, 0]
+WORLD_LAW_PRESETS = [
+    (0, "STANDARD", 1.0, 0.0, 1.0),
+    (1, "FREEZE-OUT", 1.0, -5500.0, 1.4),
+    (2, "RISING FLOOD", 1.15, -600.0, 2.6),
+    (3, "LOW-G MAGMA", 0.35, 5500.0, 0.25),
+]
 TACTICAL_EVENT_ROTATION = [
     "TIDEKIN QUENCH RESCUE!",
     "SUBTERRANEAN BREACH!",
@@ -55,6 +61,7 @@ TACTICAL_EVENT_ROTATION = [
 class DemoState:
     biome_idx: int = 0
     evo_speed_idx: int = 0
+    world_law_idx: int = 0
     evo_accum: float = 0.0
     event_accum: float = 0.0
     event_cursor: int = 2
@@ -86,6 +93,16 @@ class DemoState:
         spd = EVO_SPEEDS[self.evo_speed_idx]
         self.push_event(f"WORLD EVO: {spd}X!" if spd > 0 else "WORLD EVO PAUSED!")
         return spd
+
+    def cycle_laws(self) -> tuple[int, str, float, float, float]:
+        self.world_law_idx = (self.world_law_idx + 1) % len(WORLD_LAW_PRESETS)
+        preset = WORLD_LAW_PRESETS[self.world_law_idx]
+        self.push_event(f"WORLD LAW: {preset[1]}!")
+        return preset
+
+    @property
+    def world_law(self) -> tuple[int, str, float, float, float]:
+        return WORLD_LAW_PRESETS[self.world_law_idx]
 
     @property
     def biome_name(self) -> str:
@@ -385,6 +402,7 @@ def build_live_entities_payload(
     ]
 
     evo_label = f"{st.evo_speed}x" if st.evo_speed > 0 else "Paused"
+    wl_id, wl_name, wl_g, wl_dt, wl_precip = st.world_law
     return {
         "tick": tick,
         "world_day": 1 + st.epoch // 25,
@@ -399,6 +417,13 @@ def build_live_entities_payload(
             "erosion": st.erosion,
         },
         "events": list(st.events),
+        "world_law": {
+            "id": wl_id,
+            "name": wl_name,
+            "gravity_g": wl_g,
+            "ambient_shift": wl_dt,
+            "precipitation": wl_precip,
+        },
         "telemetry": {
             "server_tps": round(fps, 1),
             "online_players": len(players),
@@ -474,6 +499,9 @@ async def read_client_commands(
                     elif cmd == "cycle_evo":
                         spd = state.cycle_evo()
                         print(f"[Frostmarsh Live WS] {peer} -> cycle_evo -> {spd}x")
+                    elif cmd == "cycle_laws":
+                        preset = state.cycle_laws()
+                        print(f"[Frostmarsh Live WS] {peer} -> cycle_laws -> {preset[0]} ({preset[1]})")
                 except Exception:
                     pass
     except Exception:

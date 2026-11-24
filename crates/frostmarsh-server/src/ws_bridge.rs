@@ -242,12 +242,35 @@ pub fn append_tactical_events_json(
     json.push(']');
 }
 
+/// Append the additive `"world_law":{...}` JSON fragment onto an open `0x02` JSON object buffer.
+/// 100% backwards-compatible with existing clients that ignore unknown top-level keys.
+pub fn append_world_law_json(
+    json: &mut String,
+    id: u8,
+    name: &str,
+    gravity_g: f32,
+    ambient_shift: f32,
+    precipitation: f32,
+) {
+    use std::fmt::Write as _;
+    let _ = write!(
+        json,
+        ",\"world_law\":{{\"id\":{},\"name\":{},\"gravity_g\":{:.2},\"ambient_shift\":{:.1},\"precipitation\":{:.2}}}",
+        id,
+        escape_ws_json_str(name),
+        gravity_g,
+        ambient_shift,
+        precipitation
+    );
+}
+
 // ---------------- Client Commands & Live Peer Registry ----------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WsCommand {
     CycleBiome,
     CycleEvo,
+    CycleLaws,
     ResetWorld,
     RequestFullSync { peer_id: u64 },
 }
@@ -258,6 +281,7 @@ pub fn parse_client_text_command(peer_id: u64, text: &str) -> Option<WsCommand> 
     match ty.as_str() {
         "cycle_biome" => Some(WsCommand::CycleBiome),
         "cycle_evo" => Some(WsCommand::CycleEvo),
+        "cycle_laws" => Some(WsCommand::CycleLaws),
         "reset_world" => Some(WsCommand::ResetWorld),
         "request_full_sync" => Some(WsCommand::RequestFullSync { peer_id }),
         _ => None,
@@ -773,6 +797,10 @@ mod tests {
             Some(WsCommand::CycleEvo)
         );
         assert_eq!(
+            parse_client_text_command(7, r#"{"type":"cycle_laws"}"#),
+            Some(WsCommand::CycleLaws)
+        );
+        assert_eq!(
             parse_client_text_command(7, r#"{ "type" : "reset_world", "v": 1 }"#),
             Some(WsCommand::ResetWorld)
         );
@@ -819,5 +847,16 @@ mod tests {
         assert!(body.contains("CRYO-BRIDGE FORGED!"));
         assert!(body.contains("BASALT BULWARK!"));
         assert!(body.contains("\"events\":["));
+    }
+
+    #[test]
+    fn test_wave20c_world_law_json_0x02() {
+        let mut json = String::from(r#"{"tick":42,"players":[]"#);
+        append_world_law_json(&mut json, 3, "LOW-G MAGMA", 0.35, 5500.0, 0.25);
+        json.push('}');
+        let pkt = encode_entities_payload(&json);
+        assert_eq!(pkt[0], 0x02);
+        let body = std::str::from_utf8(&pkt[1..]).expect("utf8 json");
+        assert!(body.contains(r#""world_law":{"id":3,"name":"LOW-G MAGMA","gravity_g":0.35,"ambient_shift":5500.0,"precipitation":0.25}"#));
     }
 }

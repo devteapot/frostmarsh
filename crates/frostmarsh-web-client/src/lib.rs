@@ -37,6 +37,7 @@ mod wasm_app {
     };
     use crate::live_entities::{
         expand_beams_to_orbs, parse_live_entities_json, EvolutionStats, LiveBeam, TacticalEvent,
+        WorldLawInfo,
     };
     use crate::renderer::WebRenderer;
     use crate::style_name_for;
@@ -98,6 +99,7 @@ mod wasm_app {
         live_beams: Vec<LiveBeam>,
         live_evolution: Option<EvolutionStats>,
         live_events: Vec<TacticalEvent>,
+        live_world_law: Option<WorldLawInfo>,
         live_entities_active: bool,
         live_tick: u64,
         live_server_tps: f32,
@@ -210,6 +212,7 @@ mod wasm_app {
                 live_beams: Vec::new(),
                 live_evolution: None,
                 live_events: Vec::new(),
+                live_world_law: None,
                 live_entities_active: false,
                 live_tick: 0,
                 live_server_tps: 0.0,
@@ -479,6 +482,9 @@ mod wasm_app {
             if parsed.has_events {
                 self.live_events = parsed.events;
             }
+            if parsed.world_law.is_some() {
+                self.live_world_law = parsed.world_law;
+            }
             self.live_entities_active = true;
             self.live_tick = parsed.tick;
             self.live_server_tps = parsed.server_tps;
@@ -629,6 +635,16 @@ mod wasm_app {
                 events_json.push('}');
             }
             events_json.push(']');
+            let (wl_id, wl_name, wl_g, wl_dt, wl_precip) = match &self.live_world_law {
+                Some(wl) => (
+                    wl.id,
+                    wl.name.as_str(),
+                    wl.gravity_g,
+                    wl.ambient_shift,
+                    wl.precipitation,
+                ),
+                None => (0u8, "STANDARD", 1.0f32, 0.0f32, 1.0f32),
+            };
             format!(
                 concat!(
                     "{{",
@@ -669,6 +685,11 @@ mod wasm_app {
                     "\"evo_glaciers\":{},",
                     "\"evo_erosion\":{},",
                     "\"events\":{},",
+                    "\"world_law_id\":{},",
+                    "\"world_law_name\":\"{}\",",
+                    "\"world_law_g\":{:.2},",
+                    "\"world_law_dt\":{:.1},",
+                    "\"world_law_precip\":{:.2},",
                     "\"live_bricks_rx\":{},",
                     "\"last_brick_ms\":{:.3},",
                     "\"live_tick\":{},",
@@ -717,6 +738,11 @@ mod wasm_app {
                 evo.glaciers,
                 evo.erosion,
                 events_json,
+                wl_id,
+                json_escape(wl_name),
+                wl_g,
+                wl_dt,
+                wl_precip,
                 self.live_bricks_rx,
                 self.last_brick_rebuild_ms,
                 self.live_tick,
@@ -739,7 +765,9 @@ mod tests {
         ARCHETYPE_EMBERSTALKER, ARCHETYPE_SKYWING, ARCHETYPE_STRIDER, ARCHETYPE_TIDEKIN,
         NUM_ARCHETYPES,
     };
-    use crate::live_entities::{expand_beams_to_orbs, parse_live_entities_json, EvolutionStats};
+    use crate::live_entities::{
+        expand_beams_to_orbs, parse_live_entities_json, EvolutionStats, WorldLawInfo,
+    };
     use crate::style_name_for;
     use crate::surface_nets_3d::{extract_brick, SurfaceNetsWorld};
     use crate::volume::WorldVolume3D;
@@ -1038,6 +1066,31 @@ mod tests {
         assert_eq!(parsed_obj.events[1].label, "SUBTERRANEAN BREACH!");
         assert_eq!(parsed_obj.events[1].team, Some(1));
         assert_eq!(parsed_obj.events[1].tick, Some(510));
+        assert!(parsed_obj.world_law.is_none());
+
+        // Additive Wave 20C `"world_law"` object parsing
+        let law_json = r#"{
+            "tick": 777,
+            "players": [],
+            "world_law": {
+                "id": 3,
+                "name": "LOW-G MAGMA",
+                "gravity_g": 0.35,
+                "ambient_shift": 5500.0,
+                "precipitation": 0.25
+            }
+        }"#;
+        let parsed_law = parse_live_entities_json(law_json).expect("parse world_law JSON");
+        assert_eq!(
+            parsed_law.world_law,
+            Some(WorldLawInfo {
+                id: 3,
+                name: "LOW-G MAGMA".to_string(),
+                gravity_g: 0.35,
+                ambient_shift: 5500.0,
+                precipitation: 0.25,
+            })
+        );
     }
 
     #[test]

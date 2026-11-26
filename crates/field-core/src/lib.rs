@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod planet;
 pub mod planet_macro;
+pub mod rl_arena;
 pub mod sharding;
 pub mod structural;
 

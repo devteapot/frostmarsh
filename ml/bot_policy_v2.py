@@ -34,10 +34,25 @@ SELF_DIM = 24
 NUM_TOKENS = 12  # 8 nearest players + 3 shrines + 1 golden relic
 TOKEN_DIM = 12
 BOT_FEAT_DIM = SELF_DIM + NUM_TOKENS * TOKEN_DIM  # 168 floats per bot
+BRIEF_DIM = 16  # 15 conditioning floats + 1 daemon/arena bot_slot_key (masked from net)
+BRIEF_MODEL_DIM = 15
+BOT_FEAT_DIM_V3 = BOT_FEAT_DIM + BRIEF_DIM  # 184 floats per bot
+GRU_HIDDEN_DIM = 64
+NUM_ROLES = 5  # 0=Pyromancer, 1=Frostweaver, 2=Alchemist, 3=Emberstalker, 4=Burrower
 ACTION_OUT_DIM = 13  # move_x, move_y, aim_x, aim_y, 6 ability probs, 3 element probs
 SALIENCY_DIM = 16  # 4x4 spatial saliency heatmap
 INSPECT_OUT_DIM = ACTION_OUT_DIM + SALIENCY_DIM  # 29 floats per bot
 CANONICAL_WORLD_SPAN = 255.0  # Matches 256x256 grid span so 128x128 & 256x256 share identical physical radius
+
+OBJ_FREE_ROAM = 0
+OBJ_CAPTURE_SHRINE = 1
+OBJ_ESCORT_RELIC = 2
+OBJ_HUNT_ENEMY = 3
+OBJ_DEFEND_HOLD = 4
+
+STANCE_COMMIT = 0
+STANCE_HOLD = 1
+STANCE_FLEE_KITE = 2
 
 
 class BotPolicyNetV2(nn.Module):
@@ -50,6 +65,10 @@ class BotPolicyNetV2(nn.Module):
         coarse_radius_cells: float = 60.0,
         d_model: int = 64,
         blind_world: bool = False,
+        use_gru: bool = True,
+        gru_hidden_dim: int = GRU_HIDDEN_DIM,
+        use_brief: bool = True,
+        num_roles: int = NUM_ROLES,
     ):
         super().__init__()
         self.z_world_ch = z_world_ch
@@ -59,6 +78,10 @@ class BotPolicyNetV2(nn.Module):
         self.coarse_radius_cells = coarse_radius_cells
         self.patch_radius_cells = fine_radius_cells  # backward-compat alias
         self.blind_world = blind_world
+        self.use_gru = bool(use_gru)
+        self.gru_hidden_dim = int(gru_hidden_dim)
+        self.use_brief = bool(use_brief)
+        self.num_roles = int(num_roles)
 
         lin = torch.linspace(-1.0, 1.0, patch_size)
         gy, gx = torch.meshgrid(lin, lin, indexing="ij")
@@ -123,6 +146,39 @@ class BotPolicyNetV2(nn.Module):
             nn.Linear(128, 128),
             nn.GELU(),
         )
+
+        # NMMO 2.0-style Task Brief + 5-Species Role Conditioning (zero-init residual projs for clean v2 warm-start)
+        if self.use_brief:
+            self.role_emb = nn.Embedding(self.num_roles, 16)
+            self.role_proj = nn.Linear(16, 128)
+            nn.init.zeros_(self.role_proj.weight)
+            nn.init.zeros_(self.role_proj.bias)
+            self.brief_enc = nn.Sequential(
+                nn.Linear(BRIEF_MODEL_DIM + 16, 48),
+                nn.LayerNorm(48),
+                nn.GELU(),
+                nn.Linear(48, 32),
+                nn.GELU(),
+            )
+            self.brief_proj = nn.Linear(32, 128)
+            nn.init.zeros_(self.brief_proj.weight)
+            nn.init.zeros_(self.brief_proj.bias)
+        else:
+            self.role_emb = None
+            self.role_proj = None
+            self.brief_enc = None
+            self.brief_proj = None
+
+        # Lightweight 64-unit GRU residual recurrence for target/hazard object permanence
+        if self.use_gru:
+            self.gru_cell = nn.GRUCell(128, self.gru_hidden_dim)
+            self.gru_out_proj = nn.Linear(self.gru_hidden_dim, 128)
+            nn.init.normal_(self.gru_out_proj.weight, std=0.02)
+            nn.init.zeros_(self.gru_out_proj.bias)
+        else:
+            self.gru_cell = None
+            self.gru_out_proj = None
+
         self.head_vec = nn.Linear(128, 4)   # move_x, move_y, aim_x, aim_y (tanh)
         self.head_bin = nn.Linear(128, 6)   # dash, melee, cast_bolt, carve_ice, ability_e, ult_r
         self.head_elem = nn.Linear(128, 3)  # Fire, Frost, Oil logits
@@ -194,16 +250,40 @@ class BotPolicyNetV2(nn.Module):
         fine_patch = torch.cat([w_fine, eco_patch], dim=1)
         return fine_patch, w_coarse
 
+    def _extract_brief_and_role(
+        self, bot_feats: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract 15-float conditioning brief (masking slot 15 bot_slot_key) and integer role_idx in 0..4."""
+        self_feat = bot_feats[:, :SELF_DIM]
+        if bot_feats.shape[-1] >= BOT_FEAT_DIM_V3:
+            brief_15 = bot_feats[:, BOT_FEAT_DIM : BOT_FEAT_DIM + BRIEF_MODEL_DIM].float()
+            role_idx = torch.round(brief_15[:, 12] * float(self.num_roles - 1)).long().clamp(0, self.num_roles - 1)
+        else:
+            brief_15 = torch.zeros(
+                (bot_feats.shape[0], BRIEF_MODEL_DIM), device=bot_feats.device, dtype=torch.float32
+            )
+            base_cls = torch.argmax(self_feat[:, 8:11], dim=-1)
+            role_idx = torch.where(
+                self_feat[:, 16] > 0.5,
+                torch.full_like(base_cls, 4),
+                torch.where(self_feat[:, 14] > 0.5, torch.full_like(base_cls, 3), base_cls),
+            ).clamp(0, self.num_roles - 1)
+            brief_15[:, 12] = role_idx.float() / float(self.num_roles - 1)
+        return brief_15, role_idx
+
     def forward_from_patches(
         self,
         fine_patch: torch.Tensor,    # [M, 80, P, P]
         coarse_patch: torch.Tensor,  # [M, 48, P, P]
-        bot_feats: torch.Tensor,     # [M, 168]
+        bot_feats: torch.Tensor,     # [M, 168] or [M, 184]
         return_saliency: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Core forward pass from pre-sampled patches; returns (vec, bin_logits, elem_logits, h_trunk, saliency)."""
+        h_prev: torch.Tensor | None = None,
+        reset_mask: torch.Tensor | None = None,
+        return_hidden: bool = False,
+    ):
+        """Core forward pass from pre-sampled patches; returns 5-tuple (or 6-tuple with h_next when return_hidden=True)."""
         self_feat = bot_feats[:, :SELF_DIM]
-        tok_feat = bot_feats[:, SELF_DIM:].reshape(-1, NUM_TOKENS, TOKEN_DIM)
+        tok_feat = bot_feats[:, SELF_DIM:BOT_FEAT_DIM].reshape(-1, NUM_TOKENS, TOKEN_DIM)
 
         # Fine stream
         f_adapt = self.fine_adapter(fine_patch.float())
@@ -236,21 +316,92 @@ class BotPolicyNetV2(nn.Module):
         attn_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
         h_tac = self.attn_norm((q + attn_out).squeeze(1))
 
-        h_trunk = self.trunk(torch.cat([h_fine, h_coarse, h_tac], dim=-1))
+        h_base = self.trunk(torch.cat([h_fine, h_coarse, h_tac], dim=-1))
+
+        if self.use_brief and self.brief_enc is not None and self.role_emb is not None and self.brief_proj is not None:
+            brief_15, role_idx = self._extract_brief_and_role(bot_feats)
+            r_emb = self.role_emb(role_idx).to(h_base.dtype)
+            if self.role_proj is not None:
+                h_base = h_base + self.role_proj(r_emb)
+            # Explicitly gate brief residual by brief_active (slot 13) so free-play combat has zero brief interference!
+            brief_gate = brief_15[:, 13:14].clamp(0.0, 1.0).to(h_base.dtype)
+            h_brief = self.brief_enc(torch.cat([brief_15.to(h_base.dtype), r_emb], dim=-1))
+            h_base = h_base + brief_gate * self.brief_proj(h_brief)
+
+        h_next: torch.Tensor | None = None
+        if self.use_gru and self.gru_cell is not None and self.gru_out_proj is not None:
+            if h_prev is None:
+                h_cur = torch.zeros(
+                    (h_base.shape[0], self.gru_hidden_dim), device=h_base.device, dtype=torch.float32
+                )
+            else:
+                h_cur = h_prev.float()
+            if reset_mask is not None:
+                keep = (1.0 - reset_mask.float()).unsqueeze(-1)
+                h_cur = h_cur * keep
+            h_next = self.gru_cell(h_base.float(), h_cur)
+            h_trunk = h_base + self.gru_out_proj(h_next.to(h_base.dtype))
+        else:
+            h_next = h_prev
+            h_trunk = h_base
+
         vec = torch.tanh(self.head_vec(h_trunk))
         bin_logits = self.head_bin(h_trunk)
         elem_logits = self.head_elem(h_trunk)
+        if return_hidden:
+            return vec, bin_logits, elem_logits, h_trunk, saliency, h_next
         return vec, bin_logits, elem_logits, h_trunk, saliency
+
+    def forward_sequence_from_patches(
+        self,
+        fine_seq: torch.Tensor,    # [T, B, 80, P, P]
+        coarse_seq: torch.Tensor,  # [T, B, 48, P, P]
+        feat_seq: torch.Tensor,    # [T, B, 168 or 184]
+        done_seq: torch.Tensor,    # [T, B] float/bool (1 where prev step ended -> reset before step t)
+        h0: torch.Tensor | None = None,  # [B, gru_hidden_dim]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Truncated-BPTT sequence forward pass for recurrent PPO over [T, B, ...]."""
+        t_steps, batch_sz = feat_seq.shape[0], feat_seq.shape[1]
+        h_cur = (
+            h0.float()
+            if h0 is not None
+            else torch.zeros((batch_sz, self.gru_hidden_dim), device=feat_seq.device, dtype=torch.float32)
+        )
+        vecs, bins, elems, trunks = [], [], [], []
+        for t in range(t_steps):
+            reset_t = done_seq[t] if t > 0 else None
+            v, bl, el, ht, _, h_cur = self.forward_from_patches(
+                fine_seq[t],
+                coarse_seq[t],
+                feat_seq[t],
+                return_saliency=False,
+                h_prev=h_cur,
+                reset_mask=reset_t,
+                return_hidden=True,
+            )
+            vecs.append(v)
+            bins.append(bl)
+            elems.append(el)
+            trunks.append(ht)
+        return (
+            torch.stack(vecs, dim=0),
+            torch.stack(bins, dim=0),
+            torch.stack(elems, dim=0),
+            torch.stack(trunks, dim=0),
+            h_cur,
+        )
 
     def forward_logits(
         self,
         z_world: torch.Tensor,
         z_eco: torch.Tensor,
         bot_feats: torch.Tensor,
+        h_prev: torch.Tensor | None = None,
+        reset_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         fine_p, coarse_p = self.sample_shared_latents(z_world, z_eco, bot_feats[:, :SELF_DIM])
         vec, bin_logits, elem_logits, _, _ = self.forward_from_patches(
-            fine_p, coarse_p, bot_feats, return_saliency=False
+            fine_p, coarse_p, bot_feats, return_saliency=False, h_prev=h_prev, reset_mask=reset_mask
         )
         return vec, bin_logits, elem_logits
 
@@ -260,16 +411,51 @@ class BotPolicyNetV2(nn.Module):
         z_eco: torch.Tensor,
         bot_feats: torch.Tensor,
         return_saliency: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        h_prev: torch.Tensor | None = None,
+        reset_mask: torch.Tensor | None = None,
+        return_hidden: bool = False,
+    ):
         fine_p, coarse_p = self.sample_shared_latents(z_world, z_eco, bot_feats[:, :SELF_DIM])
-        vec, bin_logits, elem_logits, _, saliency = self.forward_from_patches(
-            fine_p, coarse_p, bot_feats, return_saliency=return_saliency
+        vec, bin_logits, elem_logits, _, saliency, h_next = self.forward_from_patches(
+            fine_p,
+            coarse_p,
+            bot_feats,
+            return_saliency=return_saliency,
+            h_prev=h_prev,
+            reset_mask=reset_mask,
+            return_hidden=True,
         )
         actions = torch.cat([vec, torch.sigmoid(bin_logits), F.softmax(elem_logits, dim=-1)], dim=-1)
+        if return_saliency and return_hidden:
+            assert saliency is not None
+            return actions, saliency, h_next
         if return_saliency:
             assert saliency is not None
             return actions, saliency
+        if return_hidden:
+            return actions, h_next
         return actions
+
+
+def load_bot_policy_v2_or_v3(
+    ckpt_or_sd,
+    device: torch.device | str = "cpu",
+    upgrade_to_v3: bool = False,
+) -> BotPolicyNetV2:
+    """Load either a legacy feedforward BotPolicyNetV2 checkpoint or a recurrent+brief V3 checkpoint."""
+    if isinstance(ckpt_or_sd, dict):
+        sd = ckpt_or_sd["state_dict"] if "state_dict" in ckpt_or_sd else ckpt_or_sd
+    else:
+        raw = torch.load(ckpt_or_sd, map_location=device, weights_only=False)
+        sd = raw["state_dict"] if isinstance(raw, dict) and "state_dict" in raw else raw
+
+    has_gru = any(k.startswith("gru_cell.") for k in sd)
+    has_brief = any(k.startswith("brief_enc.") for k in sd)
+    use_gru = has_gru or upgrade_to_v3
+    use_brief = has_brief or upgrade_to_v3
+    model = BotPolicyNetV2(use_gru=use_gru, use_brief=use_brief)
+    model.load_state_dict(sd, strict=not (upgrade_to_v3 and (not has_gru or not has_brief)))
+    return model.to(device)
 
 
 def sample_batched_dual_patches(

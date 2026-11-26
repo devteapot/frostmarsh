@@ -46,9 +46,23 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from bot_policy import ACTION_OUT_DIM, BOT_FEAT_DIM, INSPECT_OUT_DIM, BotPolicyNet  # noqa: E402
 try:
-    from bot_policy_v2 import BotPolicyNetV2  # type: ignore  # noqa: E402
+    from bot_policy_v2 import (  # type: ignore  # noqa: E402
+        BOT_FEAT_DIM_V3,
+        BRIEF_MODEL_DIM,
+        GRU_HIDDEN_DIM,
+        BotPolicyNetV2,
+        load_bot_policy_v2_or_v3,
+    )
 except Exception:
+    BOT_FEAT_DIM_V3 = 184
+    BRIEF_MODEL_DIM = 15
+    GRU_HIDDEN_DIM = 64
     BotPolicyNetV2 = None  # type: ignore[assignment]
+    load_bot_policy_v2_or_v3 = None  # type: ignore[assignment]
+try:
+    from system2_slm import compile_plan_to_brief  # type: ignore  # noqa: E402
+except Exception:
+    compile_plan_to_brief = None  # type: ignore[assignment]
 from model import EcosystemModel, WorldModel  # noqa: E402
 
 try:
@@ -89,6 +103,7 @@ OP_WORLD_STEP = 1
 OP_ECO_STEP = 2
 OP_BOT_POLICY = 4
 OP_BOT_POLICY_INSPECT = 5
+OP_BOT_POLICY_V3 = 14
 OP_ACOUSTIC_STEP = 6
 OP_ACTUATOR_POLICY = 7
 OP_WORLD_3D_STEP = 8
@@ -1230,20 +1245,36 @@ class InferenceEngine:
         self.eco_model.to(self.device)
 
         self.bot_policy: Any = None
-        if bot_pt.exists():
-            sd = _load_state_dict(bot_pt)
-            if BotPolicyNetV2 is not None and any(k.startswith("fine_adapter.") for k in sd):
-                bp = BotPolicyNetV2().eval()
-                bp.load_state_dict(sd)
-                bp.to(self.device)
+        self.bot_gru_states: dict[int, tuple[torch.Tensor, int]] = {}
+        self.bot_active_briefs: dict[int, tuple[dict[str, Any], int]] = {}
+        self._bot_infer_step: int = 0
+        resolved_bot_pt = bot_pt
+        if bot_pt.name == "bot_policy.pt":
+            for cand_name in ("bot_policy_v3_rl.pt", "bot_policy_v2_rl.pt", "bot_policy_rl.pt"):
+                cand = bot_pt.parent / cand_name
+                if cand.exists():
+                    resolved_bot_pt = cand
+                    break
+        if resolved_bot_pt.exists():
+            sd = _load_state_dict(resolved_bot_pt)
+            if (
+                BotPolicyNetV2 is not None
+                and load_bot_policy_v2_or_v3 is not None
+                and any(k.startswith("fine_adapter.") for k in sd)
+            ):
+                bp = load_bot_policy_v2_or_v3(sd, device=self.device, upgrade_to_v3=False).eval()
                 self.bot_policy = bp
-                print(f"[gpu_infer_daemon] Loaded Dual-Scale BotPolicyNetV2 from {bot_pt}", flush=True)
+                print(
+                    f"[gpu_infer_daemon] Loaded Dual-Scale BotPolicyNetV2 from {resolved_bot_pt} "
+                    f"(gru={bp.use_gru}:{bp.gru_hidden_dim}, brief={bp.use_brief})",
+                    flush=True,
+                )
             else:
                 bp = BotPolicyNet().eval()
                 bp.load_state_dict(sd)
                 bp.to(self.device)
                 self.bot_policy = bp
-                print(f"[gpu_infer_daemon] Loaded Shared-Latent BotPolicyNet from {bot_pt}", flush=True)
+                print(f"[gpu_infer_daemon] Loaded Shared-Latent BotPolicyNet from {resolved_bot_pt}", flush=True)
 
         self.actuator_policy: Any = None
         act_path = actuator_pt if actuator_pt is not None else (_SCRIPT_DIR / "actuator_policy_rl.pt")
@@ -2355,17 +2386,28 @@ class InferenceEngine:
                         },
                     )
                     if bid > 0:
-                        result["overrides"].append(
-                            {
-                                "bot_id": bid,
-                                "move_x": round(mx, 3),
-                                "move_y": round(my, 3),
-                                "elem": elem_ov,
-                                "ability": ab_ov,
-                                "snr_db": float(meta.get("snr_db", 12.0)),
-                                "ttl_ticks": 90,
-                            }
-                        )
+                        tb_dict = None
+                        if compile_plan_to_brief is not None:
+                            tb_dict = compile_plan_to_brief(
+                                plan,
+                                bot_pos=(bx, by),
+                                grid_w=mgw,
+                                grid_h=mgh,
+                                role_id=int(meta.get("class_id", 0)),
+                            )
+                            self.bot_active_briefs[bid] = (tb_dict, self._bot_infer_step + 180)
+                        ov_entry: dict[str, Any] = {
+                            "bot_id": bid,
+                            "move_x": round(mx, 3),
+                            "move_y": round(my, 3),
+                            "elem": elem_ov,
+                            "ability": ab_ov,
+                            "snr_db": float(meta.get("snr_db", 12.0)),
+                            "ttl_ticks": 180,
+                        }
+                        if tb_dict is not None:
+                            ov_entry["task_brief"] = tb_dict
+                        result["overrides"].append(ov_entry)
 
             result["acoustic_ms"] = round(float(result.get("acoustic_ms", infer_us / 1000.0)), 3)
             result["sparse_pct"] = round(self.last_sparse_active_frac * 100.0, 2)
@@ -2400,6 +2442,114 @@ class InferenceEngine:
                     out_t = torch.cat([actions.float(), saliency.float()], dim=-1)
                 else:
                     out_t = res.float()
+                out_np = out_t.cpu().numpy().astype(np.float32, copy=False)
+            infer_us = int((time.perf_counter() - t0) * 1_000_000)
+        return out_np.tobytes(), infer_us
+
+    def infer_bots_v3(self, n_bots: int, raw_bytes: bytes, return_saliency: bool = True) -> tuple[bytes, int]:
+        """Recurrent 64-unit GRU + 16-d NMMO 2.0 TaskBrief BotPolicyNetV2 (`op=14`, [N, 184] -> [N, 29])."""
+        if self.bot_policy is None:
+            raise RuntimeError("bot_policy checkpoint not loaded")
+        arr = np.frombuffer(raw_bytes, dtype=np.float32).reshape(n_bots, BOT_FEAT_DIM_V3).copy()
+        with self.lock:
+            t0 = time.perf_counter()
+            self._bot_infer_step += 1
+            step_now = self._bot_infer_step
+
+            # Extract per-bot IDs and respawn GRU reset flags from brief[15] (bot_slot_key)
+            bot_ids: list[int] = []
+            resets: list[bool] = []
+            for i in range(n_bots):
+                key = float(arr[i, BOT_FEAT_DIM + 15])
+                if key < -0.5:
+                    bid = max(0, int(round(-key)) - 1)
+                    needs_reset = True
+                elif key > 0.5:
+                    bid = max(0, int(round(key)) - 1)
+                    needs_reset = False
+                else:
+                    bid = i
+                    needs_reset = False
+                bot_ids.append(bid)
+                resets.append(needs_reset)
+
+                # If no server-side brief is active, inject cached System-2 brief if present and fresh
+                if arr[i, BOT_FEAT_DIM + 13] < 0.5 and bid in self.bot_active_briefs:
+                    tb, exp_step = self.bot_active_briefs[bid]
+                    if step_now <= exp_step:
+                        bv = tb.get("brief_vec_15")
+                        if isinstance(bv, list) and len(bv) == BRIEF_MODEL_DIM:
+                            arr[i, BOT_FEAT_DIM : BOT_FEAT_DIM + BRIEF_MODEL_DIM] = bv
+                    else:
+                        self.bot_active_briefs.pop(bid, None)
+
+            with torch.inference_mode():
+                num_layers = int(self.last_z_world.shape[0])
+                if num_layers > 4 and np.any(arr[:, 2] > 1.0):
+                    arr[:, 2] = np.clip(arr[:, 2] / float(num_layers - 1), 0.0, 1.0)
+                z_world_4 = self._get_z_world_4strata()
+                is_v2 = BotPolicyNetV2 is not None and isinstance(self.bot_policy, BotPolicyNetV2)
+                use_gru = bool(is_v2 and getattr(self.bot_policy, "use_gru", False))
+                bf = torch.from_numpy(arr if is_v2 else arr[:, :BOT_FEAT_DIM]).to(self.device, non_blocking=False)
+
+                h_prev: torch.Tensor | None = None
+                if use_gru:
+                    h_dim = int(getattr(self.bot_policy, "gru_hidden_dim", GRU_HIDDEN_DIM))
+                    h_prev = torch.zeros((n_bots, h_dim), device=self.device, dtype=torch.float32)
+                    for i, (bid, needs_reset) in enumerate(zip(bot_ids, resets)):
+                        if not needs_reset:
+                            cached = self.bot_gru_states.get(bid)
+                            if cached is not None and cached[0].shape[0] == h_dim:
+                                h_prev[i] = cached[0]
+
+                if self.use_fp16:
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                        if is_v2:
+                            res = self.bot_policy(
+                                z_world_4,
+                                self.last_z_eco,
+                                bf,
+                                return_saliency=return_saliency,
+                                h_prev=h_prev,
+                                return_hidden=use_gru,
+                            )
+                        else:
+                            res = self.bot_policy(z_world_4, self.last_z_eco, bf, return_saliency=return_saliency)
+                else:
+                    if is_v2:
+                        res = self.bot_policy(
+                            z_world_4,
+                            self.last_z_eco,
+                            bf,
+                            return_saliency=return_saliency,
+                            h_prev=h_prev,
+                            return_hidden=use_gru,
+                        )
+                    else:
+                        res = self.bot_policy(z_world_4, self.last_z_eco, bf, return_saliency=return_saliency)
+
+                if use_gru:
+                    if return_saliency:
+                        actions, saliency, h_next = res
+                        out_t = torch.cat([actions.float(), saliency.float()], dim=-1)
+                    else:
+                        actions, h_next = res
+                        out_t = actions.float()
+                    if h_next is not None:
+                        h_det = h_next.detach().float()
+                        for i, bid in enumerate(bot_ids):
+                            self.bot_gru_states[bid] = (h_det[i], step_now)
+                    if step_now % 120 == 0 and len(self.bot_gru_states) > 128:
+                        stale = [k for k, (_, ts) in self.bot_gru_states.items() if step_now - ts > 600]
+                        for k in stale:
+                            self.bot_gru_states.pop(k, None)
+                else:
+                    if return_saliency:
+                        actions, saliency = res
+                        out_t = torch.cat([actions.float(), saliency.float()], dim=-1)
+                    else:
+                        out_t = res.float()
+
                 out_np = out_t.cpu().numpy().astype(np.float32, copy=False)
             infer_us = int((time.perf_counter() - t0) * 1_000_000)
         return out_np.tobytes(), infer_us
@@ -2872,6 +3022,32 @@ class GPUInferDaemon:
                         continue
                     resp_hdr = HEADER_STRUCT.pack(
                         STATUS_OK, 1, 1, n_bots, ACTUATOR_INSPECT_OUT_DIM, len(out_bytes), infer_us
+                    )
+                    conn.sendall(resp_hdr)
+                    conn.sendall(out_bytes)
+                    continue
+
+                if op == OP_BOT_POLICY_V3:
+                    n_bots = int(height)
+                    expected_bytes = n_bots * BOT_FEAT_DIM_V3 * 4
+                    if n_bots <= 0 or width != BOT_FEAT_DIM_V3 or payload_bytes != expected_bytes:
+                        if 0 < payload_bytes <= 16 * 1024 * 1024:
+                            _recv_exact(conn, memoryview(bytearray(payload_bytes)))
+                        self._send_error(conn, STATUS_BAD_REQUEST, height, width)
+                        continue
+                    raw_in = bytearray(payload_bytes)
+                    if not _recv_exact(conn, memoryview(raw_in)):
+                        break
+                    try:
+                        out_bytes, infer_us = self.engine.infer_bots_v3(
+                            n_bots, bytes(raw_in), return_saliency=True
+                        )
+                    except Exception as exc:
+                        print(f"[gpu_infer_daemon] Bot policy v3 error: {exc}", file=sys.stderr)
+                        self._send_error(conn, STATUS_INTERNAL_ERROR, height, width)
+                        continue
+                    resp_hdr = HEADER_STRUCT.pack(
+                        STATUS_OK, 1, 1, n_bots, INSPECT_OUT_DIM, len(out_bytes), infer_us
                     )
                     conn.sendall(resp_hdr)
                     conn.sendall(out_bytes)

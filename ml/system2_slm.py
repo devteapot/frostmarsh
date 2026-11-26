@@ -711,6 +711,130 @@ def _clamp_word_count(text: str, max_words: int = 16) -> str:
     return clipped
 
 
+@dataclass
+class TaskBrief:
+    """NMMO 2.0-style compact commander conditioning vector fed into recurrent BotPolicyNetV2."""
+    objective: int  # 0=FREE_ROAM, 1=CAPTURE_SHRINE, 2=ESCORT_RELIC, 3=HUNT_ENEMY, 4=DEFEND_HOLD
+    stance: int     # 0=COMMIT, 1=HOLD, 2=FLEE_KITE
+    target_x: float
+    target_y: float
+    risk_budget: float
+    thermal_bias: float
+    role_id: int
+    active: bool = True
+
+    def to_vec15(self, bot_x: float, bot_y: float) -> list[float]:
+        vec = [0.0] * 15
+        vec[max(0, min(4, int(self.objective)))] = 1.0
+        vec[5 + max(0, min(2, int(self.stance)))] = 1.0
+        dx = float(self.target_x) - float(bot_x)
+        dy = float(self.target_y) - float(bot_y)
+        dist = math.hypot(dx, dy)
+        vec[8] = max(-1.0, min(1.0, dx / 100.0))
+        vec[9] = max(-1.0, min(1.0, dy / 100.0))
+        vec[10] = min(1.0, dist / 100.0)
+        vec[11] = max(0.0, min(1.0, float(self.risk_budget)))
+        vec[12] = max(0.0, min(1.0, float(max(0, min(4, int(self.role_id)))) / 4.0))
+        vec[13] = 1.0 if self.active else 0.0
+        vec[14] = max(-1.0, min(1.0, float(self.thermal_bias)))
+        return vec
+
+    def to_dict(self, bot_x: float, bot_y: float) -> dict[str, Any]:
+        return {
+            "objective": int(self.objective),
+            "stance": int(self.stance),
+            "target_x": round(float(self.target_x), 2),
+            "target_y": round(float(self.target_y), 2),
+            "risk_budget": round(float(self.risk_budget), 3),
+            "thermal_bias": round(float(self.thermal_bias), 3),
+            "role_id": int(self.role_id),
+            "active": bool(self.active),
+            "brief_vec_15": [round(v, 4) for v in self.to_vec15(bot_x, bot_y)],
+        }
+
+
+def _bot_class_to_role_id(bot_class: str | int) -> int:
+    if isinstance(bot_class, int):
+        return max(0, min(4, bot_class))
+    s = str(bot_class).lower()
+    if "cryo" in s or "frost" in s or "tide" in s:
+        return 1
+    if "alchem" in s or "sky" in s:
+        return 2
+    if "shadow" in s or "stalk" in s or "flank" in s:
+        return 3
+    if "burrow" in s or "mole" in s or "strider" in s:
+        return 4
+    return 0
+
+
+def compile_plan_to_brief(
+    plan: dict[str, Any],
+    bot_pos: tuple[float, float],
+    grid_w: float = 256.0,
+    grid_h: float = 256.0,
+    role_id: int = 0,
+) -> dict[str, Any]:
+    """Compile a System-2 SLM JSON tactical plan into the 15-float NMMO 2.0 TaskBrief dict."""
+    intent = str(plan.get("intent", "HOLD_BRIDGE")).upper().strip()
+    sector = str(plan.get("target_sector", "")).strip()
+    ab = plan.get("actuator_bias") or {}
+    tf = float(np.clip(float(ab.get("thermal_flux", 0.0)), -1.0, 1.0))
+
+    sector_map = {
+        "NW Highland": (grid_w * 0.28, grid_h * 0.25),
+        "NE Skybridge": (grid_w * 0.55, grid_h * 0.30),
+        "SW Oil Basin": (grid_w * 0.28, grid_h * 0.72),
+        "SE Shrine Valley": (grid_w * 0.72, grid_h * 0.72),
+        "L0 Cavern": (grid_w * 0.50, grid_h * 0.50),
+        "Central River": (grid_w * 0.50, grid_h * 0.50),
+        "North Village": (grid_w * 0.50, grid_h * 0.24),
+        "Harbor": (grid_w * 0.22, grid_h * 0.50),
+        "Relic": (grid_w * 0.50, grid_h * 0.50),
+    }
+    tx, ty = sector_map.get(sector, (float(bot_pos[0]), float(bot_pos[1])))
+
+    # Map intent -> (objective 0..4, stance 0..2, risk_budget 0..1)
+    intent_map: dict[str, tuple[int, int, float]] = {
+        "IGNITE_TRAP": (3, 0, 0.85),       # HUNT_ENEMY, COMMIT
+        "HUNT_ENEMY": (3, 0, 0.90),
+        "CAPTURE_SHRINE": (1, 0, 0.75),    # CAPTURE_SHRINE, COMMIT
+        "ESCORT_RELIC": (2, 0, 0.65),      # ESCORT_RELIC, COMMIT
+        "STAGE_OIL": (1, 1, 0.55),         # CAPTURE_SHRINE, HOLD
+        "HOLD_BRIDGE": (4, 1, 0.50),       # DEFEND_HOLD, HOLD
+        "FREEZE_CHOKE": (4, 1, 0.45),      # DEFEND_HOLD, HOLD
+        "HOLD_FIRE": (4, 1, 0.35),         # DEFEND_HOLD, HOLD
+        "QUENCH_FIRE": (4, 1, 0.40),       # DEFEND_HOLD, HOLD
+        "WARN_COLLAPSE": (4, 2, 0.20),     # DEFEND_HOLD, FLEE_KITE
+        "SMOKE_COVER": (0, 2, 0.25),       # FREE_ROAM, FLEE_KITE
+        "RETREAT": (0, 2, 0.15),           # FREE_ROAM, FLEE_KITE
+        "RELOCATE_COMMS": (0, 2, 0.25),    # FREE_ROAM, FLEE_KITE
+        "REQUEST_REPEAT": (4, 1, 0.30),    # DEFEND_HOLD, HOLD
+    }
+    obj, stance, risk = intent_map.get(intent, (4, 1, 0.50))
+    if "objective" in plan and isinstance(plan["objective"], int):
+        obj = max(0, min(4, plan["objective"]))
+    if "stance" in plan and isinstance(plan["stance"], int):
+        stance = max(0, min(2, plan["stance"]))
+    if "risk_budget" in plan:
+        try:
+            risk = float(np.clip(float(plan["risk_budget"]), 0.0, 1.0))
+        except Exception:
+            pass
+
+    tb = TaskBrief(
+        objective=obj,
+        stance=stance,
+        target_x=tx,
+        target_y=ty,
+        risk_budget=risk,
+        thermal_bias=tf,
+        role_id=_bot_class_to_role_id(role_id),
+        active=True,
+    )
+    return tb.to_dict(float(bot_pos[0]), float(bot_pos[1]))
+
+
 def _default_physics_plan(obs: GroundedObservation) -> dict[str, Any]:
     if obs.incoming_snr_db < -6.0:
         return {
@@ -895,6 +1019,13 @@ def parse_and_validate_plan(
             "focus_radius": fr,
         },
     }
+    plan["task_brief"] = compile_plan_to_brief(
+        plan,
+        bot_pos=(obs.bot_pos[0], obs.bot_pos[1]),
+        grid_w=256.0,
+        grid_h=256.0,
+        role_id=_bot_class_to_role_id(obs.bot_class),
+    )
 
     plan_valid = (
         isinstance(plan["reply"], str)

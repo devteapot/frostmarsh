@@ -1440,6 +1440,53 @@ struct BotCommandOverride {
     expires_tick: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct BotTaskBrief {
+    pub objective: u8,     // 0=FREE_ROAM, 1=CAPTURE_SHRINE, 2=ESCORT_RELIC, 3=HUNT_ENEMY, 4=DEFEND_HOLD
+    pub stance: u8,        // 0=COMMIT, 1=HOLD, 2=FLEE_KITE
+    pub target_x: f32,
+    pub target_y: f32,
+    pub risk_budget: f32,  // 0.0..1.0
+    pub thermal_bias: f32, // -1.0..1.0
+    pub active: bool,
+    pub from_system2: bool,
+    pub expires_tick: u64,
+}
+
+const BOT_BRIEF_DIM: usize = 16;
+const BOT_FEAT_DIM_V3: usize = 168 + BOT_BRIEF_DIM; // 184
+
+fn pack_bot_brief_tail(
+    dst: &mut [f32],
+    brief: &BotTaskBrief,
+    bot_x: f32,
+    bot_y: f32,
+    class_id: u8,
+    bot_id: u32,
+    reset_gru: bool,
+) {
+    debug_assert!(dst.len() >= BOT_BRIEF_DIM);
+    for v in &mut dst[..BOT_BRIEF_DIM] {
+        *v = 0.0;
+    }
+    let obj = (brief.objective.min(4)) as usize;
+    let st = (brief.stance.min(2)) as usize;
+    dst[obj] = 1.0;
+    dst[5 + st] = 1.0;
+    let dx = brief.target_x - bot_x;
+    let dy = brief.target_y - bot_y;
+    let dist = dx.hypot(dy);
+    dst[8] = (dx / 100.0).clamp(-1.0, 1.0);
+    dst[9] = (dy / 100.0).clamp(-1.0, 1.0);
+    dst[10] = (dist / 100.0).min(1.0);
+    dst[11] = brief.risk_budget.clamp(0.0, 1.0);
+    dst[12] = (class_id.min(4) as f32) / 4.0;
+    dst[13] = if brief.active { 1.0 } else { 0.0 };
+    dst[14] = brief.thermal_bias.clamp(-1.0, 1.0);
+    let slot_key = (bot_id as f32) + 1.0;
+    dst[15] = if reset_gru { -slot_key } else { slot_key };
+}
+
 const MATCH_DURATION_SECS: u16 = 300;
 const MATCH_SCORE_LIMIT: u16 = 500;
 const CELEBRATION_SECS: u16 = 10;
@@ -1509,6 +1556,8 @@ struct GameState {
     speech_bubbles: VecDeque<(u64, SpeechBubbleSnap)>,
     pending_chat: Option<PendingChat>,
     bot_overrides: HashMap<u32, BotCommandOverride>,
+    bot_task_briefs: HashMap<u32, BotTaskBrief>,
+    bot_gru_reset_pending: std::collections::HashSet<u32>,
     recent_actuators: VecDeque<(u32, u8, f32, f32, f32, u64)>,
     actuator_pulses: Vec<(u64, f32, ActuatorPulseSnap)>,
     time_domes: Vec<TimeDomeEntity>,
@@ -1794,6 +1843,8 @@ impl GameState {
             speech_bubbles: VecDeque::with_capacity(6),
             pending_chat: None,
             bot_overrides: HashMap::new(),
+            bot_task_briefs: HashMap::new(),
+            bot_gru_reset_pending: std::collections::HashSet::new(),
             recent_actuators: VecDeque::with_capacity(32),
             actuator_pulses: Vec::with_capacity(32),
             time_domes: Vec::with_capacity(4),
@@ -1987,6 +2038,8 @@ impl GameState {
             speech_bubbles: VecDeque::with_capacity(6),
             pending_chat: None,
             bot_overrides: HashMap::new(),
+            bot_task_briefs: HashMap::new(),
+            bot_gru_reset_pending: std::collections::HashSet::new(),
             recent_actuators: VecDeque::with_capacity(32),
             actuator_pulses: Vec::with_capacity(32),
             time_domes: Vec::with_capacity(4),
@@ -2157,6 +2210,8 @@ impl GameState {
             speech_bubbles: VecDeque::with_capacity(6),
             pending_chat: None,
             bot_overrides: HashMap::new(),
+            bot_task_briefs: HashMap::new(),
+            bot_gru_reset_pending: std::collections::HashSet::new(),
             recent_actuators: VecDeque::with_capacity(32),
             actuator_pulses: Vec::with_capacity(32),
             time_domes: Vec::with_capacity(4),
@@ -2511,6 +2566,46 @@ impl GameState {
                         expires_tick: tick_now + ttl,
                     },
                 );
+                if let Some(tb) = ov.get("task_brief") {
+                    let obj = tb.get("objective").and_then(|v| v.as_i64()).unwrap_or(4).clamp(0, 4) as u8;
+                    let stance = tb.get("stance").and_then(|v| v.as_i64()).unwrap_or(1).clamp(0, 2) as u8;
+                    let tx = tb.get("target_x").and_then(|v| v.as_f32()).unwrap_or(self.grid_w as f32 * 0.5);
+                    let ty = tb.get("target_y").and_then(|v| v.as_f32()).unwrap_or(self.grid_h as f32 * 0.5);
+                    let risk = tb.get("risk_budget").and_then(|v| v.as_f32()).unwrap_or(0.5).clamp(0.0, 1.0);
+                    let therm = tb.get("thermal_bias").and_then(|v| v.as_f32()).unwrap_or(0.0).clamp(-1.0, 1.0);
+                    let brief = BotTaskBrief {
+                        objective: obj,
+                        stance,
+                        target_x: tx,
+                        target_y: ty,
+                        risk_budget: risk,
+                        thermal_bias: therm,
+                        active: true,
+                        from_system2: true,
+                        expires_tick: tick_now + ttl.max(180),
+                    };
+                    self.bot_task_briefs.insert(bot_id, brief);
+                    // Propagate commander brief to nearby allies in the same squad for coordinated tactics
+                    if let Some(leader) = self.players.get(&bot_id).cloned() {
+                        if leader.squad_id > 0 {
+                            let squad_peers: Vec<u32> = self
+                                .players
+                                .values()
+                                .filter(|o| {
+                                    o.is_bot
+                                        && o.id != bot_id
+                                        && o.team == leader.team
+                                        && o.squad_id == leader.squad_id
+                                        && (o.x - leader.x).hypot(o.y - leader.y) <= 48.0
+                                })
+                                .map(|o| o.id)
+                                .collect();
+                            for sid in squad_peers {
+                                self.bot_task_briefs.insert(sid, brief);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -4374,6 +4469,9 @@ impl GameState {
             let (x, y, z) = self.spawn_point(team, self.sim_tick as u32 + pid);
             (0u8, x, y, z)
         };
+        if is_bot_p {
+            self.bot_gru_reset_pending.insert(pid);
+        }
         if let Some(p) = self.players.get_mut(&pid) {
             p.carrying_relic = false;
             p.face = sface;
@@ -4480,6 +4578,10 @@ impl GameState {
         self.kill_feed.clear();
         self.speech_bubbles.clear();
         self.bot_overrides.clear();
+        self.bot_task_briefs.clear();
+        for p in self.players.values().filter(|p| p.is_bot) {
+            self.bot_gru_reset_pending.insert(p.id);
+        }
         self.recent_actuators.clear();
         self.actuator_pulses.clear();
         self.time_domes.clear();
@@ -4927,8 +5029,77 @@ impl GameState {
     }
 
     /// Batched Shared-Latent Neural Bots (`op=5` inspect with `4x4` Z_world saliency, graceful fallback to `op=4`):
-    /// Packs compact ledger/entity tokens (`168` f32/bot) and sends to GB10 `gpu_infer_daemon.py`,
-    /// which samples `WorldModel`'s cached `[4, 48, 256, 256]` VRAM trunk `Z_world` + `Z_eco` ZERO-COPY!
+    fn resolve_bot_task_brief(&self, p: &PlayerEntity, tick: u64) -> BotTaskBrief {
+        if let Some(&b) = self.bot_task_briefs.get(&p.id) {
+            if b.active && tick <= b.expires_tick {
+                return b;
+            }
+        }
+        let hp_frac = (p.hp as f32 / p.max_hp.max(1) as f32).clamp(0.0, 1.0);
+        if hp_frac < 0.30 {
+            let home_x = if p.team == 0 {
+                self.grid_w as f32 * 0.16
+            } else {
+                self.grid_w as f32 * 0.84
+            };
+            return BotTaskBrief {
+                objective: 0,
+                stance: 2, // FLEE_KITE
+                target_x: home_x,
+                target_y: self.grid_h as f32 * 0.50,
+                risk_budget: 0.20,
+                thermal_bias: -0.5,
+                active: true,
+                from_system2: false,
+                expires_tick: tick + 30,
+            };
+        }
+        if p.carrying_relic {
+            let home_x = if p.team == 0 {
+                self.grid_w as f32 * 0.14
+            } else {
+                self.grid_w as f32 * 0.86
+            };
+            return BotTaskBrief {
+                objective: 2, // ESCORT_RELIC
+                stance: 2,    // FLEE_KITE toward home base
+                target_x: home_x,
+                target_y: self.grid_h as f32 * 0.50,
+                risk_budget: 0.35,
+                thermal_bias: -0.4,
+                active: true,
+                from_system2: false,
+                expires_tick: tick + 30,
+            };
+        }
+        let shrine_idx = (p.squad_id as usize) % self.shrines.len().max(1);
+        let (sx, sy) = self
+            .shrines
+            .get(shrine_idx)
+            .map(|s| (s.x, s.y))
+            .unwrap_or((self.grid_w as f32 * 0.5, self.grid_h as f32 * 0.5));
+        let (objective, stance, tx, ty, risk, therm) = match p.class_id % 5 {
+            CLASS_EMBERSTALKER => (3u8, 0u8, self.relic_x, self.relic_y, 0.85f32, 0.75f32),
+            CLASS_TIDEKIN => (4u8, 1u8, sx, sy, 0.45f32, -0.75f32),
+            CLASS_BURROWER => (1u8, 0u8, sx, sy, 0.80f32, 0.15f32),
+            CLASS_SKYWING => (2u8, 1u8, self.relic_x, self.relic_y, 0.55f32, 0.0f32),
+            _ => (1u8, 0u8, sx, sy, 0.75f32, 0.65f32),
+        };
+        BotTaskBrief {
+            objective,
+            stance,
+            target_x: tx,
+            target_y: ty,
+            risk_budget: risk,
+            thermal_bias: therm,
+            active: true,
+            from_system2: false,
+            expires_tick: tick + 30,
+        }
+    }
+
+    /// Packs compact ledger/entity tokens (`168` f32/bot + `16` f32 NMMO 2.0 TaskBrief/GRU slot = `184` f32/bot)
+    /// and sends to GB10 `gpu_infer_daemon.py` (`op=14` recurrent+brief V3, falling back to `op=5`/`op=4`).
     fn step_bots_neural_z(&mut self) -> bool {
         const SELF_DIM: usize = 24;
         const NUM_TOKENS: usize = 12;
@@ -4951,6 +5122,8 @@ impl GameState {
         let all_p: Vec<PlayerEntity> = self.players.values().cloned().collect();
 
         let mut feats = vec![0.0f32; n * BOT_FEAT_DIM];
+        let mut feats_v3 = vec![0.0f32; n * BOT_FEAT_DIM_V3];
+        let mut bot_system2_brief_active = vec![false; n];
         let mut nearest_enemy_ids = vec![0u32; n];
         for (bi, &bid) in bot_ids.iter().enumerate() {
             let Some(p) = self.players.get(&bid) else { continue; };
@@ -4976,16 +5149,26 @@ impl GameState {
             feats[base + 22] = (p.ult_r_cd.saturating_sub(tick) as f32 / 360.0).clamp(0.0, 1.0);
             feats[base + 23] = self.weather_kind as f32 / 3.0;
 
-            // Nearest 8 other players -> tokens 0..8
-            let mut others: Vec<(f32, &PlayerEntity)> = all_p
+            // Nearest 6 ENEMIES + nearest 2 ALLIES -> tokens 0..8 (prevents 60-bot ally crowds from blinding enemy attention!)
+            let mut enemies: Vec<(f32, &PlayerEntity)> = all_p
                 .iter()
-                .filter(|o| o.id != p.id)
+                .filter(|o| o.id != p.id && o.team != p.team)
                 .map(|o| ((o.x - p.x).hypot(o.y - p.y), o))
                 .collect();
-            others.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            if let Some(&(_, enemy)) = others.iter().find(|(_, o)| o.team != p.team) {
+            enemies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(&(_, enemy)) = enemies.first() {
                 nearest_enemy_ids[bi] = enemy.id;
             }
+            let mut allies: Vec<(f32, &PlayerEntity)> = all_p
+                .iter()
+                .filter(|o| o.id != p.id && o.team == p.team)
+                .map(|o| ((o.x - p.x).hypot(o.y - p.y), o))
+                .collect();
+            allies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut others: Vec<(f32, &PlayerEntity)> = Vec::with_capacity(8);
+            others.extend(enemies.into_iter().take(6));
+            let rem = 8usize.saturating_sub(others.len());
+            others.extend(allies.into_iter().take(rem));
             let z_band_scale = 3.0 / gd_m1;
             for (ti, &(d, o)) in others.iter().take(8).enumerate() {
                 let tb = base + SELF_DIM + ti * TOKEN_DIM;
@@ -5021,6 +5204,22 @@ impl GameState {
             feats[tr + 1] = ((self.relic_y - p.y) / 100.0).clamp(-1.0, 1.0);
             feats[tr + 3] = if p.carrying_relic { 1.0 } else { 0.0 };
             feats[tr + 11] = 1.0;
+
+            // Pack 184-float V3 vector: [0..168] base + [168..184] NMMO 2.0 TaskBrief & GRU slot key
+            let v3_base = bi * BOT_FEAT_DIM_V3;
+            feats_v3[v3_base..v3_base + BOT_FEAT_DIM].copy_from_slice(&feats[base..base + BOT_FEAT_DIM]);
+            let brief = self.resolve_bot_task_brief(p, tick);
+            bot_system2_brief_active[bi] = brief.from_system2 && brief.active;
+            let reset_gru = self.bot_gru_reset_pending.remove(&bid);
+            pack_bot_brief_tail(
+                &mut feats_v3[v3_base + BOT_FEAT_DIM..v3_base + BOT_FEAT_DIM_V3],
+                &brief,
+                p.x,
+                p.y,
+                p.class_id,
+                bid,
+                reset_gru,
+            );
         }
 
         const ACTUATOR_OUT_DIM: usize = 10;
@@ -5285,13 +5484,17 @@ impl GameState {
             }
         }
 
-        // Try op=5 (OP_BOT_POLICY_INSPECT: 13 actions + 16 saliency floats), fallback gracefully to op=4
-        let (out_buf, gpu_ms, stride, has_saliency) = if let Some(ref mut rpc) = self.bot_rpc {
-            match rpc.call_batched(5, 1, 1, n as u16, BOT_FEAT_DIM as u16, &feats) {
-                Ok((v, ms)) if v.len() == n * INSPECT_OUT_DIM => (v, ms, INSPECT_OUT_DIM, true),
-                _ => match rpc.call_batched(4, 1, 1, n as u16, BOT_FEAT_DIM as u16, &feats) {
-                    Ok((v, ms)) if v.len() == n * ACTION_OUT_DIM => (v, ms, ACTION_OUT_DIM, false),
-                    _ => return false,
+        // Try op=14 (OP_BOT_POLICY_V3: 184-float recurrent GRU + NMMO 2.0 TaskBrief -> 29 floats),
+        // falling back gracefully to op=5 (168->29) and op=4 (168->13).
+        let (out_buf, gpu_ms, stride, has_saliency, used_v3_brief_policy) = if let Some(ref mut rpc) = self.bot_rpc {
+            match rpc.call_batched(14, 1, 1, n as u16, BOT_FEAT_DIM_V3 as u16, &feats_v3) {
+                Ok((v, ms)) if v.len() == n * INSPECT_OUT_DIM => (v, ms, INSPECT_OUT_DIM, true, true),
+                _ => match rpc.call_batched(5, 1, 1, n as u16, BOT_FEAT_DIM as u16, &feats) {
+                    Ok((v, ms)) if v.len() == n * INSPECT_OUT_DIM => (v, ms, INSPECT_OUT_DIM, true, false),
+                    _ => match rpc.call_batched(4, 1, 1, n as u16, BOT_FEAT_DIM as u16, &feats) {
+                        Ok((v, ms)) if v.len() == n * ACTION_OUT_DIM => (v, ms, ACTION_OUT_DIM, false, false),
+                        _ => return false,
+                    },
                 },
             }
         } else {
@@ -5336,14 +5539,18 @@ impl GameState {
                 to_u8(a[8]),
                 to_u8(a[9]),
             ];
-            // Apply live acoustic human command override (g_i) if this bot physically heard the order!
+            // Apply live acoustic human command override (g_i):
+            // When op=14 recurrent brief policy is active with a System-2 TaskBrief, let the policy steer smoothly;
+            // otherwise apply legacy direct movement/ability override.
             if let Some(&ov) = self.bot_overrides.get(&bid) {
                 if tick <= ov.expires_tick {
-                    if ov.move_x.hypot(ov.move_y) > 0.05 {
-                        inp.move_x = ov.move_x;
-                        inp.move_y = ov.move_y;
-                        inp.aim_x = ov.move_x;
-                        inp.aim_y = ov.move_y;
+                    if !(used_v3_brief_policy && bot_system2_brief_active[bi]) {
+                        if ov.move_x.hypot(ov.move_y) > 0.05 {
+                            inp.move_x = ov.move_x;
+                            inp.move_y = ov.move_y;
+                            inp.aim_x = ov.move_x;
+                            inp.aim_y = ov.move_y;
+                        }
                     }
                     if let Some(oe) = ov.elem {
                         inp.bolt_element = oe % 3;
@@ -11879,5 +12086,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_wave41_bot_task_brief_and_gru_reset() {
+        let brief = BotTaskBrief {
+            objective: 1, // CAPTURE_SHRINE
+            stance: 2,    // FLEE_KITE
+            target_x: 150.0,
+            target_y: 80.0,
+            risk_budget: 0.25,
+            thermal_bias: -0.8,
+            active: true,
+            from_system2: true,
+            expires_tick: 500,
+        };
+        let mut tail = [0.0f32; BOT_BRIEF_DIM];
+        pack_bot_brief_tail(&mut tail, &brief, 100.0, 80.0, 4, 42, true);
+        assert_eq!(tail[1], 1.0);
+        assert_eq!(tail[5 + 2], 1.0);
+        assert!((tail[8] - 0.5).abs() < 1e-5);
+        assert!((tail[9] - 0.0).abs() < 1e-5);
+        assert!((tail[11] - 0.25).abs() < 1e-5);
+        assert!((tail[12] - 1.0).abs() < 1e-5);
+        assert_eq!(tail[13], 1.0);
+        assert!((tail[14] - (-0.8)).abs() < 1e-5);
+        assert!((tail[15] - (-43.0)).abs() < 1e-5);
+
+        pack_bot_brief_tail(&mut tail, &brief, 100.0, 80.0, 2, 42, false);
+        assert!((tail[12] - 0.5).abs() < 1e-5);
+        assert!((tail[15] - 43.0).abs() < 1e-5);
     }
 }

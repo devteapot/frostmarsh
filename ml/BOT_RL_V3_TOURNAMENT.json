@@ -1,0 +1,107 @@
+{
+  "checkpoint": "/home/gooning/.t3/scratch/frostmarsh-ml/bot_policy_v3_rl.pt",
+  "params": 270337,
+  "rust_vec_arena_bench": {
+    "rust_20x12_agent_steps_per_sec": 465749.9,
+    "rust_20x32_agent_steps_per_sec": 819431.6,
+    "rust_20x60_agent_steps_per_sec": 1993338.7
+  },
+  "stage0_dagger": {
+    "final_dagger_loss": 1.5753532648086548,
+    "dagger_secs": 27.41
+  },
+  "stage1_ppo_32bot": {
+    "mean_reward_first5": 0.03567,
+    "mean_reward_last5": 0.02565,
+    "final_predicates": [
+      0.5557,
+      0.4767,
+      0.4098,
+      0.599,
+      0.5683,
+      0.0399
+    ],
+    "elapsed_secs": 18.19
+  },
+  "stage2_ppo_60bot": {
+    "mean_reward_first5": 0.02817,
+    "mean_reward_last5": 0.03698,
+    "final_predicates": [
+      0.5357,
+      0.3063,
+      0.5371,
+      0.6414,
+      0.6115,
+      0.047
+    ],
+    "elapsed_secs": 64.19
+  },
+  "frozen_brief_obedience": {
+    "COMMIT_CAPTURE_NORTH_FIRE": {
+      "pred_close_target": 0.5755,
+      "pred_stance_ok": 0.4829,
+      "pred_risk_bound": 0.5727,
+      "fire_elem_pct": 100.0,
+      "frost_elem_pct": 0.0,
+      "bolt_cast_pct": 99.2,
+      "mean_nearest_bot_dist": 22.01
+    },
+    "HOLD_DEFEND_CENTER_FROST": {
+      "pred_close_target": 0.6863,
+      "pred_stance_ok": 0.4778,
+      "pred_risk_bound": 0.8051,
+      "fire_elem_pct": 0.0,
+      "frost_elem_pct": 100.0,
+      "bolt_cast_pct": 100.0,
+      "mean_nearest_bot_dist": 17.74
+    },
+    "FLEE_KITE_LOW_RISK": {
+      "pred_close_target": 0.7344,
+      "pred_stance_ok": 0.9697,
+      "pred_risk_bound": 1.0,
+      "fire_elem_pct": 0.0,
+      "frost_elem_pct": 100.0,
+      "bolt_cast_pct": 95.1,
+      "mean_nearest_bot_dist": 32.23
+    },
+    "HUNT_ENEMY_COMMIT_FIRE": {
+      "pred_close_target": 0.482,
+      "pred_stance_ok": 0.5026,
+      "pred_risk_bound": 0.6452,
+      "fire_elem_pct": 100.0,
+      "frost_elem_pct": 0.0,
+      "bolt_cast_pct": 98.2,
+      "mean_nearest_bot_dist": 17.2
+    },
+    "ESCORT_RELIC_HOLD": {
+      "pred_close_target": 0.6922,
+      "pred_stance_ok": 0.4787,
+      "pred_risk_bound": 0.6799,
+      "fire_elem_pct": 42.3,
+      "frost_elem_pct": 44.1,
+      "bolt_cast_pct": 98.2,
+      "mean_nearest_bot_dist": 17.21
+    }
+  },
+  "tournament_60bot": {
+    "v3_60bot_vs_scripted_teacher": {
+      "v3_win_rate_pct": 0.0,
+      "v3_mean_score": 174.64,
+      "opp_mean_score": 344.24,
+      "v3_mean_kills": 87.0,
+      "opp_mean_kills": 95.38
+    },
+    "v3_60bot_vs_v2_legacy_12bot": {
+      "v3_win_rate_pct": 25.0,
+      "v3_mean_score": 174.3,
+      "opp_mean_score": 214.27,
+      "v3_mean_kills": 68.25,
+      "opp_mean_kills": 83.88
+    }
+  },
+  "gb10_latency": {
+    "gb10_fp16_12bots_ms": 1.277,
+    "gb10_fp16_60bots_ms": 1.297,
+    "gb10_fp16_256bots_ms": 2.509
+  }
+}
